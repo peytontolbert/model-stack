@@ -1,0 +1,1 @@
+artifact registry w/ retention, promotions, signatures

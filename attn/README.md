@@ -1,0 +1,1 @@
+attention abstractions (MHA/GQA/MQA), KV-cache interfaces, masking logic

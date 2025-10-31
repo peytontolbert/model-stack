@@ -1,0 +1,10 @@
+cloned-repos/
+*.npz
+*.json
+*.jsonl
+*.pth
+*.pt
+*.safetensors
+__pycache__/
+experiments/
+checkpoints/
