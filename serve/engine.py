@@ -11,6 +11,7 @@ from tensor.sampling import (
     apply_presence_frequency_penalty,
     apply_no_repeat_ngram_mask,
 )
+from attn.kv_cache import init_kv_cache
 
 
 @dataclass
@@ -63,14 +64,40 @@ def generate(
     input_ids: torch.Tensor,
     *,
     cache=None,
+    attention_mask: Optional[torch.Tensor] = None,
     config: Optional[GenerationConfig] = None,
     sampler: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> torch.Tensor:
     cfg = config or GenerationConfig()
     seq = input_ids
+    # Initialize a simple KV cache for efficient decoding
+    try:
+        dev = next(model.parameters()).device
+        dt = next(model.parameters()).dtype
+        n_layers = len(getattr(model, "blocks"))
+        # Prefer explicit head_dim; else derive
+        head_dim = int(getattr(model.cfg, "head_dim", None) or (int(model.cfg.d_model) // int(model.cfg.n_heads)))
+        n_kv = int(getattr(getattr(model.blocks[0], "attn"), "n_kv_heads"))
+        cache = init_kv_cache(batch=seq.shape[0], n_layers=n_layers, n_kv_heads=n_kv, head_dim=head_dim, pagesize=128, dtype=dt, device=dev)
+    except Exception:
+        cache = None
+
     for _ in range(int(cfg.max_new_tokens)):
-        # Only pass the last token embedding to enable incremental decoding
-        logits = model(seq[:, -1:].contiguous(), None, cache)
+        # Greedy step with last token and KV cache if available
+        # Compute absolute position ids for the next token
+        try:
+            pos_ids = torch.arange(seq.shape[1] - 1, seq.shape[1], device=seq.device, dtype=torch.long)
+            pos_ids = pos_ids.view(1, 1).expand(seq.shape[0], -1)
+        except Exception:
+            pos_ids = None
+        logits = model(
+            seq[:, -1:].contiguous(),
+            attn_mask=None,
+            attention_mask=attention_mask,
+            cache=cache,
+            position_ids=pos_ids,
+            return_dict=False,
+        )
         next_logits = logits[:, -1, :]
         sampled_logits = _apply_sampling_policies(next_logits, seq, cfg)
         if sampler is not None:

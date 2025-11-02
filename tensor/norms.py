@@ -10,9 +10,13 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x_normalized = x * torch.rsqrt(variance + self.eps)
-        return x_normalized * self.weight.to(dtype=x.dtype, device=x.device)
+        # HF-compatible: accumulate in fp32
+        input_dtype = x.dtype
+        xf = x.float()
+        variance = xf.pow(2).mean(dim=-1, keepdim=True)
+        x_normalized = xf * torch.rsqrt(variance + self.eps)
+        y = x_normalized.to(dtype=input_dtype)
+        return y * self.weight.to(dtype=input_dtype, device=x.device)
 
 
 class ScaleNorm(nn.Module):

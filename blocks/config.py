@@ -21,6 +21,9 @@ class BlockConfig:
     attn_dropout: float = 0.0
     mlp_dropout: float = 0.0
 
+    # Linear layer bias options (None -> use module defaults)
+    mlp_bias: Optional[bool] = None
+
     # Positional bias/injection
     use_rope: bool = True
     rope_theta: float = 1e6
@@ -50,6 +53,7 @@ def build_block_config_from_model(cfg: ModelConfig, **overrides) -> BlockConfig:
         resid_dropout=float(overrides.pop("resid_dropout", 0.0)),
         attn_dropout=float(overrides.pop("attn_dropout", 0.0)),
         mlp_dropout=float(overrides.pop("mlp_dropout", 0.0)),
+        mlp_bias=overrides.pop("mlp_bias", None),
         use_rope=bool(overrides.pop("use_rope", True)),
         rope_theta=float(overrides.pop("rope_theta", getattr(cfg, "rope_theta", 1e6))),
         use_alibi=bool(overrides.pop("use_alibi", False)),

@@ -6,7 +6,11 @@ import json
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
+try:
+    from huggingface_hub import snapshot_download
+except Exception:
+    snapshot_download = None  # type: ignore
 from interpret.tracer import ActivationTracer
 from interpret.activation_cache import CaptureSpec
 
@@ -67,24 +71,46 @@ def _shim_getattr_nested(obj: Any, path: str) -> Any:
 
 def _shim_infer_target_shapes(model: Any) -> Dict[str, Tuple[int, int]]:
     shapes: Dict[str, Tuple[int, int]] = {}
+    # Local backend: model has .blocks
     try:
-        # Try first transformer layer
+        blocks = getattr(model, "blocks")
+        if blocks is not None and len(blocks) > 0:
+            b0 = blocks[0]
+            # attn weights
+            shapes["q_proj"] = (int(getattr(b0.attn.w_q.weight, "shape")[0]), int(getattr(b0.attn.w_q.weight, "shape")[1]))
+            shapes["k_proj"] = (int(b0.attn.w_k.weight.shape[0]), int(b0.attn.w_k.weight.shape[1]))
+            shapes["v_proj"] = (int(b0.attn.w_v.weight.shape[0]), int(b0.attn.w_v.weight.shape[1]))
+            shapes["o_proj"] = (int(b0.attn.w_o.weight.shape[0]), int(b0.attn.w_o.weight.shape[1]))
+            # mlp: split w_in into gate/up halves; w_out is down_proj
+            win_out = int(b0.mlp.w_in.weight.shape[0])
+            d_model = int(b0.mlp.w_in.weight.shape[1])
+            ff = int(win_out // 2)
+            shapes["gate_proj"] = (ff, d_model)
+            shapes["up_proj"] = (ff, d_model)
+            shapes["down_proj"] = (int(b0.mlp.w_out.weight.shape[0]), int(b0.mlp.w_out.weight.shape[1]))
+            return shapes
+    except Exception:
+        pass
+    # HF backend
+    try:
         first_layer = getattr(getattr(model, "model", model), "layers")[0]
+        for name, rel in _shim_targets_map().items():
+            try:
+                mod = _shim_getattr_nested(first_layer, rel)
+                w = getattr(mod, "weight")
+                shapes[name] = (int(w.shape[0]), int(w.shape[1]))
+            except Exception:
+                continue
+        return shapes
     except Exception:
         return {}
-    for name, rel in _shim_targets_map().items():
-        try:
-            mod = _shim_getattr_nested(first_layer, rel)
-            w = getattr(mod, "weight")
-            # torch.nn.Linear has shape [out, in]
-            shapes[name] = (int(w.shape[0]), int(w.shape[1]))
-        except Exception:
-            continue
-    return shapes
+
+
+_IGN: List[str] = []  # populated from CLI args in main()
 
 
 def _shim_modules_from_symbols(repo_root: str, seeds: List[str], *, radius: int = 1, top_k: int = 8) -> Tuple[List[str], List[str]]:
-    g = CodeGraph.load_or_build(repo_root)
+    g = CodeGraph.load_or_build(repo_root, ignore=[s for s in (_IGN or []) if s])
     modules_set: Dict[str, bool] = {}
     files_set: Dict[str, bool] = {}
     # Seed by direct symbol matches
@@ -118,7 +144,7 @@ def _shim_modules_from_symbols(repo_root: str, seeds: List[str], *, radius: int 
 
 
 def _shim_question_aware_modules_and_files(repo_root: str, prompt: str, *, top_k: int = 8) -> Tuple[List[str], List[str]]:
-    g = CodeGraph.load_or_build(repo_root)
+    g = CodeGraph.load_or_build(repo_root, ignore=[s for s in (_IGN or []) if s])
     # Simple keyword search over files, rank by hits
     try:
         import re as _re
@@ -165,7 +191,9 @@ def _shim_register_hook_mixed_adapters(
     target_weights: Optional[Dict[str, float]] = None,
 ):
     # Compute per-layer weight deltas (out,in) tensors
-    targets_map = _shim_targets_map()
+    # Use the target map provided by the shared OTF helpers so backend-specific
+    # name mappings (e.g., local vs HF) are respected.
+    targets_map = otf._targets_map()
     target_weights = target_weights or {}
     def _mat(A: np.ndarray, B: np.ndarray) -> torch.Tensor:
         return torch.from_numpy(A).to(torch.float32) @ torch.from_numpy(B).to(torch.float32)
@@ -197,10 +225,36 @@ def _shim_register_hook_mixed_adapters(
     # Apply deltas directly and return removable handles
     scale = float(alpha_star) / float(max(1, int(rank)))
     applied_pairs: List[Tuple[torch.nn.Parameter, torch.Tensor]] = []
+    # Support HF (.model.layers) and local (.blocks)
+    layers = []
     try:
         layers = list(getattr(getattr(model, "model", model), "layers"))
     except Exception:
-        layers = []
+        try:
+            layers = list(getattr(model, "blocks"))
+        except Exception:
+            layers = []
+    # Optional global cap on delta magnitude relative to base weight norm
+    def _cap_delta_if_needed(w: torch.nn.Parameter, d: torch.Tensor) -> torch.Tensor:
+        try:
+            cap_env = os.environ.get("REPO_ADAPTER_DELTA_CAP", "0.05").strip()
+            cap = float(cap_env) if cap_env else 0.0
+        except Exception:
+            cap = 0.0
+        if cap is None or cap <= 0:
+            return d
+        try:
+            wn = float(w.data.norm().item())
+            dn = float(d.norm().item())
+            if dn > 0 and wn > 0:
+                limit = cap * wn
+                if dn > limit:
+                    scale = float(limit / max(dn, 1e-12))
+                    return (scale * d)
+        except Exception:
+            return d
+        return d
+
     for i, deltas in enumerate(per_layer):
         if i >= len(layers):
             break
@@ -211,11 +265,35 @@ def _shim_register_hook_mixed_adapters(
             try:
                 mod = _shim_getattr_nested(layer, rel)
                 w: torch.nn.Parameter = getattr(mod, "weight")  # type: ignore[assignment]
-                delta = (scale * deltas[short]).to(w.device, dtype=w.dtype)
-                w.data.add_(delta)
-                applied_pairs.append((w, delta))
+                d = (scale * deltas[short]).to(w.device, dtype=w.dtype)
+                d = _cap_delta_if_needed(w, d)
+                # Special-case local MLP w_in splitting for gate/up
+                if rel.endswith("mlp.w_in") and short in ("gate_proj", "up_proj"):
+                    half = int(w.shape[0] // 2)
+                    if short == "gate_proj":
+                        part = d[:half, :] if d.shape[0] == w.shape[0] else d
+                        part = _cap_delta_if_needed(w, part)
+                        w.data[:half, :].add_(part)
+                    else:
+                        part = d[-half:, :] if d.shape[0] == w.shape[0] else d
+                        part = _cap_delta_if_needed(w, part)
+                        w.data[half:, :].add_(part)
+                    applied_pairs.append((w, torch.zeros_like(w)))
+                else:
+                    w.data.add_(d)
+                    applied_pairs.append((w, d))
             except Exception:
                 continue
+
+    # Optional debug: print how many parameter deltas were applied when requested
+    try:
+        if os.environ.get("REPO_ADAPTER_DEBUG", "").strip():
+            try:
+                print(f"[debug] repo-adapter: applied {len(applied_pairs)} parameter deltas")
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     class _AppliedDeltaHook:
         def __init__(self, pairs: List[Tuple[torch.nn.Parameter, torch.Tensor]]):
@@ -265,7 +343,7 @@ except Exception:
 
 
 def _pack_context_heads(repo_root: str, files: List[str], tok, budget_tokens: int) -> str:
-    g = CodeGraph.load_or_build(repo_root)
+    g = CodeGraph.load_or_build(repo_root, ignore=[s for s in (_IGN or []) if s])
     lines_out: List[str] = ["Repository snippets (enhanced):"]
     used = 0
     for rel in files:
@@ -295,7 +373,7 @@ def _pack_context_heads(repo_root: str, files: List[str], tok, budget_tokens: in
 
 def _pack_context_windows(repo_root: str, files: List[str], tok, budget_tokens: int) -> str:
     """Naive symbol-window packaging: include windows around first few 'def ' occurrences per file."""
-    g = CodeGraph.load_or_build(repo_root)
+    g = CodeGraph.load_or_build(repo_root, ignore=[s for s in (_IGN or []) if s])
     lines_out: List[str] = ["Repository windows (enhanced):"]
     used = 0
     for rel in files:
@@ -333,6 +411,7 @@ def _pack_context_windows(repo_root: str, files: List[str], tok, budget_tokens: 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
+    # Always use local model stack; HF is only used for tokenizer and optional snapshot download
     p.add_argument("--adapters", required=True)
     p.add_argument("--repo", required=True)
     p.add_argument("--prompt", required=True)
@@ -346,12 +425,14 @@ def main() -> None:
 
     # Device
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--device-map", default="auto", choices=["auto", "none"])
+    p.add_argument("--device-map", default="none", choices=["auto", "none"])  # no-op for local backend
     p.add_argument("--gpu-ids", default=None, help="Comma-separated GPU ids to use (sets CUDA_VISIBLE_DEVICES)")
     p.add_argument("--max-memory", default=None, help="GPU/CPU memory budget, e.g., '0:22GiB,1:22GiB,cpu:96GiB'")
     p.add_argument("--offload-folder", default=None, help="Directory to offload weights when using device_map=auto")
-    p.add_argument("--attn-impl", default="auto", choices=["auto","flash2","sdpa","eager"], help="Attention backend for HF (flash2 requires flash-attn)")
-    p.add_argument("--load-in-4bit", action="store_true", help="Load model in 4-bit quantization (requires bitsandbytes)")
+    # HF-only options removed; kept for CLI compatibility but ignored
+    p.add_argument("--attn-impl", default="auto", choices=["auto","flash2","sdpa","eager"], help="(ignored) Attention backend for HF")
+    p.add_argument("--load-in-4bit", action="store_true", help="(ignored) Load model in 4-bit quantization")
+    p.add_argument("--head-device", default="auto", choices=["auto","cpu","same"], help="Where to run the lm_head projection: auto chooses CPU if GPU free VRAM is low")
 
     # Selection & context
     p.add_argument("--of-sources", choices=["question", "zoom"], default="question")
@@ -362,6 +443,7 @@ def main() -> None:
     p.add_argument("--context-tokens", type=int, default=2000)
     p.add_argument("--require-citations", action="store_true")
     p.add_argument("--citations-per-paragraph", action="store_true")
+    p.add_argument("--ignore", action="append", default=None, help="Relative paths to ignore (repeatable), e.g., cloned_repos")
     # Function-first packaging (model-scored)
     p.add_argument("--function-first", action="store_true", help="Use model-scored function windows first, then fill budget")
     p.add_argument("--ff-max-candidates", type=int, default=24, help="Max function windows to score per selection")
@@ -376,6 +458,7 @@ def main() -> None:
     p.add_argument("--repetition-penalty", type=float, default=1.1)
     p.add_argument("--min-new-tokens", type=int, default=64)
     p.add_argument("--max-new-tokens", type=int, default=256)
+    p.add_argument("--kv-window", type=int, default=0, help="If >0, prune past_key_values to this window length per step")
 
     # Telemetry & debug
     p.add_argument("--telemetry-out", default=None, help="Path to write selection and generation metadata JSON")
@@ -383,6 +466,7 @@ def main() -> None:
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--cache-dir", default=None, help="Cache directory for HF models/tokenizers (defaults to <repo>/checkpoints)")
+    p.add_argument("--debug-targets", action="store_true", help="Print discovered target names, shapes, and layer count")
     
     # Interpretability
     p.add_argument("--interpret", action="store_true", help="Capture per-layer outputs and logit-lens top-k (baseline vs adapted)")
@@ -390,7 +474,15 @@ def main() -> None:
     p.add_argument("--interpret-topk", type=int, default=10)
     p.add_argument("--interpret-tokens", type=int, default=512, help="Max tokens for interpret forward (uses tail of prompt)")
     p.add_argument("--interpret-layer-stride", type=int, default=1, help="Capture every Nth layer to reduce memory")
+    p.add_argument("--no-adapters", action="store_true", help="Disable applying adapters; run baseline model only")
     args = p.parse_args()
+    # Ensure backend attribute exists (default to local-only backend)
+    if not hasattr(args, "backend"):
+        setattr(args, "backend", "local")
+
+    # Populate global ignore list for CodeGraph loads in helper fns
+    global _IGN
+    _IGN = [s for s in (args.ignore or []) if s]
 
     # Constrain visible GPUs early if requested; reduce fragmentation
     if args.gpu_ids and str(args.gpu_ids).strip():
@@ -417,77 +509,124 @@ def main() -> None:
     except Exception:
         pass
 
+    # Tokenizer (HF ok for text)
     tok = AutoTokenizer.from_pretrained(args.model, use_fast=True, cache_dir=cache_dir)
     torch_dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
-    # Optional max_memory mapping
-    max_memory = None
-    if args.max_memory and str(args.max_memory).strip():
-        try:
-            mm: Dict[object, str] = {}
-            for part in str(args.max_memory).split(","):
-                if ":" not in part:
-                    continue
-                dev, cap = part.split(":", 1)
-                dev = dev.strip()
-                cap = cap.strip()
-                key: object = int(dev) if dev.isdigit() else dev
-                mm[key] = cap
-            if mm:
-                max_memory = mm
-        except Exception:
-            max_memory = None
-    # Map attention implementation
-    attn_impl = None
-    if args.attn_impl == "flash2":
-        attn_impl = "flash_attention_2"
-    elif args.attn_impl == "sdpa":
-        attn_impl = "sdpa"
-    elif args.attn_impl == "eager":
-        attn_impl = "eager"
 
-    from_pretrained_kwargs = {
-        "torch_dtype": torch_dtype,
-        "low_cpu_mem_usage": True,
-        "cache_dir": cache_dir,
-    }
-    if attn_impl is not None:
-        from_pretrained_kwargs["attn_implementation"] = attn_impl
-    if args.load_in_4bit:
-        from_pretrained_kwargs["load_in_4bit"] = True
-        # Prefer bf16 math if available
+    # Ensure local snapshot of the model for weights/config
+    def _ensure_snapshot(model_id: str, cache_dir: str) -> str:
+        # 1) If user passed a local dir with config.json, use it directly
+        if os.path.isdir(model_id) and os.path.isfile(os.path.join(model_id, "config.json")):
+            return model_id
+        # 2) Try to find an existing snapshot under cache_dir
         try:
-            from_pretrained_kwargs["bnb_4bit_compute_dtype"] = torch.bfloat16 if torch_dtype == torch.bfloat16 else torch.float16
+            org_name = model_id.strip().split("/")[-2:]
+            if len(org_name) == 2:
+                org, name = org_name
+                # HF cache format: models--ORG--NAME/snapshots/<rev>
+                dir1 = os.path.join(cache_dir, f"models--{org}--{name}", "snapshots")
+                # Some caches might have slightly different name casing; scan all models--* folders
+                candidates: list[str] = []
+                if os.path.isdir(dir1):
+                    candidates.extend([os.path.join(dir1, d) for d in os.listdir(dir1)])
+                else:
+                    root = os.path.join(cache_dir)
+                    for d in os.listdir(root):
+                        if not d.startswith("models--"):
+                            continue
+                        snap = os.path.join(root, d, "snapshots")
+                        if os.path.isdir(snap):
+                            for sd in os.listdir(snap):
+                                candidates.append(os.path.join(snap, sd))
+                # Prefer newest by mtime
+                candidates = [p for p in candidates if os.path.isfile(os.path.join(p, "config.json"))]
+                if candidates:
+                    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                    return candidates[0]
         except Exception:
             pass
+        # 3) Download if nothing found locally
+        if snapshot_download is None:
+            raise RuntimeError("huggingface_hub is required to download the model snapshot")
+        return snapshot_download(repo_id=model_id, cache_dir=cache_dir)
 
-    if args.device_map == "auto":
-        from_pretrained_kwargs.update({
-            "device_map": "auto",
-            "max_memory": max_memory,
-        })
-        if args.offload_folder:
-            from_pretrained_kwargs["offload_folder"] = args.offload_folder
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            **from_pretrained_kwargs,
-        )
-    else:
-        from_pretrained_kwargs.update({
-            "device_map": None,
-        })
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            **from_pretrained_kwargs,
-        ).to(args.device)
-    model.eval()
+    ckpt_dir = _ensure_snapshot(args.model, cache_dir)
 
-    # Optional: disable KV cache to reduce memory for long prompts
+    # Build local CausalLM from our stack using config.json dims
+    from specs.config import ModelConfig
+    from model.factory import build_causal_lm
+    from model.hf_llama_loader import load_hf_llama_weights_into_local
+
     try:
-        if getattr(model, "config", None) is not None and hasattr(model.config, "use_cache"):
-            if os.environ.get("DISABLE_KV_CACHE", "0") in ("1", "true", "True"):
-                model.config.use_cache = False
+        cfg_obj = json.load(open(os.path.join(ckpt_dir, "config.json"), "r", encoding="utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"Failed to read config.json from {ckpt_dir}") from e
+    d_model = int(cfg_obj.get("hidden_size"))
+    n_layers = int(cfg_obj.get("num_hidden_layers"))
+    n_heads = int(cfg_obj.get("num_attention_heads"))
+    d_ff = int(cfg_obj.get("intermediate_size"))
+    vocab_size = int(cfg_obj.get("vocab_size"))
+    head_dim = int(cfg_obj.get("head_dim", d_model // n_heads))
+    n_kv_heads = int(cfg_obj.get("num_key_value_heads", n_heads))
+    # Prefer rope_parameters.rope_theta when present (HF convention), else rope_theta
+    rope_theta = float(cfg_obj.get("rope_theta", 1e6))
+    try:
+        rp = cfg_obj.get("rope_parameters", None)
+        if isinstance(rp, dict) and rp.get("rope_theta") is not None:
+            rope_theta = float(rp.get("rope_theta"))
     except Exception:
         pass
+    # RMSNorm epsilon
+    rms_eps = float(cfg_obj.get("rms_norm_eps", 1e-6))
+    # Parse rope_scaling dict when present
+    rs_type = None
+    rs_factor = None
+    rs_orig = None
+    rs_low = None
+    rs_high = None
+    try:
+        rope_scaling = cfg_obj.get("rope_scaling", None)
+        if isinstance(rope_scaling, dict):
+            rs_type = rope_scaling.get("type")
+            if rope_scaling.get("factor") is not None:
+                rs_factor = float(rope_scaling.get("factor"))
+            if rope_scaling.get("original_max_position_embeddings") is not None:
+                rs_orig = int(rope_scaling.get("original_max_position_embeddings"))
+            if rope_scaling.get("low_freq_factor") is not None:
+                rs_low = float(rope_scaling.get("low_freq_factor"))
+            if rope_scaling.get("high_freq_factor") is not None:
+                rs_high = float(rope_scaling.get("high_freq_factor"))
+    except Exception:
+        pass
+    mc = ModelConfig(
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        d_ff=d_ff,
+        vocab_size=vocab_size,
+        head_dim=head_dim,
+        rope_theta=rope_theta,
+        dtype=("bfloat16" if torch_dtype == torch.bfloat16 else "float32"),
+        attn_impl="sdpa",
+        rms_norm_eps=rms_eps,
+        rope_scaling_type=rs_type,
+        rope_scaling_factor=rs_factor,
+        rope_scaling_original_max_position_embeddings=rs_orig,
+        rope_scaling_low_freq_factor=rs_low,
+        rope_scaling_high_freq_factor=rs_high,
+    )
+    # Respect HF config for tied embeddings/head
+    tie_we = bool(cfg_obj.get("tie_word_embeddings", True))
+    model = build_causal_lm(mc, block="llama", n_kv_heads=n_kv_heads, tie_weights=tie_we)
+    # Pre-cast module dtype so the loader copies weights in the desired dtype (reduces CPU memory)
+    try:
+        model = model.to(dtype=torch_dtype)
+    except Exception:
+        pass
+    load_hf_llama_weights_into_local(model, ckpt_dir)
+    model = model.to(args.device).eval()
+
+    # KV cache toggle (no-op for local unless we add cache implementation flags)
 
     # Load base adapters
     base = load_adapters_npz(args.adapters)["layers"]
@@ -507,7 +646,7 @@ def main() -> None:
         return
 
     # Build on-the-fly subgraph adapter
-    g = CodeGraph.load_or_build(args.repo)
+    g = CodeGraph.load_or_build(args.repo, ignore=[s for s in (_IGN or []) if s])
     abs_files = [f if os.path.isabs(f) else os.path.abspath(os.path.join(g.root, f)) for f in files]
     sub_z = build_subgraph_embedding_from_graph(
         g,
@@ -519,9 +658,33 @@ def main() -> None:
         text_max_bytes=250000,
         text_weight=0.25,
     )
+    # Ensure target map matches backend
+    if args.backend == "local":
+        local_map = {
+            "q_proj": "attn.w_q",
+            "k_proj": "attn.w_k",
+            "v_proj": "attn.w_v",
+            "o_proj": "attn.w_o",
+            "up_proj": "mlp.w_in",
+            "gate_proj": "mlp.w_in",
+            "down_proj": "mlp.w_out",
+        }
+        setattr(otf, "_targets_map", lambda: local_map)
     target_shapes = otf._infer_target_shapes(model)  # type: ignore
-    num_layers = len(model.model.layers)
-    d_model = int(getattr(model.config, "hidden_size", target_shapes.get("q_proj", (0, 0))[0]))
+    num_layers = (len(model.blocks) if args.backend == "local" else len(model.model.layers))
+    if args.debug_targets:
+        try:
+            print(json.dumps({
+                "layers": int(num_layers),
+                "targets": sorted(list(otf._targets_map().keys())),  # type: ignore
+                "shapes": {k: list(map(int, v)) for k, v in (target_shapes or {}).items()},
+            }, indent=2))
+        except Exception:
+            pass
+    if args.backend == "local":
+        d_model = int(getattr(getattr(model, "cfg", None), "d_model", target_shapes.get("q_proj", (0, 0))[0]))
+    else:
+        d_model = int(getattr(model.config, "hidden_size", target_shapes.get("q_proj", (0, 0))[0]))
     sub = generate_lora_from_embedding(
         sub_z["z"],
         d_model=d_model,
@@ -797,16 +960,18 @@ def main() -> None:
             cache_b = dict(tracer_b._cache.items())
 
         # Apply adapters temporarily
-        hooks_tmp = otf._register_hook_mixed_adapters(  # type: ignore
-            model,
-            base,
-            sub.get("layers"),
-            alpha_star=float(args.alpha),
-            g_sub=float(args.gsub),
-            rank=int(args.rank),
-            beta=float(args.mix_beta),
-            target_weights=target_weights,
-        )
+        hooks_tmp = []
+        if not bool(args.no_adapters):
+            hooks_tmp = otf._register_hook_mixed_adapters(  # type: ignore
+                model,
+                base,
+                sub.get("layers"),
+                alpha_star=float(args.alpha),
+                g_sub=float(args.gsub),
+                rank=int(args.rank),
+                beta=float(args.mix_beta),
+                target_weights=target_weights,
+            )
         if args.verbose:
             print("[debug] interpret: adapted capturing block outputs...")
         tracer_a = ActivationTracer(model, spec=spec)
@@ -899,34 +1064,204 @@ def main() -> None:
                 print(f"[warn] failed to write interpret: {e}")
 
     # Now register mixed hooks for generation
-    hooks = otf._register_hook_mixed_adapters(  # type: ignore
-        model,
-        base,
-        sub.get("layers"),
-        alpha_star=float(args.alpha),
-        g_sub=float(args.gsub),
-        rank=int(args.rank),
-        beta=float(args.mix_beta),
-        target_weights=target_weights,
-    )
+    hooks = []
+    if not bool(args.no_adapters):
+        hooks = otf._register_hook_mixed_adapters(  # type: ignore
+            model,
+            base,
+            sub.get("layers"),
+            alpha_star=float(args.alpha),
+            g_sub=float(args.gsub),
+            rank=int(args.rank),
+            beta=float(args.mix_beta),
+            target_weights=target_weights,
+        )
 
-    gen_kwargs = {
-        "max_new_tokens": int(args.max_new_tokens),
-        "do_sample": bool(args.do_sample),
-    }
-    if args.do_sample:
-        gen_kwargs.update({
-            "temperature": float(args.temperature),
-            "top_p": float(args.top_p),
-            "repetition_penalty": float(args.repetition_penalty),
-            "min_new_tokens": int(max(0, int(args.min_new_tokens))),
-        })
-    if args.verbose:
-        print("[debug] generating...")
-    out = model.generate(**x, **gen_kwargs)
+    # For local backend, prefer built-in generate to avoid HF-only cache paths
+    try:
+        args.kv_window = 0
+        args.head_device = "same"
+    except Exception:
+        pass
+    # Generation: optional KV-pruned manual loop (disabled for local backend)
+    if False and (int(args.kv_window) > 0 or args.head_device != "same"):
+        if args.verbose:
+            print(f"[debug] generating with kv_window={int(args.kv_window)}...")
+        max_new = int(args.max_new_tokens)
+        do_sample = bool(args.do_sample)
+        temperature = float(args.temperature)
+        top_p = float(args.top_p)
+        rep_pen = float(args.repetition_penalty)
+
+        # Decide head device and prepare projection weight once
+        head_mode = str(args.head_device)
+        head_use_cpu = False
+        # Inspect current lm_head device if available
+        try:
+            lm_head = getattr(model, "lm_head", None)
+            head_param = next(lm_head.parameters()).device if (lm_head is not None) else next(model.parameters()).device
+        except Exception:
+            head_param = next(model.parameters()).device
+        if head_mode == "cpu":
+            head_use_cpu = True
+        elif head_mode == "auto":
+            try:
+                if head_param.type == "cuda":
+                    free, total = torch.cuda.mem_get_info(head_param)
+                    # Require a modest safety margin for logits matmul
+                    head_use_cpu = bool(free < (256 * 1024 * 1024))
+                else:
+                    head_use_cpu = True
+            except Exception:
+                head_use_cpu = True
+        else:
+            head_use_cpu = False
+
+        # Prepare W^T on target device
+        def _prepare_head_weight() -> Tuple[torch.Tensor, torch.device]:
+            we = model.get_output_embeddings()
+            W = we.weight
+            if head_use_cpu:
+                Wt = W.detach().to(device=torch.device("cpu"), dtype=torch.float32).t().contiguous()
+                return Wt, torch.device("cpu")
+            # use same device as hidden state; keep dtype
+            dev = next(model.parameters()).device
+            Wt = W.detach().to(device=dev).t().contiguous()
+            return Wt, dev
+
+        Wt, head_dev = _prepare_head_weight()
+
+        def _top_p_sample(logits: torch.Tensor, top_p_val: float, temp: float) -> torch.Tensor:
+            if temp and temp > 0:
+                logits = logits / float(temp)
+            probs = torch.softmax(logits, dim=-1)
+            if 0.0 < top_p_val < 1.0:
+                sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+                cum = torch.cumsum(sorted_probs, dim=-1)
+                mask = cum > top_p_val
+                # keep at least one
+                mask[..., 0] = False
+                sorted_probs = sorted_probs.masked_fill(mask, 0.0)
+                probs = torch.zeros_like(probs).scatter(-1, sorted_idx, sorted_probs)
+            return torch.multinomial(probs, num_samples=1)
+
+        # Prepare initial inputs
+        input_ids = x["input_ids"] if isinstance(x, dict) else x.input_ids
+        attention_mask = x.get("attention_mask") if isinstance(x, dict) else getattr(x, "attention_mask", None)
+        seq = input_ids
+        # Prepare EOS set (can be int or list)
+        eos_ids = getattr(model.config, "eos_token_id", None)
+        if isinstance(eos_ids, (list, tuple)):
+            eos_set = {int(x) for x in eos_ids if x is not None}
+        elif eos_ids is not None:
+            eos_set = {int(eos_ids)}
+        else:
+            eos_set = set()
+
+        for _ in range(max_new):
+            with torch.no_grad():
+                # Evaluate on the last kv_window tokens to bound compute/memory
+                win = int(args.kv_window)
+                ctx = seq[:, -win:] if win > 0 else seq[:, -1:]
+                # Run core model to get hidden states (bypass HF head)
+                core = model.model(input_ids=ctx, attention_mask=None, use_cache=False, return_dict=True)
+                h_last = core.last_hidden_state[:, -1, :]
+                if head_use_cpu and h_last.device.type != "cpu":
+                    h_proj = h_last.to(device=head_dev, dtype=Wt.dtype)
+                else:
+                    # ensure on same device/dtype as Wt
+                    h_proj = h_last.to(device=head_dev, dtype=Wt.dtype)
+                logits = torch.matmul(h_proj, Wt)
+            # repetition penalty (simple)
+            if rep_pen != 1.0:
+                gather_ids = seq
+                logits = logits.scatter_add(1, gather_ids, torch.full_like(gather_ids, -abs(rep_pen - 1.0), dtype=logits.dtype))
+            if do_sample:
+                next_id = _top_p_sample(logits, top_p, temperature)
+            else:
+                next_id = torch.argmax(logits, dim=-1, keepdim=True)
+            seq = torch.cat([seq, next_id], dim=1)
+            # No explicit HF cache; sliding window enforced via ctx slicing above
+            # Early stop
+            if eos_set:
+                try:
+                    eos_t = torch.tensor(sorted(list(eos_set)), device=next_id.device, dtype=next_id.dtype)
+                    # next_id: (B,1); check if each batch element is in eos set
+                    if torch.isin(next_id.view(-1), eos_t).all():
+                        break
+                except Exception:
+                    # Fallback: Python-side check
+                    if all(int(x) in eos_set for x in next_id.view(-1).tolist()):
+                        break
+        out = seq
+    else:
+        gen_kwargs = {
+            "max_new_tokens": int(args.max_new_tokens),
+            "do_sample": bool(args.do_sample),
+        }
+        if args.do_sample:
+            gen_kwargs.update({
+                "temperature": float(args.temperature),
+                "top_p": float(args.top_p),
+                "repetition_penalty": float(args.repetition_penalty),
+                "min_new_tokens": int(max(0, int(args.min_new_tokens))),
+            })
+        if args.verbose:
+            print("[debug] generating...")
+        try:
+            out = model.generate(**x, **gen_kwargs)
+        except RuntimeError as e:
+            msg = str(e)
+            if ("CUBLAS_STATUS_ALLOC_FAILED" in msg) or ("CUDA out of memory" in msg):
+                if args.verbose:
+                    print("[warn] CUDA allocation failed; retrying on CPU...")
+                try:
+                    # Best-effort to free some GPU memory
+                    import torch as _torch  # local alias
+                    if _torch.cuda.is_available():
+                        try:
+                            _torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    model = model.to(device="cpu", dtype=torch.float32)
+                except Exception:
+                    model = model.to(device="cpu")
+                try:
+                    x = {k: v.to("cpu") for k, v in x.items()} if isinstance(x, dict) else x.to("cpu")
+                except Exception:
+                    pass
+                out = model.generate(**x, **gen_kwargs)
+            else:
+                raise
     if args.verbose:
         print("[debug] decode...")
-    text = tok.decode(out[0], skip_special_tokens=True)
+    # Handle local generate return structure
+    try:
+        out_ids = out[0] if hasattr(out, "__getitem__") else out
+        if isinstance(out, dict) and "sequences" in out:
+            out_ids = out["sequences"]
+        # Decode only the newly generated tokens (exclude prompt/context)
+        try:
+            inp_len = int(x["input_ids"].shape[1]) if isinstance(x, dict) else int(x.input_ids.shape[1])
+        except Exception:
+            inp_len = 0
+        seq_ids = out_ids[0]
+        new_ids = seq_ids[inp_len:] if (hasattr(seq_ids, "shape") and seq_ids.shape[0] > inp_len) else seq_ids
+        text = tok.decode(new_ids, skip_special_tokens=True)
+    except Exception:
+        # Fallback: best-effort decode
+        try:
+            seq = out.get("sequences") if isinstance(out, dict) else out
+            # Best-effort prompt-trim
+            inp_len = int(x["input_ids"].shape[1]) if isinstance(x, dict) else int(getattr(x, "input_ids", [0]).shape[1])
+            seq_ids = seq[0]
+            new_ids = seq_ids[inp_len:] if (hasattr(seq_ids, "shape") and seq_ids.shape[0] > inp_len) else seq_ids
+            text = tok.decode(new_ids, skip_special_tokens=True)
+        except Exception:
+            text = "[error] failed to decode output"
 
     # Citation checks with one retry strategy
     def _has_citations(s: str, per_para: bool) -> bool:
@@ -958,8 +1293,6 @@ def main() -> None:
         retry_kwargs = {
             "max_new_tokens": int(max(int(args.max_new_tokens), 256)),
             "do_sample": False,
-            "num_beams": 2,
-            "early_stopping": True,
         }
         out2 = model.generate(**x2, **retry_kwargs)
         text2 = tok.decode(out2[0], skip_special_tokens=True)

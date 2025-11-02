@@ -260,3 +260,34 @@ def build_block_sparse_mask(seq_len: int, block: int, pattern: torch.Tensor, dev
     return mask.to(dtype)
 
 
+def create_causal_mask(
+    *,
+    input_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    cache_position: torch.Tensor | None = None,
+    past_key_values=None,
+    position_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """HF-like 4D additive causal mask builder.
+
+    Returns an additive mask shaped (B, 1, T, S) suitable for SDPA/additive masking.
+    This minimal version handles the no-cache case and combines causal and padding masks.
+    """
+    B, T, _ = input_embeds.shape
+    device = input_embeds.device
+    # Base causal mask (True means masked)
+    causal_bool = build_causal_mask(T, device=device, dtype=torch.bool)  # (T,T)
+    causal_bool = causal_bool.view(1, 1, T, T)
+
+    if attention_mask is None:
+        combined_bool = causal_bool
+    else:
+        # attention_mask: (B,T) with 1 token, 0 pad -> build padding mask (True=masked)
+        pad_bool = build_padding_mask(attention_mask).view(B, 1, 1, T)
+        combined_bool = causal_bool | pad_bool
+
+    # Convert to additive mask (neg_inf where masked)
+    add = to_additive_mask(combined_bool)
+    return add
+
+

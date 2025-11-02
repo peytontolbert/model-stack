@@ -35,8 +35,18 @@ class ModuleInfo:
 
 
 class CodeGraph:
-    def __init__(self, root: str) -> None:
+    def __init__(self, root: str, *, ignore: Optional[List[str]] = None) -> None:
         self.root = os.path.abspath(root)
+        # Ignore patterns (relative to root) or glob-like; simple prefix/glob matching
+        self._ignore: List[str] = []
+        if ignore:
+            # normalize to forward-slash relative prefixes for matching
+            for pat in ignore:
+                if not pat:
+                    continue
+                p = os.path.normpath(pat)
+                # store both relative and absolute forms for convenience
+                self._ignore.append(p)
         self.symbols_by_fqn: Dict[str, Symbol] = {}
         self.symbols_by_name: Dict[str, List[str]] = {}
         self.modules: Dict[str, ModuleInfo] = {}
@@ -52,8 +62,8 @@ class CodeGraph:
         self._cached_hashes: Dict[str, str] = {}
 
     @classmethod
-    def load_or_build(cls, root: str, *, ignore_cache: bool = False) -> "CodeGraph":
-        g = cls(root=root)
+    def load_or_build(cls, root: str, *, ignore_cache: bool = False, ignore: Optional[List[str]] = None) -> "CodeGraph":
+        g = cls(root=root, ignore=ignore)
         g.build(ignore_cache=ignore_cache)
         return g
 
@@ -71,11 +81,27 @@ class CodeGraph:
             self._post_resolve_calls()
             self._save_cache(cache_path)
             return
-        for dirpath, _, filenames in os.walk(self.root):
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            # prune ignored directories in-place
+            dir_rel = os.path.relpath(dirpath, self.root)
+            # Normalize ignore to handle nested paths
+            def _is_ignored_path(rel: str) -> bool:
+                r = rel.replace(os.sep, "/")
+                for pat in self._ignore:
+                    pp = pat.replace(os.sep, "/")
+                    if r == pp or r.startswith(pp + "/"):
+                        return True
+                return False
+            # remove child dirs that are ignored
+            dirnames[:] = [d for d in dirnames if not _is_ignored_path(os.path.join(dir_rel, d))]
+            if _is_ignored_path(dir_rel):
+                continue
             for fn in filenames:
                 if not fn.endswith(".py"):
                     continue
                 fpath = os.path.join(dirpath, fn)
+                if _is_ignored_path(os.path.relpath(fpath, self.root)):
+                    continue
                 try:
                     src = open(fpath, "r", encoding="utf-8").read()
                 except Exception:
@@ -540,10 +566,24 @@ class CodeGraph:
         self, old_mt: Dict[str, int], old_hh: Dict[str, str]
     ) -> Tuple[List[str], List[str]]:
         curr_files: List[str] = []
-        for dirpath, _, filenames in os.walk(self.root):
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dir_rel = os.path.relpath(dirpath, self.root)
+            def _is_ignored_path(rel: str) -> bool:
+                r = rel.replace(os.sep, "/")
+                for pat in self._ignore:
+                    pp = pat.replace(os.sep, "/")
+                    if r == pp or r.startswith(pp + "/"):
+                        return True
+                return False
+            dirnames[:] = [d for d in dirnames if not _is_ignored_path(os.path.join(dir_rel, d))]
+            if _is_ignored_path(dir_rel):
+                continue
             for fn in filenames:
                 if fn.endswith(".py"):
-                    curr_files.append(os.path.join(dirpath, fn))
+                    fp = os.path.join(dirpath, fn)
+                    if _is_ignored_path(os.path.relpath(fp, self.root)):
+                        continue
+                    curr_files.append(fp)
         curr = set(curr_files)
         prev = set(self.indexed_files or [])
         removed = list(prev - curr)
@@ -814,6 +854,7 @@ def _cli() -> None:
 
     p = argparse.ArgumentParser()
     p.add_argument("root", nargs="?", default="./repo")
+    p.add_argument("--ignore", action="append", default=None, help="Relative paths to ignore (repeatable)")
     p.add_argument("--owners-of", dest="owners_of", default=None)
     p.add_argument("--search", dest="search", default=None)
     p.add_argument("--defs-in", dest="defs_in", default=None)
@@ -832,7 +873,7 @@ def _cli() -> None:
     p.add_argument("--module-deps", dest="module_deps", default=None)
     p.add_argument("--unresolved", dest="unresolved", action="store_true")
     args = p.parse_args()
-    g = CodeGraph.load_or_build(args.root, ignore_cache=bool(args.no_cache))
+    g = CodeGraph.load_or_build(args.root, ignore_cache=bool(args.no_cache), ignore=[s for s in (args.ignore or []) if s])
     if args.coverage_xml:
         g.attach_coverage_from_xml(args.coverage_xml)
         # fall through to other queries if provided

@@ -17,6 +17,7 @@ class LlamaBlock(TransformerBlock):
             resid_dropout=overrides.pop("resid_dropout", 0.0),
             attn_dropout=overrides.pop("attn_dropout", 0.0),
             mlp_dropout=overrides.pop("mlp_dropout", 0.0),
+            mlp_bias=overrides.pop("mlp_bias", False),
             use_rope=overrides.pop("use_rope", True),
             rope_theta=overrides.pop("rope_theta", getattr(cfg, "rope_theta", 1e6)),
             use_alibi=overrides.pop("use_alibi", False),

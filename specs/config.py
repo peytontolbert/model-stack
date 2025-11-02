@@ -11,6 +11,7 @@ class ModelConfig:
     n_layers: int
     d_ff: int
     vocab_size: int
+    head_dim: int | None = None
     attn_impl: Literal["eager", "flash", "triton", "xformers", "sdpa", "torch", "flash2", "xformers2"] = "eager"
     rope_theta: float = 1e6
     dtype: DType = "bfloat16"
@@ -23,3 +24,13 @@ class ModelConfig:
     masking: str = "build_causal_mask"
     softmax: str = "safe_softmax"
     residual: str = "prenorm"
+    # numeric knobs
+    rms_norm_eps: float = 1e-6
+    # HF rope scaling (optional)
+    rope_scaling_type: Optional[str] = None
+    rope_scaling_factor: Optional[float] = None
+    rope_scaling_original_max_position_embeddings: Optional[int] = None
+    rope_scaling_low_freq_factor: Optional[float] = None
+    rope_scaling_high_freq_factor: Optional[float] = None
+    # HF rotary attention scaling (applied to cos/sin)
+    rope_attention_scaling: Optional[float] = None

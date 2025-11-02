@@ -17,10 +17,20 @@ class TransformerBlock(nn.Module):
         self.cfg = cfg
         self.bc = bc
         Norm = RMSNorm if bc.norm_type == "rms" else nn.LayerNorm
-        self.n1 = Norm(cfg.d_model)
-        self.n2 = Norm(cfg.d_model)
+        if Norm is RMSNorm:
+            self.n1 = Norm(cfg.d_model, eps=getattr(cfg, "rms_norm_eps", 1e-6))
+            self.n2 = Norm(cfg.d_model, eps=getattr(cfg, "rms_norm_eps", 1e-6))
+        else:
+            self.n1 = Norm(cfg.d_model)
+            self.n2 = Norm(cfg.d_model)
         self.attn = attn
-        self.mlp = MLP(cfg.d_model, cfg.d_ff, activation=bc.activation, dropout_p=bc.mlp_dropout)
+        self.mlp = MLP(
+            cfg.d_model,
+            cfg.d_ff,
+            activation=bc.activation,
+            dropout_p=bc.mlp_dropout,
+            bias=(bc.mlp_bias if bc.mlp_bias is not None else True),
+        )
         self.resid_dropout = nn.Dropout(bc.resid_dropout) if bc.resid_dropout > 0.0 else nn.Identity()
         self.drop_path = StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
         # Optional relative position bias table: (H, 2*D-1)
@@ -30,7 +40,7 @@ class TransformerBlock(nn.Module):
         else:
             self.rpb_table = None
 
-    def _forward_core(self, x: torch.Tensor, mask: torch.Tensor | None, cache=None) -> torch.Tensor:
+    def _forward_core(self, x: torch.Tensor, mask: torch.Tensor | None, cache=None, position_embeddings=None, position_ids=None) -> torch.Tensor:
         # Optional positional biases (ALiBi, RPB)
         attn_mask = mask
         if self.bc.use_alibi:
@@ -57,20 +67,20 @@ class TransformerBlock(nn.Module):
                     add = attn_mask
                 attn_mask = add + rpb
         if self.bc.norm_policy == "prenorm":
-            a = self.attn.forward(self.n1(x), None, None, attn_mask, cache)
+            a = self.attn.forward(self.n1(x), None, None, attn_mask, cache, position_embeddings=position_embeddings, position_ids=position_ids)
             x = x + self.bc.residual_scale * self.drop_path(self.resid_dropout(a))
             m = self.mlp(self.n2(x))
             x = x + self.bc.residual_scale * self.drop_path(self.resid_dropout(m))
             return x
         # post-norm
-        a = self.attn.forward(x, None, None, attn_mask, cache)
+        a = self.attn.forward(x, None, None, attn_mask, cache, position_embeddings=position_embeddings, position_ids=position_ids)
         x = self.n1(x + self.bc.residual_scale * self.drop_path(self.resid_dropout(a)))
         m = self.mlp(x)
         x = self.n2(x + self.bc.residual_scale * self.drop_path(self.resid_dropout(m)))
         return x
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None, cache=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None, cache=None, position_embeddings=None, position_ids=None) -> torch.Tensor:
         if self.bc.checkpoint_forward and self.training:
             from torch.utils.checkpoint import checkpoint
-            return checkpoint(lambda y: self._forward_core(y, mask, cache), x, use_reentrant=False)
-        return self._forward_core(x, mask, cache)
+            return checkpoint(lambda y: self._forward_core(y, mask, cache, position_embeddings, position_ids), x, use_reentrant=False)
+        return self._forward_core(x, mask, cache, position_embeddings, position_ids)

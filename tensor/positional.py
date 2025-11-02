@@ -3,21 +3,42 @@ import torch
 
 
 def build_rope_cache(seq_len: int, head_dim: int, device=None, base_theta: float = 1e6):
+    """Build RoPE cos/sin cache matching HF Transformers LLaMA implementation exactly.
+    
+    HF computes freqs for dim/2, then concatenates [freqs, freqs] to get full dimension.
+    This is different from interleaving! HF does: [f0, f1, f2, ..., f0, f1, f2, ...]
+    """
     if head_dim % 2 != 0:
         raise ValueError("RoPE head_dim must be even")
+    # Match HF: use int64 dtype for arange, then cast to float
     t = torch.arange(seq_len, device=device, dtype=torch.float32)
-    inv_freq = 1.0 / (base_theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    inv_freq = 1.0 / (
+        base_theta ** (torch.arange(0, head_dim, 2, dtype=torch.int64, device=device).float() / head_dim)
+    )
     freqs = torch.einsum("t,d->td", t, inv_freq)  # (T, Dh/2)
-    cos = torch.cos(torch.repeat_interleave(freqs, 2, dim=-1))  # (T, Dh)
-    sin = torch.sin(torch.repeat_interleave(freqs, 2, dim=-1))  # (T, Dh)
+    # HF: emb = torch.cat((freqs, freqs), dim=-1) - repeat the whole freq vector
+    emb = torch.cat((freqs, freqs), dim=-1)  # (T, Dh)
+    cos = emb.cos()
+    sin = emb.sin()
     return cos, sin
 
 def apply_rotary(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    # q,k: (B,H,T,Dh), cos/sin broadcast to (T,Dh)
-    def _rot(x): return (x * cos) + (torch.view_as_complex(
-        torch.stack([x[..., ::2], x[..., 1::2]], dim=-1)
-    ).imag * sin).reshape_as(x)  # compact example; real impl clearer
-    return _rot(q), _rot(k)
+    """Apply RoPE using HF-compatible rotate_half formulation.
+
+    q: (B,Hq,T,Dh), k: (B,Hk,T,Dh); cos/sin: (T,Dh)
+    """
+    # Broadcast cos/sin over batch and heads
+    cos_b = cos.view(1, 1, cos.shape[0], cos.shape[1])
+    sin_b = sin.view(1, 1, sin.shape[0], sin.shape[1])
+
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    q_embed = (q * cos_b) + (rotate_half(q) * sin_b)
+    k_embed = (k * cos_b) + (rotate_half(k) * sin_b)
+    return q_embed, k_embed
 
 
 def apply_rotary_scaled(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, scale: float):
@@ -206,3 +227,49 @@ def rotary_fft(q: torch.Tensor, k: torch.Tensor, theta: torch.Tensor):
     cos = torch.cos(th)
     sin = torch.sin(th)
     return apply_rotary(q, k, cos, sin)
+
+
+class RotaryEmbeddingHF:
+    """Minimal HF-like rotary embedder producing (T,Dh) cos/sin.
+
+    Uses existing build_rope_cache and optional attention scaling.
+    """
+    def __init__(self, head_dim: int, base_theta: float = 1e6, attention_scaling: float = 1.0, device=None):
+        if head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
+        self.head_dim = int(head_dim)
+        self.base_theta = float(base_theta)
+        self.attention_scaling = float(attention_scaling)
+        self.device = device
+        self._cos = torch.tensor([], device=device)
+        self._sin = torch.tensor([], device=device)
+
+    @torch.no_grad()
+    def _ensure(self, T: int, dtype: torch.dtype, device):
+        if self._cos.numel() == 0 or self._cos.shape[0] < T or self._cos.device != device:
+            cos, sin = build_rope_cache(T, self.head_dim, device=device, base_theta=self.base_theta)
+            if self.attention_scaling != 1.0:
+                cos = cos * float(self.attention_scaling)
+                sin = sin * float(self.attention_scaling)
+            self._cos = cos.to(dtype=dtype)
+            self._sin = sin.to(dtype=dtype)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        # x: (B,T,D)
+        # If position_ids provided, gather cos/sin at those absolute positions; else return [0..T-1]
+        B, T, D = x.shape
+        device, dtype = x.device, x.dtype
+        if position_ids is not None:
+            pos = position_ids
+            if pos.dim() == 2:
+                # Assume all batches share same positions; use first batch
+                pos = pos[0]
+            pos = pos.to(device)
+            T_need = int(pos.max().item()) + 1 if pos.numel() > 0 else T
+            self._ensure(T_need, dtype, device)
+            cos = self._cos.index_select(0, pos.view(-1)).view(T, -1)
+            sin = self._sin.index_select(0, pos.view(-1)).view(T, -1)
+            return cos, sin
+        self._ensure(T, dtype, device)
+        return self._cos[:T], self._sin[:T]

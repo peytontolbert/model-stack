@@ -21,6 +21,14 @@ def _root() -> Path:
 
 
 def _infer_target_shapes_from_config(model_id: str, *, cache_dir: str | None = None) -> Dict[str, tuple[int, int]]:
+    """Infer projection matrix shapes from HF config, honoring GQA for K/V.
+
+    For LLaMA variants:
+      - q_proj: (n_heads*head_dim, d_model) == (d_model, d_model)
+      - k_proj/v_proj: (n_kv_heads*head_dim, d_model)
+      - o_proj: (d_model, n_heads*head_dim) == (d_model, d_model)
+      - up/gate: (intermediate_size, d_model), down: (d_model, intermediate_size)
+    """
     try:
         from transformers import AutoConfig  # type: ignore
     except Exception as e:
@@ -29,13 +37,18 @@ def _infer_target_shapes_from_config(model_id: str, *, cache_dir: str | None = N
     cfg = AutoConfig.from_pretrained(model_id, cache_dir=cache_dir)
     d_model = int(getattr(cfg, "hidden_size", 0) or 0)
     inter = int(getattr(cfg, "intermediate_size", 0) or 0)
-    if d_model <= 0:
-        raise RuntimeError("Could not infer hidden_size from model config")
+    n_heads = int(getattr(cfg, "num_attention_heads", 0) or 0)
+    head_dim = int(getattr(cfg, "head_dim", (d_model // n_heads) if (d_model and n_heads) else 0) or 0)
+    n_kv_heads = int(getattr(cfg, "num_key_value_heads", n_heads) or n_heads)
+    if d_model <= 0 or n_heads <= 0 or head_dim <= 0:
+        raise RuntimeError("Could not infer attention dims from model config")
+    # Compute KV out dim honoring GQA
+    kv_out = int(n_kv_heads * head_dim)
     shapes: Dict[str, tuple[int, int]] = {
-        "q_proj": (d_model, d_model),
-        "k_proj": (d_model, d_model),
-        "v_proj": (d_model, d_model),
-        "o_proj": (d_model, d_model),
+        "q_proj": (d_model, d_model),              # (n_heads*Dh, d_model)
+        "k_proj": (kv_out, d_model),              # (n_kv_heads*Dh, d_model)
+        "v_proj": (kv_out, d_model),              # (n_kv_heads*Dh, d_model)
+        "o_proj": (d_model, d_model),             # (d_model, n_heads*Dh)
     }
     if inter > 0:
         shapes.update({
@@ -70,6 +83,7 @@ def main() -> None:
     p.add_argument("--gsub", type=float, default=0.75)
     p.add_argument("--mix-beta", type=float, default=0.1)
     p.add_argument("--target-weights", default=None, help="CSV like q_proj=1,o_proj=1.1,up_proj=1.1,down_proj=1.05")
+    p.add_argument("--knowledge-preset", action="store_true", help="Use a preset of target weights tuned for knowledge recall (boost o/up/down; modest q/k/v)")
 
     # Selection & context packing
     p.add_argument("--of-sources", choices=["question", "zoom"], default="question")
@@ -101,6 +115,7 @@ def main() -> None:
     p.add_argument("--telemetry-out", default=None)
     p.add_argument("--cache-dir", default=None, help="Cache directory for HF models/tokenizers (defaults to <repo>/checkpoints)")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--no-adapters", action="store_true", help="Disable applying adapters in the enhanced runner")
     args = p.parse_args()
 
     root = Path(args.repo)
@@ -132,6 +147,24 @@ def main() -> None:
             d_model = int(getattr(cfg, "hidden_size", 4096) or 4096)
         except Exception:
             num_layers, d_model = 32, 4096
+        # Parse or synthesize target weights (knowledge preset if requested and none provided)
+        def _parse_tw(spec: str | None) -> dict[str, float] | None:
+            if not spec:
+                return None
+            out: dict[str, float] = {}
+            try:
+                parts = [p.strip() for p in str(spec).split(",") if p.strip()]
+                for p in parts:
+                    if "=" not in p:
+                        out[p] = 1.0
+                        continue
+                    k, v = p.split("=", 1)
+                    out[k.strip()] = float(v)
+            except Exception:
+                return None
+            return out or None
+        tw_spec = (args.target_weights if args.target_weights else ("q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05" if args.knowledge_preset else None))
+        tw = _parse_tw(tw_spec)
         adapters = generate_lora_from_embedding(
             emb["z"],
             d_model=d_model,
@@ -141,7 +174,7 @@ def main() -> None:
             targets=list(shapes.keys()),
         target_shapes=shapes,
         layer_gate="zmean",
-        target_weights=None,
+        target_weights=tw,
         )
         manifest = {
             "model": args.model,
@@ -197,10 +230,15 @@ def main() -> None:
         cmd.append("--do-sample")
     if args.target_weights:
         cmd.extend(["--target-weights", str(args.target_weights)])
+    elif args.knowledge_preset:
+        # Propagate preset to the enhanced runner if user didn't provide explicit weights
+        cmd.extend(["--target-weights", "q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05"])
     if args.telemetry_out:
         cmd.extend(["--telemetry-out", str(args.telemetry_out)])
     if args.verbose:
         cmd.append("--verbose")
+    if args.no_adapters:
+        cmd.append("--no-adapters")
 
     # Device/memory environment
     env = os.environ.copy()

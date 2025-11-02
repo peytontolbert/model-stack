@@ -78,8 +78,9 @@ def build_repo_embedding(
     text_weight: float = 0.25,
     graph_prop_hops: int = 0,
     graph_prop_damp: float = 0.85,
+    ignore: Optional[List[str]] = None,
 ) -> Dict[str, np.ndarray]:
-    g = CodeGraph.load_or_build(repo_root)
+    g = CodeGraph.load_or_build(repo_root, ignore=ignore)
 
     # Collect lightweight features
     sym_feats: List[Tuple[str, float]] = []
@@ -172,10 +173,28 @@ def build_repo_embedding(
         if not files:
             # Fallback: collect common source files
             exts = {".py", ".md", ".rst", ".txt", ".json", ".toml", ".yaml", ".yml", ".ini"}
-            for root, _dirs, fnames in os.walk(repo_root):
+            # Normalize ignore list
+            ignore_list = [os.path.normpath(p) for p in (ignore or [])]
+            def _is_ignored(rel: str) -> bool:
+                r = os.path.normpath(rel)
+                for pat in ignore_list:
+                    if r == pat or r.startswith(pat + os.sep):
+                        return True
+                return False
+            for root, dirs, fnames in os.walk(repo_root):
+                rel_root = os.path.relpath(root, repo_root)
+                if _is_ignored(rel_root):
+                    dirs[:] = []
+                    continue
+                # prune ignored subdirs
+                dirs[:] = [d for d in dirs if not _is_ignored(os.path.join(rel_root, d))]
                 for fn in fnames:
                     if os.path.splitext(fn)[1].lower() in exts:
-                        files.append(os.path.join(root, fn))
+                        fp = os.path.join(root, fn)
+                        rel_fp = os.path.relpath(fp, repo_root)
+                        if _is_ignored(rel_fp):
+                            continue
+                        files.append(fp)
         # Normalize file paths
         norm_files: List[str] = []
         for f in files:
@@ -825,6 +844,7 @@ def main() -> None:
     p.add_argument("--repo", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--embed-dim", type=int, default=1536)
+    p.add_argument("--ignore", action="append", default=None, help="Relative path (repeatable) to ignore, like .gitignore; e.g., --ignore cloned_repos")
     p.add_argument("--include-text", action="store_true", help="Hash raw repo text/code into the embedding")
     p.add_argument("--text-max-bytes", type=int, default=0, help="Max total bytes of text to hash (0 disables)")
     p.add_argument("--max-text-tokens", type=int, default=0, help="Hard cap on number of hashed n-grams from repo text (0 disables)")
@@ -869,7 +889,8 @@ def main() -> None:
     # Build embedding: subgraph path if --modules/--files are provided
     modules_list = [m.strip() for m in str(args.modules).split(",") if m.strip()] if args.modules else None
     files_list = [f.strip() for f in str(args.files).split(",") if f.strip()] if args.files else None
-    g = CodeGraph.load_or_build(args.repo)
+    ignore_list = [s for s in (args.ignore or []) if s]
+    g = CodeGraph.load_or_build(args.repo, ignore=ignore_list)
     if modules_list or files_list:
         emb = build_subgraph_embedding_from_graph(
             g,
@@ -895,6 +916,7 @@ def main() -> None:
             text_weight=args.text_weight,
             graph_prop_hops=int(args.graph_prop_hops),
             graph_prop_damp=float(args.graph_prop_damp),
+            ignore=ignore_list,
         )
     target_shapes = _parse_target_shapes(args.target_shapes)
     if (not target_shapes) and args.probe_model:
@@ -908,9 +930,11 @@ def main() -> None:
     # Build targets list (regex-aware)
     default_targets = [t.strip() for t in (args.targets or "").split(",") if t.strip()] or ["q_proj", "o_proj", "up_proj"]
     targets_list = list(default_targets)
-    # If we know down_proj shape exists, include by default if not already chosen
-    if (target_shapes and ("down_proj" in target_shapes)) and ("down_proj" not in targets_list):
-        targets_list.append("down_proj")
+    # Broaden coverage when shapes are known: include k_proj/v_proj/down_proj/gate_proj if available
+    if target_shapes:
+        for extra in ("k_proj", "v_proj", "down_proj", "gate_proj"):
+            if (extra in target_shapes) and (extra not in targets_list):
+                targets_list.append(extra)
     if args.target_regex:
         try:
             rx = re.compile(str(args.target_regex))
