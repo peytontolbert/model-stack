@@ -4,33 +4,33 @@ This guide explains how to mix a base repo adapter (global prior) with a query-s
 
 > Note: The modular production runner `examples/repo_grounded_adapters/run_repo_adapter.py` also supports KBANN-inspired options:
 > - `--kbann-priors` for CodeGraph-derived per-target weights
-> - `--function-first` + `--cone-rank/--cone-weight` for localized cones
+> - `--function-first` for localized cones over function windows
 > - `--round-lora` for interpretable, quantized LoRA factors
 > See that runner's `--help` for details and parity with selection/packing/citation/sampling flags.
 
 ## Files
-- `experiments/repo_conditioned_adapter.py`: build/save base repo adapters.
-- `experiments/run_llama_with_repo_adapter.py`: run with saved adapters; optional subgraph overlay.
-- `experiments/run_llama_with_repo_adapter_on_the_fly.py`: build subgraph adapters per-prompt and mix with base; supports context packing and citations.
+- `examples/repo_grounded_adapters/build.py`: build/save base repo adapters (and optional per-module exports).
+- `examples/repo_grounded_adapters/run.py`: run with saved adapters; supports OTF subgraph selection, context packing, and citations.
+- `examples/repo_grounded_adapters/modules/runner.py`: modular mixer/runner used by `run.py`.
+- `examples/repo_grounded_adapters/code_graph.py`: repository indexing and utilities.
 
 ## Quick start
 1) Generate base adapters (example dims for LLaMA-3.1-8B-Instruct):
 ```bash
-python -m experiments.repo_conditioned_adapter \
+python -m examples.repo_grounded_adapters.build \
   --repo /path/to/repo \
-  --out /path/to/outdir \
-  --d-model 4096 --layers 32 --rank 8 \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --adapters-dir /path/to/outdir \
+  --embed-dim 1536 --base-rank 8 \
   --include-text --text-max-bytes 250000 --max-text-tokens 200000 \
-  --gen-backend torch --layer-gate zmean \
-  --probe-model meta-llama/Llama-3.1-8B-Instruct \
-  --peft-json --peft-bias lora_only --peft-int8 --zero-b
+  --kbann-priors --round-lora
 ```
 2) Run on-the-fly with grounding + citations:
 ```bash
-python -m experiments.run_llama_with_repo_adapter_on_the_fly \
+python -m examples.repo_grounded_adapters.run \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --adapters /path/to/outdir/adapters.npz \
   --repo /path/to/repo \
+  --adapters-dir /path/to/outdir \
   --prompt "Explain the core training loop. Cite path:line for every claim." \
   --alpha 20 --rank 12 --gsub 0.75 --mix-beta 0.08 \
   --of-sources zoom --zoom-symbol modules.train,modules.train.sft_step --zoom-radius 1 \
@@ -55,6 +55,13 @@ python -m experiments.run_llama_with_repo_adapter_on_the_fly \
 ## Tuning tips
 - Hard questions: rank 12–32, alpha 20–32; `gsub≈0.7–0.85`.
 - Emphasis: slightly upweight `o_proj`/`up_proj`, slightly downweight `v_proj`.
+## KBANN domain-theory in practice (quick checklist)
+- Build with priors and interpretability:
+  - `--kbann-priors` (or explicit `--target-weights`)
+  - `--round-lora` for small-value LoRA factors
+- Run with local cones and citations:
+  - `--function-first` plus window packing; keep `--require-citations`
+  - Use `--of-sources {question|zoom}` to select the subgraph from the CodeGraph rules
 - Context: 3000–5000 tokens for cross-module reasoning.
 - Sampling: enable for richer/complete answers; keep `min-new-tokens ≥ 64`.
 
@@ -66,9 +73,9 @@ python -m experiments.run_llama_with_repo_adapter_on_the_fly \
 
 ## Programmatic overlay (sketch)
 ```python
-from experiments.repo_conditioned_adapter import build_subgraph_embedding_from_graph, generate_lora_from_embedding
-from experiments.run_llama_with_repo_adapter import register_hook_adapters as reg
-from coding_ai.tools.code_graph import CodeGraph
+from examples.repo_grounded_adapters.code_graph import CodeGraph
+from examples.repo_grounded_adapters.modules.embedding import build_subgraph_embedding_from_graph
+from examples.repo_grounded_adapters.modules.adapter import generate_lora_from_embedding
 
 g = CodeGraph.load_or_build(repo_root)
 mods, files = ["modules.train"], ["modules/train.py"]
@@ -79,18 +86,11 @@ sub_z = build_subgraph_embedding_from_graph(
     include_text=True,
     text_max_bytes=250000,
 )
-shapes = _infer_target_shapes(model)
+# Detect shapes however you prefer; runner handles mixing
 sub = generate_lora_from_embedding(
-    sub_z["z"],
-    d_model=model.config.hidden_size,
-    num_layers=len(model.model.layers),
-    rank=12,
-    targets=list(shapes.keys()),
-    target_shapes=shapes,
+    sub_z["z"], d_model=d_model, num_layers=n_layers, rank=12, targets=list(shapes.keys()), target_shapes=shapes
 )
-hooks = reg(model, sub["layers"], alpha=20.0, rank=12, norm_kind="fro", norm_scale=0.8)
-# generate ...
-for h in hooks: h.remove()
+# Hand sub to your mixer or call modules.runner.generate_answer for end-to-end
 ```
 
 ## Planned enhancements (docs-first roadmap)

@@ -1,5 +1,10 @@
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
+import math
+import os
+import json
+import re
+from .embedding import _stable_hash
 
 def _make_random_matrix(shape: Tuple[int, int], *, seed: int) -> np.ndarray:
     rng = np.random.default_rng(seed)

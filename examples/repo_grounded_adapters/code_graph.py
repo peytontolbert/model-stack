@@ -5,6 +5,10 @@ import json
 import time  # noqa: F401
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple, Optional
+try:
+    import pathspec  # type: ignore
+except Exception:  # pragma: no cover
+    pathspec = None  # type: ignore
 
 
 @dataclass
@@ -47,6 +51,16 @@ class CodeGraph:
                 p = os.path.normpath(pat)
                 # store both relative and absolute forms for convenience
                 self._ignore.append(p)
+        # Load .gitignore as pathspec if available
+        self._pspec = None
+        try:
+            gi = os.path.join(self.root, ".gitignore")
+            if pathspec is not None and os.path.exists(gi):
+                with open(gi, "r", encoding="utf-8", errors="ignore") as fh:
+                    lines = [ln.rstrip("\n") for ln in fh]
+                self._pspec = pathspec.PathSpec.from_lines("gitwildmatch", lines)
+        except Exception:
+            self._pspec = None
         self.symbols_by_fqn: Dict[str, Symbol] = {}
         self.symbols_by_name: Dict[str, List[str]] = {}
         self.modules: Dict[str, ModuleInfo] = {}
@@ -60,6 +74,22 @@ class CodeGraph:
         self.pytest_nodes_by_module: Dict[str, List[str]] = {}
         self._cached_mtimes: Dict[str, int] = {}
         self._cached_hashes: Dict[str, str] = {}
+
+    def _is_ignored(self, rel: str) -> bool:
+        try:
+            r = rel.replace(os.sep, "/")
+            # pathspec first
+            if self._pspec is not None:
+                if self._pspec.match_file(r):
+                    return True
+            # fallback: prefix match
+            for pat in self._ignore:
+                pp = pat.replace(os.sep, "/")
+                if r == pp or r.startswith(pp + "/"):
+                    return True
+            return False
+        except Exception:
+            return False
 
     @classmethod
     def load_or_build(cls, root: str, *, ignore_cache: bool = False, ignore: Optional[List[str]] = None) -> "CodeGraph":
@@ -84,23 +114,15 @@ class CodeGraph:
         for dirpath, dirnames, filenames in os.walk(self.root):
             # prune ignored directories in-place
             dir_rel = os.path.relpath(dirpath, self.root)
-            # Normalize ignore to handle nested paths
-            def _is_ignored_path(rel: str) -> bool:
-                r = rel.replace(os.sep, "/")
-                for pat in self._ignore:
-                    pp = pat.replace(os.sep, "/")
-                    if r == pp or r.startswith(pp + "/"):
-                        return True
-                return False
             # remove child dirs that are ignored
-            dirnames[:] = [d for d in dirnames if not _is_ignored_path(os.path.join(dir_rel, d))]
-            if _is_ignored_path(dir_rel):
+            dirnames[:] = [d for d in dirnames if not self._is_ignored(os.path.join(dir_rel, d))]
+            if self._is_ignored(dir_rel):
                 continue
             for fn in filenames:
                 if not fn.endswith(".py"):
                     continue
                 fpath = os.path.join(dirpath, fn)
-                if _is_ignored_path(os.path.relpath(fpath, self.root)):
+                if self._is_ignored(os.path.relpath(fpath, self.root)):
                     continue
                 try:
                     src = open(fpath, "r", encoding="utf-8").read()
@@ -568,20 +590,13 @@ class CodeGraph:
         curr_files: List[str] = []
         for dirpath, dirnames, filenames in os.walk(self.root):
             dir_rel = os.path.relpath(dirpath, self.root)
-            def _is_ignored_path(rel: str) -> bool:
-                r = rel.replace(os.sep, "/")
-                for pat in self._ignore:
-                    pp = pat.replace(os.sep, "/")
-                    if r == pp or r.startswith(pp + "/"):
-                        return True
-                return False
-            dirnames[:] = [d for d in dirnames if not _is_ignored_path(os.path.join(dir_rel, d))]
-            if _is_ignored_path(dir_rel):
+            dirnames[:] = [d for d in dirnames if not self._is_ignored(os.path.join(dir_rel, d))]
+            if self._is_ignored(dir_rel):
                 continue
             for fn in filenames:
                 if fn.endswith(".py"):
                     fp = os.path.join(dirpath, fn)
-                    if _is_ignored_path(os.path.relpath(fp, self.root)):
+                    if self._is_ignored(os.path.relpath(fp, self.root)):
                         continue
                     curr_files.append(fp)
         curr = set(curr_files)

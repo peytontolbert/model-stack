@@ -118,7 +118,11 @@ def register_hook_mixed_adapters(
         per_layer.append(cur)
 
     scale = float(alpha_star) / float(max(1, int(rank)))
-    applied: List[Tuple[torch.nn.Parameter, torch.Tensor]] = []
+    # Store CPU-offloaded records of applied deltas to avoid holding large GPU tensors
+    # Each record: (param, cpu_delta, mode, extra)
+    #   mode == "full"  -> subtract full delta
+    #   mode == "slice" -> subtract into row slice [start:end]
+    applied: List[Tuple[torch.nn.Parameter, torch.Tensor, str, Tuple[int, int]]] = []
     # layers list
     try:
         layers = list(getattr(getattr(model, "model", model), "layers"))
@@ -166,28 +170,35 @@ def register_hook_mixed_adapters(
                         part = d[:half, :] if d.shape[0] == w.shape[0] else d
                         part = _cap_delta_if_needed(w, part)
                         w.data[:half, :].add_(part)
+                        applied.append((w, part.detach().to("cpu"), "slice", (0, half)))
                     else:
                         part = d[-half:, :] if d.shape[0] == w.shape[0] else d
                         part = _cap_delta_if_needed(w, part)
                         w.data[half:, :].add_(part)
-                    applied.append((w, torch.zeros_like(w)))
+                        applied.append((w, part.detach().to("cpu"), "slice", (half, w.shape[0])))
                 else:
                     w.data.add_(d)
-                    applied.append((w, d))
+                    applied.append((w, d.detach().to("cpu"), "full", (0, 0)))
             except Exception:
                 continue
 
     class _Applied:
-        def __init__(self, pairs: List[Tuple[torch.nn.Parameter, torch.Tensor]]):
-            self._pairs = pairs
+        def __init__(self, records: List[Tuple[torch.nn.Parameter, torch.Tensor, str, Tuple[int, int]]]):
+            self._records = records
             self._removed = False
 
         def remove(self) -> None:
             if self._removed:
                 return
-            for w, d in self._pairs:
+            for w, d_cpu, mode, extra in self._records:
                 try:
-                    w.data.sub_(d)
+                    if mode == "full":
+                        d_dev = d_cpu.to(device=w.device, dtype=w.dtype)
+                        w.data.sub_(d_dev)
+                    elif mode == "slice":
+                        start, end = extra
+                        d_dev = d_cpu.to(device=w.device, dtype=w.dtype)
+                        w.data[start:end, :].sub_(d_dev)
                 except Exception:
                     pass
             self._removed = True

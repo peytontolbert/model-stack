@@ -103,6 +103,9 @@ def main() -> None:
     p.add_argument("--ff-window-lines", type=int, default=80)
     p.add_argument("--ff-threshold", type=float, default=0.55)
     p.add_argument("--ff-noise-penalty", type=float, default=0.30)
+    # Reranking
+    p.add_argument("--rerank", action="store_true")
+    p.add_argument("--self-queries", default=None, help="Path to self_queries.jsonl for retrieval boosts")
 
     # Sampling controls
     p.add_argument("--do-sample", action="store_true")
@@ -111,6 +114,9 @@ def main() -> None:
     p.add_argument("--repetition-penalty", type=float, default=1.1)
     p.add_argument("--min-new-tokens", type=int, default=64)
     p.add_argument("--max-new-tokens", type=int, default=512)
+    # Local generation/perf controls
+    p.add_argument("--kv-window", type=int, default=0, help="Optional sliding KV window length; 0 disables")
+    p.add_argument("--head-device", choices=["same", "cpu", "auto"], default="same", help="Place lm_head on cpu/auto to save VRAM")
 
     # Device & telemetry
     p.add_argument("--device-map", default="auto", choices=["auto", "none"])
@@ -120,6 +126,7 @@ def main() -> None:
     p.add_argument("--cache-dir", default=None, help="Cache directory for HF models/tokenizers (defaults to <repo>/checkpoints)")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--no-adapters", action="store_true", help="Disable applying adapters in the enhanced runner")
+    p.add_argument("--commit-footer", action="store_true", help="Append 'answer valid for commit X' footer")
     args = p.parse_args()
 
     root = Path(args.repo)
@@ -127,7 +134,8 @@ def main() -> None:
     artifacts = ex_dir / "artifacts"
     base_dir = Path(args.adapters_dir) if args.adapters_dir else (artifacts / "base_adapters")
     base_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = Path(args.cache_dir) if args.cache_dir else (root / "checkpoints")
+    proj_root = _root()
+    cache_dir = Path(args.cache_dir) if args.cache_dir else (proj_root / "checkpoints")
     cache_dir.mkdir(parents=True, exist_ok=True)
     adapters_npz = base_dir / "adapters.npz"
 
@@ -202,6 +210,7 @@ def main() -> None:
         repo_root=str(root),
         prompt=args.prompt,
         cache_dir=str(cache_dir),
+        device_map=str(args.device_map),
         alpha=float(args.alpha),
         rank=int(args.rank),
         gsub=float(args.gsub),
@@ -225,6 +234,8 @@ def main() -> None:
         repetition_penalty=float(args.repetition_penalty),
         min_new_tokens=int(args.min_new_tokens),
         max_new_tokens=int(args.max_new_tokens),
+        kv_window=int(args.kv_window),
+        head_device=str(args.head_device),
         seed=int(args.seed),
         entropy_aware=bool(args.entropy_aware),
         rank_min=int(args.rank_min),
@@ -233,6 +244,9 @@ def main() -> None:
         gsub_max=float(args.gsub_max),
         entropy_weights=str(args.entropy_weights),
         target_weights=(str(args.target_weights) if args.target_weights else ("q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05" if args.knowledge_preset else None)),
+        rerank=bool(args.rerank),
+        self_queries_path=(str(args.self_queries) if args.self_queries else None),
+        commit_footer=bool(args.commit_footer),
         verbose=bool(args.verbose),
     )
     print(text)

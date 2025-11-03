@@ -32,33 +32,15 @@ For each module: auto-draft verifiable prompts, run the modular runner, extract 
 
 code_graph.py — fast, incremental repo index + utilities for owners, callers, refs, pytest node mapping, export (JSON/SQLite). This is your curriculum backbone.
 
-repo_conditioned_adapter.py — repo & subgraph embeddings via stable feature hashing across: symbols, docs, modules, topology (+optional text); graph propagation; normalization; deterministic seeds.
+build.py — build base adapters for a given HF model from a repository embedding (symbols/docs/topology + optional text). Infers target shapes, supports knowledge presets, KBANN priors, optional rounding, per‑module export, and writes artifacts.
 
-run.py — make base adapters once per model ID; infer shapes from HF config; set capacity & “knowledge-preset” target weights; then run a single prompt with packing/citations if desired.
+run.py — simple runner: ensures base adapters exist (or builds them), then generates an answer with optional context packing/citations and on‑the‑fly subgraph selection (question or zoom). Uses the modular runner under the hood.
 
-run_llama_with_repo_adapter_on_the_fly.py — minimal OTF mixer: resolve layer modules, build per-layer deltas, add to weight tensors, question/zoom selection knobs (zoom_radius, include_text, text_weight).
+modules/tune.py — optional distillation helpers (verify modules via Q/A + citations/tests; export tuned artifacts). Also available through build.py via --self-tune-out.
 
-run_repo_adapter.py — production mixer: target map shims, question-aware module/file selection, context packing, target-weight parsing, delta-cap safety; built on modular utilities.
+3) Grounded run loop (concise)
 
-self_tune.py — curriculum/self-play loop for repo Q/A: build prompts per module, run enhanced runner, extract citations, run mapped tests, export per-module adapters (rank, deps), persist distill.jsonl + logs.
-
-tensor_utils.py — safe tensor ops + (optional) opt_einsum contraction planning cache; handy for future perf passes.
-
-3) “Ultimate” self-tune loop (grounded, verifiable)
-
-Propose verifiable tasks per module (e.g., “Explain top functions in X with path:line” and “What does foo do?”).
-
-Solve with adapters mixed from the subgraph most relevant to the prompt; require citations.
-
-Verify with two cheap verifiers:
-
-Citation verifier: extract path:line hits and check they exist in the indexed files.
-
-Test verifier: run mapped pytest nodes for that module when present; accept soft-pass if no tests.
-
-Select/Keep: only write per-module adapters for answers that pass verification; optionally include a bounded set of import deps when exporting.
-
-This mirrors the Absolute Zero shape (single model both proposes & solves with verifiable rewards). Your verifiers are (a) path:line and (b) tests; rewards are pass/fail of those. Keep a rolling buffer (distill) and iterate.
+Select modules/files by question (or zoom), mix the base adapter with an on-the-fly subgraph adapter, pack context with citations, and generate the answer. Keep per-paragraph citations on.
 
 4) Controls that make it robust
 
@@ -73,23 +55,25 @@ Safety/determinism: keep your determinism checks and unsafe-code filters in the 
 5) Minimal “gold” CLI surface (what you ship)
 
 Make base adapters (once per model)
-python run.py --model <hf-id> --adapters-dir <out> --base-rank 8 --embed-dim 1536 --knowledge-preset
-
-Answer with OTF adapters
-python run_llama_with_repo_adapter_on_the_fly.py --model <hf-id> --adapters <base/adapters.npz> --repo <path> --prompt "<q>" --of-sources question --include-text
-
-Build adapters (base + optional per-module)
-python -m examples.repo_grounded_adapters.build_repo_adapter \
-  --model <hf-id> --repo <path> --adapters-dir <out> \
+python -m examples.repo_grounded_adapters.build \
+  --repo <path> --model <hf-id> --adapters-dir <out> \
   --embed-dim 1536 --base-rank 8 --include-text --kbann-priors --round-lora
 
-Answer with modular repo adapter runner
-python -m examples.repo_grounded_adapters.run_repo_adapter \
-  --model <hf-id> --adapters <out>/adapters.npz --repo <path> \
-  --prompt "<q>" --pack-context --require-citations
+Answer with repo adapters (with OTF subgraph selection)
+python -m examples.repo_grounded_adapters.run \
+  --model <hf-id> --repo <path> --adapters-dir <out> \
+  --prompt "<q>" --of-sources question --pack-context --require-citations --verbose
 
-Self-tune (per-module distill + adapters)
-python self_tune.py --repo <path> --model <hf-id> --adapters <npz> --out <dir> --per-module-adapters --include-deps --rank 8 --context-tokens 5000 --resume
+Optional: per-module export
+# Per-module embeddings/adapters (static)
+python -m examples.repo_grounded_adapters.build \
+  --repo <path> --model <hf-id> --adapters-dir <out> \
+  --per-module --include-deps --max-deps 4 --sub-rank 8
+
+Artifacts written by build
+- adapters.npz, embedding.npz
+- sources.jsonl (path, sha256, bytes)
+- manifest.json (includes: commit, tree, created_at, schema_version, model/dims/layers/rank, targets/target_shapes, include_text + graph propagation knobs, target_weights, selection summary, CodeGraph counts, sources_file + sources_count)
 
 6) Curriculum & “fast-weights” angle (why this works)
 
@@ -111,8 +95,27 @@ Delta safety: keep the global delta-norm cap (env) in production to prevent bad 
 
 8) KBANN-inspired options (domain-theory → adapters)
 
-- Domain priors (rules → weights): enable `--kbann-priors` to derive per-target weights from CodeGraph structure (imports/calls/ownership). Prior boosts emphasize `o_proj`/`up_proj`/`down_proj`, lightly damp `v_proj`.
-- Cone-like capacity (localized ranks): enable `--function-first` with `--cone-rank` and `--cone-weight` to add small, local adapters tied to top function windows and merge them with the subgraph adapter.
-- Curriculum-first self-tune: start from module-scoped Q/A via `self_tune.py`, then expand to cross-module prompts; symbolic priors narrow the search while adapters learn the missing glue.
-- NOFM-style evidence: function-first packaging + citations surfaces the N-of-M evidence your answers relied on; export telemetry for downstream rule extraction.
-- Interpretability during tuning: add `--round-lora` (with `--round-threshold`) to round LoRA A/B to a tiny value set {−q, 0, +q}, improving later attribution of which files/features mattered.
+-- Domain priors (rules → weights): enable `--kbann-priors` to derive per-target weights from CodeGraph structure (imports/calls/ownership). Prior boosts emphasize `o_proj`/`up_proj`/`down_proj`, lightly damp `v_proj`.
+-- Cone-like capacity (localized ranks): at run-time, enable `--function-first` (with window packing) to add small, local adapters tied to top function windows and blend them with the subgraph adapter.
+-- NOFM-style evidence: function-first packaging + citations surfaces the N-of-M evidence your answers relied on; export telemetry for downstream rule extraction.
+-- Interpretability: add `--round-lora` (with `--round-threshold`) to round LoRA A/B to a tiny value set {−q, 0, +q}, improving later attribution of which files/features mattered.
+
+9) Repository as Domain Theory (KBANN mapping)
+
+- Use CodeGraph as the rule base (domain theory): treat imports, calls, ownership, and API signatures as approximately-correct symbolic rules.
+- Initialize adapters from rules:
+  - Choose targets: emphasize attention/MLP submodules that best express code relationships (`q/k/v/o`, `up/gate/down`).
+  - Per-target priors: use `--kbann-priors` or `--target-weights` to bias layer deltas toward “defines/uses” edges; downweight mutually exclusive paths.
+  - Sparse, light init: the base build seeds LoRA with small, structured A/B; `--round-lora` preserves interpretability.
+- Local constructive induction (cones): during run, `--function-first` focuses small ranks on the exact function/file windows that matter for the question.
+- Curriculum without training: even without tuning, the combination of (a) graph-derived priors in build and (b) question-aware subgraph mixing in run provides rule-guided, grounded answers with citations.
+
+9) If you skip self‑tune (what you miss vs. tuned flow)
+
+- Verified modules list and distill buffer (JSONL) of successful Q/A is not produced.
+- No per‑module tuned adapter exports; you rely on base adapters + on‑the‑fly subgraph mixing.
+- No test‑gated pruning of weak modules; selection remains heuristic (question/zoom) rather than verification‑driven.
+
+What you still get without tune
+- Full CodeGraph indexing and a repo embedding that projects tokenized sources (when `--include-text` is enabled) into the adapter prior pre‑run.
+- A compact base adapter prior and the ability to mix on‑the‑fly subgraph adapters at run time for grounded, question‑specific answers.

@@ -1,3 +1,10 @@
+import os
+import json
+import re
+from typing import Any, Dict, List, Optional, Tuple
+import torch
+
+
 def ensure_snapshot(model_id: str, cache_dir: str) -> str:
     try:
         import os as _os
@@ -35,7 +42,7 @@ def ensure_snapshot(model_id: str, cache_dir: str) -> str:
         raise e
 
 
-def build_local_llama_from_snapshot(ckpt_dir: str, device: str, torch_dtype) -> Any:
+def build_local_llama_from_snapshot(ckpt_dir: str, device: str, torch_dtype, device_map: Optional[str] = None, gpu_ids: Optional[str] = None) -> Any:
     import os as _os
     import json as _json
     import torch as _torch
@@ -58,6 +65,17 @@ def build_local_llama_from_snapshot(ckpt_dir: str, device: str, torch_dtype) -> 
     from specs.config import ModelConfig  # type: ignore
     from model.factory import build_causal_lm  # type: ignore
     from model.hf_llama_loader import load_hf_llama_weights_into_local  # type: ignore
+    # Optional distributed stack imports (best-effort)
+    try:
+        from dist.engine import DistributedEngine  # type: ignore
+        from specs.dist import DistConfig  # type: ignore
+        from dist import utils as _dist_utils  # type: ignore
+        _HAS_DIST = True
+    except Exception:
+        DistributedEngine = None  # type: ignore
+        DistConfig = None  # type: ignore
+        _dist_utils = None  # type: ignore
+        _HAS_DIST = False
     mc = ModelConfig(
         d_model=d_model,
         n_heads=n_heads,
@@ -76,7 +94,58 @@ def build_local_llama_from_snapshot(ckpt_dir: str, device: str, torch_dtype) -> 
     except Exception:
         pass
     load_hf_llama_weights_into_local(model, ckpt_dir)
-    model = model.to(device).eval()
+
+    # Adaptive single-device selection: if device_map=="auto", choose GPU with most free memory
+    target_device = device
+    try:
+        if str(device).startswith("cuda") and (device_map == "auto") and _torch.cuda.is_available():
+            num = _torch.cuda.device_count()
+            if num and num > 0:
+                # Probe free mem without permanently changing current device
+                try:
+                    orig = _torch.cuda.current_device()
+                except Exception:
+                    orig = 0
+                best_idx = 0
+                best_free = -1
+                for i in range(num):
+                    try:
+                        # Prefer index-aware API when available
+                        free, _total = _torch.cuda.mem_get_info(i)  # type: ignore[arg-type]
+                    except Exception:
+                        # Fallback: switch temporarily
+                        try:
+                            _torch.cuda.set_device(i)
+                            free, _total = _torch.cuda.mem_get_info()
+                        except Exception:
+                            continue
+                    if int(free) > int(best_free):
+                        best_free = int(free)
+                        best_idx = i
+                # Set chosen device globally so subsequent .to("cuda") aligns
+                try:
+                    _torch.cuda.set_device(best_idx)
+                except Exception:
+                    pass
+                target_device = f"cuda:{best_idx}"
+                # Restore not needed since we set to best_idx intentionally
+    except Exception:
+        target_device = device
+
+    model = model.to(target_device).eval()
+
+    # If launched under torchrun (WORLD_SIZE>1) and dist stack is available, initialize and wrap
+    try:
+        if _HAS_DIST:
+            world = int(os.environ.get("WORLD_SIZE", "1"))
+            if world > 1:
+                cfg = DistConfig(backend="nccl", strategy="DDP", precision=("bf16" if torch_dtype == _torch.bfloat16 else "fp32"))  # type: ignore
+                eng = DistributedEngine(cfg)  # type: ignore
+                eng.init()
+                model = eng.wrap_model(model)
+    except Exception:
+        # Non-fatal: fall back to single-device model
+        pass
     return model, cfg_obj
 
 

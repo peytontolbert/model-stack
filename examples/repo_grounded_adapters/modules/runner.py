@@ -25,6 +25,7 @@ from examples.repo_grounded_adapters.modules.selection import (
     question_aware_modules_and_files,
     prompt_token_set,
     name_matches_prompt,
+    rerank_modules_and_files,
 )
 from examples.repo_grounded_adapters.modules.mixing import (
     targets_map,
@@ -59,6 +60,7 @@ def generate_answer(
     *,
     cache_dir: Optional[str] = None,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    device_map: str = "none",
     gpu_ids: Optional[str] = None,
     # selection
     of_sources: str = "question",
@@ -94,6 +96,9 @@ def generate_answer(
     # citations
     require_citations: bool = False,
     citations_per_paragraph: bool = False,
+    # retrieval/rerank
+    rerank: bool = True,
+    self_queries_path: Optional[str] = None,
     # generation
     do_sample: bool = False,
     temperature: float = 0.7,
@@ -106,6 +111,8 @@ def generate_answer(
     # misc
     seed: int = 0,
     verbose: bool = False,
+    # provenance footer
+    commit_footer: bool = False,
 ) -> str:
     if gpu_ids and str(gpu_ids).strip():
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids).strip()
@@ -120,7 +127,15 @@ def generate_answer(
     except Exception:
         pass
 
-    cache_dir = cache_dir or os.path.join(repo_root, "checkpoints")
+    # Prefer explicit cache_dir; else env; else project root (/..../checkpoints)
+    if not cache_dir:
+        env_cache = os.environ.get("TRANSFORMER_CACHE_DIR") or os.environ.get("HF_HOME")
+        if env_cache:
+            cache_dir = env_cache
+        else:
+            mod_dir = os.path.dirname(__file__)
+            proj_root = os.path.abspath(os.path.join(mod_dir, "..", "..", ".."))
+            cache_dir = os.path.join(proj_root, "checkpoints")
     try:
         os.makedirs(cache_dir, exist_ok=True)
     except Exception:
@@ -130,7 +145,7 @@ def generate_answer(
     torch_dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
 
     ckpt_dir = ensure_snapshot(model_id, cache_dir)
-    model, _cfg = build_local_llama_from_snapshot(ckpt_dir, device, torch_dtype)
+    model, _cfg = build_local_llama_from_snapshot(ckpt_dir, device, torch_dtype, device_map=device_map, gpu_ids=gpu_ids)
 
     # Load base adapters
     base_layers = load_adapters_npz(adapters_npz)["layers"]
@@ -147,6 +162,15 @@ def generate_answer(
     if verbose:
         try:
             print(f"[debug] selection modules={modules} files={files}")
+        except Exception:
+            pass
+
+    # Rerank with code semantics
+    if bool(rerank):
+        try:
+            modules, files = rerank_modules_and_files(repo_root, prompt, modules, files, ignore=ignore_list, self_queries_path=self_queries_path)
+            if verbose:
+                print(f"[debug] reranked modules={modules} files={files}")
         except Exception:
             pass
 
@@ -280,6 +304,29 @@ def generate_answer(
     final_prompt = prompt
     if bool(pack_context) and files:
         packed = ""
+        # Identifier header from selected files/modules
+        try:
+            idents: List[str] = []
+            mods_sel = set(modules or [])
+            files_rel = set(files or [])
+            for f in list(files_rel)[:8]:
+                m = g.module_for_file(f)
+                if m:
+                    mods_sel.add(m)
+            for m in list(mods_sel)[:12]:
+                for fqn in g.defs_in(m)[:8]:
+                    name = fqn.split(".")[-1]
+                    if name and name not in idents:
+                        idents.append(name)
+                        if len(idents) >= 24:
+                            break
+                if len(idents) >= 24:
+                    break
+            ident_header = ""
+            if idents:
+                ident_header = "[identifiers] " + ", ".join(idents) + "\n\n"
+        except Exception:
+            ident_header = ""
         if pack_mode == "windows":
             if function_first:
                 fn_windows = collect_function_windows(repo_root, files, int(ff_window_lines), max_candidates=int(ff_max_candidates))
@@ -338,7 +385,7 @@ def generate_answer(
         else:
             packed = pack_context_heads(repo_root, files, tok, int(context_tokens))
         if packed:
-            final_prompt = packed + "\n\n" + final_prompt
+            final_prompt = (ident_header + packed + "\n\n" + final_prompt) if ident_header else (packed + "\n\n" + final_prompt)
     if require_citations:
         final_prompt = (
             final_prompt
@@ -417,7 +464,8 @@ def generate_answer(
             Wt, head_dev = _prep(model, head_use_cpu)
             input_ids = x["input_ids"] if isinstance(x, dict) else x.input_ids
             seq = input_ids
-            eos_ids = getattr(model.config, "eos_token_id", None)
+            # Use tokenizer for EOS; local model may not expose .config
+            eos_ids = getattr(tok, "eos_token_id", None)
             if isinstance(eos_ids, (list, tuple)):
                 eos_set = {int(xx) for xx in eos_ids if xx is not None}
             elif eos_ids is not None:
@@ -428,10 +476,45 @@ def generate_answer(
                 with torch.no_grad():
                     win = int(kv_window)
                     ctx = seq[:, -win:] if win > 0 else seq[:, -1:]
-                    core = model.model(input_ids=ctx, attention_mask=None, use_cache=False, return_dict=True)
-                    h_last = core.last_hidden_state[:, -1, :]
-                    h_proj = h_last.to(device=head_dev, dtype=Wt.dtype)
-                    logits = torch.matmul(h_proj, Wt)
+                    out_core = model(input_ids=ctx, attention_mask=None)
+                    logits = None
+                    # Prefer direct logits if available
+                    try:
+                        if isinstance(out_core, dict) and ("logits" in out_core):
+                            logits = out_core["logits"][:, -1, :]
+                    except Exception:
+                        logits = None
+                    if logits is None:
+                        # Tensor or module attribute fallbacks
+                        try:
+                            if hasattr(out_core, "logits"):
+                                logits = out_core.logits[:, -1, :]
+                            elif torch.is_tensor(out_core):
+                                if out_core.dim() == 3:
+                                    logits = out_core[:, -1, :]
+                                elif out_core.dim() == 2:
+                                    logits = out_core
+                            # Last-hidden-state projection fallback
+                            if logits is None:
+                                h_last = None
+                                if isinstance(out_core, dict) and ("last_hidden_state" in out_core):
+                                    h_last = out_core["last_hidden_state"][:, -1, :]
+                                elif hasattr(out_core, "last_hidden_state"):
+                                    h_last = out_core.last_hidden_state[:, -1, :]
+                                if h_last is not None:
+                                    h_proj = h_last.to(device=head_dev, dtype=Wt.dtype)
+                                    logits = torch.matmul(h_proj, Wt)
+                            if logits is None:
+                                # Final fallback: advance one token greedily
+                                tmp = model.generate(input_ids=ctx, max_new_tokens=1, do_sample=False)
+                                next_id = tmp[:, -1:].to(seq.device)
+                                seq = torch.cat([seq, next_id], dim=1)
+                                continue
+                        except Exception:
+                            tmp = model.generate(input_ids=ctx, max_new_tokens=1, do_sample=False)
+                            next_id = tmp[:, -1:].to(seq.device)
+                            seq = torch.cat([seq, next_id], dim=1)
+                            continue
                 if float(repetition_penalty) != 1.0:
                     gather_ids = seq
                     logits = logits.scatter_add(1, gather_ids, torch.full_like(gather_ids, -abs(float(repetition_penalty) - 1.0), dtype=logits.dtype))
@@ -544,6 +627,30 @@ def generate_answer(
                 text = text2 + "\n\nReferences (from context):\n" + "\n".join(refs)
             else:
                 text = text2 or "INSUFFICIENT_EVIDENCE: No path:line citations found per policy."
+
+    # Append commit footer for provenance if requested
+    if bool(commit_footer):
+        try:
+            # Try to read manifest next to adapters_npz
+            mn = None
+            try:
+                base_dir = os.path.dirname(adapters_npz)
+                mf = os.path.join(base_dir, "manifest.json")
+                if os.path.exists(mf):
+                    obj = json.loads(open(mf, "r", encoding="utf-8").read())
+                    mn = str(obj.get("commit") or obj.get("git", {}).get("commit") or "")
+            except Exception:
+                mn = None
+            if not mn:
+                try:
+                    mn = os.popen(f"git -C {repo_root} rev-parse HEAD").read().strip()
+                except Exception:
+                    mn = None
+            if mn:
+                short = mn[:12]
+                text = text.rstrip() + f"\n\nAnswer valid for commit {short}."
+        except Exception:
+            pass
 
     # Clean up hooks
     for h in hooks:
