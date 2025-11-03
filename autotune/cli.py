@@ -9,6 +9,8 @@ from .spaces import Choice, IntRange, LogUniform, SearchSpace, Uniform
 from .study import Study, StudyConfig
 from .algorithms.random import RandomSearch
 from .algorithms.grid import GridSearch
+from .algorithms.sobol import SobolSearch
+from .algorithms.lhs import LatinHypercubeSearch
 from .callbacks import VizLogger
 from .bench.attn import benchmark_attention_backends, select_fastest_backend
 from .bench.kernel import bench_attn as bench_attn_kernels, bench_rope as bench_rope_kernels, select_fastest as select_fastest_kernel, list_kernels
@@ -54,7 +56,7 @@ def main(argv: list[str] | None = None) -> None:
     p_study = sub.add_parser("study", help="Run a hyperparameter study")
     p_study.add_argument("--objective", type=str, required=True, help="module:function objective(params, trial) -> score")
     p_study.add_argument("--space", type=str, required=True, help="Path to JSON search space definition")
-    p_study.add_argument("--algo", type=str, default="random", choices=["random", "grid"]) 
+    p_study.add_argument("--algo", type=str, default="random", choices=["random", "grid", "sobol", "lhs"]) 
     p_study.add_argument("--metric", type=str, default="objective")
     p_study.add_argument("--mode", type=str, default="min", choices=["min", "max"]) 
     p_study.add_argument("--max-trials", type=int, default=20)
@@ -199,7 +201,14 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd == "study":
         objective = _load_objective(args.objective)
         space = _parse_space(args.space)
-        algo = RandomSearch(args.seed) if args.algo == "random" else GridSearch()
+        if args.algo == "random":
+            algo = RandomSearch(args.seed)
+        elif args.algo == "grid":
+            algo = GridSearch()
+        elif args.algo == "sobol":
+            algo = SobolSearch(seed=args.seed)
+        else:
+            algo = LatinHypercubeSearch(seed=args.seed)
         # Optional scheduler
         scheduler = None
         if args.scheduler == "asha":

@@ -2,6 +2,12 @@
 
 This guide explains how to mix a base repo adapter (global prior) with a query-specific subgraph adapter (local evidence), and optionally prepend code snippets so answers are grounded and cite actual files/lines.
 
+> Note: The modular production runner `examples/repo_grounded_adapters/run_repo_adapter.py` also supports KBANN-inspired options:
+> - `--kbann-priors` for CodeGraph-derived per-target weights
+> - `--function-first` + `--cone-rank/--cone-weight` for localized cones
+> - `--round-lora` for interpretable, quantized LoRA factors
+> See that runner's `--help` for details and parity with selection/packing/citation/sampling flags.
+
 ## Files
 - `experiments/repo_conditioned_adapter.py`: build/save base repo adapters.
 - `experiments/run_llama_with_repo_adapter.py`: run with saved adapters; optional subgraph overlay.

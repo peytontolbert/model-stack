@@ -4,36 +4,8 @@ import json
 import gc
 import torch
 from typing import Tuple
-
-
-def _ensure_snapshot(model_id: str, cache_dir: str) -> str:
-    # If local dir with config.json, use directly
-    if os.path.isdir(model_id) and os.path.isfile(os.path.join(model_id, "config.json")):
-        return model_id
-    # Try existing HF snapshot in cache_dir
-    org_name = model_id.strip().split("/")[-2:]
-    if len(org_name) == 2:
-        org, name = org_name
-        dir1 = os.path.join(cache_dir, f"models--{org}--{name}", "snapshots")
-        cands = []
-        if os.path.isdir(dir1):
-            cands.extend([os.path.join(dir1, d) for d in os.listdir(dir1)])
-        cands = [p for p in cands if os.path.isfile(os.path.join(p, "config.json"))]
-        if cands:
-            cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return cands[0]
-    # Otherwise, try to download
-    from huggingface_hub import snapshot_download  # type: ignore
-    return snapshot_download(repo_id=model_id, cache_dir=cache_dir)
-
-
-def _local_logits_last(model, input_ids: torch.Tensor) -> torch.Tensor:
-    # Use model's own forward to obtain logits directly
-    with torch.no_grad():
-        out = model(input_ids=input_ids, attention_mask=None, return_dict=True)
-        logits_last = out["logits"][:, -1, :]
-    return logits_last.to(torch.float32)
-
+from examples.repo_grounded_adapters.modules.model import ensure_snapshot
+from examples.repo_grounded_adapters.modules.runtime import local_logits_last
 
 def main() -> None:
     import argparse
@@ -98,7 +70,7 @@ def main() -> None:
         pass
 
     # Local
-    ckpt_dir = _ensure_snapshot(args.model, args.cache_dir)
+    ckpt_dir = ensure_snapshot(args.model, args.cache_dir)
     from specs.config import ModelConfig
     from model.factory import build_causal_lm
     from model.hf_llama_loader import load_hf_llama_weights_into_local
@@ -128,7 +100,7 @@ def main() -> None:
     if use_cuda:
         local = local.to(device="cuda", dtype=torch.bfloat16).eval()
         x_cuda = {k: v.to("cuda") for k, v in x.items()}
-        logits_local = _local_logits_last(local, x_cuda["input_ids"]).to(device="cpu", dtype=torch.float32)
+        logits_local = local_logits_last(local, x_cuda["input_ids"]).to(device="cpu", dtype=torch.float32)
         # Local generation (greedy)
         try:
             out_loc = local.generate(input_ids=x_cuda["input_ids"], max_new_tokens=int(args.gen_new), do_sample=False, return_dict=True)

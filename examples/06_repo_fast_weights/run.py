@@ -6,7 +6,8 @@ from typing import Dict, Any
 import numpy as np
 
 from specs.config import ModelConfig
-from experiments.repo_conditioned_adapter import build_repo_embedding
+from examples.repo_grounded_adapters.modules.embedding import build_repo_embedding
+
 from experiments.repo_conditioned_fast_weights import (
     derive_fast_weight_hparams,
     save_npz_fast_weights,

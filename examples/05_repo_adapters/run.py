@@ -6,12 +6,8 @@ from typing import Dict, Any
 import numpy as np
 
 from specs.config import ModelConfig
-from experiments.repo_conditioned_adapter import (
-    build_repo_embedding,
-    generate_lora_from_embedding,
-    save_npz,
-)
-
+from examples.repo_grounded_adapters.modules.adapter import save_npz
+from examples.repo_grounded_adapters.modules.embedding import build_repo_embedding, generate_lora_from_embedding
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]

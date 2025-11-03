@@ -9,11 +9,8 @@ from typing import Dict
 
 import numpy as np
 
-from examples.repo_grounded_adapters.repo_conditioned_adapter import (
-    build_repo_embedding,
-    generate_lora_from_embedding,
-    save_npz,
-)
+from examples.repo_grounded_adapters.modules.embedding import build_repo_embedding
+from examples.repo_grounded_adapters.modules.adapter import generate_lora_from_embedding, save_npz
 
 
 def _root() -> Path:
@@ -84,6 +81,13 @@ def main() -> None:
     p.add_argument("--mix-beta", type=float, default=0.1)
     p.add_argument("--target-weights", default=None, help="CSV like q_proj=1,o_proj=1.1,up_proj=1.1,down_proj=1.05")
     p.add_argument("--knowledge-preset", action="store_true", help="Use a preset of target weights tuned for knowledge recall (boost o/up/down; modest q/k/v)")
+    # Entropy-aware capacity (forward to enhanced runner)
+    p.add_argument("--entropy-aware", action="store_true")
+    p.add_argument("--rank-min", type=int, default=8)
+    p.add_argument("--rank-max", type=int, default=32)
+    p.add_argument("--gsub-min", type=float, default=0.6)
+    p.add_argument("--gsub-max", type=float, default=0.9)
+    p.add_argument("--entropy-weights", default="repo=0.4,subgraph=0.4,question=0.2")
 
     # Selection & context packing
     p.add_argument("--of-sources", choices=["question", "zoom"], default="question")
@@ -185,79 +189,53 @@ def main() -> None:
         }
         save_npz(str(base_dir), embedding=emb, adapters=adapters, manifest=manifest)
 
-    # Build command for the enhanced HF runner (pass-through of options)
-    cmd = [
-        sys.executable,
-        "-m",
-        "examples.repo_grounded_adapters.run_llama_with_repo_adapter_enhanced",
-        "--model", args.model,
-        "--adapters", str(adapters_npz),
-        "--repo", str(root),
-        "--prompt", args.prompt,
-        "--cache-dir", str(cache_dir),
-        "--alpha", str(args.alpha),
-        "--rank", str(args.rank),
-        "--gsub", str(args.gsub),
-        "--mix-beta", str(args.mix_beta),
-        "--of-sources", args.of_sources,
-        "--zoom-symbol", str(args.zoom_symbol) if args.zoom_symbol is not None else "",
-        "--zoom-radius", str(int(args.zoom_radius)),
-        "--pack-mode", args.pack_mode,
-        "--context-tokens", str(int(args.context_tokens)),
-        "--temperature", str(args.temperature),
-        "--top-p", str(args.top_p),
-        "--repetition-penalty", str(args.repetition_penalty),
-        "--min-new-tokens", str(int(args.min_new_tokens)),
-        "--max-new-tokens", str(int(args.max_new_tokens)),
-        "--device-map", args.device_map,
-        "--seed", str(int(args.seed)),
-    ]
-    if args.pack_context:
-        cmd.append("--pack-context")
-    if args.require_citations:
-        cmd.append("--require-citations")
-    if args.citations_per_paragraph:
-        cmd.append("--citations-per-paragraph")
-    if args.function_first:
-        cmd.extend([
-            "--function-first",
-            "--ff-max-candidates", str(int(args.ff_max_candidates)),
-            "--ff-window-lines", str(int(args.ff_window_lines)),
-            "--ff-threshold", str(float(args.ff_threshold)),
-            "--ff-noise-penalty", str(float(args.ff_noise_penalty)),
-        ])
-    if args.do_sample:
-        cmd.append("--do-sample")
-    if args.target_weights:
-        cmd.extend(["--target-weights", str(args.target_weights)])
-    elif args.knowledge_preset:
-        # Propagate preset to the enhanced runner if user didn't provide explicit weights
-        cmd.extend(["--target-weights", "q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05"])
-    if args.telemetry_out:
-        cmd.extend(["--telemetry-out", str(args.telemetry_out)])
-    if args.verbose:
-        cmd.append("--verbose")
-    if args.no_adapters:
-        cmd.append("--no-adapters")
+    # Run directly via orchestrator
+    from examples.repo_grounded_adapters.modules.runner import generate_answer
 
-    # Device/memory environment
-    env = os.environ.copy()
     if args.gpu_ids and str(args.gpu_ids).strip():
-        env["CUDA_VISIBLE_DEVICES"] = str(args.gpu_ids).strip()
-    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    if args.max_memory and str(args.max_memory).strip():
-        cmd.extend(["--max-memory", str(args.max_memory)])
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_ids).strip()
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    # Clean empty zoom-symbol arg if not provided
-    try:
-        if "--zoom-symbol" in cmd:
-            zi = cmd.index("--zoom-symbol")
-            if cmd[zi + 1] == "":
-                del cmd[zi:zi + 2]
-    except Exception:
-        pass
-
-    subprocess.run(cmd, check=True, env=env)
+    text = generate_answer(
+        model_id=args.model,
+        adapters_npz=str(adapters_npz),
+        repo_root=str(root),
+        prompt=args.prompt,
+        cache_dir=str(cache_dir),
+        alpha=float(args.alpha),
+        rank=int(args.rank),
+        gsub=float(args.gsub),
+        beta=float(args.mix_beta),
+        of_sources=args.of_sources,
+        zoom_symbol=args.zoom_symbol,
+        zoom_radius=int(args.zoom_radius),
+        pack_context=bool(args.pack_context),
+        pack_mode=args.pack_mode,
+        context_tokens=int(args.context_tokens),
+        require_citations=bool(args.require_citations),
+        citations_per_paragraph=bool(args.citations_per_paragraph),
+        function_first=bool(args.function_first),
+        ff_max_candidates=int(args.ff_max_candidates),
+        ff_window_lines=int(args.ff_window_lines),
+        ff_threshold=float(args.ff_threshold),
+        ff_noise_penalty=float(args.ff_noise_penalty),
+        do_sample=bool(args.do_sample),
+        temperature=float(args.temperature),
+        top_p=float(args.top_p),
+        repetition_penalty=float(args.repetition_penalty),
+        min_new_tokens=int(args.min_new_tokens),
+        max_new_tokens=int(args.max_new_tokens),
+        seed=int(args.seed),
+        entropy_aware=bool(args.entropy_aware),
+        rank_min=int(args.rank_min),
+        rank_max=int(args.rank_max),
+        gsub_min=float(args.gsub_min),
+        gsub_max=float(args.gsub_max),
+        entropy_weights=str(args.entropy_weights),
+        target_weights=(str(args.target_weights) if args.target_weights else ("q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05" if args.knowledge_preset else None)),
+        verbose=bool(args.verbose),
+    )
+    print(text)
 
 
 if __name__ == "__main__":
