@@ -593,3 +593,25 @@ def build_subgraph_embedding_from_graph(
         result["z_text"] = z_text.astype(np.float32)
     return result
 
+
+def join_embeddings(z_old: Optional[np.ndarray], z_new: Optional[np.ndarray], *, w_old: float = 1.0, w_new: float = 1.0) -> Optional[np.ndarray]:
+    """Monotone anytime join of two embedding vectors.
+
+    Returns a unit-normalized convex-like combination w_old*unit(z_old) + w_new*unit(z_new).
+    If both are None, returns None.
+    """
+    try:
+        def _unit(a: np.ndarray) -> np.ndarray:
+            n = float(np.linalg.norm(a))
+            return (a / n) if n > 0 else a
+        if z_old is None and z_new is None:
+            return None
+        if z_old is None:
+            return _unit((max(0.0, float(w_new)) * _unit(z_new.astype(np.float32))))
+        if z_new is None:
+            return _unit((max(0.0, float(w_old)) * _unit(z_old.astype(np.float32))))
+        a = max(0.0, float(w_old)) * _unit(z_old.astype(np.float32))
+        b = max(0.0, float(w_new)) * _unit(z_new.astype(np.float32))
+        return _unit(a + b)
+    except Exception:
+        return z_new if z_new is not None else z_old

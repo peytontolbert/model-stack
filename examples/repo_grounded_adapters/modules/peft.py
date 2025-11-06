@@ -1,6 +1,7 @@
 from typing import Dict, Any, List, Optional
 import os
 import re
+from model.inspect import detect_target_names_from_model_full
 
 def infer_target_names(model_id: str) -> Dict[str, str]:
     names = detect_target_names_from_model_full(model_id, target_regex=None) or {}
@@ -62,42 +63,3 @@ def save_peft_like(out_dir: str, adapters: Dict[str, Any], *, r: int, alpha: int
     except Exception:
         pass
 
-
-def detect_target_names_from_model_full(model_id: str, target_regex: Optional[str] = None) -> Optional[Dict[str, str]]:
-    """Return mapping from short target name (last token) to full module path for export."""
-    try:
-        import torch  # local
-        from transformers import AutoModelForCausalLM  # type: ignore
-
-        rx = re.compile(str(target_regex)) if target_regex else None
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch.float32,
-            device_map=None,
-        )
-        model.eval()
-        names: Dict[str, str] = {}
-        root = getattr(model, "model", model)
-        layer0 = None
-        try:
-            layer0 = root.layers[0]
-        except Exception:
-            layer0 = root
-        for name, mod in layer0.named_modules():
-            try:
-                w = getattr(mod, "weight", None)
-                if w is None or getattr(w, "ndim", 0) != 2:
-                    continue
-                short = name.split(".")[-1]
-                if rx is not None:
-                    if not rx.search(short) and not rx.search(name):
-                        continue
-                else:
-                    if not short.endswith(("q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj")):
-                        continue
-                names[short] = name
-            except Exception:
-                continue
-        return names or None
-    except Exception:
-        return None

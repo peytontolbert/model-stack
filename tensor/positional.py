@@ -234,23 +234,43 @@ class RotaryEmbeddingHF:
 
     Uses existing build_rope_cache and optional attention scaling.
     """
-    def __init__(self, head_dim: int, base_theta: float = 1e6, attention_scaling: float = 1.0, device=None):
+    def __init__(self, head_dim: int, base_theta: float = 1e6, attention_scaling: float = 1.0, device=None,
+                 scaling_type: str | None = None,
+                 scaling_factor: float | None = None,
+                 original_max_position_embeddings: int | None = None,
+                 low_freq_factor: float | None = None,
+                 high_freq_factor: float | None = None):
         if head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         self.head_dim = int(head_dim)
         self.base_theta = float(base_theta)
         self.attention_scaling = float(attention_scaling)
         self.device = device
+        self.scaling_type = scaling_type
+        self.scaling_factor = scaling_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+        self.low_freq_factor = low_freq_factor
+        self.high_freq_factor = high_freq_factor
         self._cos = torch.tensor([], device=device)
         self._sin = torch.tensor([], device=device)
 
     @torch.no_grad()
     def _ensure(self, T: int, dtype: torch.dtype, device):
         if self._cos.numel() == 0 or self._cos.shape[0] < T or self._cos.device != device:
-            cos, sin = build_rope_cache(T, self.head_dim, device=device, base_theta=self.base_theta)
+            # Determine effective base theta based on scaling type
+            base = float(self.base_theta)
+            st = (self.scaling_type or "").lower() if isinstance(self.scaling_type, str) else None
+            if st == "linear" and self.scaling_factor is not None:
+                try:
+                    base = float(base) * float(self.scaling_factor)
+                except Exception:
+                    base = float(base)
+            cos, sin = build_rope_cache(T, self.head_dim, device=device, base_theta=base)
+            # Apply attention scaling multiplier
             if self.attention_scaling != 1.0:
                 cos = cos * float(self.attention_scaling)
                 sin = sin * float(self.attention_scaling)
+            # Advanced rope scalings disabled by default for HF parity; linear handled via base theta above.
             self._cos = cos.to(dtype=dtype)
             self._sin = sin.to(dtype=dtype)
 

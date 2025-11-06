@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> None:
     p_study = sub.add_parser("study", help="Run a hyperparameter study")
     p_study.add_argument("--objective", type=str, required=True, help="module:function objective(params, trial) -> score")
     p_study.add_argument("--space", type=str, required=True, help="Path to JSON search space definition")
-    p_study.add_argument("--algo", type=str, default="random", choices=["random", "grid", "sobol", "lhs"]) 
+    p_study.add_argument("--algo", type=str, default="random", choices=["random", "grid", "sobol", "lhs", "halton"]) 
     p_study.add_argument("--metric", type=str, default="objective")
     p_study.add_argument("--mode", type=str, default="min", choices=["min", "max"]) 
     p_study.add_argument("--max-trials", type=int, default=20)
@@ -207,8 +207,11 @@ def main(argv: list[str] | None = None) -> None:
             algo = GridSearch()
         elif args.algo == "sobol":
             algo = SobolSearch(seed=args.seed)
-        else:
+        elif args.algo == "lhs":
             algo = LatinHypercubeSearch(seed=args.seed)
+        else:
+            from .algorithms.halton import HaltonSearch
+            algo = HaltonSearch(seed=args.seed)
         # Optional scheduler
         scheduler = None
         if args.scheduler == "asha":

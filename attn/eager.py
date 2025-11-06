@@ -1,4 +1,5 @@
 from typing import Optional
+import os
 import torch
 import torch.nn as nn
 
@@ -53,10 +54,11 @@ class EagerAttention(nn.Module):
         self.backend_override = backend_override.lower() if isinstance(backend_override, str) else None
 
         # Use n_heads * head_dim for Q projection (matches HF exactly)
-        self.w_q = nn.Linear(self.d_model, self.n_heads * self.head_dim, bias=False)
-        self.w_k = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=False)
-        self.w_v = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=False)
-        self.w_o = nn.Linear(self.n_heads * self.head_dim, self.d_model, bias=False)
+        attn_bias = bool(getattr(cfg, "attention_bias", False))
+        self.w_q = nn.Linear(self.d_model, self.n_heads * self.head_dim, bias=attn_bias)
+        self.w_k = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=attn_bias)
+        self.w_v = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=attn_bias)
+        self.w_o = nn.Linear(self.n_heads * self.head_dim, self.d_model, bias=attn_bias)
 
         self.register_buffer("_rope_cos", torch.tensor([]), persistent=False)
         self.register_buffer("_rope_sin", torch.tensor([]), persistent=False)
@@ -91,6 +93,8 @@ class EagerAttention(nn.Module):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        import os, traceback
+        trace = (os.getenv("GEN_TRACE_ATTENTION", os.getenv("GEN_TRACE", "0")) == "1")
         x = q
         B, T, D = x.shape
         device, dtype = x.device, x.dtype
@@ -140,23 +144,73 @@ class EagerAttention(nn.Module):
             kh_all = kh_all.repeat_interleave(repeat, dim=1)
             vh_all = vh_all.repeat_interleave(repeat, dim=1)
 
-        # HF parity: compute attention using explicit matmul + float32 softmax
-        # Shapes: qh, kh_all, vh_all -> (B, H, T, Dh)
-        # scores: (B, H, T, S)
+        # Use explicit matmul + float32 softmax (HF-eager parity) if enabled; else route to SDPA
         S = kh_all.shape[2]
-        scores = torch.matmul(qh, kh_all.transpose(2, 3)) * float(self.scaling)
+        add = None
         if mask is not None:
             add = to_additive_mask(mask) if mask.dtype == torch.bool else mask
-            # Ensure key length alignment
             if add.shape[-1] != S:
                 add = add[..., :S]
-            scores = scores + add.to(dtype=scores.dtype)
-        # Softmax in float32 like HF, then cast back
-        attn_probs = torch.nn.functional.softmax(scores.float(), dim=-1).to(dtype)
-        if self.training and self.attn_dropout_p > 0.0:
-            attn_probs = torch.nn.functional.dropout(attn_probs, p=self.attn_dropout_p)
-        out = torch.matmul(attn_probs, vh_all)  # (B,H,T,Dh)
-        y = merge_heads(out)
+            # Ensure mask shape is (B,H,T,S) and dtype matches query dtype
+            if add.ndim == 4 and add.shape[1] == 1:
+                add = add.expand(B, self.n_heads, T, S)
+            # Keep additive mask in float32 for numerical stability (bf16 can underflow -inf)
+            # SDPA accepts float masks; avoid downcasting to attention dtype
+            import torch as _torch
+            add = add.to(dtype=_torch.float32)
+            # Guarantee self (diagonal) is unmasked to avoid fully-masked rows (HF parity)
+            if position_ids is not None:
+                try:
+                    pos = position_ids
+                    if pos.dim() == 2:
+                        # (B,T)
+                        pos_idx = pos.clamp_min(0).clamp_max(S - 1)
+                        zeros = torch.zeros(B, self.n_heads, T, 1, dtype=add.dtype, device=add.device)
+                        idx = pos_idx.view(B, 1, T, 1).expand(B, self.n_heads, T, 1)
+                        add = add.scatter(dim=3, index=idx, src=zeros)
+                except Exception:
+                    pass
+        parity_exact = os.environ.get("ATTN_PARITY_EXACT", "0") == "1"
+        if parity_exact:
+            # HF-like: explicit attention scores + additive mask + float32 softmax
+            scores = torch.matmul(qh, kh_all.transpose(2, 3)) * float(self.scaling)  # (B,H,T,S)
+            if add is not None:
+                scores = scores + add.to(dtype=scores.dtype)
+            attn_probs = torch.nn.functional.softmax(scores.float(), dim=-1).to(dtype)
+            if self.training and self.attn_dropout_p > 0.0:
+                attn_probs = torch.nn.functional.dropout(attn_probs, p=self.attn_dropout_p)
+            out = torch.matmul(attn_probs, vh_all)
+            y = merge_heads(out)
+        else:
+            # Choose backend; avoid double causal when explicit mask is provided
+            is_causal_flag = add is None
+            backend = self.backend_override or select_attention_backend(
+                is_causal=is_causal_flag, dtype=dtype, seq=T, heads=self.n_heads, device=device
+            )
+            mask_for_backend = add
+            # Some backends (torch SDPA) may expect float/bool mask with dtype matching q/k/v
+            if mask_for_backend is not None and backend == "torch" and mask_for_backend.dtype != qh.dtype:
+                mask_for_backend = mask_for_backend.to(dtype=qh.dtype)
+          #  if trace:
+           #     try:
+            #        print(f"[attn] backend={backend} causal={is_causal_flag} qdtype={qh.dtype} mdtype={(mask_for_backend.dtype if mask_for_backend is not None else None)} T={T} S={kh_all.shape[2]}")
+            #    except Exception:
+            #        pass
+            try:
+                out = scaled_dot_product_attention(
+                    qh, kh_all, vh_all,
+                    attn_mask=mask_for_backend,
+                    dropout_p=(self.attn_dropout_p if self.training else 0.0),
+                    backend=backend,
+                    is_causal=is_causal_flag,
+                    scale=float(self.scaling),
+                )
+            except Exception:
+                if trace:
+                    print("[attn] exception in SDPA/backend call")
+                    traceback.print_exc()
+                raise
+            y = merge_heads(out)
 
         # Append newly produced KV to cache (stored with Hk heads)
         if cache is not None and T > 0:

@@ -6,54 +6,19 @@ import argparse
 from pathlib import Path
 import subprocess
 from typing import Dict
+import json
+import os as _os
 
 import numpy as np
 
 from examples.repo_grounded_adapters.modules.embedding import build_repo_embedding
 from examples.repo_grounded_adapters.modules.adapter import generate_lora_from_embedding, save_npz
-
+from blocks.inspect import infer_target_shapes_from_config as _infer_shapes_unused  # legacy; avoid transformers
+from model.hf_snapshot import ensure_snapshot
 
 def _root() -> Path:
     return Path(__file__).resolve().parents[2]
 
-
-def _infer_target_shapes_from_config(model_id: str, *, cache_dir: str | None = None) -> Dict[str, tuple[int, int]]:
-    """Infer projection matrix shapes from HF config, honoring GQA for K/V.
-
-    For LLaMA variants:
-      - q_proj: (n_heads*head_dim, d_model) == (d_model, d_model)
-      - k_proj/v_proj: (n_kv_heads*head_dim, d_model)
-      - o_proj: (d_model, n_heads*head_dim) == (d_model, d_model)
-      - up/gate: (intermediate_size, d_model), down: (d_model, intermediate_size)
-    """
-    try:
-        from transformers import AutoConfig  # type: ignore
-    except Exception as e:
-        raise RuntimeError("Install 'transformers' to run this example") from e
-
-    cfg = AutoConfig.from_pretrained(model_id, cache_dir=cache_dir)
-    d_model = int(getattr(cfg, "hidden_size", 0) or 0)
-    inter = int(getattr(cfg, "intermediate_size", 0) or 0)
-    n_heads = int(getattr(cfg, "num_attention_heads", 0) or 0)
-    head_dim = int(getattr(cfg, "head_dim", (d_model // n_heads) if (d_model and n_heads) else 0) or 0)
-    n_kv_heads = int(getattr(cfg, "num_key_value_heads", n_heads) or n_heads)
-    if d_model <= 0 or n_heads <= 0 or head_dim <= 0:
-        raise RuntimeError("Could not infer attention dims from model config")
-    # Compute KV out dim honoring GQA
-    kv_out = int(n_kv_heads * head_dim)
-    shapes: Dict[str, tuple[int, int]] = {
-        "q_proj": (d_model, d_model),              # (n_heads*Dh, d_model)
-        "k_proj": (kv_out, d_model),              # (n_kv_heads*Dh, d_model)
-        "v_proj": (kv_out, d_model),              # (n_kv_heads*Dh, d_model)
-        "o_proj": (d_model, d_model),             # (d_model, n_heads*Dh)
-    }
-    if inter > 0:
-        shapes.update({
-            "up_proj": (inter, d_model),
-            "down_proj": (d_model, inter),
-            "gate_proj": (inter, d_model),
-        })
-    return shapes
 
 
 def main() -> None:
@@ -123,7 +88,14 @@ def main() -> None:
     p.add_argument("--gpu-ids", default=None)
     p.add_argument("--max-memory", default=None)
     p.add_argument("--telemetry-out", default=None)
-    p.add_argument("--cache-dir", default=None, help="Cache directory for HF models/tokenizers (defaults to <repo>/checkpoints)")
+    # DCPO/Structured controls
+    p.add_argument("--structured", action="store_true")
+    p.add_argument("--lfp-iters", type=int, default=1)
+    p.add_argument("--budget-H", type=float, default=0.0)
+    p.add_argument("--monotone-selection", action="store_true")
+    p.add_argument("--samples", type=int, default=1)
+    p.add_argument("--cone-join", choices=["concat", "weighted"], default="concat")
+    p.add_argument("--cache-dir", default="/data/transformer_10/checkpoints", help="Cache directory for HF models/tokenizers")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--no-adapters", action="store_true", help="Disable applying adapters in the enhanced runner")
     p.add_argument("--commit-footer", action="store_true", help="Append 'answer valid for commit X' footer")
@@ -135,7 +107,7 @@ def main() -> None:
     base_dir = Path(args.adapters_dir) if args.adapters_dir else (artifacts / "base_adapters")
     base_dir.mkdir(parents=True, exist_ok=True)
     proj_root = _root()
-    cache_dir = Path(args.cache_dir) if args.cache_dir else (proj_root / "checkpoints")
+    cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     adapters_npz = base_dir / "adapters.npz"
 
@@ -149,16 +121,25 @@ def main() -> None:
             text_max_bytes=int(args.text_max_bytes),
             max_text_tokens=int(args.max_text_tokens),
         )
-        # Infer shapes from HF model config
-        shapes = _infer_target_shapes_from_config(args.model, cache_dir=str(cache_dir))
-        # Infer dims from config
-        try:
-            from transformers import AutoConfig  # type: ignore
-            cfg = AutoConfig.from_pretrained(args.model, cache_dir=str(cache_dir))
-            num_layers = int(getattr(cfg, "num_hidden_layers", 32) or 32)
-            d_model = int(getattr(cfg, "hidden_size", 4096) or 4096)
-        except Exception:
-            num_layers, d_model = 32, 4096
+        # Infer shapes and dims from local snapshot config.json (no transformers)
+        snap_dir = ensure_snapshot(args.model, str(cache_dir))
+        cfg_path = _os.path.join(snap_dir, "config.json")
+        cfg_obj = json.load(open(cfg_path, "r", encoding="utf-8"))
+        d_model = int(cfg_obj.get("hidden_size", 4096))
+        num_layers = int(cfg_obj.get("num_hidden_layers", 32))
+        n_heads = int(cfg_obj.get("num_attention_heads", 32))
+        n_kv_heads = int(cfg_obj.get("num_key_value_heads", n_heads))
+        d_ff = int(cfg_obj.get("intermediate_size", 11008))
+        head_dim = int(cfg_obj.get("head_dim", d_model // max(1, n_heads)))
+        shapes: Dict[str, tuple[int, int]] = {
+            "q_proj": (n_heads * head_dim, d_model),
+            "k_proj": (n_kv_heads * head_dim, d_model),
+            "v_proj": (n_kv_heads * head_dim, d_model),
+            "o_proj": (d_model, n_heads * head_dim),
+            "up_proj": (d_ff, d_model),
+            "gate_proj": (d_ff, d_model),
+            "down_proj": (d_model, d_ff),
+        }
         # Parse or synthesize target weights (knowledge preset if requested and none provided)
         def _parse_tw(spec: str | None) -> dict[str, float] | None:
             if not spec:
@@ -199,57 +180,126 @@ def main() -> None:
 
     # Run directly via orchestrator
     from examples.repo_grounded_adapters.modules.runner import generate_answer
+    from examples.repo_grounded_adapters.modules.runner import generate_answer_structured
 
     if args.gpu_ids and str(args.gpu_ids).strip():
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_ids).strip()
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    text = generate_answer(
-        model_id=args.model,
-        adapters_npz=str(adapters_npz),
-        repo_root=str(root),
-        prompt=args.prompt,
-        cache_dir=str(cache_dir),
-        device_map=str(args.device_map),
-        alpha=float(args.alpha),
-        rank=int(args.rank),
-        gsub=float(args.gsub),
-        beta=float(args.mix_beta),
-        of_sources=args.of_sources,
-        zoom_symbol=args.zoom_symbol,
-        zoom_radius=int(args.zoom_radius),
-        pack_context=bool(args.pack_context),
-        pack_mode=args.pack_mode,
-        context_tokens=int(args.context_tokens),
-        require_citations=bool(args.require_citations),
-        citations_per_paragraph=bool(args.citations_per_paragraph),
-        function_first=bool(args.function_first),
-        ff_max_candidates=int(args.ff_max_candidates),
-        ff_window_lines=int(args.ff_window_lines),
-        ff_threshold=float(args.ff_threshold),
-        ff_noise_penalty=float(args.ff_noise_penalty),
-        do_sample=bool(args.do_sample),
-        temperature=float(args.temperature),
-        top_p=float(args.top_p),
-        repetition_penalty=float(args.repetition_penalty),
-        min_new_tokens=int(args.min_new_tokens),
-        max_new_tokens=int(args.max_new_tokens),
-        kv_window=int(args.kv_window),
-        head_device=str(args.head_device),
-        seed=int(args.seed),
-        entropy_aware=bool(args.entropy_aware),
-        rank_min=int(args.rank_min),
-        rank_max=int(args.rank_max),
-        gsub_min=float(args.gsub_min),
-        gsub_max=float(args.gsub_max),
-        entropy_weights=str(args.entropy_weights),
-        target_weights=(str(args.target_weights) if args.target_weights else ("q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05" if args.knowledge_preset else None)),
-        rerank=bool(args.rerank),
-        self_queries_path=(str(args.self_queries) if args.self_queries else None),
-        commit_footer=bool(args.commit_footer),
-        verbose=bool(args.verbose),
-    )
-    print(text)
+    if bool(args.structured):
+        res = generate_answer_structured(
+            model_id=args.model,
+            adapters_npz=str(adapters_npz),
+            repo_root=str(root),
+            prompt=args.prompt,
+            cache_dir=str(cache_dir),
+            device_map=str(args.device_map),
+            alpha=float(args.alpha),
+            rank=int(args.rank),
+            gsub=float(args.gsub),
+            beta=float(args.mix_beta),
+            of_sources=args.of_sources,
+            zoom_symbol=args.zoom_symbol,
+            zoom_radius=int(args.zoom_radius),
+            pack_context=bool(args.pack_context),
+            pack_mode=args.pack_mode,
+            context_tokens=int(args.context_tokens),
+            require_citations=bool(args.require_citations),
+            citations_per_paragraph=bool(args.citations_per_paragraph),
+            function_first=bool(args.function_first),
+            ff_max_candidates=int(args.ff_max_candidates),
+            ff_window_lines=int(args.ff_window_lines),
+            ff_threshold=float(args.ff_threshold),
+            ff_noise_penalty=float(args.ff_noise_penalty),
+            do_sample=bool(args.do_sample),
+            temperature=float(args.temperature),
+            top_p=float(args.top_p),
+            repetition_penalty=float(args.repetition_penalty),
+            min_new_tokens=int(args.min_new_tokens),
+            max_new_tokens=int(args.max_new_tokens),
+            kv_window=int(args.kv_window),
+            head_device=str(args.head_device),
+            seed=int(args.seed),
+            entropy_aware=bool(args.entropy_aware),
+            rank_min=int(args.rank_min),
+            rank_max=int(args.rank_max),
+            gsub_min=float(args.gsub_min),
+            gsub_max=float(args.gsub_max),
+            entropy_weights=str(args.entropy_weights),
+            target_weights=(str(args.target_weights) if args.target_weights else ("q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05" if args.knowledge_preset else None)),
+            rerank=bool(args.rerank),
+            self_queries_path=(str(args.self_queries) if args.self_queries else None),
+            commit_footer=bool(args.commit_footer),
+            verbose=bool(args.verbose),
+            lfp_iters=int(args.lfp_iters),
+            budget_H=float(args.budget_H),
+            monotone_selection=bool(args.monotone_selection),
+            repo_state_path=None,
+            samples=int(args.samples),
+            cone_join=str(args.cone_join),
+            telemetry_out=(str(args.telemetry_out) if args.telemetry_out else None),
+        )
+        print(res.get("text", ""))
+        if args.verbose:
+            try:
+                import json as _json
+                print(_json.dumps({
+                    "must": len(res.get("must", [])),
+                    "may": len(res.get("may", [])),
+                    "lfp_passes": res.get("lfp_passes"),
+                    "converged": res.get("converged"),
+                    "confidence": res.get("confidence"),
+                }, indent=2))
+            except Exception:
+                pass
+    else:
+        text = generate_answer(
+            model_id=args.model,
+            adapters_npz=str(adapters_npz),
+            repo_root=str(root),
+            prompt=args.prompt,
+            cache_dir=str(cache_dir),
+            device_map=str(args.device_map),
+            alpha=float(args.alpha),
+            rank=int(args.rank),
+            gsub=float(args.gsub),
+            beta=float(args.mix_beta),
+            of_sources=args.of_sources,
+            zoom_symbol=args.zoom_symbol,
+            zoom_radius=int(args.zoom_radius),
+            pack_context=bool(args.pack_context),
+            pack_mode=args.pack_mode,
+            context_tokens=int(args.context_tokens),
+            require_citations=bool(args.require_citations),
+            citations_per_paragraph=bool(args.citations_per_paragraph),
+            function_first=bool(args.function_first),
+            ff_max_candidates=int(args.ff_max_candidates),
+            ff_window_lines=int(args.ff_window_lines),
+            ff_threshold=float(args.ff_threshold),
+            ff_noise_penalty=float(args.ff_noise_penalty),
+            do_sample=bool(args.do_sample),
+            temperature=float(args.temperature),
+            top_p=float(args.top_p),
+            repetition_penalty=float(args.repetition_penalty),
+            min_new_tokens=int(args.min_new_tokens),
+            max_new_tokens=int(args.max_new_tokens),
+            kv_window=int(args.kv_window),
+            head_device=str(args.head_device),
+            seed=int(args.seed),
+            entropy_aware=bool(args.entropy_aware),
+            rank_min=int(args.rank_min),
+            rank_max=int(args.rank_max),
+            gsub_min=float(args.gsub_min),
+            gsub_max=float(args.gsub_max),
+            entropy_weights=str(args.entropy_weights),
+            target_weights=(str(args.target_weights) if args.target_weights else ("q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05" if args.knowledge_preset else None)),
+            rerank=bool(args.rerank),
+            self_queries_path=(str(args.self_queries) if args.self_queries else None),
+            commit_footer=bool(args.commit_footer),
+            verbose=bool(args.verbose),
+            monotone_selection=bool(args.monotone_selection),
+        )
+        print(text)
 
 
 if __name__ == "__main__":

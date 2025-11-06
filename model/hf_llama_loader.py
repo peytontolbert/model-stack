@@ -26,6 +26,14 @@ def _stack_gate_up(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return torch.cat([gate, up], dim=0).contiguous()
 
 
+def _stack_gate_up_bias(gate_b: torch.Tensor, up_b: torch.Tensor) -> torch.Tensor:
+    if gate_b.dim() != 1 or up_b.dim() != 1:
+        raise ValueError("Gate/Up biases must be 1D tensors")
+    if gate_b.shape[0] != up_b.shape[0]:
+        raise ValueError(f"Gate/Up bias size mismatch: {gate_b.shape} vs {up_b.shape}")
+    return torch.cat([gate_b, up_b], dim=0).contiguous()
+
+
 def _assert_shape(name: str, got: Tuple[int, ...], exp: Tuple[int, ...]) -> None:
     if tuple(got) != tuple(exp):
         raise ValueError(f"Shape mismatch for {name}: got {tuple(got)} expected {tuple(exp)}")
@@ -90,17 +98,29 @@ def load_hf_llama_weights_into_local(model: torch.nn.Module, model_dir: str) -> 
             _assert_shape(f"layers.{li}.q_proj", tuple(tensor.shape), (n_heads * head_dim, d_model))
             blk.attn.w_q.weight.data.copy_(tensor.to(device=device, dtype=dtype))
             return
+        if sub == "self_attn.q_proj.bias" and getattr(blk.attn.w_q, "bias", None) is not None:
+            blk.attn.w_q.bias.data.copy_(tensor.to(device=device, dtype=dtype))
+            return
         if sub == "self_attn.k_proj.weight":
             _assert_shape(f"layers.{li}.k_proj", tuple(tensor.shape), (n_kv_heads * head_dim, d_model))
             blk.attn.w_k.weight.data.copy_(tensor.to(device=device, dtype=dtype))
+            return
+        if sub == "self_attn.k_proj.bias" and getattr(blk.attn.w_k, "bias", None) is not None:
+            blk.attn.w_k.bias.data.copy_(tensor.to(device=device, dtype=dtype))
             return
         if sub == "self_attn.v_proj.weight":
             _assert_shape(f"layers.{li}.v_proj", tuple(tensor.shape), (n_kv_heads * head_dim, d_model))
             blk.attn.w_v.weight.data.copy_(tensor.to(device=device, dtype=dtype))
             return
+        if sub == "self_attn.v_proj.bias" and getattr(blk.attn.w_v, "bias", None) is not None:
+            blk.attn.w_v.bias.data.copy_(tensor.to(device=device, dtype=dtype))
+            return
         if sub == "self_attn.o_proj.weight":
             _assert_shape(f"layers.{li}.o_proj", tuple(tensor.shape), (d_model, n_heads * head_dim))
             blk.attn.w_o.weight.data.copy_(tensor.to(device=device, dtype=dtype))
+            return
+        if sub == "self_attn.o_proj.bias" and getattr(blk.attn.w_o, "bias", None) is not None:
+            blk.attn.w_o.bias.data.copy_(tensor.to(device=device, dtype=dtype))
             return
         # Norms
         if sub == "input_layernorm.weight":
@@ -116,6 +136,9 @@ def load_hf_llama_weights_into_local(model: torch.nn.Module, model_dir: str) -> 
             _assert_shape(f"layers.{li}.mlp.w_out", tuple(tensor.shape), (blk.mlp.w_out.weight.shape[0], blk.mlp.w_out.weight.shape[1]))
             blk.mlp.w_out.weight.data.copy_(tensor.to(device=device, dtype=dtype))
             return
+        if sub == "mlp.down_proj.bias" and getattr(blk.mlp.w_out, "bias", None) is not None:
+            blk.mlp.w_out.bias.data.copy_(tensor.to(device=device, dtype=dtype))
+            return
         if sub == "mlp.gate_proj.weight":
             pending_in.setdefault(li, {})["gate"] = tensor
             # Try fuse if up already present
@@ -127,6 +150,15 @@ def load_hf_llama_weights_into_local(model: torch.nn.Module, model_dir: str) -> 
                 blk.mlp.w_in.weight.data.copy_(w_in.to(device=device, dtype=dtype))
                 pending_in.pop(li, None)
             return
+        if sub == "mlp.gate_proj.bias" and getattr(blk.mlp.w_in, "bias", None) is not None:
+            pending_in.setdefault(li, {})["gate_b"] = tensor
+            if "up_b" in pending_in[li]:
+                gb = pending_in[li].pop("gate_b")
+                ub = pending_in[li].pop("up_b")
+                b_in = _stack_gate_up_bias(gb, ub)
+                blk.mlp.w_in.bias.data.copy_(b_in.to(device=device, dtype=dtype))
+                pending_in.pop(li, None)
+            return
         if sub == "mlp.up_proj.weight":
             pending_in.setdefault(li, {})["up"] = tensor
             if "gate" in pending_in[li]:
@@ -135,6 +167,15 @@ def load_hf_llama_weights_into_local(model: torch.nn.Module, model_dir: str) -> 
                 w_in = _stack_gate_up(gate, up)
                 _assert_shape(f"layers.{li}.mlp.w_in", tuple(w_in.shape), (blk.mlp.w_in.weight.shape[0], blk.mlp.w_in.weight.shape[1]))
                 blk.mlp.w_in.weight.data.copy_(w_in.to(device=device, dtype=dtype))
+                pending_in.pop(li, None)
+            return
+        if sub == "mlp.up_proj.bias" and getattr(blk.mlp.w_in, "bias", None) is not None:
+            pending_in.setdefault(li, {})["up_b"] = tensor
+            if "gate_b" in pending_in[li]:
+                gb = pending_in[li].pop("gate_b")
+                ub = pending_in[li].pop("up_b")
+                b_in = _stack_gate_up_bias(gb, ub)
+                blk.mlp.w_in.bias.data.copy_(b_in.to(device=device, dtype=dtype))
                 pending_in.pop(li, None)
             return
 

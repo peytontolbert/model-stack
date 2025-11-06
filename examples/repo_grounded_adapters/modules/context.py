@@ -124,7 +124,20 @@ def score_yes_no(tok, model, q: str) -> float:
     q_ids = {k: v.to(dev) for k, v in q_ids.items()}
     with torch.no_grad():
         out_lm = model(**q_ids)
-        logits = out_lm.logits  # [1, T, V]
+        # Support both HF-style outputs and raw tensor outputs
+        if isinstance(out_lm, torch.Tensor):
+            logits = out_lm
+        else:
+            logits = getattr(out_lm, "logits", None)
+            if logits is None:
+                # Best-effort fallbacks
+                if isinstance(out_lm, (tuple, list)) and out_lm:
+                    logits = out_lm[0]
+                else:
+                    logits = getattr(out_lm, "last_hidden_state", None)
+            if logits is None:
+                # As a last resort, return neutral 0.5
+                return 0.5
         last = logits[:, -1, :]
         t1 = tok("1", add_special_tokens=False).input_ids
         t0 = tok("0", add_special_tokens=False).input_ids

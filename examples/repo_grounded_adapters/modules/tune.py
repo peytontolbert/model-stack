@@ -14,10 +14,8 @@ from examples.repo_grounded_adapters.modules.embedding import build_subgraph_emb
 from examples.repo_grounded_adapters.modules.adapter import (
     save_npz,
     generate_lora_from_embedding,
-    detect_target_shapes_from_model_full,
-    detect_target_shapes_from_model,
 )
-
+from model.inspect import detect_target_shapes_from_model_full, detect_target_shapes_from_model
 
 def distill_repo(
     repo: str,

@@ -227,9 +227,13 @@ def as_bool_mask(x: torch.Tensor, true_means: str = "masked") -> torch.Tensor:
     raise TypeError("Unsupported mask dtype")
 
 
-def to_additive_mask(bool_mask: torch.Tensor, neg_inf_value: float = -1e9) -> torch.Tensor:
-    # True (masked) -> neg_inf, False -> 0
-    return bool_mask.to(torch.float32).mul(neg_inf_value)
+def to_additive_mask(bool_mask: torch.Tensor, neg_inf_value: float = float('-inf')) -> torch.Tensor:
+    # True (masked) -> -inf, False -> 0 (float32; callers may cast to attn dtype)
+    x = bool_mask.to(torch.float32)
+    if neg_inf_value == float('-inf'):
+        # Multiply by -inf via where to avoid NaNs on 0 * inf
+        return torch.where(x > 0, torch.full_like(x, float('-inf')), torch.zeros_like(x))
+    return x.mul(neg_inf_value)
 
 
 def apply_additive_mask_(scores: torch.Tensor, add_mask: torch.Tensor) -> torch.Tensor:
@@ -268,23 +272,71 @@ def create_causal_mask(
     past_key_values=None,
     position_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """HF-like 4D additive causal mask builder.
+    """HF-like 4D additive causal mask builder handling cached keys.
 
-    Returns an additive mask shaped (B, 1, T, S) suitable for SDPA/additive masking.
-    This minimal version handles the no-cache case and combines causal and padding masks.
+    - Returns additive mask shaped (B, 1, T, S) where S is total key length (past + present).
+    - Uses absolute `position_ids` or `cache_position` to determine S and future masking.
+    - Combines causal and padding masks. If `attention_mask` is shorter than S, right-pad with ones (keep).
     """
     B, T, _ = input_embeds.shape
     device = input_embeds.device
-    # Base causal mask (True means masked)
-    causal_bool = build_causal_mask(T, device=device, dtype=torch.bool)  # (T,T)
-    causal_bool = causal_bool.view(1, 1, T, T)
 
-    if attention_mask is None:
-        combined_bool = causal_bool
+    # Determine total key length S from position context
+    S = T
+    if position_ids is not None:
+        pos = position_ids
+        if pos.dim() == 2:
+            pos = pos[0]
+        try:
+            S = int(pos.max().item()) + 1
+        except Exception:
+            S = max(T, 1)
+    elif cache_position is not None:
+        cp = cache_position
+        if cp.dim() > 0:
+            try:
+                S = int(cp.max().item()) + 1
+            except Exception:
+                S = max(T, 1)
+    # If an attention_mask is provided and longer than S, expand S to match
+    if attention_mask is not None:
+        try:
+            am_len = int(attention_mask.shape[-1])
+            if am_len > S:
+                S = am_len
+        except Exception:
+            pass
+
+    # Build future mask using absolute positions if provided
+    if position_ids is not None:
+        pos = position_ids
+        if pos.dim() == 2:
+            pos = pos[0]
+        qpos = pos.view(T, 1)  # (T,1)
+        kpos = torch.arange(S, device=device, dtype=qpos.dtype).view(1, S)  # (1,S)
+        future = kpos > qpos  # (T,S)
+        causal_bool = future.view(1, 1, T, S)
     else:
-        # attention_mask: (B,T) with 1 token, 0 pad -> build padding mask (True=masked)
-        pad_bool = build_padding_mask(attention_mask).view(B, 1, 1, T)
+        # Fallback to standard causal when absolute positions are unavailable
+        causal_bool = build_causal_mask(S, device=device, dtype=torch.bool)  # (S,S)
+        # Take the last T rows as queries
+        causal_bool = causal_bool[-T:].view(1, 1, T, S)
+
+    # Padding mask (True means masked)
+    if attention_mask is not None:
+        pm = attention_mask
+        # Right-pad to length S with ones (keep)
+        if pm.shape[-1] < S:
+            pad_len = S - pm.shape[-1]
+            pad = torch.ones(pm.shape[0], pad_len, dtype=pm.dtype, device=pm.device)
+            pm = torch.cat([pm, pad], dim=-1)
+        elif pm.shape[-1] > S:
+            # Truncate to match S if longer
+            pm = pm[..., :S]
+        pad_bool = build_padding_mask(pm).view(B, 1, 1, S)
         combined_bool = causal_bool | pad_bool
+    else:
+        combined_bool = causal_bool
 
     # Convert to additive mask (neg_inf where masked)
     add = to_additive_mask(combined_bool)

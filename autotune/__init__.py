@@ -6,6 +6,7 @@ from .algorithms.random import RandomSearch
 from .algorithms.grid import GridSearch
 from .algorithms.sobol import SobolSearch
 from .algorithms.lhs import LatinHypercubeSearch
+from .algorithms.halton import HaltonSearch
 
 __all__ = [
     "Choice",
@@ -22,6 +23,7 @@ __all__ = [
     "GridSearch",
     "SobolSearch",
     "LatinHypercubeSearch",
+    "HaltonSearch",
 ]
 
 

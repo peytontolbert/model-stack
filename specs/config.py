@@ -16,6 +16,11 @@ class ModelConfig:
     rope_theta: float = 1e6
     dtype: DType = "bfloat16"
     kv_cache_paged: bool = True
+    # attention options
+    attention_bias: bool = False
+    attn_dropout: float = 0.0
+    # optional sliding-window length for KV cache during generation
+    sliding_window: Optional[int] = None
     version: int = 1
     # tensor-backed op selections (resolved via specs.ops)
     activation: str = "silu"
@@ -34,3 +39,5 @@ class ModelConfig:
     rope_scaling_high_freq_factor: Optional[float] = None
     # HF rotary attention scaling (applied to cos/sin)
     rope_attention_scaling: Optional[float] = None
+    # Token ids
+    pad_token_id: Optional[int] = None

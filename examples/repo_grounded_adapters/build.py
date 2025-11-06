@@ -17,10 +17,15 @@ from examples.repo_grounded_adapters.modules.adapter import (
     generate_lora_from_embedding,
     generate_lora_from_embedding_torch,
     save_npz,
-    detect_target_shapes_from_model,
-    detect_target_shapes_from_model_full,
 )
+from model.hf_snapshot import ensure_snapshot
 from examples.repo_grounded_adapters.modules.capacity import entropy_score
+from examples.repo_grounded_adapters.modules.repo_state import (
+    load_repo_state,
+    save_repo_state,
+    join_repo_states,
+    new_state_from_run,
+)
 
 def main() -> None:
     p = argparse.ArgumentParser()
@@ -63,7 +68,7 @@ def main() -> None:
         help="Files-only mode: relative file paths to include (repeatable)",
     )
     # HF cache/model
-    p.add_argument("--cache-dir", default=None)
+    p.add_argument("--cache-dir", default="/data/transformer_10/checkpoints")
     p.add_argument("--probe-full", action="store_true")
     p.add_argument("--gen-backend", choices=["numpy", "torch"], default="numpy")
     p.add_argument("--seed", type=int, default=0)
@@ -74,6 +79,9 @@ def main() -> None:
     p.add_argument("--rank-min", type=int, default=None)
     p.add_argument("--rank-max", type=int, default=None)
     p.add_argument("--mdl-budget-params", type=int, default=0, help="Optional MDL-style global parameter budget across all layers/targets (approximate)")
+    # RepoState seeding
+    p.add_argument("--init-repo-state", action="store_true", help="Initialize or update baseline RepoState (.repo_state.json) after build")
+    p.add_argument("--repo-state-path", default=None, help="Optional explicit path to write RepoState JSON; defaults to <repo>/.repo_state.json")
     # (self-tune is no longer part of build; use modules/tune.py externally if desired)
     args = p.parse_args()
 
@@ -158,18 +166,25 @@ def main() -> None:
         os.makedirs(cache_dir, exist_ok=True)
     except Exception:
         pass
-    target_shapes: Optional[Dict[str, Tuple[int, int]]] = None
-    # Prefer config-based detection; allow full probing only when requested
-    try:
-        target_shapes = detect_target_shapes_from_model(args.model)
-    except Exception:
-        target_shapes = None
-    if (not target_shapes) and bool(args.probe_full):
-        try:
-            target_shapes = detect_target_shapes_from_model_full(args.model, target_regex=None)
-        except Exception:
-            target_shapes = target_shapes or None
-    num_layers, d_model = auto_model_dims(args.model, cache_dir)
+    # Infer shapes/dims from local snapshot config.json (no transformers)
+    snap_dir = ensure_snapshot(args.model, cache_dir)
+    cfg_path = os.path.join(snap_dir, "config.json")
+    cfg_obj = json.load(open(cfg_path, "r", encoding="utf-8"))
+    d_model = int(cfg_obj.get("hidden_size", 4096))
+    num_layers = int(cfg_obj.get("num_hidden_layers", 32))
+    n_heads = int(cfg_obj.get("num_attention_heads", 32))
+    n_kv_heads = int(cfg_obj.get("num_key_value_heads", n_heads))
+    d_ff = int(cfg_obj.get("intermediate_size", 11008))
+    head_dim = int(cfg_obj.get("head_dim", d_model // max(1, n_heads)))
+    target_shapes: Optional[Dict[str, Tuple[int, int]]] = {
+        "q_proj": (n_heads * head_dim, d_model),
+        "k_proj": (n_kv_heads * head_dim, d_model),
+        "v_proj": (n_kv_heads * head_dim, d_model),
+        "o_proj": (d_model, n_heads * head_dim),
+        "up_proj": (d_ff, d_model),
+        "gate_proj": (d_ff, d_model),
+        "down_proj": (d_model, d_ff),
+    }
 
     # Target weights: parse or preset
     def _parse_tw(spec: Optional[str]) -> Optional[Dict[str, float]]:
@@ -584,6 +599,14 @@ def main() -> None:
             "mdl_budget_params": (int(args.mdl_budget_params) if args.mdl_budget_params else 0),
         },
     }
+    # Record dcpo capability and repo state path (if requested)
+    if bool(args.init_repo_state):
+        try:
+            manifest["dcpo"] = {"enabled": True}
+            if args.repo_state_path:
+                manifest["dcpo"]["repo_state_path"] = os.path.abspath(args.repo_state_path)
+        except Exception:
+            pass
     save_npz(out_dir, embedding=emb, adapters=adapters, manifest=manifest)
 
     # Also export a JSONL of repository sources (path, sha256, bytes)
@@ -800,6 +823,56 @@ def main() -> None:
                 continue
 
     # (tuning pipeline removed from build)
+
+    # Optional RepoState initialization (baseline dcpo state)
+    if bool(args.init_repo_state):
+        try:
+            # Collect non-test modules and repo-relative files
+            modules_all = []
+            try:
+                for m, mi in getattr(g, "modules", {}).items():
+                    if getattr(mi, "is_test", False):
+                        continue
+                    modules_all.append(m)
+            except Exception:
+                modules_all = sorted(list(getattr(g, "modules", {}).keys()))
+            files_rel = []
+            try:
+                for f_abs in getattr(g, "indexed_files", []) or []:
+                    try:
+                        rel = os.path.relpath(f_abs, args.repo)
+                    except Exception:
+                        rel = f_abs
+                    files_rel.append(rel.replace("\\", "/"))
+            except Exception:
+                files_rel = []
+            # Create baseline state from repo embedding z
+            z_vec = emb.get("z") if isinstance(emb, dict) else None
+            st_prev = load_repo_state(args.repo, path=(args.repo_state_path or None))
+            st_new = new_state_from_run(
+                args.repo,
+                modules=sorted(list(set(modules_all))),
+                files=sorted(list(set(files_rel))),
+                citations=[],
+                z_vec=(z_vec if hasattr(z_vec, "shape") else None),
+                beh_event={"type": "build", "ok": True},
+                H_increment=0.0,
+            )
+            st_join = join_repo_states(st_prev, st_new)
+            save_repo_state(st_join, path=(args.repo_state_path or None))
+            if args.verbose:
+                print(json.dumps({
+                    "repo_state": {
+                        "path": (args.repo_state_path or os.path.join(os.path.abspath(args.repo), ".repo_state.json")),
+                        "modules": len(st_join.candidates_modules),
+                        "files": len(st_join.candidates_files),
+                        "facts": len(st_join.facts),
+                        "vec_weight": st_join.vec_weight,
+                    }
+                }, indent=2))
+        except Exception as _e:
+            if args.verbose:
+                print(json.dumps({"repo_state_error": str(_e)}))
 
 
 if __name__ == "__main__":

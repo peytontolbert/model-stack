@@ -3,7 +3,7 @@ Autotune: Hyperparameter and Systems Tuning
 This module provides a lightweight but comprehensive framework for automated tuning across model, runtime, and kernel-level knobs. It integrates with existing components like `viz`, `attn`, and `dist` while remaining framework-agnostic for your objective function.
 
 Highlights
-- Random, grid, Sobol quasi-random, and Latin hypercube search (pluggable)
+- Random, grid, Sobol/Halton quasi-random, and Latin hypercube search (pluggable)
 - Simple, composable search spaces (choice, int ranges, uniform, log-uniform)
 - Trial orchestration with persistent local storage
 - Viz logging integration for trial metrics
@@ -60,7 +60,7 @@ python -m autotune.cli study \
 python -m autotune.cli bench-attn --seq 512 --heads 16 --d-k 64 --dtype bf16
 ```
 
-Available algorithms for `--algo`: `random`, `grid`, `sobol`, `lhs`.
+Available algorithms for `--algo`: `random`, `grid`, `sobol`, `lhs`, `halton`.
 
 Example using Sobol quasi-random search:
 ```bash
@@ -68,6 +68,16 @@ python -m autotune.cli study \
   --objective mypkg.objectives:train_eval \
   --space space.json \
   --algo sobol \
+  --metric loss --mode min \
+  --max-trials 25
+```
+
+Example using Halton quasi-random search:
+```bash
+python -m autotune.cli study \
+  --objective mypkg.objectives:train_eval \
+  --space space.json \
+  --algo halton \
   --metric loss --mode min \
   --max-trials 25
 ```
