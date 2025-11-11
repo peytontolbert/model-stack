@@ -47,6 +47,12 @@ from examples.repo_grounded_adapters.modules.context import (
 from examples.repo_grounded_adapters.modules.verify import has_citations
 from examples.repo_grounded_adapters.modules.verify import normalize_citations
 from examples.repo_grounded_adapters.modules.verify import extract_typed_facts
+from examples.repo_grounded_adapters.modules.verify import resolve_claim_spans
+from examples.repo_grounded_adapters.modules.verify import validate_spans
+from examples.repo_grounded_adapters.modules.verify import extract_symbol_mentions
+from examples.repo_grounded_adapters.modules.verify import repair_citations
+from examples.repo_grounded_adapters.modules.sim_index import build_symbol_index
+from examples.repo_grounded_adapters.modules.sim_index import choose_path_style
 from examples.repo_grounded_adapters.modules.interpret import (
     is_block,
     block_out_hook,
@@ -97,6 +103,18 @@ def generate_answer(
     gsub_max: float = 0.9,
     entropy_weights: str = "repo=0.4,subgraph=0.4,question=0.2",
     target_weights: Optional[str] = None,
+    layer_schedule: bool = False,
+    q_aware_weights: bool = False,
+    mixture_m: int = 0,
+    adapters_bank: Optional[str] = None,
+    per_target_rank_schedule: bool = False,
+    rank_budget: int = 0,
+    ablate_attn: bool = False,
+    ablate_mlp: bool = False,
+    alpha_warmup: bool = False,
+    adapter_aware_decoding: bool = False,
+    layer_rank_tiers: bool = False,
+    # cones/rounding
     # cones/rounding
     cone_rank: int = 2,
     cone_weight: float = 0.5,
@@ -155,6 +173,18 @@ def generate_answer(
     # Local tokenizer (no transformers)
     snap_dir = ensure_snapshot(model_id, cache_dir)
     tok_local = LocalLlamaTokenizer(snap_dir)
+    class _TokAdapter:
+        def __init__(self, base):
+            self._b = base
+        class _Ret:
+            def __init__(self, ids):
+                self.input_ids = ids
+        def __call__(self, text: str, add_special_tokens: bool = False, return_tensors: str | None = None):
+            ids = self._b.encode(text)
+            if return_tensors == "pt":
+                return {"input_ids": torch.tensor([ids], dtype=torch.long)}
+            return _TokAdapter._Ret(ids)
+    tok = _TokAdapter(tok_local)
     def _tok_encode(text: str) -> List[int]:
         return tok_local.encode(text)
     def _tok_len(text: str) -> int:
@@ -322,6 +352,67 @@ def generate_answer(
         except Exception:
             pass
 
+    # Optional mixture bank: mix top-m module adapters from bank by concatenation (Σ π_i Δθ_i)
+    if adapters_bank and int(mixture_m) > 0:
+        try:
+            import glob
+            bank_root = os.path.abspath(os.path.expanduser(os.path.expandvars(adapters_bank)))
+            sel_mods = [m for m in (modules or []) if m]
+            picked = 0
+            for mod in sel_mods:
+                if picked >= int(mixture_m):
+                    break
+                mod_dir1 = os.path.join(bank_root, "sub_adapters", mod.replace("/", "_"))
+                mod_dir2 = os.path.join(bank_root, mod.replace("/", "_"))
+                cand = None
+                for d in (mod_dir1, mod_dir2):
+                    fp = os.path.join(d, "adapters.npz")
+                    if os.path.isfile(fp):
+                        cand = fp
+                        break
+                if not cand:
+                    continue
+                try:
+                    bank_ad = load_adapters_npz(cand)
+                except Exception:
+                    continue
+                # uniform π for now
+                w = 1.0 / float(min(len(sel_mods), int(mixture_m)))
+                sw = float(max(0.0, min(1.0, w))) ** 0.5
+                # per-layer concat
+                merged_layers = []
+                for i in range(num_layers):
+                    baseL = sub["layers"][i]
+                    bL = bank_ad["layers"][i] if i < len(bank_ad.get("layers", [])) else {}
+                    dst: Dict[str, Dict[str, np.ndarray]] = {}
+                    for name in tmap.keys():
+                        if (name in baseL) and (name in bL):
+                            A1 = baseL[name]["A"]; B1 = baseL[name]["B"]
+                            A2 = (sw * bL[name]["A"]).astype(np.float32); B2 = (sw * bL[name]["B"]).astype(np.float32)
+                            A = np.concatenate([A1, A2], axis=1)
+                            B = np.concatenate([B1, B2], axis=0)
+                            dst[name] = {"A": A, "B": B, "gate": baseL[name].get("gate", np.array([0.0], dtype=np.float32))}
+                        elif name in baseL:
+                            dst[name] = baseL[name]
+                        elif name in bL:
+                            A = (sw * bL[name]["A"]).astype(np.float32)
+                            dst[name] = {"A": A, "B": bL[name]["B"], "gate": bL[name].get("gate", np.array([0.0], dtype=np.float32))}
+                    merged_layers.append(dst)
+                sub = {"layers": merged_layers}
+                # try infer rank increment from a present target
+                try:
+                    for i in range(num_layers):
+                        any_name = next((n for n in tmap.keys() if n in bank_ad["layers"][i]), None)
+                        if any_name:
+                            inc = int(bank_ad["layers"][i][any_name]["B"].shape[0])
+                            scaled_rank = int(scaled_rank + inc)
+                            break
+                except Exception:
+                    pass
+                picked += 1
+        except Exception:
+            pass
+
     # Optional rounding of LoRA factors
     if bool(round_lora):
         try:
@@ -421,9 +512,9 @@ def generate_answer(
                         out_lines.extend(aux.splitlines())
                 packed = "\n".join(out_lines) if len(out_lines) > 1 else ""
             else:
-                packed = pack_context_windows(repo_root, files, tok_local, int(context_tokens))
+                packed = pack_context_windows(repo_root, files, tok, int(context_tokens))
         else:
-            packed = pack_context_heads(repo_root, files, tok_local, int(context_tokens))
+            packed = pack_context_heads(repo_root, files, tok, int(context_tokens))
         if packed:
             final_prompt = (ident_header + packed + "\n\n" + final_prompt) if ident_header else (packed + "\n\n" + final_prompt)
     if require_citations:
@@ -439,6 +530,17 @@ def generate_answer(
               "Use only files shown in [ctx] above. Provide at least 3 citations overall.\n"
         )
 
+    # Adapter-aware decoding: pointer-first nudge when citations are required
+    if bool(adapter_aware_decoding) and bool(require_citations):
+        try:
+            example_rel = files[0] if files else None
+            example_path = example_rel if example_rel else "file.py"
+        except Exception:
+            example_path = "file.py"
+        final_prompt = (
+            f"[pointer-first] Start with a citation like [{example_path}:A-B], then explain.\n\n"
+            + final_prompt
+        )
     ids = torch.tensor([_tok_encode(final_prompt)], dtype=torch.long, device=device)
     x = {"input_ids": ids}
 
@@ -466,16 +568,116 @@ def generate_answer(
         except Exception:
             return None
     tw = _parse_target_weights(target_weights) or {}
+    # Optional question-aware reweighting
+    if bool(q_aware_weights):
+        try:
+            ql = str(prompt).lower()
+            mul: Dict[str, float] = {}
+            if any(k in ql for k in ["signature", "param", "argument", "type", "prototype"]):
+                mul.update({"o_proj": 1.10, "v_proj": 1.08})
+            if any(k in ql for k in ["why", "fail", "error", "behavior", "incorrect", "bug"]):
+                mul.update({"up_proj": 1.06, "down_proj": 1.05, "gate_proj": 1.04})
+            if any(k in ql for k in ["where", "defined", "definition", "locate", "find"]):
+                mul.update({"q_proj": 1.03})
+            for k, m in mul.items():
+                tw[k] = float(tw.get(k, 1.0)) * float(m)
+        except Exception:
+            pass
+    # Optional ablations
+    if bool(ablate_attn):
+        for k in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            tw[k] = 0.0
+    if bool(ablate_mlp):
+        for k in ("up_proj", "down_proj", "gate_proj"):
+            tw[k] = 0.0
+    # Optional per-layer schedule (gentle rise toward top third)
+    layer_multipliers: Optional[List[float]] = None
+    if bool(layer_schedule):
+        try:
+            L_layers = len(base_layers or [])
+            if L_layers > 0:
+                layer_multipliers = []
+                for i in range(L_layers):
+                    frac = float(i) / float(max(1, L_layers - 1))
+                    if frac < (1.0 / 3.0):
+                        lm = 0.95 + 0.15 * (frac / (1.0 / 3.0))
+                    elif frac < (2.0 / 3.0):
+                        lm = 1.05 + 0.05 * ((frac - (1.0 / 3.0)) / (1.0 / 3.0))
+                    else:
+                        lm = 1.10 + 0.05 * ((frac - (2.0 / 3.0)) / (1.0 / 3.0))
+                    layer_multipliers.append(float(lm))
+        except Exception:
+            layer_multipliers = None
+    # Optional per-target rank trimming (global per target; optional budget)
+    per_target_keep: Optional[Dict[str, int]] = None
+    if bool(per_target_rank_schedule):
+        try:
+            # Heuristic fractions by target group
+            base_frac: Dict[str, float] = {
+                "o_proj": 1.00, "up_proj": 1.00, "down_proj": 0.90, "gate_proj": 0.80,
+                "q_proj": 0.70, "k_proj": 0.65, "v_proj": 0.60,
+            }
+            per_target_keep = {}
+            for t, frac in base_frac.items():
+                keep = int(max(1, min(int(scaled_rank), round(int(scaled_rank) * float(frac)))))
+                per_target_keep[t] = keep
+            # Apply global per-layer rank budget if requested
+            try:
+                budget = int(max(0, int(rank_budget)))
+            except Exception:
+                budget = 0
+            if budget > 0 and per_target_keep:
+                total = int(sum(int(v) for v in per_target_keep.values()))
+                if total > budget:
+                    scale = float(budget) / float(max(1, total))
+                    for t in list(per_target_keep.keys()):
+                        per_target_keep[t] = int(max(1, round(int(per_target_keep[t]) * scale)))
+        except Exception:
+            per_target_keep = None
+    alpha_used = float(alpha * (0.5 if bool(alpha_warmup) else 1.0))
+    # Optional layer-tiered per-target keeps
+    per_target_keep_layers: Optional[List[Dict[str, int]]] = None
+    if bool(layer_rank_tiers):
+        try:
+            L_layers = len(base_layers or [])
+            if L_layers > 0:
+                per_target_keep_layers = []
+                def tier_for(frac: float) -> str:
+                    if frac < (1.0/3.0): return "low"
+                    if frac < (2.0/3.0): return "mid"
+                    return "top"
+                for i in range(L_layers):
+                    frac = float(i) / float(max(1, L_layers - 1))
+                    tier = tier_for(frac)
+                    # desired keeps by group
+                    if tier == "low":
+                        vals = {"q_proj": 2, "k_proj": 2, "v_proj": 8, "o_proj": 8, "up_proj": 12, "down_proj": 12}
+                        vals["gate_proj"] = min(8, int(0.5 * vals["up_proj"]))  # 6
+                    elif tier == "mid":
+                        vals = {"q_proj": 3, "k_proj": 3, "v_proj": 12, "o_proj": 12, "up_proj": 16, "down_proj": 16}
+                        vals["gate_proj"] = min(8, int(0.5 * vals["up_proj"]))  # 8
+                    else:
+                        vals = {"q_proj": 4, "k_proj": 4, "v_proj": 16, "o_proj": 16, "up_proj": 24, "down_proj": 24}
+                        vals["gate_proj"] = min(8, int(0.5 * vals["up_proj"]))  # 8
+                    # cap by scaled_rank and >=1
+                    for k in list(vals.keys()):
+                        vals[k] = int(max(1, min(int(scaled_rank), int(vals[k]))))
+                    per_target_keep_layers.append(vals)
+        except Exception:
+            per_target_keep_layers = None
     hooks = register_hook_mixed_adapters(
         model,
         base_layers,
         sub.get("layers"),
-        alpha_star=float(alpha),
+        alpha_star=float(alpha_used),
         g_sub=float(scaled_gsub),
         rank=int(scaled_rank),
         beta=float(beta),
         target_weights=tw,
         backend="local",
+        layer_multipliers=layer_multipliers,
+        per_target_keep=per_target_keep,
+        per_target_keep_layers=per_target_keep_layers,
     )
 
     # Generation (always use model.generate for stability)
@@ -493,6 +695,13 @@ def generate_answer(
                 "repetition_penalty": float(repetition_penalty),
                 "min_new_tokens": int(max(0, int(min_new_tokens))),
             })
+        if bool(adapter_aware_decoding) and bool(require_citations):
+            try:
+                # gentle nudge: slightly higher top_p, slightly lower repetition penalty
+                gen_kwargs["top_p"] = float(min(0.99, float(gen_kwargs.get("top_p", top_p)) + 0.03))
+                gen_kwargs["repetition_penalty"] = float(max(1.0, float(gen_kwargs.get("repetition_penalty", repetition_penalty)) - 0.05))
+            except Exception:
+                pass
         out = model.generate(**x, **gen_kwargs)
     except RuntimeError as e:
         msg = str(e)
@@ -557,6 +766,45 @@ def generate_answer(
             + f"\n\nRewrite the answer. For EACH paragraph, end with a citation like [{example_path}:123-160].\n"
               "Use at least 3 citations overall and only files shown in [ctx]."
         )
+        # Stage-2 fallback: re-register hooks with stronger top-layer emphasis and slightly higher g_sub
+        try:
+            for h in hooks:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+            # reuse tw; build boosted layer multipliers even if layer_schedule was off
+            L_layers = len(base_layers or [])
+            layer_multipliers2: Optional[List[float]] = None
+            if L_layers > 0:
+                layer_multipliers2 = []
+                for i in range(L_layers):
+                    frac = float(i) / float(max(1, L_layers - 1))
+                    # Emphasize top third more aggressively
+                    if frac < (1.0 / 3.0):
+                        lm = 0.95
+                    elif frac < (2.0 / 3.0):
+                        lm = 1.05
+                    else:
+                        lm = 1.20
+                    layer_multipliers2.append(float(lm))
+            boosted_gsub = float(min(0.95, float(scaled_gsub) * 1.10))
+            # Re-register with same per-target keep and boosted schedule
+            hooks = register_hook_mixed_adapters(
+                model,
+                base_layers,
+                sub.get("layers"),
+                alpha_star=float(alpha),
+                g_sub=float(boosted_gsub),
+                rank=int(scaled_rank),
+                beta=float(beta),
+                target_weights=tw,
+                backend="local",
+                layer_multipliers=layer_multipliers2,
+                per_target_keep=per_target_keep,
+            )
+        except Exception:
+            pass
         x2_ids = torch.tensor([_tok_encode(retry_prompt)], dtype=torch.long, device=device)
         x2 = {"input_ids": x2_ids}
         retry_kwargs = {
@@ -595,14 +843,57 @@ def generate_answer(
         if has_citations(text2, bool(citations_per_paragraph)):
             text = text2
         else:
+            # Smart fallback: cite anchored spans from selected files
             refs = []
-            for rel in files[:4]:
-                path = rel if rel.startswith("modules/") else f"modules/{os.path.basename(rel)}"
-                refs.append(f"- {path}:1-120")
+            try:
+                g_local = CodeGraph.load_or_build(repo_root)
+            except Exception:
+                g_local = None
+            try:
+                sym_idx = build_symbol_index(g_local, files) if g_local else None
+            except Exception:
+                sym_idx = None
+            spans = []
+            try:
+                spans = resolve_claim_spans(text2, g_local, sym_idx, files) if g_local else []
+                spans = validate_spans(spans, g_local) if g_local else spans
+            except Exception:
+                spans = []
+            style = choose_path_style(files or [])
+            def _fmt_path(p: str) -> str:
+                try:
+                    return (os.path.basename(p) if style == "basename" else p)
+                except Exception:
+                    return p
+            for (rel, a_ln, b_ln) in spans[:4]:
+                refs.append(f"- { _fmt_path(rel) }:{int(a_ln)}-{int(b_ln)}")
+            if not refs:
+                # Last resort: simple per-file headers
+                for rel in files[:4]:
+                    path = rel if rel.startswith("modules/") else f"modules/{os.path.basename(rel)}"
+                    refs.append(f"- {path}:1-120")
             if refs:
                 text = text2 + "\n\nReferences (from context):\n" + "\n".join(refs)
             else:
                 text = text2 or "INSUFFICIENT_EVIDENCE: No path:line citations found per policy."
+
+    # Repair citations to anchored spans when present
+    try:
+        cits_present = normalize_citations(text or "")
+        if cits_present:
+            g_local3 = CodeGraph.load_or_build(repo_root)
+            repaired = repair_citations(text or "", g_local3, files or [])
+            if repaired:
+                styleR = choose_path_style([p for (p, _, _) in repaired])
+                def _fmt_pathR(p: str) -> str:
+                    try:
+                        return (os.path.basename(p) if styleR == "basename" else p)
+                    except Exception:
+                        return p
+                refsR = [f"- {_fmt_pathR(p)}:{int(a)}-{int(b)}" for (p, a, b) in repaired[:6]]
+                text = (text or "") + "\n\nReferences (repaired):\n" + "\n".join(refsR)
+    except Exception:
+        pass
 
     # Append commit footer for provenance if requested
     if bool(commit_footer):
@@ -673,6 +964,18 @@ def generate_answer_structured(
     gsub_max: float = 0.9,
     entropy_weights: str = "repo=0.4,subgraph=0.4,question=0.2",
     target_weights: Optional[str] = None,
+    layer_schedule: bool = False,
+    q_aware_weights: bool = False,
+    mixture_m: int = 0,
+    adapters_bank: Optional[str] = None,
+    # Extra mixing/decoding knobs (opt-in)
+    per_target_rank_schedule: bool = False,
+    rank_budget: int = 0,
+    ablate_attn: bool = False,
+    ablate_mlp: bool = False,
+    alpha_warmup: bool = False,
+    adapter_aware_decoding: bool = False,
+    layer_rank_tiers: bool = False,
     cone_rank: int = 2,
     cone_weight: float = 0.5,
     round_lora: bool = False,
@@ -703,11 +1006,13 @@ def generate_answer_structured(
     cone_join: str = "concat",  # "concat" | "weighted"
     # Telemetry
     telemetry_out: Optional[str] = None,
+    telemetry_verify_tests: bool = False,
 ) -> Dict[str, Any]:
     """Generate a structured answer with citations and RepoState updates.
 
     Returns a dict: {text, citations, must, may, selection, lfp_passes, converged, provenance, confidence}.
     """
+    t_start = time.time()
     if gpu_ids and str(gpu_ids).strip():
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids).strip()
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -804,16 +1109,16 @@ def generate_answer_structured(
                 scaled_rank, scaled_gsub = scale_capacity(es, rank_min=int(rank_min), rank_max=int(rank_max), gsub_min=float(gsub_min), gsub_max=float(gsub_max))
             except Exception:
                 pass
-        # Build sub adapters
+            # Build sub adapters
         sub = generate_lora_from_embedding(
-            sub_z["z"],
-            d_model=int(d_model_local),
-            num_layers=int(num_layers),
-            rank=int(scaled_rank),
-            seed=int(seed) + 2,
-            targets=list(tmap.keys()),
-            target_shapes=t_shapes,
-        )
+                sub_z["z"],
+                d_model=int(d_model_local),
+                num_layers=int(num_layers),
+                rank=int(scaled_rank),
+                seed=int(seed) + 2,
+                targets=list(tmap.keys()),
+                target_shapes=t_shapes,
+            )
         # Optional cones
         cr = max(0, int(cone_rank))
         if bool(function_first) and cr > 0:
@@ -875,6 +1180,66 @@ def generate_answer_structured(
                         scaled_rank = int(scaled_rank + cr)
             except Exception:
                 pass
+        # Optional mixture bank: mix top-m module adapters from bank by concatenation (Σ π_i Δθ_i)
+        if adapters_bank and int(mixture_m) > 0:
+            try:
+                import glob
+                bank_root = os.path.abspath(os.path.expanduser(os.path.expandvars(adapters_bank)))
+                sel_mods = [m for m in (modules or []) if m]
+                picked = 0
+                for mod in sel_mods:
+                    if picked >= int(mixture_m):
+                        break
+                    mod_dir1 = os.path.join(bank_root, "sub_adapters", mod.replace("/", "_"))
+                    mod_dir2 = os.path.join(bank_root, mod.replace("/", "_"))
+                    cand = None
+                    for d in (mod_dir1, mod_dir2):
+                        fp = os.path.join(d, "adapters.npz")
+                        if os.path.isfile(fp):
+                            cand = fp
+                            break
+                    if not cand:
+                        continue
+                    try:
+                        bank_ad = load_adapters_npz(cand)
+                    except Exception:
+                        continue
+                    # uniform π for now
+                    w = 1.0 / float(min(len(sel_mods), int(mixture_m)))
+                    sw = float(max(0.0, min(1.0, w))) ** 0.5
+                    # per-layer concat
+                    merged_layers = []
+                    for i in range(num_layers):
+                        baseL = sub["layers"][i]
+                        bL = bank_ad["layers"][i] if i < len(bank_ad.get("layers", [])) else {}
+                        dst: Dict[str, Dict[str, np.ndarray]] = {}
+                        for name in tmap.keys():
+                            if (name in baseL) and (name in bL):
+                                A1 = baseL[name]["A"]; B1 = baseL[name]["B"]
+                                A2 = (sw * bL[name]["A"]).astype(np.float32); B2 = (sw * bL[name]["B"]).astype(np.float32)
+                                A = np.concatenate([A1, A2], axis=1)
+                                B = np.concatenate([B1, B2], axis=0)
+                                dst[name] = {"A": A, "B": B, "gate": baseL[name].get("gate", np.array([0.0], dtype=np.float32))}
+                            elif name in baseL:
+                                dst[name] = baseL[name]
+                            elif name in bL:
+                                A = (sw * bL[name]["A"]).astype(np.float32)
+                                dst[name] = {"A": A, "B": bL[name]["B"], "gate": bL[name].get("gate", np.array([0.0], dtype=np.float32))}
+                        merged_layers.append(dst)
+                    sub = {"layers": merged_layers}
+                    # try infer rank increment from a present target
+                    try:
+                        for i in range(num_layers):
+                            any_name = next((n for n in tmap.keys() if n in bank_ad["layers"][i]), None)
+                            if any_name:
+                                inc = int(bank_ad["layers"][i][any_name]["B"].shape[0])
+                                scaled_rank = int(scaled_rank + inc)
+                                break
+                    except Exception:
+                        pass
+                    picked += 1
+            except Exception:
+                pass
         # Rounding
         if bool(round_lora):
             try:
@@ -892,6 +1257,28 @@ def generate_answer_structured(
                             tensors[key] = out
             except Exception:
                 pass
+
+        # Delta norm diagnostics (approximate AB norms per target averaged across layers)
+        delta_norms: Dict[str, float] = {}
+        try:
+            sums: Dict[str, float] = {}
+            counts: Dict[str, int] = {}
+            for i in range(len(sub.get("layers", []))):
+                for name, tensors in sub["layers"][i].items():
+                    try:
+                        A = tensors.get("A"); B = tensors.get("B")
+                        if isinstance(A, np.ndarray) and isinstance(B, np.ndarray):
+                            AB = (A @ B)
+                            n = float(np.linalg.norm(AB)) if AB.size > 0 else 0.0
+                            sums[name] = float(sums.get(name, 0.0) + n)
+                            counts[name] = int(counts.get(name, 0) + 1)
+                    except Exception:
+                        continue
+            for k, v in sums.items():
+                c = max(1, int(counts.get(k, 1)))
+                delta_norms[k] = float(v / float(c))
+        except Exception:
+            delta_norms = {}
 
         # Prompt + context
         final_prompt = prompt
@@ -987,6 +1374,17 @@ def generate_answer_structured(
                 + f"\n\nInstruction: For EVERY claim, append a citation of the form {example_path}:START-END.\n"
                   "Use only files shown in [ctx] above. Provide at least 3 citations overall.\n"
             )
+            # Adapter-aware decoding prompt nudge (pointer-first) for consistency
+            if bool(adapter_aware_decoding):
+                try:
+                    example_rel = files_for_ctx[0] if files_for_ctx else None
+                    example_path = example_rel if example_rel else "file.py"
+                except Exception:
+                    example_path = "file.py"
+                final_prompt = (
+                    f"[pointer-first] Start with a citation like [{example_path}:A-B], then explain.\n\n"
+                    + final_prompt
+                )
 
         # Apply mixed adapters
         x_ids = torch.tensor([[i for i in tok_local.encode(final_prompt)]], dtype=torch.long, device=device)
@@ -1009,16 +1407,110 @@ def generate_answer_structured(
             except Exception:
                 return None
         tw = _parse_target_weights(target_weights) or {}
+        # Optional question-aware reweighting
+        if bool(q_aware_weights):
+            try:
+                ql = str(prompt).lower()
+                mul: Dict[str, float] = {}
+                if any(k in ql for k in ["signature", "param", "argument", "type", "prototype"]):
+                    mul.update({"o_proj": 1.10, "v_proj": 1.08})
+                if any(k in ql for k in ["why", "fail", "error", "behavior", "incorrect", "bug"]):
+                    mul.update({"up_proj": 1.06, "down_proj": 1.05, "gate_proj": 1.04})
+                if any(k in ql for k in ["where", "defined", "definition", "locate", "find"]):
+                    mul.update({"q_proj": 1.03})
+                for k, m in mul.items():
+                    tw[k] = float(tw.get(k, 1.0)) * float(m)
+            except Exception:
+                pass
+        # Optional per-layer schedule
+        layer_multipliers: Optional[List[float]] = None
+        if bool(layer_schedule):
+            try:
+                L_layers = len(base_layers or [])
+                if L_layers > 0:
+                    layer_multipliers = []
+                    for i in range(L_layers):
+                        frac = float(i) / float(max(1, L_layers - 1))
+                        if frac < (1.0 / 3.0):
+                            lm = 0.95 + 0.15 * (frac / (1.0 / 3.0))
+                        elif frac < (2.0 / 3.0):
+                            lm = 1.05 + 0.05 * ((frac - (1.0 / 3.0)) / (1.0 / 3.0))
+                        else:
+                            lm = 1.10 + 0.05 * ((frac - (2.0 / 3.0)) / (1.0 / 3.0))
+                        layer_multipliers.append(float(lm))
+            except Exception:
+                layer_multipliers = None
+        # Apply ablations
+        if bool(ablate_attn):
+            for k in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                tw[k] = 0.0
+        if bool(ablate_mlp):
+            for k in ("up_proj", "down_proj", "gate_proj"):
+                tw[k] = 0.0
+        # Optional per-target rank trimming
+        per_target_keep: Optional[Dict[str, int]] = None
+        if bool(per_target_rank_schedule):
+            try:
+                base_frac: Dict[str, float] = {
+                    "o_proj": 1.00, "up_proj": 1.00, "down_proj": 0.90, "gate_proj": 0.80,
+                    "q_proj": 0.70, "k_proj": 0.65, "v_proj": 0.60,
+                }
+                per_target_keep = {}
+                for t, frac in base_frac.items():
+                    keep = int(max(1, min(int(scaled_rank), round(int(scaled_rank) * float(frac)))))
+                    per_target_keep[t] = keep
+                budget = int(max(0, int(rank_budget)))
+                if budget > 0 and per_target_keep:
+                    total = int(sum(int(v) for v in per_target_keep.values()))
+                    if total > budget:
+                        scale = float(budget) / float(max(1, total))
+                        for t in list(per_target_keep.keys()):
+                            per_target_keep[t] = int(max(1, round(int(per_target_keep[t]) * scale)))
+            except Exception:
+                per_target_keep = None
+        # Optional per-layer rank tiers
+        per_target_keep_layers: Optional[List[Dict[str, int]]] = None
+        if bool(layer_rank_tiers):
+            try:
+                L_layers = len(base_layers or [])
+                if L_layers > 0:
+                    per_target_keep_layers = []
+                    def tier_for(frac: float) -> str:
+                        if frac < (1.0/3.0): return "low"
+                        if frac < (2.0/3.0): return "mid"
+                        return "top"
+                    for i in range(L_layers):
+                        frac = float(i) / float(max(1, L_layers - 1))
+                        tier = tier_for(frac)
+                        if tier == "low":
+                            vals = {"q_proj": 2, "k_proj": 2, "v_proj": 8, "o_proj": 8, "up_proj": 12, "down_proj": 12}
+                            vals["gate_proj"] = min(8, int(0.5 * vals["up_proj"]))
+                        elif tier == "mid":
+                            vals = {"q_proj": 3, "k_proj": 3, "v_proj": 12, "o_proj": 12, "up_proj": 16, "down_proj": 16}
+                            vals["gate_proj"] = min(8, int(0.5 * vals["up_proj"]))
+                        else:
+                            vals = {"q_proj": 4, "k_proj": 4, "v_proj": 16, "o_proj": 16, "up_proj": 24, "down_proj": 24}
+                            vals["gate_proj"] = min(8, int(0.5 * vals["up_proj"]))
+                        for k in list(vals.keys()):
+                            vals[k] = int(max(1, min(int(scaled_rank), int(vals[k]))))
+                        per_target_keep_layers.append(vals)
+            except Exception:
+                per_target_keep_layers = None
+        # Alpha warmup on first structured pass
+        alpha_used = float(alpha * (0.5 if (bool(alpha_warmup) and int(lfp_passes) == 0) else 1.0))
         hooks = register_hook_mixed_adapters(
             model,
             base_layers,
             sub.get("layers"),
-            alpha_star=float(alpha),
+            alpha_star=float(alpha_used),
             g_sub=float(scaled_gsub),
             rank=int(scaled_rank),
             beta=float(beta),
             target_weights=tw,
             backend="local",
+            layer_multipliers=layer_multipliers,
+            per_target_keep=per_target_keep,
+            per_target_keep_layers=per_target_keep_layers,
         )
 
         # Generate (possibly multiple samples)
@@ -1037,6 +1529,12 @@ def generate_answer_structured(
                         "repetition_penalty": float(repetition_penalty),
                         "min_new_tokens": int(max(0, int(min_new_tokens))),
                     })
+                if bool(adapter_aware_decoding) and bool(require_citations):
+                    try:
+                        gen_kwargs["top_p"] = float(min(0.99, float(gen_kwargs.get("top_p", top_p)) + 0.03))
+                        gen_kwargs["repetition_penalty"] = float(max(1.0, float(gen_kwargs.get("repetition_penalty", repetition_penalty)) - 0.05))
+                    except Exception:
+                        pass
                 out = model.generate(**x, **gen_kwargs)
             except RuntimeError as e:
                 msg = str(e)
@@ -1100,6 +1598,59 @@ def generate_answer_structured(
                 if has_citations(text2, bool(citations_per_paragraph)):
                     text = text2
                     missing_citations = False
+            # If still missing citations, append smart references from anchored spans
+            if require_citations and missing_citations:
+                refs = []
+                try:
+                    g_local = CodeGraph.load_or_build(repo_root)
+                except Exception:
+                    g_local = None
+                try:
+                    sym_idx = build_symbol_index(g_local, files_for_ctx) if g_local else None
+                except Exception:
+                    sym_idx = None
+                spans = []
+                try:
+                    spans = resolve_claim_spans(text, g_local, sym_idx, files_for_ctx) if g_local else []
+                    spans = validate_spans(spans, g_local) if g_local else spans
+                except Exception:
+                    spans = []
+                style = choose_path_style(files_for_ctx or [])
+                def _fmt_path2(p: str) -> str:
+                    try:
+                        return (os.path.basename(p) if style == "basename" else p)
+                    except Exception:
+                        return p
+                for (rel, a_ln, b_ln) in spans[:4]:
+                    refs.append(f"- { _fmt_path2(rel) }:{int(a_ln)}-{int(b_ln)}")
+                if not refs:
+                    for rel in files_for_ctx[:4]:
+                        path = rel if rel.startswith("modules/") else f"modules/{os.path.basename(rel)}"
+                        refs.append(f"- {path}:1-120")
+                if refs:
+                    text = (text or "") + "\n\nReferences (from context):\n" + "\n".join(refs)
+
+            # Repair citations to anchored spans when present (before capturing first text)
+            try:
+                cits_local = normalize_citations(text or "")
+                if cits_local:
+                    g_fix = CodeGraph.load_or_build(repo_root)
+                    repaired_local = repair_citations(text or "", g_fix, files_for_ctx or [])
+                    if repaired_local:
+                        style_fix = choose_path_style([p for (p, _, _) in repaired_local])
+                        def _fmt_path_fix(p: str) -> str:
+                            try:
+                                return (os.path.basename(p) if style_fix == "basename" else p)
+                            except Exception:
+                                return p
+                        refs_fix = [f"- {_fmt_path_fix(p)}:{int(a)}-{int(b)}" for (p, a, b) in repaired_local[:6]]
+                        text = (text or "") + "\n\nReferences (repaired):\n" + "\n".join(refs_fix)
+                        try:
+                            union_cites.update(set(repaired_local))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
             if not text_first:
                 text_first = text
@@ -1117,7 +1668,7 @@ def generate_answer_structured(
             except Exception:
                 pass
 
-        diag = {"rank": scaled_rank, "gsub": scaled_gsub, "targets": list(tmap.keys())}
+        diag = {"rank": scaled_rank, "gsub": scaled_gsub, "targets": list(tmap.keys()), "delta_norms": (delta_norms or None)}
         beh = {"oom_retry": bool(oom_retry), "gen_error": gen_err is not None}
         return text_first, modules, files, diag, (union_cites or set()), (inter_cites or set()), beh
 
@@ -1134,11 +1685,17 @@ def generate_answer_structured(
     # LFP loop
     prev_checksum = state_prev.checksum()
     text_last = ""
+    retries_used = 0
     for it in range(max(1, int(lfp_iters))):
         mods_hint = sorted(list(selected_mods_acc))
         files_hint = sorted(list(selected_files_acc))
         text, sel_mods, sel_files, diag, cites_u, cites_i, beh_diag = _one_pass(mods_hint, files_hint)
         lfp_passes += 1
+        try:
+            if bool(beh_diag.get("gen_error")):
+                retries_used += 1
+        except Exception:
+            pass
         # Facts from citations (union/intersection across samples per pass)
         union_set.update(cites_u)
         if it == 0:
@@ -1211,6 +1768,12 @@ def generate_answer_structured(
     must = sorted(list(must_set))
     may = sorted(list(union_set - must_set))
 
+    elapsed = None
+    try:
+        elapsed = float(max(0.0, time.time() - t_start))
+    except Exception:
+        elapsed = None
+
     result = {
         "text": text_last,
         "citations": sorted(list(union_set)),
@@ -1224,7 +1787,68 @@ def generate_answer_structured(
         "converged": bool(converged),
         "provenance": {"commit": commit_sha},
         "confidence": float(confidence),
+        "metrics": {
+            "citations_total": int(len(union_set)),
+            "citations_must": int(len(must)),
+            "modules_selected": int(len(selected_mods_acc)),
+            "files_selected": int(len(selected_files_acc)),
+            "elapsed_sec": elapsed,
+            "retries": int(retries_used),
+            "delta_norms": (diag.get("delta_norms") if isinstance(diag, dict) else None),
+        },
     }
+    # Optional signature edit distance (rough, per-citation snippet vs answer)
+    try:
+        def _lev_norm(a: str, b: str) -> float:
+            a = a.strip()[:256]; b = b.strip()[:1024]
+            if not a or not b:
+                return 1.0
+            la, lb = len(a), len(b)
+            prev = list(range(lb + 1))
+            cur = [0] * (lb + 1)
+            for i in range(1, la + 1):
+                cur[0] = i
+                ai = a[i - 1]
+                for j in range(1, lb + 1):
+                    cost = 0 if ai == b[j - 1] else 1
+                    cur[j] = min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+                prev, cur = cur, prev
+            dist = float(prev[lb])
+            norm = dist / float(max(1, max(la, lb)))
+            return max(0.0, min(1.0, norm))
+        ed_vals: List[float] = []
+        ans_txt = result["text"] or ""
+        for (rel, a_ln, b_ln) in result.get("citations", [])[:6]:
+            try:
+                pth = rel if os.path.isabs(rel) else os.path.abspath(os.path.join(repo_root, rel))
+                with open(pth, "r", encoding="utf-8", errors="ignore") as fh:
+                    lines = fh.read().splitlines()
+                a0 = max(1, int(a_ln)); b0 = min(len(lines), int(b_ln))
+                snippet = "\n".join(lines[a0 - 1 : b0])
+                ed_vals.append(_lev_norm(snippet, ans_txt))
+            except Exception:
+                continue
+        if ed_vals:
+            result["metrics"]["signature_edit_mean"] = float(sum(ed_vals) / float(len(ed_vals)))
+            result["metrics"]["signature_edit_min"] = float(min(ed_vals))
+    except Exception:
+        pass
+    # Optional tests verification (best-effort)
+    if bool(telemetry_verify_tests):
+        try:
+            from examples.repo_grounded_adapters.modules.verify import verify_with_tests as _verify_tests
+            tests_checked = 0
+            tests_passed = 0
+            g_local = CodeGraph.load_or_build(repo_root)
+            env = os.environ.copy()
+            for m in list(sorted(list(selected_mods_acc)))[:3]:
+                ok = _verify_tests(g_local, m, repo_root=repo_root, env=env)
+                tests_checked += 1
+                tests_passed += (1 if ok else 0)
+            result.setdefault("metrics", {})["tests_checked"] = int(tests_checked)
+            result.setdefault("metrics", {})["tests_passed"] = int(tests_passed)
+        except Exception:
+            pass
 
     # Telemetry sidecar
     if telemetry_out:
@@ -1238,4 +1862,6 @@ def generate_answer_structured(
             pass
 
     return result
+
+
 

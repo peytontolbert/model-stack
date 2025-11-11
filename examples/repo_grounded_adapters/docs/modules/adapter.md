@@ -3,10 +3,10 @@
 Generates deterministic LoRA A/B factors from repository embeddings and provides NPZ IO helpers.
 
 ### Key APIs
-- `generate_lora_from_embedding(z, d_model, num_layers, rank=8, seed=0, targets=None, target_shapes=None, layer_gate="zmean", target_weights=None, learn_bias=False)`
+- `generate_lora_from_embedding(z, d_model, num_layers, rank=8, seed=0, targets=None, target_shapes=None, layer_gate="zmean", target_weights=None, learn_bias=False, map_cap=None)`
   - Returns `{ layers: List[Dict[target->{A,B,gate(,bias)}]], rank, d_model, targets, gates }`.
   - Deterministic per‑layer/per‑target seeds; optional MLP seed coupling for `up_proj`/`gate_proj`.
-- `generate_lora_from_embedding_torch(...)`
+- `generate_lora_from_embedding_torch(..., map_cap=None)`
   - Torch‑native variant; supports `einsum_opt` for opt_einsum‑style planning.
 - `save_npz(out_dir, embedding, adapters, manifest)` and `load_adapters_npz(path)`
   - Flatten/restore adapter tensors to/from NPZ.
@@ -17,6 +17,8 @@ Generates deterministic LoRA A/B factors from repository embeddings and provides
 - `rank`: LoRA rank per target (effective rank may be later trimmed).
 - `layer_gate`: `zmean|cosine|hump|linear` gate per layer.
 - `target_weights`: multiplicative scaling per target, e.g. boost `o_proj`/`up_proj`.
+- Mapping: always normalizes `z` and applies a light per‑target scalar derived from disjoint `z` segments to reduce target interference.
+- `map_cap`: optional Frobenius norm cap for A and B (per target) applied post‑scaling; use small values to constrain extremes (disabled by default).
 
 ### Usage (NumPy path)
 ```python

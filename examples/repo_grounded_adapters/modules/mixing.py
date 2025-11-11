@@ -24,11 +24,22 @@ def register_hook_mixed_adapters(
     beta: float,
     target_weights: Optional[Dict[str, float]] = None,
     backend: str = "local",
+    layer_multipliers: Optional[List[float]] = None,
+    per_target_keep: Optional[Dict[str, int]] = None,
+    per_target_keep_layers: Optional[List[Dict[str, int]]] = None,
 ):
     tmap = targets_map(backend)
     target_weights = target_weights or {}
+    per_target_keep = per_target_keep or {}
+    per_target_keep_layers = per_target_keep_layers or []
 
-    def _mat(A: np.ndarray, B: np.ndarray) -> torch.Tensor:
+    def _mat(A: np.ndarray, B: np.ndarray, *, keep: Optional[int] = None) -> torch.Tensor:
+        if isinstance(keep, int) and keep > 0:
+            k = int(min(keep, A.shape[1], B.shape[0]))
+            if k > 0:
+                At = torch.from_numpy(A[:, :k]).to(torch.float32)
+                Bt = torch.from_numpy(B[:k, :]).to(torch.float32)
+                return At @ Bt
         return torch.from_numpy(A).to(torch.float32) @ torch.from_numpy(B).to(torch.float32)
 
     L = max(len(base_layers or []), len(sub_layers or []))
@@ -71,26 +82,41 @@ def register_hook_mixed_adapters(
         if i >= len(layers):
             break
         layer = layers[i]
+        lm = 1.0
+        try:
+            if layer_multipliers is not None and i < len(layer_multipliers):
+                lm = float(layer_multipliers[i])
+        except Exception:
+            lm = 1.0
         # Build deltas for this layer only on CPU, apply, then free
         base = base_layers[i] if i < len(base_layers or []) else None
         sub = (sub_layers[i] if (sub_layers is not None and i < len(sub_layers)) else None)
         deltas_cpu: Dict[str, torch.Tensor] = {}
         for name in tmap.keys():
             acc: Optional[torch.Tensor] = None
+            # layer-specific keep overrides global keep
+            keep_layer = None
+            try:
+                if 0 <= i < len(per_target_keep_layers):
+                    keep_layer = int(per_target_keep_layers[i].get(name, 0))
+            except Exception:
+                keep_layer = None
+            keep_global = int(per_target_keep.get(name, 0)) if per_target_keep else 0
+            keep_eff = keep_layer if (keep_layer and keep_layer > 0) else (keep_global if keep_global > 0 else None)
             if base is not None and name in base:
                 try:
-                    acc = _mat(base[name]["A"], base[name]["B"]).to(torch.float32)
+                    acc = _mat(base[name]["A"], base[name]["B"], keep=keep_eff).to(torch.float32)
                 except Exception:
                     acc = None
             if sub is not None and name in sub:
                 try:
-                    sub_m = _mat(sub[name]["A"], sub[name]["B"]).to(torch.float32)
+                    sub_m = _mat(sub[name]["A"], sub[name]["B"], keep=keep_eff).to(torch.float32)
                     acc = sub_m if acc is None else ((1.0 - float(g_sub)) * acc + float(g_sub) * sub_m)
                 except Exception:
                     pass
             if acc is not None:
                 tw = float(target_weights.get(name, 1.0))
-                deltas_cpu[name] = (tw * acc).contiguous()
+                deltas_cpu[name] = (lm * tw * acc).contiguous()
         for short, rel in tmap.items():
             if short not in deltas_cpu:
                 continue

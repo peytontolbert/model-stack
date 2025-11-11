@@ -12,13 +12,14 @@ import platform
 import numpy as np
 
 from examples.repo_grounded_adapters.code_graph import CodeGraph
-from examples.repo_grounded_adapters.modules.embedding import build_repo_embedding, build_subgraph_embedding_from_graph, auto_model_dims
+from examples.repo_grounded_adapters.modules.embedding import build_repo_embedding, build_subgraph_embedding_from_graph
 from examples.repo_grounded_adapters.modules.adapter import (
     generate_lora_from_embedding,
     generate_lora_from_embedding_torch,
     save_npz,
 )
 from model.hf_snapshot import ensure_snapshot
+from model.inspect import detect_target_shapes_from_model
 from examples.repo_grounded_adapters.modules.capacity import entropy_score
 from examples.repo_grounded_adapters.modules.repo_state import (
     load_repo_state,
@@ -45,6 +46,8 @@ def main() -> None:
     p.add_argument("--base-rank", type=int, default=8)
     p.add_argument("--target-weights", default=None)
     p.add_argument("--knowledge-preset", action="store_true")
+    # Adapter mapping is always enhanced; no CLI toggle
+    p.add_argument("--code-recall-preset", action="store_true", help="Opt-in preset tuned for code recall (o,v,up,down,gate emphasized; light q,k)")
     # Priors & rounding
     p.add_argument("--kbann-priors", action="store_true")
     p.add_argument("--kbann-strong", action="store_true", help="Stronger inhibitory priors: boost o/up/down; damp v,k (slightly q)")
@@ -55,8 +58,9 @@ def main() -> None:
     p.add_argument("--round-axis", choices=["row", "col", "global"], default="row", help="Soft mode axis for top-k sparsification")
     p.add_argument("--zero-b", action="store_true", help="After generation, set all B matrices to zero (official LoRA init)")
     p.add_argument("--learn-bias", action="store_true", help="Export zero bias vectors so downstream can fine-tune bias only")
-    # Per-module export
-    p.add_argument("--per-module", action="store_true")
+    # Per-module export (built by default; use --no-per-module to skip)
+    p.add_argument("--per-module", action="store_true", help="DEPRECATED: no effect; per-module bank is built by default. Use --no-per-module to disable.")
+    p.add_argument("--no-per-module", action="store_true", help="Disable building per-module sub_adapters bank (built by default)")
     p.add_argument("--include-deps", action="store_true")
     p.add_argument("--max-deps", type=int, default=4)
     p.add_argument("--sub-rank", type=int, default=8)
@@ -85,6 +89,14 @@ def main() -> None:
     # (self-tune is no longer part of build; use modules/tune.py externally if desired)
     args = p.parse_args()
 
+    # Warn on deprecated/ignored flags for per-module export
+    try:
+        if bool(args.per_module) and bool(args.no_per_module):
+            print("[repo_adapters.build] Warning: Both --per-module and --no-per-module were provided; proceeding with --no-per-module (disables per-module bank).", file=sys.stderr)
+        elif bool(args.per_module):
+            print("[repo_adapters.build] Warning: --per-module is deprecated and has no effect; per-module bank is built by default. Use --no-per-module to disable.", file=sys.stderr)
+    except Exception:
+        pass
     # Determinism: set seeds and hash seed (best-effort)
     try:
         os.environ["PYTHONHASHSEED"] = str(int(args.seed))
@@ -202,8 +214,11 @@ def main() -> None:
         except Exception:
             return None
     tw = _parse_tw(args.target_weights)
-    if (tw is None) and bool(args.knowledge_preset):
-        tw = {"q_proj": 0.95, "k_proj": 0.95, "v_proj": 0.95, "o_proj": 1.10, "up_proj": 1.10, "down_proj": 1.05}
+    if tw is None:
+        if bool(args.code_recall_preset):
+            tw = {"o_proj": 1.15, "v_proj": 1.10, "up_proj": 1.10, "down_proj": 1.05, "gate_proj": 1.00, "q_proj": 0.95, "k_proj": 0.90}
+        elif bool(args.knowledge_preset):
+            tw = {"q_proj": 0.95, "k_proj": 0.95, "v_proj": 0.95, "o_proj": 1.10, "up_proj": 1.10, "down_proj": 1.05}
 
     # Optional KBANN priors (domain-derived boosts)
     kbann_mode = None
@@ -667,8 +682,8 @@ def main() -> None:
     if args.verbose:
         print(json.dumps({"status": "ok", "adapters": os.path.join(out_dir, "adapters.npz"), "embedding": os.path.join(out_dir, "embedding.npz")}, indent=2))
 
-    # Optional per-module export
-    if bool(args.per_module):
+    # Per-module export (default-on unless explicitly disabled)
+    if not bool(args.no_per_module):
         sub_root = os.path.join(out_dir, "sub_adapters")
         os.makedirs(sub_root, exist_ok=True)
         # Shapes again for export

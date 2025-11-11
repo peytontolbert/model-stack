@@ -44,11 +44,17 @@ Select modules/files by question (or zoom), mix the base adapter with an on-the-
 
 4) Controls that make it robust
 
-Capacity knobs: --rank, --alpha, --gsub (blend base vs subgraph); per-target weights (e.g., boost o/up/down for “knowledge recall”); optional delta-norm caps via REPO_ADAPTER_DELTA_CAP.
+Capacity knobs: --rank, --alpha, --gsub (blend base vs subgraph); per-target weights (e.g., boost o/up/down for “knowledge recall”); `--layer-schedule` (opt‑in per-layer multipliers rising toward top third); optional delta-norm caps via REPO_ADAPTER_DELTA_CAP.
+Layer tiers and rank budgets: `--layer-rank-tiers` (per-layer keeps by target group), `--rank-budget` (cap sum of per-target keeps per layer).
+Adapter mapping: always-on enhanced mapping (normalized z + per-target segment scaling).
 
 Selection knobs: --of-sources question|zoom, --zoom-symbol, --zoom-radius, and text feature control (--include-text, --text-max-bytes, --max-text-tokens, --text-weight).
 
 Context knobs: packing mode (heads/windows), token budget, and per-paragraph citation enforcement.
+
+Question-aware weights: `--q-aware-weights` (opt‑in) upweights target groups based on prompt intent (e.g., signatures → o,v; behavior → up/down/gate; definitions → light q).
+
+Mixture bank: `--mixture-m` + `--adapters-bank` (opt‑in) mixes top‑m per‑module adapters (from build `--per-module`) into the subgraph delta.
 
 Safety/determinism: keep your determinism checks and unsafe-code filters in the runner/verifier when you start executing any repo snippets (mirrors the “verifiable environment” pattern).
 
@@ -59,10 +65,24 @@ python -m examples.repo_grounded_adapters.build \
   --repo <path> --model <hf-id> --adapters-dir <out> \
   --embed-dim 1536 --base-rank 8 --include-text --kbann-priors --round-lora
 
+# Optional code‑recall preset
+python -m examples.repo_grounded_adapters.build \
+  --repo <path> --model <hf-id> --adapters-dir <out> \
+  --embed-dim 1536 --base-rank 8 --include-text --code-recall-preset
+
 Answer with repo adapters (with OTF subgraph selection)
 python -m examples.repo_grounded_adapters.run \
   --model <hf-id> --repo <path> --adapters-dir <out> \
   --prompt "<q>" --of-sources question --pack-context --require-citations --verbose
+
+# Optional enhancements (opt‑in)
+python -m examples.repo_grounded_adapters.run \
+  --model <hf-id> --repo <path> --adapters-dir <out> \
+  --prompt "<q>" --of-sources question --pack-context --require-citations \
+  --code-recall-preset --layer-schedule --layer-rank-tiers --q-aware-weights \
+  --mixture-m 3 --adapters-bank <out> \
+  --alpha-warmup --adapter-aware-decoding \
+  --verbose
 
 Optional: per-module export
 # Per-module embeddings/adapters (static)

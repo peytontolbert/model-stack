@@ -26,11 +26,19 @@ def generate_lora_from_embedding(
     layer_gate: str = "zmean",
     target_weights: Optional[Dict[str, float]] = None,
     learn_bias: bool = False,
+    map_cap: Optional[float] = None,
 ) -> Dict[str, List[Dict[str, Dict[str, np.ndarray]]]]:
     if targets is None:
         targets = ["q_proj", "o_proj", "up_proj"]
 
     z = z.astype(np.float32)
+    # Always-on normalization for mapping
+    try:
+        nz = float(np.linalg.norm(z))
+        if nz > 0:
+            z = (z / nz).astype(np.float32)
+    except Exception:
+        pass
     gates: List[float] = []
     layers: List[Dict[str, Dict[str, np.ndarray]]] = []
 
@@ -52,6 +60,17 @@ def generate_lora_from_embedding(
         # Pair MLP projections: reuse seed and gate across up/gate/down; up/gate share A/B
         mlp_seed = key ^ _stable_hash("mlp_pair", seed)
         up_pair: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        # Precompute per-target scalar from disjoint z segments (always-on)
+        per_target_scale: Dict[str, float] = {}
+        try:
+            seg_len = max(8, int(len(z) // max(1, len(targets))))
+            for idx_t, tgt in enumerate(targets):
+                start = (layer_idx * 17 + idx_t * seg_len) % len(z)
+                idxs = (np.arange(seg_len) + start) % len(z)
+                seg = z[idxs]
+                per_target_scale[tgt] = float(np.tanh(np.mean(seg) * 1.5))
+        except Exception:
+            per_target_scale = {}
         for tgt in targets:
             # A: d_out x r ; B: r x d_in
             if target_shapes and tgt in target_shapes:
@@ -82,11 +101,28 @@ def generate_lora_from_embedding(
             alpha = float(np.clip(np.mean(seg) * 1.5, -1.0, 1.0))
             A = (1.0 + alpha * gate) * A
             B = (1.0 - alpha * gate) * B
+            # Enhanced: per-target scalar (light) to reduce interference across targets
+            if per_target_scale and tgt in per_target_scale:
+                s_t = float(per_target_scale[tgt])
+                A = (1.0 + 0.15 * s_t) * A
+                B = (1.0 - 0.15 * s_t) * B
             if target_weights and tgt in target_weights:
                 tw = float(target_weights[tgt])
                 s = float(max(0.0, tw)) ** 0.5
                 A = s * A
                 B = s * B
+            # Optional norm cap on A/B (Frobenius) to avoid runaway scales
+            try:
+                if map_cap is not None and float(map_cap) > 0:
+                    capv = float(map_cap)
+                    nA = float(np.linalg.norm(A)) if A.size > 0 else 0.0
+                    if nA > capv and nA > 0:
+                        A = (capv / nA) * A
+                    nB = float(np.linalg.norm(B)) if B.size > 0 else 0.0
+                    if nB > capv and nB > 0:
+                        B = (capv / nB) * B
+            except Exception:
+                pass
             e: Dict[str, np.ndarray] = {"A": A, "B": B, "gate": np.array([gate], dtype=np.float32)}
             if learn_bias:
                 e["bias"] = np.zeros((int(d_out),), dtype=np.float32)
@@ -109,6 +145,7 @@ def generate_lora_from_embedding_torch(
     einsum_opt: str = "auto",
     layer_gate: str = "zmean",
     target_weights: Optional[Dict[str, float]] = None,
+    map_cap: Optional[float] = None,
 ) -> Dict[str, List[Dict[str, Dict[str, np.ndarray]]]]:
     import torch  # local import to avoid hard dep when unused
 
@@ -116,6 +153,12 @@ def generate_lora_from_embedding_torch(
         targets = ["q_proj", "o_proj", "up_proj"]
 
     zt = torch.from_numpy(z.astype(np.float32))
+    try:
+        nz = float(torch.linalg.vector_norm(zt).item())
+        if nz > 0:
+            zt = (zt / nz).to(torch.float32)
+    except Exception:
+        pass
     layers: List[Dict[str, Dict[str, np.ndarray]]] = []
     gates: List[float] = []
     # Global seeding for reproducibility in case external torch ops run
@@ -142,6 +185,17 @@ def generate_lora_from_embedding_torch(
         gen.manual_seed(key)
         mlp_seed = key ^ _stable_hash("mlp_pair", seed)
         up_pair: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        # Precompute per-target scale (always-on)
+        per_target_scale: Dict[str, float] = {}
+        try:
+            seg_len = max(8, int(len(zt) // max(1, len(targets))))
+            for idx_t, tgt in enumerate(targets):
+                start = (layer_idx * 17 + idx_t * seg_len) % len(zt)
+                idxs = (torch.arange(seg_len) + start) % len(zt)
+                seg = zt[idxs]
+                per_target_scale[tgt] = float(torch.tanh(seg.mean() * 1.5).item())
+        except Exception:
+            per_target_scale = {}
         for tgt in targets:
             if target_shapes and tgt in target_shapes:
                 d_out, d_in = target_shapes[tgt]
@@ -174,11 +228,27 @@ def generate_lora_from_embedding_torch(
                 alpha = torch.tanh((seg * w).sum() / 8.0)
             A = (1.0 + float(alpha.item()) * gate) * A
             B = (1.0 - float(alpha.item()) * gate) * B
+            if per_target_scale and tgt in per_target_scale:
+                s_t = float(per_target_scale[tgt])
+                A = (1.0 + 0.15 * s_t) * A
+                B = (1.0 - 0.15 * s_t) * B
             if target_weights and tgt in target_weights:
                 tw = float(target_weights[tgt])
                 s = float(max(0.0, tw)) ** 0.5
                 A = (s * A)
                 B = (s * B)
+            # Optional norm cap (Frobenius) on A/B
+            try:
+                if map_cap is not None and float(map_cap) > 0:
+                    capv = float(map_cap)
+                    nA = float(torch.linalg.matrix_norm(A).item()) if A.numel() > 0 else 0.0
+                    if nA > capv and nA > 0:
+                        A = (capv / nA) * A
+                    nB = float(torch.linalg.matrix_norm(B).item()) if B.numel() > 0 else 0.0
+                    if nB > capv and nB > 0:
+                        B = (capv / nB) * B
+            except Exception:
+                pass
             e: Dict[str, np.ndarray] = {
                 "A": A.numpy().astype(np.float32),
                 "B": B.numpy().astype(np.float32),

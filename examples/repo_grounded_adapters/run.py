@@ -46,6 +46,7 @@ def main() -> None:
     p.add_argument("--mix-beta", type=float, default=0.1)
     p.add_argument("--target-weights", default=None, help="CSV like q_proj=1,o_proj=1.1,up_proj=1.1,down_proj=1.05")
     p.add_argument("--knowledge-preset", action="store_true", help="Use a preset of target weights tuned for knowledge recall (boost o/up/down; modest q/k/v)")
+    p.add_argument("--code-recall-preset", action="store_true", help="Opt-in preset tuned for code recall (o,v,up,down,gate emphasized; light q,k)")
     # Entropy-aware capacity (forward to enhanced runner)
     p.add_argument("--entropy-aware", action="store_true")
     p.add_argument("--rank-min", type=int, default=8)
@@ -68,6 +69,23 @@ def main() -> None:
     p.add_argument("--ff-window-lines", type=int, default=80)
     p.add_argument("--ff-threshold", type=float, default=0.55)
     p.add_argument("--ff-noise-penalty", type=float, default=0.30)
+    # Layer schedule and q-aware weights (opt-in)
+    p.add_argument("--layer-schedule", action="store_true", help="Enable a light per-layer multiplier rising toward top third (additive; default off)")
+    p.add_argument("--q-aware-weights", action="store_true", help="Heuristic reweighting of targets by question intent (additive; default off)")
+    p.add_argument("--per-target-rank-schedule", action="store_true", help="Trim per-target effective rank at run-time (additive; default off)")
+    p.add_argument("--rank-budget", type=int, default=0, help="Optional per-layer rank budget across targets; rescale keeps to meet budget (0 disables)")
+    p.add_argument("--ablate-attn", action="store_true", help="Ablate attention targets (q/k/v/o) by zeroing their weights")
+    p.add_argument("--ablate-mlp", action="store_true", help="Ablate MLP targets (up/down/gate) by zeroing their weights")
+    p.add_argument("--layer-rank-tiers", action="store_true", help="Use top/mid/low thirds per-layer rank keeps by target group (opt-in)")
+    # Mixture bank (opt-in)
+    p.add_argument("--mixture-m", type=int, default=0, help="Top-m subgraph adapters from bank to mix (0 disables)")
+    p.add_argument("--adapters-bank", default=None, help="Path to a bank of sub_adapters (from build --per-module)")
+    # Adapter mapping is always enhanced; no CLI toggle
+    # Alpha warmup and decoding hooks (opt-in)
+    p.add_argument("--alpha-warmup", action="store_true", help="Use a lighter alpha on first attempt (or first structured pass), then full alpha on retry/subsequent passes")
+    p.add_argument("--adapter-aware-decoding", action="store_true", help="Slightly relax sampling and prompt pointer-first when citations are required")
+    # Telemetry verification (opt-in)
+    p.add_argument("--telemetry-tests", action="store_true", help="Attempt simple verify_with_tests() on a few selected modules and record results (structured path only)")
     # Reranking
     p.add_argument("--rerank", action="store_true")
     p.add_argument("--self-queries", default=None, help="Path to self_queries.jsonl for retrieval boosts")
@@ -156,7 +174,16 @@ def main() -> None:
             except Exception:
                 return None
             return out or None
-        tw_spec = (args.target_weights if args.target_weights else ("q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05" if args.knowledge_preset else None))
+        # Default presets (opt-in): knowledge preset (existing), or code-recall preset (new)
+        code_recall_spec = "o_proj=1.15,v_proj=1.10,up_proj=1.10,down_proj=1.05,gate_proj=1.00,q_proj=0.95,k_proj=0.90"
+        knowledge_spec = "q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05"
+        tw_spec = (
+            args.target_weights if args.target_weights else (
+                code_recall_spec if args.code_recall_preset else (
+                    knowledge_spec if args.knowledge_preset else None
+                )
+            )
+        )
         tw = _parse_tw(tw_spec)
         adapters = generate_lora_from_embedding(
             emb["z"],
@@ -226,7 +253,11 @@ def main() -> None:
             gsub_min=float(args.gsub_min),
             gsub_max=float(args.gsub_max),
             entropy_weights=str(args.entropy_weights),
-            target_weights=(str(args.target_weights) if args.target_weights else ("q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05" if args.knowledge_preset else None)),
+            target_weights=(str(args.target_weights) if args.target_weights else (
+                "o_proj=1.15,v_proj=1.10,up_proj=1.10,down_proj=1.05,gate_proj=1.00,q_proj=0.95,k_proj=0.90" if args.code_recall_preset else (
+                    "q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05" if args.knowledge_preset else None
+                )
+            )),
             rerank=bool(args.rerank),
             self_queries_path=(str(args.self_queries) if args.self_queries else None),
             commit_footer=bool(args.commit_footer),
@@ -238,6 +269,19 @@ def main() -> None:
             samples=int(args.samples),
             cone_join=str(args.cone_join),
             telemetry_out=(str(args.telemetry_out) if args.telemetry_out else None),
+            layer_schedule=bool(args.layer_schedule),
+            q_aware_weights=bool(args.q_aware_weights),
+            mixture_m=int(args.mixture_m),
+            adapters_bank=(str(args.adapters_bank) if args.adapters_bank else None),
+            # Forward additional knobs to structured path
+            per_target_rank_schedule=bool(args.per_target_rank_schedule),
+            rank_budget=int(args.rank_budget),
+            ablate_attn=bool(args.ablate_attn),
+            ablate_mlp=bool(args.ablate_mlp),
+            alpha_warmup=bool(args.alpha_warmup),
+            adapter_aware_decoding=bool(args.adapter_aware_decoding),
+            layer_rank_tiers=bool(args.layer_rank_tiers),
+            telemetry_verify_tests=bool(args.telemetry_tests),
         )
         print(res.get("text", ""))
         if args.verbose:
@@ -292,12 +336,28 @@ def main() -> None:
             gsub_min=float(args.gsub_min),
             gsub_max=float(args.gsub_max),
             entropy_weights=str(args.entropy_weights),
-            target_weights=(str(args.target_weights) if args.target_weights else ("q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05" if args.knowledge_preset else None)),
+            target_weights=(str(args.target_weights) if args.target_weights else (
+                "o_proj=1.15,v_proj=1.10,up_proj=1.10,down_proj=1.05,gate_proj=1.00,q_proj=0.95,k_proj=0.90" if args.code_recall_preset else (
+                    "q_proj=0.95,k_proj=0.95,v_proj=0.95,o_proj=1.10,up_proj=1.10,down_proj=1.05" if args.knowledge_preset else None
+                )
+            )),
             rerank=bool(args.rerank),
             self_queries_path=(str(args.self_queries) if args.self_queries else None),
             commit_footer=bool(args.commit_footer),
             verbose=bool(args.verbose),
             monotone_selection=bool(args.monotone_selection),
+            layer_schedule=bool(args.layer_schedule),
+            q_aware_weights=bool(args.q_aware_weights),
+            mixture_m=int(args.mixture_m),
+            adapters_bank=(str(args.adapters_bank) if args.adapters_bank else None),
+            per_target_rank_schedule=bool(args.per_target_rank_schedule),
+            rank_budget=int(args.rank_budget),
+            ablate_attn=bool(args.ablate_attn),
+            ablate_mlp=bool(args.ablate_mlp),
+            # map mode hook reserved for structured path
+            alpha_warmup=bool(args.alpha_warmup),
+            adapter_aware_decoding=bool(args.adapter_aware_decoding),
+            layer_rank_tiers=bool(args.layer_rank_tiers),
         )
         print(text)
 

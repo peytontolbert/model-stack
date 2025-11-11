@@ -2,6 +2,7 @@
 *.npz
 *.json
 *.jsonl
+*.log
 *.pth
 *.pt
 *.safetensors
@@ -12,3 +13,6 @@ cloned-repos/
 examples/repo_grounded_adapters/artifacts/
 examples/repo_grounded_adapters/smoke_repo/
 examples/be_great/
+.gitignore
+
+examples/program_conditioned_adapter/examples/hide/
