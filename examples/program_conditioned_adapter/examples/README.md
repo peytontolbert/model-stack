@@ -400,6 +400,12 @@ Quickstart: run installed program smokes
   - python examples/program_conditioned_adapter/examples/agent_pr_autofix/run_smoke_example.py
 - Agent Contract Guard:
   - python examples/program_conditioned_adapter/examples/agent_contract_guard/run_smoke_example.py
+ - Dataset‑Grounded Training:
+  - python examples/program_conditioned_adapter/examples/dataset_grounded_training/run_smoke_example.py
+ - Speech‑to‑Speech Adapter:
+  - python examples/program_conditioned_adapter/examples/speech_s2s_adapter/run_smoke_example.py
+ - Docs Truth Enforcer:
+  - python examples/program_conditioned_adapter/examples/docs_truth_enforcer/run_smoke_example.py
 - Program Composer Agent:
   - python examples/program_conditioned_adapter/examples/program_composer_agent/run_smoke_example.py
 - Self‑Tune PCA:
@@ -562,6 +568,7 @@ Tabular / Dataframe Grounding
 - Adapters:
   - media_render_planner (graph of transforms, codecs, budgets)
   - cad_param_qa (dimension‑cited answers)
+  - speech_s2s_adapter (ASR→TTS with prosody/alignment/latency checks)
 - Signals: timelines, node graphs, codec params, geometry/constraints
 - Verifiers: hash‑based artifact checks, visual probes, parameter bounds
 

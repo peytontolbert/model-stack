@@ -146,6 +146,7 @@ class CausalLM(nn.Module):
         top_k: int | None = None,
         eos_token_id: int | list[int] | None = None,
         no_repeat_ngram_size: int = 0,
+        repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
         attention_mask: torch.Tensor | None = None,
@@ -172,6 +173,40 @@ class CausalLM(nn.Module):
             #        traceback.print_exc()
                 raise
             logits = out["logits"][:, -1, :]
+            # Apply repetition / presence / frequency penalties (non-Transformers implementation)
+            try:
+                # seq shape: (B, T)
+                B = int(seq.shape[0])
+                V = int(logits.shape[-1])
+                for b in range(B):
+                    prev = seq[b]  # (T,)
+                    if prev.numel() > 0:
+                        # Repetition penalty (>1.0 discourages repeated tokens)
+                        if repetition_penalty is not None and float(repetition_penalty) != 1.0:
+                            rp = float(repetition_penalty)
+                            # For tokens present in prev, scale logits: positive -> /= rp, negative -> *= rp
+                            uniq = torch.unique(prev)
+                            idx = uniq.to(logits.device)
+                            vals = logits[b, idx]
+                            pos = vals > 0
+                            vals = torch.where(pos, vals / rp, vals * rp)
+                            logits[b, idx] = vals
+                        # Presence/frequency penalties (OpenAI-style)
+                        pp = float(presence_penalty or 0.0)
+                        fp = float(frequency_penalty or 0.0)
+                        if (pp != 0.0) or (fp != 0.0):
+                            # token counts in previous sequence
+                            counts = torch.bincount(prev.to(torch.long), minlength=V).to(logits.device, logits.dtype)
+                            # presence: subtract pp if token count > 0
+                            if pp != 0.0:
+                                pres_mask = (counts > 0).to(logits.dtype)
+                                logits[b, :] = logits[b, :] - (pp * pres_mask)
+                            # frequency: subtract fp * count
+                            if fp != 0.0:
+                                logits[b, :] = logits[b, :] - (fp * counts)
+            except Exception:
+                # Penalties are best-effort; ignore on failure to keep generation robust
+                pass
             # Apply simple sampling policies
             if do_sample:
                 x = logits.float()

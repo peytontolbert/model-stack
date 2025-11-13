@@ -1,0 +1,5 @@
+global-include *.md *.txt *.json *.yml *.yaml
+recursive-exclude **/artifacts *.*
+recursive-exclude **/datasets *.*
+
+

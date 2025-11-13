@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "model-stack"
+version = "0.1.0"
+description = "Local model stack: adapters, training utilities, and examples."
+authors = [{ name = "Model Stack Contributors" }]
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = []
+readme = { text = "Model stack package for adapters, training utilities, and examples.", content-type = "text/plain" }
+
+[project.urls]
+Homepage = "https://github.com/peytontolbert/model-stack"
+Repository = "https://github.com/peytontolbert/model-stack"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["*"]
+exclude = ["*.tests*", "tests*", "docs*", "scripts*/**", "examples/**/datasets/**", "examples/**/artifacts/**"]
+
+
