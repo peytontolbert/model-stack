@@ -71,6 +71,13 @@ def scaled_dot_product_attention(
     Note: PyTorch SDPA applies scale=1/sqrt(head_dim) by default.
     If you want HF-style explicit scaling, set scale and this will override SDPA's default.
     """
+    def _sdpa_mask(mask: Optional[torch.Tensor], q_in: torch.Tensor, target_backend: Optional[str]) -> Optional[torch.Tensor]:
+        if mask is None:
+            return None
+        if target_backend == "torch" and mask.dtype != q_in.dtype and mask.dtype != torch.bool:
+            return mask.to(dtype=q_in.dtype)
+        return mask
+
     if (backend is None or backend == "torch") and float(dropout_p) == 0.0:
         try:
             from runtime.ops import attention as native_attention
@@ -97,14 +104,15 @@ def scaled_dot_product_attention(
     if backend is None or backend == "torch":
         # PyTorch SDPA handles scaling internally (default: 1/sqrt(head_dim))
         # Only pass explicit scale if we want to override
+        sdpa_mask = _sdpa_mask(attn_mask, q, "torch")
         try:
             return torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+                q, k, v, attn_mask=sdpa_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
             )
         except Exception:
             k_exp, v_exp = _expand_gqa_kv(q, k, v)
             return torch.nn.functional.scaled_dot_product_attention(
-                q, k_exp, v_exp, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+                q, k_exp, v_exp, attn_mask=sdpa_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
             )
 
     # Try kernel registry first for requested backends
@@ -149,13 +157,15 @@ def scaled_dot_product_attention(
         try:
             import triton  # type: ignore  # noqa: F401
             # Fallback: use torch SDPA if only triton is present without a kernel impl
+            sdpa_mask = _sdpa_mask(attn_mask, q, "torch")
             return torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+                q, k, v, attn_mask=sdpa_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
             )
         except Exception:
             k_exp, v_exp = _expand_gqa_kv(q, k, v)
+            sdpa_mask = _sdpa_mask(attn_mask, q, "torch")
             return torch.nn.functional.scaled_dot_product_attention(
-                q, k_exp, v_exp, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+                q, k_exp, v_exp, attn_mask=sdpa_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
             )
 
     if backend == "xformers":
@@ -172,8 +182,9 @@ def scaled_dot_product_attention(
             k_x, v_x = _expand_gqa_kv(q, k, v)
             return xops.memory_efficient_attention(q, k_x, v_x, attn_bias=attn_mask, p=dropout_p, op=None, scale=scale)
         except Exception:
+            sdpa_mask = _sdpa_mask(attn_mask, q, "torch")
             return torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+                q, k, v, attn_mask=sdpa_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
             )
 
     raise ValueError("Unknown backend")

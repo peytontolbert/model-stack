@@ -123,6 +123,9 @@ std::map<std::string, bool> NativeOpMap() {
       {"merge_heads", true},
       {"head_output_projection", true},
       {"prepare_attention_mask", true},
+      {"token_counts", true},
+      {"append_tokens", true},
+      {"decode_positions", true},
       {"rms_norm", true},
       {"add_rms_norm", true},
       {"layer_norm", true},
@@ -210,9 +213,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
+      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
       "attention_prefill", "sampling"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
@@ -686,6 +689,54 @@ torch::Tensor RepetitionPenaltyForward(
   return out;
 }
 
+torch::Tensor TokenCountsForward(
+    const torch::Tensor& token_ids,
+    int64_t vocab_size,
+    torch::ScalarType counts_dtype) {
+  TORCH_CHECK(token_ids.defined(), "token_counts_forward: token_ids must be defined");
+  TORCH_CHECK(token_ids.dim() == 2, "token_counts_forward: token_ids must be rank-2 (B, T)");
+  TORCH_CHECK(vocab_size > 0, "token_counts_forward: vocab_size must be positive");
+  auto counts = torch::zeros(
+      {token_ids.size(0), vocab_size},
+      torch::TensorOptions().dtype(counts_dtype).device(token_ids.device()));
+  if (token_ids.numel() == 0) {
+    return counts;
+  }
+  auto ones = torch::ones(token_ids.sizes(), torch::TensorOptions().dtype(counts_dtype).device(token_ids.device()));
+  return counts.scatter_add(1, token_ids.to(torch::kLong), ones);
+}
+
+py::tuple AppendTokensForward(
+    const torch::Tensor& seq,
+    const torch::Tensor& next_id,
+    const c10::optional<torch::Tensor>& attention_mask) {
+  TORCH_CHECK(seq.defined() && next_id.defined(), "append_tokens_forward: seq and next_id must be defined");
+  TORCH_CHECK(seq.dim() == 2 && next_id.dim() == 2, "append_tokens_forward: seq and next_id must be rank-2");
+  TORCH_CHECK(seq.size(0) == next_id.size(0), "append_tokens_forward: batch mismatch");
+  auto next_seq = torch::cat({seq, next_id}, 1);
+  py::object next_mask = py::none();
+  if (attention_mask.has_value() && attention_mask.value().defined()) {
+    auto ones = torch::ones(
+        {next_id.size(0), next_id.size(1)},
+        torch::TensorOptions().dtype(attention_mask.value().scalar_type()).device(attention_mask.value().device()));
+    next_mask = py::cast(torch::cat({attention_mask.value(), ones}, 1));
+  }
+  return py::make_tuple(next_seq, next_mask);
+}
+
+py::tuple DecodePositionsForward(
+    int64_t batch_size,
+    int64_t seq_len,
+    const torch::Tensor& reference) {
+  TORCH_CHECK(reference.defined(), "decode_positions_forward: reference tensor must be defined");
+  TORCH_CHECK(batch_size > 0 && seq_len > 0, "decode_positions_forward: batch_size and seq_len must be positive");
+  auto pos = torch::full(
+      {batch_size, 1},
+      seq_len - 1,
+      torch::TensorOptions().dtype(torch::kLong).device(reference.device()));
+  return py::make_tuple(pos, pos.view({-1}));
+}
+
 torch::Tensor LinearForward(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -973,6 +1024,12 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("sample_next_token_forward", &SampleNextTokenForward, py::arg("logits"), py::arg("do_sample"));
   m.def("repetition_penalty_forward", &RepetitionPenaltyForward, py::arg("logits"), py::arg("token_ids"),
         py::arg("penalty"));
+  m.def("token_counts_forward", &TokenCountsForward, py::arg("token_ids"), py::arg("vocab_size"),
+        py::arg("counts_dtype"));
+  m.def("append_tokens_forward", &AppendTokensForward, py::arg("seq"), py::arg("next_id"),
+        py::arg("attention_mask") = py::none());
+  m.def("decode_positions_forward", &DecodePositionsForward, py::arg("batch_size"), py::arg("seq_len"),
+        py::arg("reference"));
   m.def("linear_forward", &LinearForward, py::arg("x"), py::arg("weight"), py::arg("bias") = py::none(),
         py::arg("backend") = "auto");
   m.def("pack_linear_weight_forward", &PackLinearWeightForward, py::arg("weight"), py::arg("bias") = py::none());

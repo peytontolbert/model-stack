@@ -350,6 +350,54 @@ def presence_frequency_penalty(
     return logits - penalty
 
 
+def token_counts(
+    token_ids: torch.Tensor,
+    *,
+    vocab_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if has_native_op("token_counts"):
+        module = native_module()
+        if module is not None and hasattr(module, "token_counts_forward"):
+            return module.token_counts_forward(token_ids, int(vocab_size), dtype)
+    counts = torch.zeros(token_ids.shape[0], int(vocab_size), dtype=dtype, device=token_ids.device)
+    if token_ids.numel() == 0:
+        return counts
+    ones = torch.ones_like(token_ids, dtype=dtype)
+    return counts.scatter_add(1, token_ids.to(torch.long), ones)
+
+
+def append_tokens(
+    seq: torch.Tensor,
+    next_id: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if has_native_op("append_tokens"):
+        module = native_module()
+        if module is not None and hasattr(module, "append_tokens_forward"):
+            next_seq, next_mask = module.append_tokens_forward(seq, next_id, attention_mask)
+            return next_seq, next_mask
+    next_seq = torch.cat([seq, next_id], dim=1)
+    if attention_mask is None:
+        return next_seq, None
+    ones = torch.ones(next_id.shape[0], next_id.shape[1], device=attention_mask.device, dtype=attention_mask.dtype)
+    return next_seq, torch.cat([attention_mask, ones], dim=1)
+
+
+def decode_positions(
+    *,
+    batch_size: int,
+    seq_len: int,
+    reference: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if has_native_op("decode_positions"):
+        module = native_module()
+        if module is not None and hasattr(module, "decode_positions_forward"):
+            return module.decode_positions_forward(int(batch_size), int(seq_len), reference)
+    pos_ids = torch.full((int(batch_size), 1), int(seq_len) - 1, device=reference.device, dtype=torch.long)
+    return pos_ids, pos_ids.view(-1)
+
+
 def sample_next_token(logits: torch.Tensor, do_sample: bool) -> torch.Tensor:
     if has_native_op("sampling"):
         module = native_module()

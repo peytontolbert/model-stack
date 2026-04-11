@@ -3,6 +3,9 @@ from typing import Optional, Callable
 
 import torch
 
+from runtime.ops import append_tokens as runtime_append_tokens
+from runtime.ops import decode_positions as runtime_decode_positions
+from runtime.ops import token_counts as runtime_token_counts
 from tensor.sampling import (
     apply_transformers_repetition_penalty,
     apply_temperature,
@@ -59,12 +62,11 @@ def _apply_sampling_policies(
         min_val = torch.finfo(x.dtype).min if x.dtype.is_floating_point else -1e9
         x = x.masked_fill(mask, min_val)
     if cfg.presence_penalty != 0.0 or cfg.frequency_penalty != 0.0:
-        # Build counts (simplified): frequency per token over the sequence
-        B, V = x.shape[0], x.shape[-1]
-        counts = torch.zeros(B, V, dtype=x.dtype, device=x.device)
-        for b in range(B):
-            ids, c = input_ids[b].unique(return_counts=True)
-            counts[b].index_add_(0, ids, c.to(x.dtype))
+        counts = runtime_token_counts(
+            input_ids,
+            vocab_size=x.shape[-1],
+            dtype=x.dtype,
+        )
         x = apply_presence_frequency_penalty(x, counts, cfg.presence_penalty, cfg.frequency_penalty)
     return x
 
@@ -156,20 +158,18 @@ def generate(
                 print(f"[engine] step={step} seq_len={seq.shape[1]} logits_dtype={next_logits.dtype} next_id={int(next_id[0,0].item())}")
             except Exception:
                 pass
-        seq = torch.cat([seq, next_id], dim=1)
-        # Extend attention_mask by 1 token (mark as non-pad)
-        if attention_mask is not None:
-            ones = torch.ones(next_id.shape[0], 1, device=attention_mask.device, dtype=attention_mask.dtype)
-            attention_mask = torch.cat([attention_mask, ones], dim=1)
+        seq, attention_mask = runtime_append_tokens(seq, next_id, attention_mask)
         if cfg.eos_id is not None:
             if (next_id == int(cfg.eos_id)).all():
                 break
         next_logits = None
         if cache is not None:
             try:
-                pos_ids = torch.arange(seq.shape[1] - 1, seq.shape[1], device=seq.device, dtype=torch.long)
-                pos_ids = pos_ids.view(1, 1).expand(seq.shape[0], -1)
-                cache_pos = pos_ids.view(-1)
+                pos_ids, cache_pos = runtime_decode_positions(
+                    batch_size=seq.shape[0],
+                    seq_len=seq.shape[1],
+                    reference=seq,
+                )
             except Exception:
                 pos_ids = None
                 cache_pos = None
