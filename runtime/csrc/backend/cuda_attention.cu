@@ -22,14 +22,15 @@ __global__ void attention_forward_kernel(
     int mask_kind,
     scalar_t* __restrict__ out,
     int64_t batch,
-    int64_t heads,
+    int64_t q_heads,
+    int64_t kv_heads,
     int64_t tq,
     int64_t sk,
     int64_t dh,
     float scale,
     bool is_causal) {
   const int64_t row = static_cast<int64_t>(blockIdx.x);
-  const int64_t total_rows = batch * heads * tq;
+  const int64_t total_rows = batch * q_heads * tq;
   if (row >= total_rows) {
     return;
   }
@@ -38,12 +39,14 @@ __global__ void attention_forward_kernel(
 
   const int64_t query_idx = row % tq;
   const int64_t tmp = row / tq;
-  const int64_t head_idx = tmp % heads;
-  const int64_t batch_idx = tmp / heads;
+  const int64_t head_idx = tmp % q_heads;
+  const int64_t batch_idx = tmp / q_heads;
+  const int64_t head_group = q_heads / kv_heads;
+  const int64_t kv_head_idx = head_idx / head_group;
 
-  const int64_t q_base = (((batch_idx * heads) + head_idx) * tq + query_idx) * dh;
-  const int64_t kv_base = ((batch_idx * heads) + head_idx) * sk * dh;
-  const int64_t mask_base = (((batch_idx * heads) + head_idx) * tq + query_idx) * sk;
+  const int64_t q_base = (((batch_idx * q_heads) + head_idx) * tq + query_idx) * dh;
+  const int64_t kv_base = ((batch_idx * kv_heads) + kv_head_idx) * sk * dh;
+  const int64_t mask_base = (((batch_idx * q_heads) + head_idx) * tq + query_idx) * sk;
 
   float local_max = -INFINITY;
   for (int64_t s = threadIdx.x; s < sk; s += blockDim.x) {
@@ -167,6 +170,12 @@ bool UseCudaAttentionKernel(
       return false;
     }
   }
+  if (k.size(1) != v.size(1)) {
+    return false;
+  }
+  if (q.size(1) % k.size(1) != 0) {
+    return false;
+  }
   return true;
 }
 
@@ -183,9 +192,19 @@ torch::Tensor CudaAttentionForward(
     const c10::optional<torch::Tensor>& attn_mask,
     bool is_causal,
     const c10::optional<double>& scale) {
+  auto k_all = k;
+  auto v_all = v;
+  if (q.size(1) != k.size(1)) {
+    const auto repeat = q.size(1) / k.size(1);
+    auto head_index = torch::arange(k.size(1), torch::TensorOptions().dtype(torch::kLong).device(k.device()))
+                          .repeat_interleave(repeat);
+    k_all = torch::index_select(k, 1, head_index);
+    v_all = torch::index_select(v, 1, head_index);
+  }
+
   if (!UseCudaAttentionKernel(q, k, v, attn_mask)) {
     const double scale_value = scale.has_value() ? scale.value() : (1.0 / std::sqrt(static_cast<double>(q.size(3))));
-    auto scores = torch::matmul(q, k.transpose(2, 3)) * scale_value;
+    auto scores = torch::matmul(q, k_all.transpose(2, 3)) * scale_value;
     if (attn_mask.has_value() && attn_mask.value().defined()) {
       if (attn_mask.value().scalar_type() == torch::kBool) {
         scores = scores.masked_fill(attn_mask.value(), -INFINITY);
@@ -194,11 +213,11 @@ torch::Tensor CudaAttentionForward(
       }
     }
     if (is_causal) {
-      auto causal = torch::ones({q.size(2), k.size(2)}, torch::TensorOptions().dtype(torch::kBool).device(q.device())).triu(1);
-      scores = scores.masked_fill(causal.view({1, 1, q.size(2), k.size(2)}), -INFINITY);
+      auto causal = torch::ones({q.size(2), k_all.size(2)}, torch::TensorOptions().dtype(torch::kBool).device(q.device())).triu(1);
+      scores = scores.masked_fill(causal.view({1, 1, q.size(2), k_all.size(2)}), -INFINITY);
     }
     auto probs = torch::softmax(scores.to(torch::kFloat32), -1).to(q.scalar_type());
-    return torch::matmul(probs, v);
+    return torch::matmul(probs, v_all);
   }
 
   c10::cuda::CUDAGuard device_guard{q.device()};
@@ -223,13 +242,14 @@ torch::Tensor CudaAttentionForward(
 
   auto out = torch::empty_like(q_contig);
   const auto batch = q_contig.size(0);
-  const auto heads = q_contig.size(1);
+  const auto q_heads = q_contig.size(1);
+  const auto kv_heads = k_contig.size(1);
   const auto tq = q_contig.size(2);
   const auto sk = k_contig.size(2);
   const auto dh = q_contig.size(3);
   const float scale_value = static_cast<float>(
       scale.has_value() ? scale.value() : (1.0 / std::sqrt(static_cast<double>(dh))));
-  const dim3 blocks(static_cast<unsigned int>(batch * heads * tq));
+  const dim3 blocks(static_cast<unsigned int>(batch * q_heads * tq));
   const dim3 threads(kThreads);
   auto stream = c10::cuda::getCurrentCUDAStream(q.get_device());
 
@@ -245,7 +265,8 @@ torch::Tensor CudaAttentionForward(
             mask_kind,
             out.data_ptr<scalar_t>(),
             batch,
-            heads,
+            q_heads,
+            kv_heads,
             tq,
             sk,
             dh,

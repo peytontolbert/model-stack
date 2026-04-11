@@ -150,11 +150,14 @@ class EagerAttention(nn.Module):
         else:
             kh_all, vh_all = kh_new, vh_new
 
-        # Expand KV heads to match attention heads if using GQA
-        if self.n_kv_heads != self.n_heads:
+        def _expanded_kv_heads() -> tuple[torch.Tensor, torch.Tensor]:
+            if self.n_kv_heads == self.n_heads:
+                return kh_all, vh_all
             repeat = self.n_heads // self.n_kv_heads
-            kh_all = kh_all.repeat_interleave(repeat, dim=1)
-            vh_all = vh_all.repeat_interleave(repeat, dim=1)
+            return (
+                kh_all.repeat_interleave(repeat, dim=1),
+                vh_all.repeat_interleave(repeat, dim=1),
+            )
 
         # Use explicit matmul + float32 softmax (HF-eager parity) if enabled; else route to SDPA
         S = kh_all.shape[2]
@@ -184,14 +187,15 @@ class EagerAttention(nn.Module):
                     pass
         parity_exact = os.environ.get("ATTN_PARITY_EXACT", "0") == "1"
         if parity_exact:
+            kh_attn, vh_attn = _expanded_kv_heads()
             # HF-like: explicit attention scores + additive mask + float32 softmax
-            scores = torch.matmul(qh, kh_all.transpose(2, 3)) * float(self.scaling)  # (B,H,T,S)
+            scores = torch.matmul(qh, kh_attn.transpose(2, 3)) * float(self.scaling)  # (B,H,T,S)
             if add is not None:
                 scores = scores + add.to(dtype=scores.dtype)
             attn_probs = torch.nn.functional.softmax(scores.float(), dim=-1).to(dtype)
             if self.training and self.attn_dropout_p > 0.0:
                 attn_probs = torch.nn.functional.dropout(attn_probs, p=self.attn_dropout_p)
-            out = torch.matmul(attn_probs, vh_all)
+            out = torch.matmul(attn_probs, vh_attn)
             y = merge_heads(out)
         else:
             # Choose backend; avoid double causal when explicit mask is provided
@@ -199,6 +203,11 @@ class EagerAttention(nn.Module):
             backend = self.backend_override or select_attention_backend(
                 is_causal=is_causal_flag, dtype=dtype, seq=T, heads=self.n_heads, device=device
             )
+            use_native_gqa = backend == "torch" and (self.attn_dropout_p if self.training else 0.0) == 0.0
+            if use_native_gqa:
+                kh_backend, vh_backend = kh_all, vh_all
+            else:
+                kh_backend, vh_backend = _expanded_kv_heads()
             mask_for_backend = add
             # Some backends (torch SDPA) may expect float/bool mask with dtype matching q/k/v
             if mask_for_backend is not None and backend == "torch" and mask_for_backend.dtype != qh.dtype:
@@ -210,7 +219,7 @@ class EagerAttention(nn.Module):
             #        pass
             try:
                 out = scaled_dot_product_attention(
-                    qh, kh_all, vh_all,
+                    qh, kh_backend, vh_backend,
                     attn_mask=mask_for_backend,
                     dropout_p=(self.attn_dropout_p if self.training else 0.0),
                     backend=backend,

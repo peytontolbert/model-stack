@@ -494,7 +494,8 @@ torch::Tensor NativeAttentionForward(
   TORCH_CHECK(q.defined() && k.defined() && v.defined(), "attention_forward: q, k, v must be defined");
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "attention_forward: q, k, v must be rank-4");
   TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0), "attention_forward: batch mismatch");
-  TORCH_CHECK(q.size(1) == k.size(1) && q.size(1) == v.size(1), "attention_forward: head mismatch");
+  TORCH_CHECK(k.size(1) == v.size(1), "attention_forward: key/value head mismatch");
+  TORCH_CHECK(q.size(1) % k.size(1) == 0, "attention_forward: query heads must be a multiple of kv heads");
   TORCH_CHECK(k.size(2) == v.size(2), "attention_forward: source-length mismatch");
   TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3), "attention_forward: head_dim mismatch");
 
@@ -504,8 +505,18 @@ torch::Tensor NativeAttentionForward(
   }
 #endif
 
+  auto k_all = k;
+  auto v_all = v;
+  if (q.size(1) != k.size(1)) {
+    const auto repeat = q.size(1) / k.size(1);
+    auto head_index = torch::arange(k.size(1), torch::TensorOptions().dtype(torch::kLong).device(k.device()))
+                          .repeat_interleave(repeat);
+    k_all = at::index_select(k, 1, head_index);
+    v_all = at::index_select(v, 1, head_index);
+  }
+
   const double scale_value = scale.has_value() ? scale.value() : (1.0 / std::sqrt(static_cast<double>(q.size(3))));
-  auto scores = torch::matmul(q, k.transpose(-2, -1)) * scale_value;
+  auto scores = torch::matmul(q, k_all.transpose(-2, -1)) * scale_value;
 
   if (attn_mask.has_value() && attn_mask.value().defined()) {
     auto mask = attn_mask.value();
@@ -518,13 +529,13 @@ torch::Tensor NativeAttentionForward(
 
   if (is_causal) {
     auto tgt = q.size(2);
-    auto src = k.size(2);
+    auto src = k_all.size(2);
     auto causal = torch::ones({tgt, src}, torch::TensorOptions().dtype(torch::kBool).device(q.device())).triu(1);
     scores = scores.masked_fill(causal.view({1, 1, tgt, src}), -std::numeric_limits<float>::infinity());
   }
 
   auto probs = torch::softmax(scores.to(torch::kFloat32), -1).to(q.scalar_type());
-  return torch::matmul(probs, v);
+  return torch::matmul(probs, v_all);
 }
 
 torch::Tensor TemperatureForward(const torch::Tensor& logits, double tau) {

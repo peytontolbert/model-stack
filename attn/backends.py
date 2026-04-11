@@ -85,13 +85,27 @@ def scaled_dot_product_attention(
         except Exception:
             pass
 
+    def _expand_gqa_kv(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if q_in.shape[1] == k_in.shape[1]:
+            return k_in, v_in
+        if q_in.shape[1] % k_in.shape[1] != 0 or k_in.shape[1] != v_in.shape[1]:
+            raise ValueError("attention backend requires q heads to be a multiple of kv heads")
+        repeat = q_in.shape[1] // k_in.shape[1]
+        return k_in.repeat_interleave(repeat, dim=1), v_in.repeat_interleave(repeat, dim=1)
+
     # Prefer torch SDPA for portability; route when explicitly requested
     if backend is None or backend == "torch":
         # PyTorch SDPA handles scaling internally (default: 1/sqrt(head_dim))
         # Only pass explicit scale if we want to override
-        return torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
-        )
+        try:
+            return torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+            )
+        except Exception:
+            k_exp, v_exp = _expand_gqa_kv(q, k, v)
+            return torch.nn.functional.scaled_dot_product_attention(
+                q, k_exp, v_exp, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+            )
 
     # Try kernel registry first for requested backends
     try:
@@ -109,21 +123,23 @@ def scaled_dot_product_attention(
         # fallback to direct import
         try:
             from flash_attn import flash_attn_func  # type: ignore
+            k_flash, v_flash = _expand_gqa_kv(q, k, v)
             B, H, T, D = q.shape
-            S = k.shape[2]
+            S = k_flash.shape[2]
             # FlashAttention expects softmax_scale, default is 1/sqrt(D)
             out = flash_attn_func(
                 q.reshape(B * H, T, D), 
-                k.reshape(B * H, S, D), 
-                v.reshape(B * H, S, D), 
+                k_flash.reshape(B * H, S, D), 
+                v_flash.reshape(B * H, S, D), 
                 causal=is_causal or False, 
                 dropout_p=dropout_p,
                 softmax_scale=scale
             )
             return out.reshape(B, H, T, D)
         except Exception:
+            k_exp, v_exp = _expand_gqa_kv(q, k, v)
             return torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+                q, k_exp, v_exp, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
             )
 
     if backend == "triton":
@@ -137,8 +153,9 @@ def scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
             )
         except Exception:
+            k_exp, v_exp = _expand_gqa_kv(q, k, v)
             return torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+                q, k_exp, v_exp, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
             )
 
     if backend == "xformers":
@@ -152,11 +169,11 @@ def scaled_dot_product_attention(
                 pass
         try:
             import xformers.ops as xops  # type: ignore
-            return xops.memory_efficient_attention(q, k, v, attn_bias=attn_mask, p=dropout_p, op=None, scale=scale)
+            k_x, v_x = _expand_gqa_kv(q, k, v)
+            return xops.memory_efficient_attention(q, k_x, v_x, attn_bias=attn_mask, p=dropout_p, op=None, scale=scale)
         except Exception:
             return torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
             )
 
     raise ValueError("Unknown backend")
-

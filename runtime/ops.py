@@ -219,7 +219,16 @@ def attention(
         if module is not None and hasattr(module, "attention_forward"):
             return module.attention_forward(q, k, v, attn_mask, is_causal, scale)
 
-    scores = torch.matmul(q, k.transpose(2, 3))
+    k_all = k
+    v_all = v
+    if q.shape[1] != k.shape[1]:
+        if q.shape[1] % k.shape[1] != 0 or k.shape[1] != v.shape[1]:
+            raise ValueError("attention fallback requires q heads to be a multiple of kv heads")
+        repeat = q.shape[1] // k.shape[1]
+        k_all = k.repeat_interleave(repeat, dim=1)
+        v_all = v.repeat_interleave(repeat, dim=1)
+
+    scores = torch.matmul(q, k_all.transpose(2, 3))
     if scale is None:
         scores = scores * (q.shape[-1] ** -0.5)
     else:
@@ -231,12 +240,12 @@ def attention(
             scores = scores + attn_mask.to(dtype=scores.dtype)
     if is_causal:
         causal = torch.triu(
-            torch.ones(q.shape[2], k.shape[2], device=q.device, dtype=torch.bool),
+            torch.ones(q.shape[2], k_all.shape[2], device=q.device, dtype=torch.bool),
             diagonal=1,
         )
-        scores = scores.masked_fill(causal.view(1, 1, q.shape[2], k.shape[2]), float("-inf"))
+        scores = scores.masked_fill(causal.view(1, 1, q.shape[2], k_all.shape[2]), float("-inf"))
     probs = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
-    return torch.matmul(probs, v)
+    return torch.matmul(probs, v_all)
 
 
 def temperature(logits: torch.Tensor, tau: float) -> torch.Tensor:
