@@ -1,5 +1,8 @@
+import os
 from typing import Optional
 import torch
+from runtime.ops import kv_cache_append as runtime_kv_cache_append
+from runtime.native import has_native_op
 
 
 class PagedKVCache:
@@ -57,7 +60,73 @@ class PagedKVCache:
         return _LayerCacheView(self, layer_idx)
 
 
-def init_kv_cache(batch: int, n_layers: int, n_kv_heads: int, head_dim: int, pagesize: int, dtype: torch.dtype, device: torch.device) -> PagedKVCache:
+class ContiguousKVCache:
+    def __init__(self, batch: int, n_layers: int, n_kv_heads: int, head_dim: int, pagesize: int, dtype: torch.dtype, device: torch.device):
+        self.batch = batch
+        self.n_layers = n_layers
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+        self.pagesize = pagesize
+        self.dtype = dtype
+        self.device = device
+        self.K: list[list[torch.Tensor | None]] = [[None for _ in range(batch)] for _ in range(n_layers)]
+        self.V: list[list[torch.Tensor | None]] = [[None for _ in range(batch)] for _ in range(n_layers)]
+        self.lengths = [[0 for _ in range(batch)] for _ in range(n_layers)]
+
+    def append(self, layer_idx: int, b: int, k_chunk: torch.Tensor, v_chunk: torch.Tensor):
+        k_prev = self.K[layer_idx][b]
+        v_prev = self.V[layer_idx][b]
+        k_next, v_next = runtime_kv_cache_append(
+            k_prev,
+            v_prev,
+            k_chunk.to(device=self.device, dtype=self.dtype).contiguous(),
+            v_chunk.to(device=self.device, dtype=self.dtype).contiguous(),
+        )
+        self.K[layer_idx][b] = k_next
+        self.V[layer_idx][b] = v_next
+        self.lengths[layer_idx][b] = int(k_next.shape[1])
+
+    def slice(self, layer_idx: int, b: int, start: int, end: int):
+        k = self.K[layer_idx][b]
+        v = self.V[layer_idx][b]
+        if k is None or v is None:
+            return None, None
+        s = max(int(start), 0)
+        e = min(int(end), int(k.shape[1]))
+        if s >= e:
+            return None, None
+        return k[:, s:e, :], v[:, s:e, :]
+
+    def evict(self, max_tokens: int, policy: str = "fifo"):
+        keep = max(int(max_tokens), 0)
+        for l in range(self.n_layers):
+            for b in range(self.batch):
+                k = self.K[l][b]
+                v = self.V[l][b]
+                if k is None or v is None:
+                    self.lengths[l][b] = 0
+                    continue
+                cur = int(k.shape[1])
+                if cur <= keep:
+                    self.lengths[l][b] = cur
+                    continue
+                if policy in ("fifo", "sliding-window", "lru"):
+                    self.K[l][b] = k[:, cur - keep :, :].contiguous() if keep > 0 else None
+                    self.V[l][b] = v[:, cur - keep :, :].contiguous() if keep > 0 else None
+                    self.lengths[l][b] = keep
+
+    def layer(self, layer_idx: int):
+        return _LayerCacheView(self, layer_idx)
+
+
+def init_kv_cache(batch: int, n_layers: int, n_kv_heads: int, head_dim: int, pagesize: int, dtype: torch.dtype, device: torch.device):
+    backend = (os.getenv("MODEL_STACK_KV_BACKEND", "auto") or "auto").strip().lower()
+    if backend == "contiguous":
+        return ContiguousKVCache(batch, n_layers, n_kv_heads, head_dim, pagesize, dtype, device)
+    if backend == "paged":
+        return PagedKVCache(batch, n_layers, n_kv_heads, head_dim, pagesize, dtype, device)
+    if has_native_op("kv_cache_append"):
+        return ContiguousKVCache(batch, n_layers, n_kv_heads, head_dim, pagesize, dtype, device)
     return PagedKVCache(batch, n_layers, n_kv_heads, head_dim, pagesize, dtype, device)
 
 
@@ -126,4 +195,3 @@ class _LayerCacheView:
     def length(self) -> int:
         # Return the maximum sequence length across batch for this layer
         return max(self.parent.lengths[self.layer_idx]) if self.parent.lengths[self.layer_idx] else 0
-

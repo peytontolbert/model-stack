@@ -88,3 +88,22 @@ def apply_rotary(
         return torch.cat((-x2, x1), dim=-1)
 
     return (q * cos_b) + (rotate_half(q) * sin_b), (k * cos_b) + (rotate_half(k) * sin_b)
+
+
+def kv_cache_append(
+    k_cache: torch.Tensor | None,
+    v_cache: torch.Tensor | None,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if has_native_op("kv_cache_append"):
+        module = native_module()
+        if module is not None and hasattr(module, "kv_cache_append_forward"):
+            next_k, next_v = module.kv_cache_append_forward(k_cache, v_cache, k_new, v_new)
+            return next_k, next_v
+
+    k_chunk = k_new.contiguous()
+    v_chunk = v_new.contiguous()
+    if k_cache is None or v_cache is None:
+        return k_chunk, v_chunk
+    return torch.cat([k_cache.contiguous(), k_chunk], dim=1), torch.cat([v_cache.contiguous(), v_chunk], dim=1)

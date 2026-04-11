@@ -16,7 +16,7 @@ std::map<std::string, bool> NativeOpMap() {
   return {
       {"rms_norm", true},
       {"rope", true},
-      {"kv_cache_append", false},
+      {"kv_cache_append", true},
       {"attention_decode", false},
       {"attention_prefill", false},
       {"sampling", false},
@@ -31,7 +31,7 @@ py::dict RuntimeInfo() {
 #else
   info["compiled_with_cuda"] = false;
 #endif
-  info["native_ops"] = std::vector<std::string>{"rms_norm", "rope"};
+  info["native_ops"] = std::vector<std::string>{"rms_norm", "rope", "kv_cache_append"};
   info["planned_ops"] = std::vector<std::string>{
       "rms_norm", "rope", "kv_cache_append", "attention_decode",
       "attention_prefill", "sampling"};
@@ -111,6 +111,41 @@ std::vector<torch::Tensor> ApplyRotaryForward(
   return {q_out, k_out};
 }
 
+std::vector<torch::Tensor> KvCacheAppendForward(
+    const c10::optional<torch::Tensor>& k_cache,
+    const c10::optional<torch::Tensor>& v_cache,
+    const torch::Tensor& k_new,
+    const torch::Tensor& v_new) {
+  TORCH_CHECK(k_new.defined() && v_new.defined(), "kv_cache_append_forward: k_new and v_new must be defined");
+  TORCH_CHECK(k_new.dim() == 3 && v_new.dim() == 3, "kv_cache_append_forward: k_new and v_new must be rank-3");
+  TORCH_CHECK(k_new.sizes() == v_new.sizes(), "kv_cache_append_forward: k_new and v_new shapes must match");
+
+  auto k_chunk = k_new.contiguous();
+  auto v_chunk = v_new.contiguous();
+
+  if (!k_cache.has_value() || !k_cache.value().defined()) {
+    TORCH_CHECK(
+        !v_cache.has_value() || !v_cache.value().defined(),
+        "kv_cache_append_forward: v_cache cannot be defined when k_cache is undefined");
+    return {k_chunk, v_chunk};
+  }
+
+  TORCH_CHECK(v_cache.has_value() && v_cache.value().defined(), "kv_cache_append_forward: v_cache must be defined");
+  const auto& k_prev = k_cache.value();
+  const auto& v_prev = v_cache.value();
+  TORCH_CHECK(k_prev.dim() == 3 && v_prev.dim() == 3, "kv_cache_append_forward: cached tensors must be rank-3");
+  TORCH_CHECK(k_prev.sizes() == v_prev.sizes(), "kv_cache_append_forward: cached K/V shapes must match");
+  TORCH_CHECK(k_prev.size(0) == k_chunk.size(0), "kv_cache_append_forward: head count mismatch");
+  TORCH_CHECK(k_prev.size(2) == k_chunk.size(2), "kv_cache_append_forward: head_dim mismatch");
+  TORCH_CHECK(k_prev.device() == k_chunk.device(), "kv_cache_append_forward: device mismatch");
+  TORCH_CHECK(k_prev.scalar_type() == k_chunk.scalar_type(), "kv_cache_append_forward: dtype mismatch");
+
+  return {
+      torch::cat({k_prev.contiguous(), k_chunk}, 1),
+      torch::cat({v_prev.contiguous(), v_chunk}, 1),
+  };
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_model_stack_native, m) {
@@ -121,4 +156,6 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("eps") = 1e-6);
   m.def("apply_rotary_forward", &ApplyRotaryForward, py::arg("q"), py::arg("k"), py::arg("cos"),
         py::arg("sin"));
+  m.def("kv_cache_append_forward", &KvCacheAppendForward, py::arg("k_cache") = py::none(),
+        py::arg("v_cache") = py::none(), py::arg("k_new"), py::arg("v_new"));
 }
