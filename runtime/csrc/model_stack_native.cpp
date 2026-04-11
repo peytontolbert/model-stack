@@ -25,8 +25,16 @@ torch::Tensor CudaRmsNormForward(
     const c10::optional<torch::Tensor>& weight,
     double eps);
 bool HasCudaRmsNormKernel();
+torch::Tensor CublasLtLinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias);
+bool HasCublasLtLinearBackend();
 #else
 bool HasCudaRmsNormKernel() {
+  return false;
+}
+bool HasCublasLtLinearBackend() {
   return false;
 }
 #endif
@@ -51,11 +59,16 @@ std::map<std::string, bool> NativeOpMap() {
 }
 
 std::vector<std::string> SupportedLinearBackends() {
+#if MODEL_STACK_WITH_CUDA
+  if (HasCublasLtLinearBackend()) {
+    return {"aten", "cublaslt"};
+  }
+#endif
   return {"aten"};
 }
 
 std::vector<std::string> PlannedLinearBackends() {
-  return {"cublaslt"};
+  return HasCublasLtLinearBackend() ? std::vector<std::string>{} : std::vector<std::string>{"cublaslt"};
 }
 
 std::string NormalizeBackendName(const std::string& name) {
@@ -70,13 +83,13 @@ std::string ResolveLinearBackend(const std::string& requested) {
   std::string candidate = NormalizeBackendName(requested);
   if (candidate.empty() || candidate == "auto") {
     const char* env_value = std::getenv("MODEL_STACK_LINEAR_BACKEND");
-    candidate = env_value != nullptr ? NormalizeBackendName(env_value) : "aten";
+    candidate = env_value != nullptr ? NormalizeBackendName(env_value) : "";
     if (candidate.empty() || candidate == "auto") {
-      candidate = "aten";
+      candidate = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
     }
   }
   TORCH_CHECK(
-      candidate == "aten",
+      candidate == "aten" || (candidate == "cublaslt" && HasCublasLtLinearBackend()),
       "Unsupported linear backend request: ",
       candidate,
       " (supported backends: aten; planned backends: cublaslt)");
@@ -110,10 +123,20 @@ py::dict RuntimeInfo() {
   info["planned_ops"] = std::vector<std::string>{
       "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "attention_decode",
       "attention_prefill", "sampling"};
-  info["linear_backend_default"] = "aten";
+  info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
   info["linear_backends_planned"] = PlannedLinearBackends();
-  info["cuda_backend_ops"] = HasCudaRmsNormKernel() ? std::vector<std::string>{"rms_norm"} : std::vector<std::string>{};
+  info["cublaslt_linear_dtypes"] = HasCublasLtLinearBackend()
+      ? std::vector<std::string>{"float32", "float16"}
+      : std::vector<std::string>{};
+  std::vector<std::string> cuda_backend_ops;
+  if (HasCudaRmsNormKernel()) {
+    cuda_backend_ops.push_back("rms_norm");
+  }
+  if (HasCublasLtLinearBackend()) {
+    cuda_backend_ops.push_back("linear");
+  }
+  info["cuda_backend_ops"] = cuda_backend_ops;
   return info;
 }
 
@@ -362,6 +385,9 @@ torch::Tensor LinearForward(
     const torch::Tensor& weight,
     const c10::optional<torch::Tensor>& bias,
     const std::string& backend) {
+  auto AtenLinearForward = [&]() {
+    return at::linear(x, weight, bias);
+  };
   TORCH_CHECK(x.defined() && weight.defined(), "linear_forward: x and weight must be defined");
   TORCH_CHECK(x.dim() >= 2, "linear_forward: x must have rank >= 2");
   TORCH_CHECK(weight.dim() == 2, "linear_forward: weight must be rank-2");
@@ -372,8 +398,12 @@ torch::Tensor LinearForward(
     TORCH_CHECK(b.size(0) == weight.size(0), "linear_forward: bias size mismatch");
   }
   const auto resolved_backend = ResolveLinearBackend(backend);
-  (void)resolved_backend;
-  return at::linear(x, weight, bias);
+#if MODEL_STACK_WITH_CUDA
+  if (resolved_backend == "cublaslt" && x.is_cuda()) {
+    return CublasLtLinearForward(x, weight, bias);
+  }
+#endif
+  return AtenLinearForward();
 }
 
 torch::Tensor MlpForward(
@@ -386,8 +416,7 @@ torch::Tensor MlpForward(
     bool gated,
     const std::string& backend) {
   const auto resolved_backend = ResolveLinearBackend(backend);
-  (void)resolved_backend;
-  auto hidden = at::linear(x, w_in_weight, w_in_bias);
+  auto hidden = LinearForward(x, w_in_weight, w_in_bias, resolved_backend);
   torch::Tensor projected;
   if (gated) {
     TORCH_CHECK(hidden.size(-1) % 2 == 0, "mlp_forward: gated projection width must be even");
@@ -398,7 +427,7 @@ torch::Tensor MlpForward(
   } else {
     projected = ApplyActivation(hidden, activation);
   }
-  return at::linear(projected, w_out_weight, w_out_bias);
+  return LinearForward(projected, w_out_weight, w_out_bias, resolved_backend);
 }
 
 std::vector<torch::Tensor> QkvProjectionForward(
@@ -411,11 +440,10 @@ std::vector<torch::Tensor> QkvProjectionForward(
     const c10::optional<torch::Tensor>& v_bias,
     const std::string& backend) {
   const auto resolved_backend = ResolveLinearBackend(backend);
-  (void)resolved_backend;
   return {
-      at::linear(x, q_weight, q_bias),
-      at::linear(x, k_weight, k_bias),
-      at::linear(x, v_weight, v_bias),
+      LinearForward(x, q_weight, q_bias, resolved_backend),
+      LinearForward(x, k_weight, k_bias, resolved_backend),
+      LinearForward(x, v_weight, v_bias, resolved_backend),
   };
 }
 
