@@ -344,6 +344,18 @@ def linear(
     return F.linear(x, weight, bias)
 
 
+def pack_linear_weight(
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if has_native_op("pack_linear_weight"):
+        module = native_module()
+        if module is not None and hasattr(module, "pack_linear_weight_forward"):
+            packed_weight, packed_bias = module.pack_linear_weight_forward(weight, bias)
+            return packed_weight, packed_bias
+    return weight.contiguous(), None if bias is None else bias.contiguous()
+
+
 def split_heads(
     x: torch.Tensor,
     num_heads: int,
@@ -401,6 +413,76 @@ def qkv_projection(
         linear(x, q_weight, q_bias, backend=backend),
         linear(x, k_weight, k_bias, backend=backend),
         linear(x, v_weight, v_bias, backend=backend),
+    )
+
+
+def pack_qkv_weights(
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor | None,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor | None,
+    v_weight: torch.Tensor,
+    v_bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, int, int, int]:
+    if has_native_op("pack_qkv_weights"):
+        module = native_module()
+        if module is not None and hasattr(module, "pack_qkv_weights_forward"):
+            packed_weight, packed_bias, q_size, k_size, v_size = module.pack_qkv_weights_forward(
+                q_weight,
+                q_bias,
+                k_weight,
+                k_bias,
+                v_weight,
+                v_bias,
+            )
+            return packed_weight, packed_bias, int(q_size), int(k_size), int(v_size)
+    packed_weight = torch.cat([q_weight, k_weight, v_weight], dim=0).contiguous()
+    packed_bias = None
+    if q_bias is not None or k_bias is not None or v_bias is not None:
+        bias_parts: list[torch.Tensor] = []
+        target_device = packed_weight.device
+        target_dtype = packed_weight.dtype
+        for bias, width in ((q_bias, q_weight.shape[0]), (k_bias, k_weight.shape[0]), (v_bias, v_weight.shape[0])):
+            if bias is None:
+                bias_parts.append(torch.zeros(width, device=target_device, dtype=target_dtype))
+            else:
+                bias_parts.append(bias.to(device=target_device, dtype=target_dtype).contiguous())
+        packed_bias = torch.cat(bias_parts, dim=0).contiguous()
+    return packed_weight, packed_bias, int(q_weight.shape[0]), int(k_weight.shape[0]), int(v_weight.shape[0])
+
+
+def qkv_packed_heads_projection(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    packed_bias: torch.Tensor | None,
+    *,
+    q_size: int,
+    k_size: int,
+    v_size: int,
+    q_heads: int,
+    kv_heads: int,
+    backend: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if has_native_op("qkv_packed_heads_projection"):
+        module = native_module()
+        if module is not None and hasattr(module, "qkv_packed_heads_projection_forward"):
+            q, k, v = module.qkv_packed_heads_projection_forward(
+                x,
+                packed_weight,
+                packed_bias,
+                int(q_size),
+                int(k_size),
+                int(v_size),
+                int(q_heads),
+                int(kv_heads),
+                str(backend or "auto"),
+            )
+            return q, k, v
+    fused = linear(x, packed_weight, packed_bias, backend=backend)
+    return (
+        split_heads(fused[..., :q_size], q_heads),
+        split_heads(fused[..., q_size: q_size + k_size], kv_heads),
+        split_heads(fused[..., q_size + k_size: q_size + k_size + v_size], kv_heads),
     )
 
 

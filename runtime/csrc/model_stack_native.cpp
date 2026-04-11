@@ -113,8 +113,11 @@ std::map<std::string, bool> NativeOpMap() {
   return {
       {"embedding", true},
       {"linear", true},
+      {"pack_linear_weight", true},
       {"mlp", true},
       {"qkv_projection", true},
+      {"pack_qkv_weights", true},
+      {"qkv_packed_heads_projection", true},
       {"qkv_heads_projection", true},
       {"split_heads", true},
       {"merge_heads", true},
@@ -206,9 +209,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "embedding", "linear", "mlp", "qkv_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "embedding", "linear", "mlp", "qkv_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
+      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
       "attention_prefill", "sampling"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
@@ -254,6 +257,12 @@ bool HasOp(const std::string& name) {
   const auto it = ops.find(name);
   return it != ops.end() && it->second;
 }
+
+torch::Tensor SplitHeadsForward(
+    const torch::Tensor& x,
+    int64_t num_heads);
+
+torch::Tensor MergeHeadsForward(const torch::Tensor& x);
 
 torch::Tensor RmsNormForward(
     const torch::Tensor& x,
@@ -742,6 +751,90 @@ std::vector<torch::Tensor> QkvProjectionForward(
   };
 }
 
+py::tuple PackLinearWeightForward(
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias) {
+  TORCH_CHECK(weight.defined(), "pack_linear_weight_forward: weight must be defined");
+  TORCH_CHECK(weight.dim() == 2, "pack_linear_weight_forward: weight must be rank-2");
+  py::object packed_bias = py::none();
+  if (bias.has_value() && bias.value().defined()) {
+    TORCH_CHECK(bias.value().dim() == 1, "pack_linear_weight_forward: bias must be rank-1");
+    TORCH_CHECK(bias.value().size(0) == weight.size(0), "pack_linear_weight_forward: bias size mismatch");
+    packed_bias = py::cast(bias.value().contiguous());
+  }
+  return py::make_tuple(weight.contiguous(), packed_bias);
+}
+
+py::tuple PackQkvWeightsForward(
+    const torch::Tensor& q_weight,
+    const c10::optional<torch::Tensor>& q_bias,
+    const torch::Tensor& k_weight,
+    const c10::optional<torch::Tensor>& k_bias,
+    const torch::Tensor& v_weight,
+    const c10::optional<torch::Tensor>& v_bias) {
+  TORCH_CHECK(q_weight.defined() && k_weight.defined() && v_weight.defined(),
+              "pack_qkv_weights_forward: q/k/v weights must be defined");
+  TORCH_CHECK(q_weight.dim() == 2 && k_weight.dim() == 2 && v_weight.dim() == 2,
+              "pack_qkv_weights_forward: q/k/v weights must be rank-2");
+  TORCH_CHECK(q_weight.size(1) == k_weight.size(1) && q_weight.size(1) == v_weight.size(1),
+              "pack_qkv_weights_forward: q/k/v input feature size mismatch");
+  auto fused_weight = torch::cat({q_weight, k_weight, v_weight}, 0).contiguous();
+  py::object fused_bias = py::none();
+  if ((q_bias.has_value() && q_bias.value().defined()) ||
+      (k_bias.has_value() && k_bias.value().defined()) ||
+      (v_bias.has_value() && v_bias.value().defined())) {
+    auto bias_options = fused_weight.options();
+    auto make_bias = [&](const c10::optional<torch::Tensor>& maybe_bias, int64_t size) {
+      if (maybe_bias.has_value() && maybe_bias.value().defined()) {
+        TORCH_CHECK(maybe_bias.value().dim() == 1, "pack_qkv_weights_forward: bias must be rank-1");
+        TORCH_CHECK(maybe_bias.value().size(0) == size, "pack_qkv_weights_forward: bias size mismatch");
+        return maybe_bias.value().to(bias_options).contiguous();
+      }
+      return torch::zeros({size}, bias_options);
+    };
+    fused_bias = py::cast(torch::cat({
+        make_bias(q_bias, q_weight.size(0)),
+        make_bias(k_bias, k_weight.size(0)),
+        make_bias(v_bias, v_weight.size(0)),
+    }).contiguous());
+  }
+  return py::make_tuple(
+      fused_weight,
+      fused_bias,
+      q_weight.size(0),
+      k_weight.size(0),
+      v_weight.size(0));
+}
+
+std::vector<torch::Tensor> QkvPackedHeadsProjectionForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const c10::optional<torch::Tensor>& packed_bias,
+    int64_t q_size,
+    int64_t k_size,
+    int64_t v_size,
+    int64_t q_heads,
+    int64_t kv_heads,
+    const std::string& backend) {
+  TORCH_CHECK(packed_weight.defined(), "qkv_packed_heads_projection_forward: packed_weight must be defined");
+  TORCH_CHECK(packed_weight.dim() == 2, "qkv_packed_heads_projection_forward: packed_weight must be rank-2");
+  TORCH_CHECK(q_size > 0 && k_size > 0 && v_size > 0,
+              "qkv_packed_heads_projection_forward: q/k/v sizes must be positive");
+  TORCH_CHECK(packed_weight.size(0) == q_size + k_size + v_size,
+              "qkv_packed_heads_projection_forward: packed weight row count mismatch");
+  if (packed_bias.has_value() && packed_bias.value().defined()) {
+    TORCH_CHECK(packed_bias.value().dim() == 1, "qkv_packed_heads_projection_forward: packed_bias must be rank-1");
+    TORCH_CHECK(packed_bias.value().size(0) == packed_weight.size(0),
+                "qkv_packed_heads_projection_forward: packed_bias size mismatch");
+  }
+  auto fused = LinearForward(x, packed_weight, packed_bias, backend);
+  return {
+      SplitHeadsForward(fused.slice(-1, 0, q_size), q_heads),
+      SplitHeadsForward(fused.slice(-1, q_size, q_size + k_size), kv_heads),
+      SplitHeadsForward(fused.slice(-1, q_size + k_size, q_size + k_size + v_size), kv_heads),
+  };
+}
+
 torch::Tensor EmbeddingForward(
     const torch::Tensor& weight,
     const torch::Tensor& indices,
@@ -834,12 +927,19 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("penalty"));
   m.def("linear_forward", &LinearForward, py::arg("x"), py::arg("weight"), py::arg("bias") = py::none(),
         py::arg("backend") = "auto");
+  m.def("pack_linear_weight_forward", &PackLinearWeightForward, py::arg("weight"), py::arg("bias") = py::none());
   m.def("mlp_forward", &MlpForward, py::arg("x"), py::arg("w_in_weight"), py::arg("w_in_bias") = py::none(),
         py::arg("w_out_weight"), py::arg("w_out_bias") = py::none(), py::arg("activation") = "gelu",
         py::arg("gated") = false, py::arg("backend") = "auto");
+  m.def("pack_qkv_weights_forward", &PackQkvWeightsForward, py::arg("q_weight"),
+        py::arg("q_bias") = py::none(), py::arg("k_weight"), py::arg("k_bias") = py::none(),
+        py::arg("v_weight"), py::arg("v_bias") = py::none());
   m.def("qkv_projection_forward", &QkvProjectionForward, py::arg("x"), py::arg("q_weight"),
         py::arg("q_bias") = py::none(), py::arg("k_weight"), py::arg("k_bias") = py::none(),
         py::arg("v_weight"), py::arg("v_bias") = py::none(), py::arg("backend") = "auto");
+  m.def("qkv_packed_heads_projection_forward", &QkvPackedHeadsProjectionForward, py::arg("x"),
+        py::arg("packed_weight"), py::arg("packed_bias") = py::none(), py::arg("q_size"), py::arg("k_size"),
+        py::arg("v_size"), py::arg("q_heads"), py::arg("kv_heads"), py::arg("backend") = "auto");
   m.def("qkv_heads_projection_forward", &QkvHeadsProjectionForward, py::arg("x"), py::arg("q_weight"),
         py::arg("q_bias") = py::none(), py::arg("k_weight"), py::arg("k_bias") = py::none(),
         py::arg("v_weight"), py::arg("v_bias") = py::none(), py::arg("q_heads"), py::arg("kv_heads"),

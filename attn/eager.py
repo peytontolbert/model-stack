@@ -6,9 +6,13 @@ import torch.nn as nn
 from runtime.ops import (
     head_output_projection as runtime_head_output_projection,
     linear as runtime_linear,
+    pack_linear_weight as runtime_pack_linear_weight,
+    pack_qkv_weights as runtime_pack_qkv_weights,
+    qkv_packed_heads_projection as runtime_qkv_packed_heads_projection,
     qkv_heads_projection as runtime_qkv_heads_projection,
     split_heads as runtime_split_heads,
 )
+from runtime.native import resolve_linear_backend
 from specs.config import ModelConfig
 from .interfaces import Attention, KVCache
 from .backends import scaled_dot_product_attention, select_attention_backend
@@ -67,6 +71,69 @@ class EagerAttention(nn.Module):
 
         self.register_buffer("_rope_cos", torch.tensor([]), persistent=False)
         self.register_buffer("_rope_sin", torch.tensor([]), persistent=False)
+        self._packed_qkv_signature = None
+        self._packed_qkv_weight = None
+        self._packed_qkv_bias = None
+        self._packed_q_sizes = None
+        self._packed_o_signature = None
+        self._packed_o_weight = None
+        self._packed_o_bias = None
+
+    @staticmethod
+    def _tensor_signature(t: torch.Tensor | None):
+        if t is None:
+            return None
+        return (
+            str(t.device),
+            str(t.dtype),
+            tuple(t.shape),
+            int(getattr(t, "_version", 0)),
+            int(t.data_ptr()),
+        )
+
+    def _packed_backend(self, x: torch.Tensor) -> str | None:
+        if self.training or (not x.is_cuda):
+            return None
+        backend = resolve_linear_backend("auto")
+        return backend if backend == "cublaslt" else None
+
+    def _ensure_packed_qkv(self, backend: str):
+        signature = (
+            backend,
+            self._tensor_signature(self.w_q.weight),
+            self._tensor_signature(self.w_q.bias),
+            self._tensor_signature(self.w_k.weight),
+            self._tensor_signature(self.w_k.bias),
+            self._tensor_signature(self.w_v.weight),
+            self._tensor_signature(self.w_v.bias),
+        )
+        if signature != self._packed_qkv_signature:
+            packed_weight, packed_bias, q_size, k_size, v_size = runtime_pack_qkv_weights(
+                self.w_q.weight,
+                self.w_q.bias,
+                self.w_k.weight,
+                self.w_k.bias,
+                self.w_v.weight,
+                self.w_v.bias,
+            )
+            self._packed_qkv_signature = signature
+            self._packed_qkv_weight = packed_weight
+            self._packed_qkv_bias = packed_bias
+            self._packed_q_sizes = (q_size, k_size, v_size)
+        return self._packed_qkv_weight, self._packed_qkv_bias, self._packed_q_sizes
+
+    def _ensure_packed_output(self, backend: str):
+        signature = (
+            backend,
+            self._tensor_signature(self.w_o.weight),
+            self._tensor_signature(self.w_o.bias),
+        )
+        if signature != self._packed_o_signature:
+            packed_weight, packed_bias = runtime_pack_linear_weight(self.w_o.weight, self.w_o.bias)
+            self._packed_o_signature = signature
+            self._packed_o_weight = packed_weight
+            self._packed_o_bias = packed_bias
+        return self._packed_o_weight, self._packed_o_bias
 
     def _ensure_rope_cache(self, seq_len: int, device, dtype):
         if not self.use_rope:
@@ -103,19 +170,35 @@ class EagerAttention(nn.Module):
         x = q
         B, T, D = x.shape
         device, dtype = x.device, x.dtype
+        packed_backend = self._packed_backend(x)
 
         if k is None and v is None:
-            qh, kh_new, vh_new = runtime_qkv_heads_projection(
-                x,
-                self.w_q.weight,
-                self.w_q.bias,
-                self.w_k.weight,
-                self.w_k.bias,
-                self.w_v.weight,
-                self.w_v.bias,
-                q_heads=self.n_heads,
-                kv_heads=self.n_kv_heads,
-            )
+            if packed_backend is not None:
+                packed_weight, packed_bias, packed_sizes = self._ensure_packed_qkv(packed_backend)
+                q_size, k_size, v_size = packed_sizes
+                qh, kh_new, vh_new = runtime_qkv_packed_heads_projection(
+                    x,
+                    packed_weight,
+                    packed_bias,
+                    q_size=q_size,
+                    k_size=k_size,
+                    v_size=v_size,
+                    q_heads=self.n_heads,
+                    kv_heads=self.n_kv_heads,
+                    backend=packed_backend,
+                )
+            else:
+                qh, kh_new, vh_new = runtime_qkv_heads_projection(
+                    x,
+                    self.w_q.weight,
+                    self.w_q.bias,
+                    self.w_k.weight,
+                    self.w_k.bias,
+                    self.w_v.weight,
+                    self.w_v.bias,
+                    q_heads=self.n_heads,
+                    kv_heads=self.n_kv_heads,
+                )
         else:
             q_lin = runtime_linear(x, self.w_q.weight, self.w_q.bias)
             k_lin = runtime_linear(x if k is None else k, self.w_k.weight, self.w_k.bias)
@@ -240,4 +323,7 @@ class EagerAttention(nn.Module):
         if cache is not None and T > 0:
             cache.append(kh_new, vh_new)
 
+        if packed_backend is not None:
+            packed_o_weight, packed_o_bias = self._ensure_packed_output(packed_backend)
+            return runtime_head_output_projection(out, packed_o_weight, packed_o_bias, backend=packed_backend)
         return runtime_head_output_projection(out, self.w_o.weight, self.w_o.bias)
