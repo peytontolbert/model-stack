@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from runtime.ops import rms_norm as runtime_rms_norm
 from .numerics import chunked_norm
 
 
@@ -10,13 +11,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # HF-compatible: accumulate in fp32
-        input_dtype = x.dtype
-        xf = x.float()
-        variance = xf.pow(2).mean(dim=-1, keepdim=True)
-        x_normalized = xf * torch.rsqrt(variance + self.eps)
-        y = x_normalized.to(dtype=input_dtype)
-        return y * self.weight.to(dtype=input_dtype, device=x.device)
+        return runtime_rms_norm(x, weight=self.weight, eps=self.eps)
 
 
 class ScaleNorm(nn.Module):
@@ -117,13 +112,7 @@ def masked_rmsnorm(
 
 def rmsnorm(x: torch.Tensor, weight: torch.Tensor | None = None, eps: float = 1e-6, dim: int = -1) -> torch.Tensor:
     """Functional RMSNorm with axis support and fp32 accumulation."""
-    dims = _to_tuple_dims(dim, x.ndim)
-    mean_sq = (x.float() * x.float()).mean(dim=dims, keepdim=True)
-    y = x * torch.rsqrt(mean_sq + eps)
-    if weight is not None:
-        w = _reshape_param_for_dims(weight, x, dims)
-        y = y * w
-    return y.to(dtype=x.dtype)
+    return runtime_rms_norm(x, weight=weight, eps=eps, dim=dim)
 
 
 def layer_norm(
@@ -351,4 +340,3 @@ def online_rms(x: torch.Tensor, state: dict | None = None, eps: float = 1e-6) ->
     rms = xf / torch.sqrt(var / count.clamp_min(1.0) + eps)
     new_state = {"mean": mean.to(dtype=x.dtype), "var": var.to(dtype=x.dtype), "count": count.to(dtype=x.dtype)}
     return rms.to(dtype=x.dtype), new_state
-

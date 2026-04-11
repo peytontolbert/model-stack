@@ -92,6 +92,7 @@ SCOPE_RULES = [
     ScopeRule("tensor/tests/**", "python_reference", 29),
     ScopeRule("blocks/examples/**", "python_reference", 1),
     ScopeRule("example.py", "python_reference", 1),
+    ScopeRule("setup.py", "python_reference", 1),
     ScopeRule("tools/**", "python_reference", 1),
     ScopeRule("examples/00_tiny_lm/**", "python_reference", 1),
     ScopeRule("examples/01_sft_dialog/**", "python_reference", 1),

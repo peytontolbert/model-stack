@@ -6,7 +6,9 @@
 *.pth
 *.pt
 *.safetensors
+*.so
 __pycache__/
+build/
 experiments/
 checkpoints/
 cloned-repos/

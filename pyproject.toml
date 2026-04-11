@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68", "wheel", "pybind11>=2.11"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -22,5 +22,4 @@ include-package-data = true
 [tool.setuptools.packages.find]
 include = ["*"]
 exclude = ["*.tests*", "tests*", "docs*", "scripts*/**", "examples/**/datasets/**", "examples/**/artifacts/**"]
-
 

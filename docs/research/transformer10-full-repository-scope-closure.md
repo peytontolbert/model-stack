@@ -11,11 +11,11 @@ This document makes the remaining tree explicit.
 
 ## 1. Why This Exists
 
-As of this pass, the repository contains 1513 non-`__init__` Python files.
+As of this pass, the repository contains 1517 non-`__init__` Python files.
 
-The earlier core migration ledger in `transformer10-module-target-state-matrix.md` explicitly covers 180 of them. Those 180 are the core product modules that define the actual model-stack.
+The earlier core migration ledger in `transformer10-module-target-state-matrix.md` explicitly covers 182 of them. Those 182 are the core product modules that define the actual model-stack, including the new `runtime/` Python extension boundary.
 
-The remaining 1333 files fall into four categories:
+The remaining 1335 files fall into four categories:
 
 - nested product-support subpackages that still need target classification
 - test/reference trees
@@ -77,6 +77,7 @@ These trees are real repository assets, but they are not authoritative execution
 | `tensor/tests/**` | 29 | `python_reference` | parity and regression suite, later mirrored by C++ tests | keep as validation assets during migration |
 | `blocks/examples/**` | 1 | `python_reference` | example-only | not part of the runtime product surface |
 | `example.py` | 1 | `python_reference` | example-only | root demo script |
+| `setup.py` | 1 | `python_reference` | local extension build entrypoint | repository packaging/build glue, not model-runtime product logic |
 | `tools/**` | 1 | `python_reference` | repository-maintenance tooling | verification and repo-health scripts are support tooling, not runtime product code |
 | `examples/00_tiny_lm/**` through `examples/12_data_tokenize_shard/**` | 12 | `python_reference` | runnable examples over bindings | keep as smoke and usage examples |
 | `examples/debug_attention.py` | 1 | `python_reference` | debug example | parity/debug only |

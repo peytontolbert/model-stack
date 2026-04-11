@@ -251,6 +251,13 @@ Priority:
 |---|---|---|---|---|
 | `safety/guard.py` | `cpp_runtime` | `t10::serve::SafetyHook` | P2 | serving policy interface |
 
+## `runtime/`
+
+| Module | State | Target | Prio | Notes |
+|---|---|---|---|---|
+| `runtime/native.py` | `python_binding` | extension loader and capability probe over `_model_stack_native` | P0 | canonical Python entrypoint for runtime ABI detection |
+| `runtime/ops.py` | `python_binding` | extension-backed op dispatch surface | P0 | routes tensor ops to native kernels when enabled and preserves exact fallback behavior otherwise |
+
 ## `serve/`
 
 | Module | State | Target | Prio | Notes |
