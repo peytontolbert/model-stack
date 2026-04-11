@@ -115,6 +115,10 @@ std::map<std::string, bool> NativeOpMap() {
       {"linear", true},
       {"mlp", true},
       {"qkv_projection", true},
+      {"qkv_heads_projection", true},
+      {"split_heads", true},
+      {"merge_heads", true},
+      {"head_output_projection", true},
       {"rms_norm", true},
       {"add_rms_norm", true},
       {"layer_norm", true},
@@ -202,9 +206,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "mlp", "qkv_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
+      "embedding", "linear", "mlp", "qkv_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
       "attention_prefill", "sampling"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
@@ -749,6 +753,50 @@ torch::Tensor EmbeddingForward(
   return at::embedding(weight, indices.to(torch::kLong), padding_idx, false, false);
 }
 
+torch::Tensor SplitHeadsForward(
+    const torch::Tensor& x,
+    int64_t num_heads) {
+  TORCH_CHECK(x.defined(), "split_heads_forward: x must be defined");
+  TORCH_CHECK(x.dim() == 3, "split_heads_forward: x must have shape (B, T, D)");
+  TORCH_CHECK(num_heads > 0, "split_heads_forward: num_heads must be positive");
+  TORCH_CHECK(x.size(2) % num_heads == 0, "split_heads_forward: model dim must be divisible by num_heads");
+  const auto head_dim = x.size(2) / num_heads;
+  return x.contiguous().view({x.size(0), x.size(1), num_heads, head_dim}).permute({0, 2, 1, 3}).contiguous();
+}
+
+torch::Tensor MergeHeadsForward(const torch::Tensor& x) {
+  TORCH_CHECK(x.defined(), "merge_heads_forward: x must be defined");
+  TORCH_CHECK(x.dim() == 4, "merge_heads_forward: x must have shape (B, H, T, Dh)");
+  return x.permute({0, 2, 1, 3}).contiguous().view({x.size(0), x.size(2), x.size(1) * x.size(3)});
+}
+
+std::vector<torch::Tensor> QkvHeadsProjectionForward(
+    const torch::Tensor& x,
+    const torch::Tensor& q_weight,
+    const c10::optional<torch::Tensor>& q_bias,
+    const torch::Tensor& k_weight,
+    const c10::optional<torch::Tensor>& k_bias,
+    const torch::Tensor& v_weight,
+    const c10::optional<torch::Tensor>& v_bias,
+    int64_t q_heads,
+    int64_t kv_heads,
+    const std::string& backend) {
+  auto qkv = QkvProjectionForward(x, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, backend);
+  return {
+      SplitHeadsForward(qkv[0], q_heads),
+      SplitHeadsForward(qkv[1], kv_heads),
+      SplitHeadsForward(qkv[2], kv_heads),
+  };
+}
+
+torch::Tensor HeadOutputProjectionForward(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias,
+    const std::string& backend) {
+  return LinearForward(MergeHeadsForward(x), weight, bias, backend);
+}
+
 std::string ResolveLinearBackendPy(const std::string& requested) {
   return ResolveLinearBackend(requested);
 }
@@ -792,6 +840,14 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("qkv_projection_forward", &QkvProjectionForward, py::arg("x"), py::arg("q_weight"),
         py::arg("q_bias") = py::none(), py::arg("k_weight"), py::arg("k_bias") = py::none(),
         py::arg("v_weight"), py::arg("v_bias") = py::none(), py::arg("backend") = "auto");
+  m.def("qkv_heads_projection_forward", &QkvHeadsProjectionForward, py::arg("x"), py::arg("q_weight"),
+        py::arg("q_bias") = py::none(), py::arg("k_weight"), py::arg("k_bias") = py::none(),
+        py::arg("v_weight"), py::arg("v_bias") = py::none(), py::arg("q_heads"), py::arg("kv_heads"),
+        py::arg("backend") = "auto");
+  m.def("split_heads_forward", &SplitHeadsForward, py::arg("x"), py::arg("num_heads"));
+  m.def("merge_heads_forward", &MergeHeadsForward, py::arg("x"));
+  m.def("head_output_projection_forward", &HeadOutputProjectionForward, py::arg("x"), py::arg("weight"),
+        py::arg("bias") = py::none(), py::arg("backend") = "auto");
   m.def("embedding_forward", &EmbeddingForward, py::arg("weight"), py::arg("indices"),
         py::arg("padding_idx") = -1);
 }

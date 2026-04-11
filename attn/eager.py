@@ -3,11 +3,15 @@ import os
 import torch
 import torch.nn as nn
 
-from runtime.ops import linear as runtime_linear, qkv_projection as runtime_qkv_projection
+from runtime.ops import (
+    head_output_projection as runtime_head_output_projection,
+    linear as runtime_linear,
+    qkv_heads_projection as runtime_qkv_heads_projection,
+    split_heads as runtime_split_heads,
+)
 from specs.config import ModelConfig
 from .interfaces import Attention, KVCache
 from .backends import scaled_dot_product_attention, select_attention_backend
-from tensor.shape import split_heads, merge_heads
 from tensor.masking import to_additive_mask
 from tensor.positional import build_rope_cache, apply_rotary
 
@@ -101,7 +105,7 @@ class EagerAttention(nn.Module):
         device, dtype = x.device, x.dtype
 
         if k is None and v is None:
-            q_lin, k_lin, v_lin = runtime_qkv_projection(
+            qh, kh_new, vh_new = runtime_qkv_heads_projection(
                 x,
                 self.w_q.weight,
                 self.w_q.bias,
@@ -109,15 +113,16 @@ class EagerAttention(nn.Module):
                 self.w_k.bias,
                 self.w_v.weight,
                 self.w_v.bias,
+                q_heads=self.n_heads,
+                kv_heads=self.n_kv_heads,
             )
         else:
             q_lin = runtime_linear(x, self.w_q.weight, self.w_q.bias)
             k_lin = runtime_linear(x if k is None else k, self.w_k.weight, self.w_k.bias)
             v_lin = runtime_linear(x if v is None else v, self.w_v.weight, self.w_v.bias)
-
-        qh = split_heads(q_lin, self.n_heads)          # (B, H, T, Dh)
-        kh_new = split_heads(k_lin, self.n_kv_heads)   # (B, Hk, T, Dh)
-        vh_new = split_heads(v_lin, self.n_kv_heads)   # (B, Hk, T, Dh)
+            qh = runtime_split_heads(q_lin, self.n_heads)          # (B, H, T, Dh)
+            kh_new = runtime_split_heads(k_lin, self.n_kv_heads)   # (B, Hk, T, Dh)
+            vh_new = runtime_split_heads(v_lin, self.n_kv_heads)   # (B, Hk, T, Dh)
 
         # Apply RoPE using provided embeddings or internal cache
         if self.use_rope:
@@ -196,7 +201,6 @@ class EagerAttention(nn.Module):
             if self.training and self.attn_dropout_p > 0.0:
                 attn_probs = torch.nn.functional.dropout(attn_probs, p=self.attn_dropout_p)
             out = torch.matmul(attn_probs, vh_attn)
-            y = merge_heads(out)
         else:
             # Choose backend; avoid double causal when explicit mask is provided
             is_causal_flag = add is None
@@ -231,10 +235,9 @@ class EagerAttention(nn.Module):
                     print("[attn] exception in SDPA/backend call")
                     traceback.print_exc()
                 raise
-            y = merge_heads(out)
 
         # Append newly produced KV to cache (stored with Hk heads)
         if cache is not None and T > 0:
             cache.append(kh_new, vh_new)
 
-        return runtime_linear(y, self.w_o.weight, self.w_o.bias)
+        return runtime_head_output_projection(out, self.w_o.weight, self.w_o.bias)

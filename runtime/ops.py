@@ -344,6 +344,34 @@ def linear(
     return F.linear(x, weight, bias)
 
 
+def split_heads(
+    x: torch.Tensor,
+    num_heads: int,
+) -> torch.Tensor:
+    if has_native_op("split_heads"):
+        module = native_module()
+        if module is not None and hasattr(module, "split_heads_forward"):
+            return module.split_heads_forward(x, int(num_heads))
+    if x.ndim != 3:
+        raise ValueError("split_heads expects x with shape (B, T, D)")
+    bsz, seq, width = x.shape
+    if width % int(num_heads) != 0:
+        raise ValueError(f"Model dim {width} not divisible by heads {num_heads}")
+    head_dim = width // int(num_heads)
+    return x.view(bsz, seq, int(num_heads), head_dim).permute(0, 2, 1, 3).contiguous()
+
+
+def merge_heads(x: torch.Tensor) -> torch.Tensor:
+    if has_native_op("merge_heads"):
+        module = native_module()
+        if module is not None and hasattr(module, "merge_heads_forward"):
+            return module.merge_heads_forward(x)
+    if x.ndim != 4:
+        raise ValueError("merge_heads expects x with shape (B, H, T, Dh)")
+    bsz, heads, seq, head_dim = x.shape
+    return x.permute(0, 2, 1, 3).contiguous().view(bsz, seq, heads * head_dim)
+
+
 def qkv_projection(
     x: torch.Tensor,
     q_weight: torch.Tensor,
@@ -374,6 +402,66 @@ def qkv_projection(
         linear(x, k_weight, k_bias, backend=backend),
         linear(x, v_weight, v_bias, backend=backend),
     )
+
+
+def qkv_heads_projection(
+    x: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor | None,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor | None,
+    v_weight: torch.Tensor,
+    v_bias: torch.Tensor | None,
+    *,
+    q_heads: int,
+    kv_heads: int,
+    backend: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if has_native_op("qkv_heads_projection"):
+        module = native_module()
+        if module is not None and hasattr(module, "qkv_heads_projection_forward"):
+            q, k, v = module.qkv_heads_projection_forward(
+                x,
+                q_weight,
+                q_bias,
+                k_weight,
+                k_bias,
+                v_weight,
+                v_bias,
+                int(q_heads),
+                int(kv_heads),
+                str(backend or "auto"),
+            )
+            return q, k, v
+    q, k, v = qkv_projection(
+        x,
+        q_weight,
+        q_bias,
+        k_weight,
+        k_bias,
+        v_weight,
+        v_bias,
+        backend=backend,
+    )
+    return (
+        split_heads(q, q_heads),
+        split_heads(k, kv_heads),
+        split_heads(v, kv_heads),
+    )
+
+
+def head_output_projection(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    backend: str | None = None,
+) -> torch.Tensor:
+    if has_native_op("head_output_projection"):
+        module = native_module()
+        if module is not None and hasattr(module, "head_output_projection_forward"):
+            return module.head_output_projection_forward(x, weight, bias, str(backend or "auto"))
+    return linear(merge_heads(x), weight, bias, backend=backend)
 
 
 def mlp(
