@@ -8,6 +8,7 @@ from runtime.ops import (
     linear as runtime_linear,
     pack_linear_weight as runtime_pack_linear_weight,
     pack_qkv_weights as runtime_pack_qkv_weights,
+    prepare_attention_mask as runtime_prepare_attention_mask,
     qkv_packed_heads_projection as runtime_qkv_packed_heads_projection,
     qkv_heads_projection as runtime_qkv_heads_projection,
     split_heads as runtime_split_heads,
@@ -16,7 +17,6 @@ from runtime.native import resolve_linear_backend
 from specs.config import ModelConfig
 from .interfaces import Attention, KVCache
 from .backends import scaled_dot_product_attention, select_attention_backend
-from tensor.masking import to_additive_mask
 from tensor.positional import build_rope_cache, apply_rotary
 
 
@@ -254,30 +254,14 @@ class EagerAttention(nn.Module):
 
         # Use explicit matmul + float32 softmax (HF-eager parity) if enabled; else route to SDPA
         S = kh_all.shape[2]
-        add = None
-        if mask is not None:
-            add = to_additive_mask(mask) if mask.dtype == torch.bool else mask
-            if add.shape[-1] != S:
-                add = add[..., :S]
-            # Ensure mask shape is (B,H,T,S) and dtype matches query dtype
-            if add.ndim == 4 and add.shape[1] == 1:
-                add = add.expand(B, self.n_heads, T, S)
-            # Keep additive mask in float32 for numerical stability (bf16 can underflow -inf)
-            # SDPA accepts float masks; avoid downcasting to attention dtype
-            import torch as _torch
-            add = add.to(dtype=_torch.float32)
-            # Guarantee self (diagonal) is unmasked to avoid fully-masked rows (HF parity)
-            if position_ids is not None:
-                try:
-                    pos = position_ids
-                    if pos.dim() == 2:
-                        # (B,T)
-                        pos_idx = pos.clamp_min(0).clamp_max(S - 1)
-                        zeros = torch.zeros(B, self.n_heads, T, 1, dtype=add.dtype, device=add.device)
-                        idx = pos_idx.view(B, 1, T, 1).expand(B, self.n_heads, T, 1)
-                        add = add.scatter(dim=3, index=idx, src=zeros)
-                except Exception:
-                    pass
+        add = runtime_prepare_attention_mask(
+            mask,
+            batch_size=B,
+            num_heads=self.n_heads,
+            tgt_len=T,
+            src_len=S,
+            position_ids=position_ids,
+        )
         parity_exact = os.environ.get("ATTN_PARITY_EXACT", "0") == "1"
         if parity_exact:
             kh_attn, vh_attn = _expanded_kv_heads()

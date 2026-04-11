@@ -248,6 +248,58 @@ def attention(
     return torch.matmul(probs, v_all)
 
 
+def prepare_attention_mask(
+    mask: torch.Tensor | None,
+    *,
+    batch_size: int,
+    num_heads: int,
+    tgt_len: int,
+    src_len: int,
+    position_ids: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    if mask is None:
+        return None
+    if has_native_op("prepare_attention_mask"):
+        module = native_module()
+        if module is not None and hasattr(module, "prepare_attention_mask_forward"):
+            return module.prepare_attention_mask_forward(
+                mask,
+                int(batch_size),
+                int(num_heads),
+                int(tgt_len),
+                int(src_len),
+                position_ids,
+            )
+
+    prepared = mask
+    if prepared.dtype == torch.bool:
+        prepared = torch.where(
+            prepared,
+            torch.full_like(prepared, float("-inf"), dtype=torch.float32),
+            torch.zeros_like(prepared, dtype=torch.float32),
+        )
+    else:
+        prepared = prepared.to(dtype=torch.float32)
+    if prepared.shape[-1] != src_len:
+        prepared = prepared[..., :src_len]
+    if prepared.ndim == 4 and prepared.shape[1] == 1:
+        prepared = prepared.expand(int(batch_size), int(num_heads), int(tgt_len), int(src_len))
+    if position_ids is not None:
+        try:
+            if position_ids.dim() == 2:
+                pos_idx = position_ids.clamp_min(0).clamp_max(max(int(src_len) - 1, 0))
+                zeros = torch.zeros(
+                    int(batch_size), int(num_heads), int(tgt_len), 1,
+                    dtype=prepared.dtype,
+                    device=prepared.device,
+                )
+                idx = pos_idx.view(int(batch_size), 1, int(tgt_len), 1).expand(int(batch_size), int(num_heads), int(tgt_len), 1)
+                prepared = prepared.scatter(dim=3, index=idx, src=zeros)
+        except Exception:
+            pass
+    return prepared
+
+
 def temperature(logits: torch.Tensor, tau: float) -> torch.Tensor:
     if has_native_op("sampling"):
         module = native_module()

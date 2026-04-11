@@ -122,6 +122,7 @@ std::map<std::string, bool> NativeOpMap() {
       {"split_heads", true},
       {"merge_heads", true},
       {"head_output_projection", true},
+      {"prepare_attention_mask", true},
       {"rms_norm", true},
       {"add_rms_norm", true},
       {"layer_norm", true},
@@ -209,9 +210,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
+      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
       "attention_prefill", "sampling"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
@@ -495,6 +496,51 @@ torch::Tensor KvCacheWriteForward(
 
   cache.slice(1, start, start + chunk.size(1)).copy_(chunk);
   return cache;
+}
+
+torch::Tensor PrepareAttentionMaskForward(
+    const torch::Tensor& mask,
+    int64_t batch_size,
+    int64_t num_heads,
+    int64_t tgt_len,
+    int64_t src_len,
+    const c10::optional<torch::Tensor>& position_ids) {
+  TORCH_CHECK(mask.defined(), "prepare_attention_mask_forward: mask must be defined");
+  TORCH_CHECK(batch_size > 0 && num_heads > 0 && tgt_len >= 0 && src_len >= 0,
+              "prepare_attention_mask_forward: invalid target dimensions");
+  TORCH_CHECK(mask.dim() >= 2 && mask.dim() <= 4, "prepare_attention_mask_forward: mask rank must be between 2 and 4");
+
+  torch::Tensor prepared;
+  if (mask.scalar_type() == torch::kBool) {
+    auto masked = torch::full(mask.sizes(), -std::numeric_limits<float>::infinity(),
+                              torch::TensorOptions().dtype(torch::kFloat32).device(mask.device()));
+    auto zeros = torch::zeros(mask.sizes(), torch::TensorOptions().dtype(torch::kFloat32).device(mask.device()));
+    prepared = torch::where(mask, masked, zeros);
+  } else {
+    prepared = mask.to(torch::kFloat32);
+  }
+
+  if (prepared.size(-1) != src_len) {
+    TORCH_CHECK(prepared.size(-1) >= src_len, "prepare_attention_mask_forward: source length exceeds mask width");
+    prepared = prepared.slice(-1, 0, src_len);
+  }
+
+  if (prepared.dim() == 4 && prepared.size(1) == 1) {
+    prepared = prepared.expand({batch_size, num_heads, tgt_len, src_len});
+  }
+
+  if (position_ids.has_value() && position_ids.value().defined()) {
+    auto pos = position_ids.value();
+    if (pos.dim() == 2) {
+      auto pos_idx = pos.clamp_min(0).clamp_max(src_len > 0 ? src_len - 1 : 0);
+      auto zeros = torch::zeros({batch_size, num_heads, tgt_len, 1},
+                                torch::TensorOptions().dtype(prepared.scalar_type()).device(prepared.device()));
+      auto idx = pos_idx.view({batch_size, 1, tgt_len, 1}).expand({batch_size, num_heads, tgt_len, 1});
+      prepared = prepared.scatter(3, idx, zeros);
+    }
+  }
+
+  return prepared;
 }
 
 torch::Tensor NativeAttentionForward(
@@ -915,6 +961,8 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("kv_cache_append_forward", &KvCacheAppendForward, py::arg("k_cache") = py::none(),
         py::arg("v_cache") = py::none(), py::arg("k_new"), py::arg("v_new"));
   m.def("kv_cache_write_forward", &KvCacheWriteForward, py::arg("cache"), py::arg("chunk"), py::arg("start"));
+  m.def("prepare_attention_mask_forward", &PrepareAttentionMaskForward, py::arg("mask"), py::arg("batch_size"),
+        py::arg("num_heads"), py::arg("tgt_len"), py::arg("src_len"), py::arg("position_ids") = py::none());
   m.def("attention_forward", &NativeAttentionForward, py::arg("q"), py::arg("k"), py::arg("v"),
         py::arg("attn_mask") = py::none(), py::arg("is_causal") = false, py::arg("scale") = py::none());
   m.def("temperature_forward", &TemperatureForward, py::arg("logits"), py::arg("tau"));
