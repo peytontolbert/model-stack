@@ -1,9 +1,16 @@
 import torch
 import torch.nn.functional as F
+from runtime.ops import (
+    presence_frequency_penalty as runtime_presence_frequency_penalty,
+    sample_next_token as runtime_sample_next_token,
+    temperature as runtime_temperature,
+    topk_mask as runtime_topk_mask,
+    topp_mask as runtime_topp_mask,
+)
 
 
 def apply_temperature(logits: torch.Tensor, tau: float) -> torch.Tensor:
-    return logits / max(tau, 1e-8)
+    return runtime_temperature(logits, tau)
 
 
 def apply_repetition_penalty(logits: torch.Tensor, freq_counts: torch.Tensor, presence_counts: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
@@ -73,13 +80,17 @@ def apply_min_tokens_to_keep_mask(logits: torch.Tensor, k_min: int, dim: int = -
 
 
 def apply_topk_mask(logits: torch.Tensor, k: int, dim: int = -1) -> torch.Tensor:
-    from tensor.numerics import mask_topk
-    return mask_topk(logits, k=k, dim=dim)
+    if dim != -1:
+        from tensor.numerics import mask_topk
+        return mask_topk(logits, k=k, dim=dim)
+    return runtime_topk_mask(logits, k)
 
 
 def apply_topp_mask(logits: torch.Tensor, p: float, dim: int = -1) -> torch.Tensor:
-    from tensor.numerics import mask_topp
-    return mask_topp(logits, p=p, dim=dim)
+    if dim != -1:
+        from tensor.numerics import mask_topp
+        return mask_topp(logits, p=p, dim=dim)
+    return runtime_topp_mask(logits, p)
 
 
 def build_regex_constraint_mask(prefix_ids: torch.Tensor, dfa_state, vocab_size: int) -> torch.Tensor:
@@ -106,10 +117,16 @@ def apply_no_repeat_ngram_mask(logits: torch.Tensor, input_ids: torch.Tensor, n:
 
 
 def apply_presence_frequency_penalty(logits: torch.Tensor, counts: torch.Tensor, alpha_presence: float, alpha_frequency: float) -> torch.Tensor:
-    penalty = alpha_presence * (counts > 0).to(logits.dtype) + alpha_frequency * counts.to(logits.dtype)
-    while penalty.ndim < logits.ndim:
-        penalty = penalty.unsqueeze(-1)
-    return logits - penalty
+    if logits.ndim != counts.ndim:
+        penalty = alpha_presence * (counts > 0).to(logits.dtype) + alpha_frequency * counts.to(logits.dtype)
+        while penalty.ndim < logits.ndim:
+            penalty = penalty.unsqueeze(-1)
+        return logits - penalty
+    return runtime_presence_frequency_penalty(logits, counts, alpha_presence, alpha_frequency)
+
+
+def sample_next_token(logits: torch.Tensor, do_sample: bool) -> torch.Tensor:
+    return runtime_sample_next_token(logits, do_sample)
 
 
 # Tail Free Sampling (TFS) and eta sampling
@@ -222,5 +239,4 @@ def gumbel_softmax(logits: torch.Tensor, tau: float, hard: bool = False, dim: in
         y_hard = torch.zeros_like(y).scatter(dim, idx, 1.0)
         y = (y_hard - y).detach() + y
     return y
-
 

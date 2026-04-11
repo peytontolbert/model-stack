@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from typing import Optional, Callable
 
 import torch
-import torch.nn.functional as F
 
 from tensor.sampling import (
     apply_temperature,
@@ -10,6 +9,7 @@ from tensor.sampling import (
     apply_topp_mask,
     apply_presence_frequency_penalty,
     apply_no_repeat_ngram_mask,
+    sample_next_token,
 )
 from attn.kv_cache import init_kv_cache, kv_cache_evict
 
@@ -138,11 +138,7 @@ def generate(
             if next_id.ndim == 1:
                 next_id = next_id.unsqueeze(-1)
         else:
-            if getattr(cfg, "do_sample", False):
-                probs = F.softmax(sampled_logits.float(), dim=-1)
-                next_id = torch.multinomial(probs, num_samples=1)
-            else:
-                next_id = torch.argmax(sampled_logits, dim=-1, keepdim=True)
+            next_id = sample_next_token(sampled_logits, getattr(cfg, "do_sample", False))
         if trace:
             try:
                 print(f"[engine] step={step} seq_len={seq.shape[1]} logits_dtype={next_logits.dtype} next_id={int(next_id[0,0].item())}")
@@ -163,5 +159,3 @@ def generate(
             if (next_id == int(cfg.eos_id)).all():
                 break
     return seq
-
-

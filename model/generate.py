@@ -1,7 +1,6 @@
 import torch
-import torch.nn.functional as F
 
-from tensor.sampling import apply_temperature, apply_topk_mask, apply_topp_mask
+from tensor.sampling import apply_temperature, apply_topk_mask, apply_topp_mask, sample_next_token
 
 
 @torch.no_grad()
@@ -45,12 +44,10 @@ def sample_generate(
         if mask is not None:
             min_val = torch.finfo(logits.dtype).min if logits.dtype.is_floating_point else -1e9
             logits = logits.masked_fill(mask, min_val)
-        probs = F.softmax(logits.float(), dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
+        next_token = sample_next_token(logits, True)
         seq = torch.cat([seq, next_token], dim=1)
         if eos_id is not None:
             if (next_token == eos_id).all():
                 break
     return seq
-
 

@@ -142,3 +142,64 @@ def attention(
         scores = scores.masked_fill(causal.view(1, 1, q.shape[2], k.shape[2]), float("-inf"))
     probs = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
     return torch.matmul(probs, v)
+
+
+def temperature(logits: torch.Tensor, tau: float) -> torch.Tensor:
+    if has_native_op("sampling"):
+        module = native_module()
+        if module is not None and hasattr(module, "temperature_forward"):
+            return module.temperature_forward(logits, float(tau))
+    return logits / max(float(tau), 1e-8)
+
+
+def topk_mask(logits: torch.Tensor, k: int) -> torch.Tensor:
+    if has_native_op("sampling"):
+        module = native_module()
+        if module is not None and hasattr(module, "topk_mask_forward"):
+            return module.topk_mask_forward(logits, int(k))
+    values = torch.topk(logits, k=int(k), dim=-1).values
+    kth = values[..., -1:].contiguous()
+    mask = logits < kth
+    equals = logits == kth
+    return mask & (~equals)
+
+
+def topp_mask(logits: torch.Tensor, p: float) -> torch.Tensor:
+    if has_native_op("sampling"):
+        module = native_module()
+        if module is not None and hasattr(module, "topp_mask_forward"):
+            return module.topp_mask_forward(logits, float(p))
+    probs = torch.softmax(logits.float(), dim=-1)
+    sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+    cum = torch.cumsum(sorted_probs, dim=-1)
+    cutoff = cum > float(p)
+    cutoff[..., 0] = False
+    mask = torch.zeros_like(cutoff, dtype=torch.bool)
+    return mask.scatter(-1, sorted_idx, cutoff)
+
+
+def presence_frequency_penalty(
+    logits: torch.Tensor,
+    counts: torch.Tensor,
+    alpha_presence: float,
+    alpha_frequency: float,
+) -> torch.Tensor:
+    if has_native_op("sampling"):
+        module = native_module()
+        if module is not None and hasattr(module, "presence_frequency_penalty_forward"):
+            return module.presence_frequency_penalty_forward(
+                logits, counts, float(alpha_presence), float(alpha_frequency)
+            )
+    penalty = alpha_presence * (counts > 0).to(logits.dtype) + alpha_frequency * counts.to(logits.dtype)
+    return logits - penalty
+
+
+def sample_next_token(logits: torch.Tensor, do_sample: bool) -> torch.Tensor:
+    if has_native_op("sampling"):
+        module = native_module()
+        if module is not None and hasattr(module, "sample_next_token_forward"):
+            return module.sample_next_token_forward(logits, bool(do_sample))
+    if do_sample:
+        probs = torch.softmax(logits.float(), dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+    return torch.argmax(logits, dim=-1, keepdim=True)

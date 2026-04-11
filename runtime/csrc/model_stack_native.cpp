@@ -19,7 +19,7 @@ std::map<std::string, bool> NativeOpMap() {
       {"kv_cache_append", true},
       {"attention_decode", true},
       {"attention_prefill", true},
-      {"sampling", false},
+      {"sampling", true},
   };
 }
 
@@ -32,7 +32,7 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "rms_norm", "rope", "kv_cache_append", "attention_decode", "attention_prefill"};
+      "rms_norm", "rope", "kv_cache_append", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
       "rms_norm", "rope", "kv_cache_append", "attention_decode",
       "attention_prefill", "sampling"};
@@ -184,6 +184,64 @@ torch::Tensor NativeAttentionForward(
   return torch::matmul(probs, v);
 }
 
+torch::Tensor TemperatureForward(const torch::Tensor& logits, double tau) {
+  TORCH_CHECK(logits.defined(), "temperature_forward: logits must be defined");
+  TORCH_CHECK(std::isfinite(tau), "temperature_forward: tau must be finite");
+  const auto denom = std::max(tau, 1e-8);
+  return logits / denom;
+}
+
+torch::Tensor TopkMaskForward(const torch::Tensor& logits, int64_t k) {
+  TORCH_CHECK(logits.defined(), "topk_mask_forward: logits must be defined");
+  TORCH_CHECK(logits.dim() >= 1, "topk_mask_forward: logits must have rank >= 1");
+  const auto vocab = logits.size(-1);
+  TORCH_CHECK(vocab > 0, "topk_mask_forward: logits last dimension must be non-empty");
+  TORCH_CHECK(k > 0, "topk_mask_forward: k must be positive");
+  const auto bounded_k = std::min<int64_t>(k, vocab);
+  auto topk = std::get<0>(torch::topk(logits, bounded_k, -1));
+  auto kth = topk.select(-1, bounded_k - 1).unsqueeze(-1);
+  auto mask = logits < kth;
+  auto equals = logits == kth;
+  return mask.logical_and(equals.logical_not());
+}
+
+torch::Tensor ToppMaskForward(const torch::Tensor& logits, double p) {
+  TORCH_CHECK(logits.defined(), "topp_mask_forward: logits must be defined");
+  TORCH_CHECK(logits.dim() >= 1, "topp_mask_forward: logits must have rank >= 1");
+  auto probs = torch::softmax(logits.to(torch::kFloat32), -1);
+  auto sorted = torch::sort(probs, -1, true);
+  auto sorted_probs = std::get<0>(sorted);
+  auto sorted_idx = std::get<1>(sorted);
+  auto cum = torch::cumsum(sorted_probs, -1);
+  auto cutoff = cum > p;
+  cutoff.select(-1, 0).fill_(false);
+  auto mask = torch::zeros_like(cutoff, cutoff.options().dtype(torch::kBool));
+  return mask.scatter(-1, sorted_idx, cutoff);
+}
+
+torch::Tensor PresenceFrequencyPenaltyForward(
+    const torch::Tensor& logits,
+    const torch::Tensor& counts,
+    double alpha_presence,
+    double alpha_frequency) {
+  TORCH_CHECK(logits.defined() && counts.defined(), "presence_frequency_penalty_forward: tensors must be defined");
+  TORCH_CHECK(logits.sizes() == counts.sizes(), "presence_frequency_penalty_forward: logits/counts shape mismatch");
+  auto penalty =
+      alpha_presence * counts.gt(0).to(logits.scalar_type()) +
+      alpha_frequency * counts.to(logits.scalar_type());
+  return logits - penalty;
+}
+
+torch::Tensor SampleNextTokenForward(const torch::Tensor& logits, bool do_sample) {
+  TORCH_CHECK(logits.defined(), "sample_next_token_forward: logits must be defined");
+  TORCH_CHECK(logits.dim() == 2, "sample_next_token_forward: logits must be rank-2 (B, V)");
+  if (do_sample) {
+    auto probs = torch::softmax(logits.to(torch::kFloat32), -1);
+    return torch::multinomial(probs, 1);
+  }
+  return std::get<1>(torch::max(logits, -1, true));
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_model_stack_native, m) {
@@ -198,4 +256,10 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("v_cache") = py::none(), py::arg("k_new"), py::arg("v_new"));
   m.def("attention_forward", &NativeAttentionForward, py::arg("q"), py::arg("k"), py::arg("v"),
         py::arg("attn_mask") = py::none(), py::arg("is_causal") = false, py::arg("scale") = py::none());
+  m.def("temperature_forward", &TemperatureForward, py::arg("logits"), py::arg("tau"));
+  m.def("topk_mask_forward", &TopkMaskForward, py::arg("logits"), py::arg("k"));
+  m.def("topp_mask_forward", &ToppMaskForward, py::arg("logits"), py::arg("p"));
+  m.def("presence_frequency_penalty_forward", &PresenceFrequencyPenaltyForward, py::arg("logits"),
+        py::arg("counts"), py::arg("alpha_presence"), py::arg("alpha_frequency"));
+  m.def("sample_next_token_forward", &SampleNextTokenForward, py::arg("logits"), py::arg("do_sample"));
 }
