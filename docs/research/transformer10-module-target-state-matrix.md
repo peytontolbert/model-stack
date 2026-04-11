@@ -67,6 +67,7 @@ Priority:
 | `blocks/llama_block.py` | `cpp_runtime` | `t10::blocks::LlamaBlock` | P0 | core causal LM block |
 | `blocks/local_attn_block.py` | `cpp_runtime` | `t10::blocks::LocalAttentionBlock` | P1 | local mask variant |
 | `blocks/moe_block.py` | `cpp_runtime` | `t10::blocks::MoEBlock` | P1 | MoE block and expert MLP |
+| `blocks/native_fusion.py` | `cpp_runtime` | `t10::blocks::fusion` | P0 | temporary Python bridge for fused residual-plus-RMSNorm path before block fusion fully moves into C++ |
 | `blocks/parallel_block.py` | `cpp_runtime` | `t10::blocks::ParallelTransformerBlock` | P1 | parallel residual topology |
 | `blocks/policies.py` | `cpp_runtime` | `t10::blocks::PolicySet` | P0 | norm/attn/MLP policy validation |
 | `blocks/prefix_lm_block.py` | `cpp_runtime` | `t10::blocks::PrefixLMBlock` | P1 | prefix-LM block variant |

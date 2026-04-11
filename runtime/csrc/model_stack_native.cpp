@@ -25,6 +25,13 @@ torch::Tensor CudaRmsNormForward(
     const c10::optional<torch::Tensor>& weight,
     double eps);
 bool HasCudaRmsNormKernel();
+std::vector<torch::Tensor> CudaAddRmsNormForward(
+    const torch::Tensor& x,
+    const torch::Tensor& update,
+    const c10::optional<torch::Tensor>& weight,
+    double residual_scale,
+    double eps);
+bool HasCudaAddRmsNormKernel();
 torch::Tensor CublasLtLinearForward(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -57,6 +64,9 @@ bool HasCudaAttentionKernel();
 bool HasCudaRmsNormKernel() {
   return false;
 }
+bool HasCudaAddRmsNormKernel() {
+  return false;
+}
 bool HasCublasLtLinearBackend() {
   return false;
 }
@@ -85,6 +95,7 @@ std::map<std::string, bool> NativeOpMap() {
       {"mlp", true},
       {"qkv_projection", true},
       {"rms_norm", true},
+      {"add_rms_norm", true},
       {"rope", true},
       {"kv_cache_append", true},
       {"kv_cache_write", true},
@@ -168,9 +179,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "add_rms_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
+      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "add_rms_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
       "attention_prefill", "sampling"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
@@ -181,6 +192,9 @@ py::dict RuntimeInfo() {
   std::vector<std::string> cuda_backend_ops;
   if (HasCudaRmsNormKernel()) {
     cuda_backend_ops.push_back("rms_norm");
+  }
+  if (HasCudaAddRmsNormKernel()) {
+    cuda_backend_ops.push_back("add_rms_norm");
   }
   if (HasCudaRopeKernel()) {
     cuda_backend_ops.push_back("rope");
@@ -243,6 +257,31 @@ torch::Tensor RmsNormForward(
   }
 
   return out;
+}
+
+std::vector<torch::Tensor> AddRmsNormForward(
+    const torch::Tensor& x,
+    const torch::Tensor& update,
+    const c10::optional<torch::Tensor>& weight,
+    double residual_scale,
+    double eps) {
+  TORCH_CHECK(x.defined() && update.defined(), "add_rms_norm_forward: x and update must be defined");
+  TORCH_CHECK(x.dim() >= 1 && update.dim() >= 1, "add_rms_norm_forward: x and update must have rank >= 1");
+  TORCH_CHECK(x.sizes() == update.sizes(), "add_rms_norm_forward: x and update shape mismatch");
+  TORCH_CHECK(x.scalar_type() == update.scalar_type(), "add_rms_norm_forward: x and update dtype mismatch");
+  TORCH_CHECK(x.device() == update.device(), "add_rms_norm_forward: x and update device mismatch");
+  TORCH_CHECK(std::isfinite(residual_scale), "add_rms_norm_forward: residual_scale must be finite");
+  TORCH_CHECK(std::isfinite(eps) && eps > 0.0, "add_rms_norm_forward: eps must be positive and finite");
+
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && update.is_cuda() && HasCudaAddRmsNormKernel()) {
+    return CudaAddRmsNormForward(x, update, weight, residual_scale, eps);
+  }
+#endif
+
+  auto combined = x + (update * residual_scale);
+  auto normalized = RmsNormForward(combined, weight, eps);
+  return {combined, normalized};
 }
 
 std::vector<torch::Tensor> ApplyRotaryForward(
@@ -613,6 +652,8 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("resolve_linear_backend", &ResolveLinearBackendPy, py::arg("requested") = "auto");
   m.def("rms_norm_forward", &RmsNormForward, py::arg("x"), py::arg("weight") = py::none(),
         py::arg("eps") = 1e-6);
+  m.def("add_rms_norm_forward", &AddRmsNormForward, py::arg("x"), py::arg("update"),
+        py::arg("weight") = py::none(), py::arg("residual_scale") = 1.0, py::arg("eps") = 1e-6);
   m.def("apply_rotary_forward", &ApplyRotaryForward, py::arg("q"), py::arg("k"), py::arg("cos"),
         py::arg("sin"));
   m.def("kv_cache_append_forward", &KvCacheAppendForward, py::arg("k_cache") = py::none(),

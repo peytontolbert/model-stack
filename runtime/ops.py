@@ -68,6 +68,29 @@ def rms_norm(
     return _rms_norm_reference(x, weight=weight, eps=eps, dim=dim)
 
 
+def add_rms_norm(
+    x: torch.Tensor,
+    update: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    *,
+    residual_scale: float = 1.0,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if has_native_op("add_rms_norm"):
+        module = native_module()
+        if module is not None and hasattr(module, "add_rms_norm_forward"):
+            combined, normalized = module.add_rms_norm_forward(
+                x,
+                update,
+                weight,
+                float(residual_scale),
+                float(eps),
+            )
+            return combined, normalized
+    combined = x + (update * float(residual_scale))
+    return combined, _rms_norm_reference(combined, weight=weight, eps=eps, dim=-1)
+
+
 def apply_rotary(
     q: torch.Tensor,
     k: torch.Tensor,
