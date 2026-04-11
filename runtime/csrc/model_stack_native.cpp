@@ -135,6 +135,7 @@ py::dict RuntimeInfo() {
   }
   if (HasCublasLtLinearBackend()) {
     cuda_backend_ops.push_back("linear");
+    cuda_backend_ops.push_back("qkv_projection");
   }
   info["cuda_backend_ops"] = cuda_backend_ops;
   return info;
@@ -440,6 +441,40 @@ std::vector<torch::Tensor> QkvProjectionForward(
     const c10::optional<torch::Tensor>& v_bias,
     const std::string& backend) {
   const auto resolved_backend = ResolveLinearBackend(backend);
+#if MODEL_STACK_WITH_CUDA
+  if (resolved_backend == "cublaslt" && x.is_cuda()) {
+    TORCH_CHECK(
+        q_weight.size(1) == k_weight.size(1) && q_weight.size(1) == v_weight.size(1),
+        "qkv_projection_forward: q/k/v input feature size mismatch");
+    auto fused_weight = torch::cat({q_weight, k_weight, v_weight}, 0);
+    c10::optional<torch::Tensor> fused_bias = c10::nullopt;
+    if ((q_bias.has_value() && q_bias.value().defined()) ||
+        (k_bias.has_value() && k_bias.value().defined()) ||
+        (v_bias.has_value() && v_bias.value().defined())) {
+      auto bias_options = fused_weight.options().device(x.device()).dtype(x.scalar_type());
+      auto make_bias = [&](const c10::optional<torch::Tensor>& maybe_bias, int64_t size) {
+        if (maybe_bias.has_value() && maybe_bias.value().defined()) {
+          return maybe_bias.value().to(bias_options);
+        }
+        return torch::zeros({size}, bias_options);
+      };
+      fused_bias = torch::cat({
+          make_bias(q_bias, q_weight.size(0)),
+          make_bias(k_bias, k_weight.size(0)),
+          make_bias(v_bias, v_weight.size(0)),
+      });
+    }
+    auto fused = LinearForward(x, fused_weight, fused_bias, resolved_backend);
+    auto q_size = q_weight.size(0);
+    auto k_size = k_weight.size(0);
+    auto v_size = v_weight.size(0);
+    return {
+        fused.slice(-1, 0, q_size),
+        fused.slice(-1, q_size, q_size + k_size),
+        fused.slice(-1, q_size + k_size, q_size + k_size + v_size),
+    };
+  }
+#endif
   return {
       LinearForward(x, q_weight, q_bias, resolved_backend),
       LinearForward(x, k_weight, k_bias, resolved_backend),
