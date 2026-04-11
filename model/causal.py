@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+from runtime.ops import linear as runtime_linear
 from specs.config import ModelConfig
 from compress import apply_compression
 from blocks.factory import build_block_stack
@@ -126,7 +127,7 @@ class CausalLM(nn.Module):
                 layer_cache = cache.layer(i)
                 x = blk(x, mask, layer_cache, (cos, sin), position_ids)
         x = self.norm(x)
-        logits = self.lm_head(x)
+        logits = runtime_linear(x, self.lm_head.weight, self.lm_head.bias)
         if return_dict:
             return {"logits": logits, "last_hidden_state": x}
         return logits
@@ -244,5 +245,4 @@ class CausalLM(nn.Module):
         if return_dict:
             return {"sequences": seq}
         return seq
-
 

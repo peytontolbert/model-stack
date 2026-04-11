@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <ATen/ops/linear.h>
 
 #include <cmath>
 #include <map>
@@ -14,6 +15,7 @@ constexpr int kAbiVersion = MODEL_STACK_ABI_VERSION;
 
 std::map<std::string, bool> NativeOpMap() {
   return {
+      {"linear", true},
       {"rms_norm", true},
       {"rope", true},
       {"kv_cache_append", true},
@@ -32,9 +34,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "rms_norm", "rope", "kv_cache_append", "attention_decode", "attention_prefill", "sampling"};
+      "linear", "rms_norm", "rope", "kv_cache_append", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "rms_norm", "rope", "kv_cache_append", "attention_decode",
+      "linear", "rms_norm", "rope", "kv_cache_append", "attention_decode",
       "attention_prefill", "sampling"};
   return info;
 }
@@ -242,6 +244,22 @@ torch::Tensor SampleNextTokenForward(const torch::Tensor& logits, bool do_sample
   return std::get<1>(torch::max(logits, -1, true));
 }
 
+torch::Tensor LinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias) {
+  TORCH_CHECK(x.defined() && weight.defined(), "linear_forward: x and weight must be defined");
+  TORCH_CHECK(x.dim() >= 2, "linear_forward: x must have rank >= 2");
+  TORCH_CHECK(weight.dim() == 2, "linear_forward: weight must be rank-2");
+  TORCH_CHECK(x.size(-1) == weight.size(1), "linear_forward: input feature size mismatch");
+  if (bias.has_value() && bias.value().defined()) {
+    const auto& b = bias.value();
+    TORCH_CHECK(b.dim() == 1, "linear_forward: bias must be rank-1");
+    TORCH_CHECK(b.size(0) == weight.size(0), "linear_forward: bias size mismatch");
+  }
+  return at::linear(x, weight, bias);
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_model_stack_native, m) {
@@ -262,4 +280,5 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("presence_frequency_penalty_forward", &PresenceFrequencyPenaltyForward, py::arg("logits"),
         py::arg("counts"), py::arg("alpha_presence"), py::arg("alpha_frequency"));
   m.def("sample_next_token_forward", &SampleNextTokenForward, py::arg("logits"), py::arg("do_sample"));
+  m.def("linear_forward", &LinearForward, py::arg("x"), py::arg("weight"), py::arg("bias") = py::none());
 }

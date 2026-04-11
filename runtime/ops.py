@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from runtime.native import has_native_op, native_module
 
@@ -203,3 +204,15 @@ def sample_next_token(logits: torch.Tensor, do_sample: bool) -> torch.Tensor:
         probs = torch.softmax(logits.float(), dim=-1)
         return torch.multinomial(probs, num_samples=1)
     return torch.argmax(logits, dim=-1, keepdim=True)
+
+
+def linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if has_native_op("linear"):
+        module = native_module()
+        if module is not None and hasattr(module, "linear_forward"):
+            return module.linear_forward(x, weight, bias)
+    return F.linear(x, weight, bias)
