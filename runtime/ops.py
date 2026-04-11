@@ -237,7 +237,7 @@ def linear(
     if has_native_op("linear"):
         module = native_module()
         if module is not None and hasattr(module, "linear_forward"):
-            return module.linear_forward(x, weight, bias, resolve_linear_backend(backend))
+            return module.linear_forward(x, weight, bias, str(backend or "auto"))
     return F.linear(x, weight, bias)
 
 
@@ -263,7 +263,7 @@ def qkv_projection(
                 k_bias,
                 v_weight,
                 v_bias,
-                resolve_linear_backend(backend),
+                str(backend or "auto"),
             )
             return q, k, v
     return (
@@ -295,7 +295,7 @@ def mlp(
                 w_out_bias,
                 str(activation),
                 bool(gated),
-                resolve_linear_backend(backend),
+                str(backend or "auto"),
             )
     hidden = linear(x, w_in_weight, w_in_bias, backend=backend)
     act = str(activation).lower()

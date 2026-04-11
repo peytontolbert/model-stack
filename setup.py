@@ -25,6 +25,7 @@ def native_extensions():
     if use_cuda:
         extension_cls = CUDAExtension
         sources.append("runtime/csrc/backend/cuda_rms_norm.cu")
+        sources.append("runtime/csrc/backend/cuda_gated_activation.cu")
         sources.append("runtime/csrc/backend/cublaslt_linear.cu")
         define_macros.append(("MODEL_STACK_WITH_CUDA", "1"))
         extra_compile_args["nvcc"] = [

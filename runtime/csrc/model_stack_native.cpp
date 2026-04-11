@@ -30,11 +30,18 @@ torch::Tensor CublasLtLinearForward(
     const torch::Tensor& weight,
     const c10::optional<torch::Tensor>& bias);
 bool HasCublasLtLinearBackend();
+torch::Tensor CudaGatedActivationForward(
+    const torch::Tensor& x,
+    const std::string& activation);
+bool HasCudaGatedActivationKernel();
 #else
 bool HasCudaRmsNormKernel() {
   return false;
 }
 bool HasCublasLtLinearBackend() {
+  return false;
+}
+bool HasCudaGatedActivationKernel() {
   return false;
 }
 #endif
@@ -110,6 +117,19 @@ torch::Tensor ApplyActivation(const torch::Tensor& x, const std::string& activat
   return at::gelu(x, "none");
 }
 
+torch::Tensor ApplyGatedActivation(const torch::Tensor& x, const std::string& activation) {
+  TORCH_CHECK(x.size(-1) % 2 == 0, "apply_gated_activation: hidden width must be even");
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && HasCudaGatedActivationKernel()) {
+    return CudaGatedActivationForward(x, activation);
+  }
+#endif
+  const auto split = x.size(-1) / 2;
+  auto a = x.slice(-1, 0, split);
+  auto b = x.slice(-1, split, x.size(-1));
+  return ApplyActivation(a, activation) * b;
+}
+
 py::dict RuntimeInfo() {
   py::dict info;
   info["abi_version"] = kAbiVersion;
@@ -136,6 +156,9 @@ py::dict RuntimeInfo() {
   if (HasCublasLtLinearBackend()) {
     cuda_backend_ops.push_back("linear");
     cuda_backend_ops.push_back("qkv_projection");
+  }
+  if (HasCudaGatedActivationKernel()) {
+    cuda_backend_ops.push_back("gated_activation");
   }
   info["cuda_backend_ops"] = cuda_backend_ops;
   return info;
@@ -416,15 +439,25 @@ torch::Tensor MlpForward(
     const std::string& activation,
     bool gated,
     const std::string& backend) {
-  const auto resolved_backend = ResolveLinearBackend(backend);
-  auto hidden = LinearForward(x, w_in_weight, w_in_bias, resolved_backend);
-  torch::Tensor projected;
-  if (gated) {
-    TORCH_CHECK(hidden.size(-1) % 2 == 0, "mlp_forward: gated projection width must be even");
+  const auto normalized_backend = NormalizeBackendName(backend);
+  const bool auto_backend = normalized_backend.empty() || normalized_backend == "auto";
+  if (auto_backend && gated && x.is_cuda() && x.scalar_type() != torch::kFloat32) {
+    auto hidden = at::linear(x, w_in_weight, w_in_bias);
+    torch::Tensor projected;
+    if (hidden.size(-1) % 2 != 0) {
+      TORCH_CHECK(false, "mlp_forward: gated projection width must be even");
+    }
     const auto split = hidden.size(-1) / 2;
     auto a = hidden.slice(-1, 0, split);
     auto b = hidden.slice(-1, split, hidden.size(-1));
     projected = ApplyActivation(a, activation) * b;
+    return at::linear(projected, w_out_weight, w_out_bias);
+  }
+  const auto resolved_backend = ResolveLinearBackend(backend);
+  auto hidden = LinearForward(x, w_in_weight, w_in_bias, resolved_backend);
+  torch::Tensor projected;
+  if (gated) {
+    projected = ApplyGatedActivation(hidden, activation);
   } else {
     projected = ApplyActivation(hidden, activation);
   }
