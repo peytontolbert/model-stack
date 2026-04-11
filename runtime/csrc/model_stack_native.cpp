@@ -34,6 +34,12 @@ torch::Tensor CudaGatedActivationForward(
     const torch::Tensor& x,
     const std::string& activation);
 bool HasCudaGatedActivationKernel();
+std::vector<torch::Tensor> CudaApplyRotaryForward(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin);
+bool HasCudaRopeKernel();
 #else
 bool HasCudaRmsNormKernel() {
   return false;
@@ -42,6 +48,9 @@ bool HasCublasLtLinearBackend() {
   return false;
 }
 bool HasCudaGatedActivationKernel() {
+  return false;
+}
+bool HasCudaRopeKernel() {
   return false;
 }
 #endif
@@ -153,6 +162,9 @@ py::dict RuntimeInfo() {
   if (HasCudaRmsNormKernel()) {
     cuda_backend_ops.push_back("rms_norm");
   }
+  if (HasCudaRopeKernel()) {
+    cuda_backend_ops.push_back("rope");
+  }
   if (HasCublasLtLinearBackend()) {
     cuda_backend_ops.push_back("linear");
     cuda_backend_ops.push_back("qkv_projection");
@@ -227,6 +239,13 @@ std::vector<torch::Tensor> ApplyRotaryForward(
   TORCH_CHECK(
       q.size(3) % 2 == 0,
       "apply_rotary_forward: head_dim must be even");
+
+#if MODEL_STACK_WITH_CUDA
+  if (q.is_cuda() && k.is_cuda() && cos.is_cuda() && sin.is_cuda() &&
+      q.scalar_type() != torch::kBFloat16 && HasCudaRopeKernel()) {
+    return CudaApplyRotaryForward(q, k, cos, sin);
+  }
+#endif
 
   auto cos_b = cos.view({1, 1, cos.size(0), cos.size(1)});
   auto sin_b = sin.view({1, 1, sin.size(0), sin.size(1)});
