@@ -71,6 +71,20 @@ def scaled_dot_product_attention(
     Note: PyTorch SDPA applies scale=1/sqrt(head_dim) by default.
     If you want HF-style explicit scaling, set scale and this will override SDPA's default.
     """
+    if (backend is None or backend == "torch") and float(dropout_p) == 0.0:
+        try:
+            from runtime.ops import attention as native_attention
+            return native_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                is_causal=bool(is_causal),
+                scale=scale,
+            )
+        except Exception:
+            pass
+
     # Prefer torch SDPA for portability; route when explicitly requested
     if backend is None or backend == "torch":
         # PyTorch SDPA handles scaling internally (default: 1/sqrt(head_dim))
@@ -145,5 +159,4 @@ def scaled_dot_product_attention(
             )
 
     raise ValueError("Unknown backend")
-
 

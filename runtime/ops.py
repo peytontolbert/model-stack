@@ -107,3 +107,38 @@ def kv_cache_append(
     if k_cache is None or v_cache is None:
         return k_chunk, v_chunk
     return torch.cat([k_cache.contiguous(), k_chunk], dim=1), torch.cat([v_cache.contiguous(), v_chunk], dim=1)
+
+
+def attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    *,
+    is_causal: bool = False,
+    scale: float | None = None,
+) -> torch.Tensor:
+    op_name = "attention_decode" if q.shape[2] == 1 else "attention_prefill"
+    if has_native_op(op_name):
+        module = native_module()
+        if module is not None and hasattr(module, "attention_forward"):
+            return module.attention_forward(q, k, v, attn_mask, is_causal, scale)
+
+    scores = torch.matmul(q, k.transpose(2, 3))
+    if scale is None:
+        scores = scores * (q.shape[-1] ** -0.5)
+    else:
+        scores = scores * float(scale)
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            scores = scores.masked_fill(attn_mask, float("-inf"))
+        else:
+            scores = scores + attn_mask.to(dtype=scores.dtype)
+    if is_causal:
+        causal = torch.triu(
+            torch.ones(q.shape[2], k.shape[2], device=q.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        scores = scores.masked_fill(causal.view(1, 1, q.shape[2], k.shape[2]), float("-inf"))
+    probs = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
+    return torch.matmul(probs, v)
