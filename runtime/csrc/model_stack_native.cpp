@@ -19,6 +19,18 @@
 namespace py = pybind11;
 namespace torch_ext = torch;
 
+#if MODEL_STACK_WITH_CUDA
+torch::Tensor CudaRmsNormForward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& weight,
+    double eps);
+bool HasCudaRmsNormKernel();
+#else
+bool HasCudaRmsNormKernel() {
+  return false;
+}
+#endif
+
 namespace {
 
 constexpr int kAbiVersion = MODEL_STACK_ABI_VERSION;
@@ -101,6 +113,7 @@ py::dict RuntimeInfo() {
   info["linear_backend_default"] = "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
   info["linear_backends_planned"] = PlannedLinearBackends();
+  info["cuda_backend_ops"] = HasCudaRmsNormKernel() ? std::vector<std::string>{"rms_norm"} : std::vector<std::string>{};
   return info;
 }
 
@@ -117,6 +130,12 @@ torch::Tensor RmsNormForward(
   TORCH_CHECK(x.defined(), "rms_norm_forward: x must be defined");
   TORCH_CHECK(x.dim() >= 1, "rms_norm_forward: x must have at least one dimension");
   TORCH_CHECK(std::isfinite(eps) && eps > 0.0, "rms_norm_forward: eps must be positive and finite");
+
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && HasCudaRmsNormKernel()) {
+    return CudaRmsNormForward(x, weight, eps);
+  }
+#endif
 
   const auto input_dtype = x.scalar_type();
   auto xf = x.to(torch::kFloat32);
