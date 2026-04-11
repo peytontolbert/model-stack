@@ -1,7 +1,7 @@
 import os
 from typing import Optional
 import torch
-from runtime.ops import kv_cache_append as runtime_kv_cache_append
+from runtime.ops import kv_cache_write as runtime_kv_cache_write
 from runtime.native import has_native_op
 
 
@@ -66,25 +66,55 @@ class ContiguousKVCache:
         self.n_layers = n_layers
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
-        self.pagesize = pagesize
+        self.pagesize = max(int(pagesize), 1)
         self.dtype = dtype
         self.device = device
         self.K: list[list[torch.Tensor | None]] = [[None for _ in range(batch)] for _ in range(n_layers)]
         self.V: list[list[torch.Tensor | None]] = [[None for _ in range(batch)] for _ in range(n_layers)]
         self.lengths = [[0 for _ in range(batch)] for _ in range(n_layers)]
+        self.capacities = [[0 for _ in range(batch)] for _ in range(n_layers)]
 
-    def append(self, layer_idx: int, b: int, k_chunk: torch.Tensor, v_chunk: torch.Tensor):
+    def _allocate(self, capacity: int) -> torch.Tensor:
+        return torch.empty(
+            self.n_kv_heads,
+            int(capacity),
+            self.head_dim,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    def _ensure_capacity(self, layer_idx: int, b: int, needed: int) -> None:
+        cur_cap = int(self.capacities[layer_idx][b])
+        if cur_cap >= int(needed):
+            return
+        new_cap = max(self.pagesize, cur_cap if cur_cap > 0 else self.pagesize)
+        while new_cap < int(needed):
+            new_cap *= 2
+        k_new = self._allocate(new_cap)
+        v_new = self._allocate(new_cap)
+        cur_len = int(self.lengths[layer_idx][b])
         k_prev = self.K[layer_idx][b]
         v_prev = self.V[layer_idx][b]
-        k_next, v_next = runtime_kv_cache_append(
-            k_prev,
-            v_prev,
-            k_chunk.to(device=self.device, dtype=self.dtype).contiguous(),
-            v_chunk.to(device=self.device, dtype=self.dtype).contiguous(),
-        )
-        self.K[layer_idx][b] = k_next
-        self.V[layer_idx][b] = v_next
-        self.lengths[layer_idx][b] = int(k_next.shape[1])
+        if k_prev is not None and cur_len > 0:
+            runtime_kv_cache_write(k_new, k_prev[:, :cur_len, :].contiguous(), 0)
+        if v_prev is not None and cur_len > 0:
+            runtime_kv_cache_write(v_new, v_prev[:, :cur_len, :].contiguous(), 0)
+        self.K[layer_idx][b] = k_new
+        self.V[layer_idx][b] = v_new
+        self.capacities[layer_idx][b] = int(new_cap)
+
+    def append(self, layer_idx: int, b: int, k_chunk: torch.Tensor, v_chunk: torch.Tensor):
+        k_chunk = k_chunk.to(device=self.device, dtype=self.dtype).contiguous()
+        v_chunk = v_chunk.to(device=self.device, dtype=self.dtype).contiguous()
+        cur_len = int(self.lengths[layer_idx][b])
+        next_len = cur_len + int(k_chunk.shape[1])
+        self._ensure_capacity(layer_idx, b, next_len)
+        k_buf = self.K[layer_idx][b]
+        v_buf = self.V[layer_idx][b]
+        assert k_buf is not None and v_buf is not None
+        runtime_kv_cache_write(k_buf, k_chunk, cur_len)
+        runtime_kv_cache_write(v_buf, v_chunk, cur_len)
+        self.lengths[layer_idx][b] = next_len
 
     def slice(self, layer_idx: int, b: int, start: int, end: int):
         k = self.K[layer_idx][b]
@@ -92,7 +122,7 @@ class ContiguousKVCache:
         if k is None or v is None:
             return None, None
         s = max(int(start), 0)
-        e = min(int(end), int(k.shape[1]))
+        e = min(int(end), int(self.lengths[layer_idx][b]))
         if s >= e:
             return None, None
         return k[:, s:e, :], v[:, s:e, :]
@@ -106,13 +136,20 @@ class ContiguousKVCache:
                 if k is None or v is None:
                     self.lengths[l][b] = 0
                     continue
-                cur = int(k.shape[1])
-                if cur <= keep:
-                    self.lengths[l][b] = cur
+                live = int(self.lengths[l][b])
+                if live <= keep:
+                    self.lengths[l][b] = live
                     continue
                 if policy in ("fifo", "sliding-window", "lru"):
-                    self.K[l][b] = k[:, cur - keep :, :].contiguous() if keep > 0 else None
-                    self.V[l][b] = v[:, cur - keep :, :].contiguous() if keep > 0 else None
+                    if keep > 0:
+                        tail_k = k[:, live - keep : live, :].contiguous()
+                        tail_v = v[:, live - keep : live, :].contiguous()
+                        runtime_kv_cache_write(k, tail_k, 0)
+                        runtime_kv_cache_write(v, tail_v, 0)
+                    else:
+                        self.K[l][b] = None
+                        self.V[l][b] = None
+                        self.capacities[l][b] = 0
                     self.lengths[l][b] = keep
 
     def layer(self, layer_idx: int):

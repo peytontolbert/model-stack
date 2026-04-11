@@ -40,6 +40,11 @@ std::vector<torch::Tensor> CudaApplyRotaryForward(
     const torch::Tensor& cos,
     const torch::Tensor& sin);
 bool HasCudaRopeKernel();
+torch::Tensor CudaKvCacheWriteForward(
+    const torch::Tensor& cache,
+    const torch::Tensor& chunk,
+    int64_t start);
+bool HasCudaKvCacheKernel();
 torch::Tensor CudaAttentionForward(
     const torch::Tensor& q,
     const torch::Tensor& k,
@@ -61,6 +66,9 @@ bool HasCudaGatedActivationKernel() {
 bool HasCudaRopeKernel() {
   return false;
 }
+bool HasCudaKvCacheKernel() {
+  return false;
+}
 bool HasCudaAttentionKernel() {
   return false;
 }
@@ -79,6 +87,7 @@ std::map<std::string, bool> NativeOpMap() {
       {"rms_norm", true},
       {"rope", true},
       {"kv_cache_append", true},
+      {"kv_cache_write", true},
       {"attention_decode", true},
       {"attention_prefill", true},
       {"sampling", true},
@@ -159,9 +168,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "attention_decode",
+      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
       "attention_prefill", "sampling"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
@@ -175,6 +184,9 @@ py::dict RuntimeInfo() {
   }
   if (HasCudaRopeKernel()) {
     cuda_backend_ops.push_back("rope");
+  }
+  if (HasCudaKvCacheKernel()) {
+    cuda_backend_ops.push_back("kv_cache");
   }
   if (HasCudaAttentionKernel()) {
     cuda_backend_ops.push_back("attention");
@@ -309,6 +321,29 @@ std::vector<torch::Tensor> KvCacheAppendForward(
       torch::cat({k_prev.contiguous(), k_chunk}, 1),
       torch::cat({v_prev.contiguous(), v_chunk}, 1),
   };
+}
+
+torch::Tensor KvCacheWriteForward(
+    const torch::Tensor& cache,
+    const torch::Tensor& chunk,
+    int64_t start) {
+  TORCH_CHECK(cache.defined() && chunk.defined(), "kv_cache_write_forward: cache and chunk must be defined");
+  TORCH_CHECK(cache.dim() == 3 && chunk.dim() == 3, "kv_cache_write_forward: cache and chunk must be rank-3");
+  TORCH_CHECK(cache.size(0) == chunk.size(0), "kv_cache_write_forward: head count mismatch");
+  TORCH_CHECK(cache.size(2) == chunk.size(2), "kv_cache_write_forward: head_dim mismatch");
+  TORCH_CHECK(cache.device() == chunk.device(), "kv_cache_write_forward: device mismatch");
+  TORCH_CHECK(cache.scalar_type() == chunk.scalar_type(), "kv_cache_write_forward: dtype mismatch");
+  TORCH_CHECK(start >= 0, "kv_cache_write_forward: start must be non-negative");
+  TORCH_CHECK(start + chunk.size(1) <= cache.size(1), "kv_cache_write_forward: chunk exceeds cache capacity");
+
+#if MODEL_STACK_WITH_CUDA
+  if (cache.is_cuda() && chunk.is_cuda() && HasCudaKvCacheKernel()) {
+    return CudaKvCacheWriteForward(cache, chunk, start);
+  }
+#endif
+
+  cache.slice(1, start, start + chunk.size(1)).copy_(chunk);
+  return cache;
 }
 
 torch::Tensor NativeAttentionForward(
@@ -582,6 +617,7 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("sin"));
   m.def("kv_cache_append_forward", &KvCacheAppendForward, py::arg("k_cache") = py::none(),
         py::arg("v_cache") = py::none(), py::arg("k_new"), py::arg("v_new"));
+  m.def("kv_cache_write_forward", &KvCacheWriteForward, py::arg("cache"), py::arg("chunk"), py::arg("start"));
   m.def("attention_forward", &NativeAttentionForward, py::arg("q"), py::arg("k"), py::arg("v"),
         py::arg("attn_mask") = py::none(), py::arg("is_causal") = false, py::arg("scale") = py::none());
   m.def("temperature_forward", &TemperatureForward, py::arg("logits"), py::arg("tau"));

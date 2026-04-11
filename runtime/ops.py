@@ -110,6 +110,19 @@ def kv_cache_append(
     return torch.cat([k_cache.contiguous(), k_chunk], dim=1), torch.cat([v_cache.contiguous(), v_chunk], dim=1)
 
 
+def kv_cache_write(
+    cache: torch.Tensor,
+    chunk: torch.Tensor,
+    start: int,
+) -> torch.Tensor:
+    if has_native_op("kv_cache_write"):
+        module = native_module()
+        if module is not None and hasattr(module, "kv_cache_write_forward"):
+            return module.kv_cache_write_forward(cache, chunk, int(start))
+    cache[:, int(start): int(start) + chunk.shape[1], :].copy_(chunk)
+    return cache
+
+
 def attention(
     q: torch.Tensor,
     k: torch.Tensor,
