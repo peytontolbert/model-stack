@@ -1,5 +1,6 @@
 # tensor/positional.py
 import torch
+from runtime.ops import apply_rotary as runtime_apply_rotary
 
 
 def build_rope_cache(seq_len: int, head_dim: int, device=None, base_theta: float = 1e6):
@@ -27,18 +28,7 @@ def apply_rotary(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch
 
     q: (B,Hq,T,Dh), k: (B,Hk,T,Dh); cos/sin: (T,Dh)
     """
-    # Broadcast cos/sin over batch and heads
-    cos_b = cos.view(1, 1, cos.shape[0], cos.shape[1])
-    sin_b = sin.view(1, 1, sin.shape[0], sin.shape[1])
-
-    def rotate_half(x: torch.Tensor) -> torch.Tensor:
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-    q_embed = (q * cos_b) + (rotate_half(q) * sin_b)
-    k_embed = (k * cos_b) + (rotate_half(k) * sin_b)
-    return q_embed, k_embed
+    return runtime_apply_rotary(q, k, cos, sin)
 
 
 def apply_rotary_scaled(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, scale: float):

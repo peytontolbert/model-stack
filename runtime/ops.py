@@ -65,3 +65,26 @@ def rms_norm(
         if module is not None and hasattr(module, "rms_norm_forward"):
             return module.rms_norm_forward(x, weight, eps)
     return _rms_norm_reference(x, weight=weight, eps=eps, dim=dim)
+
+
+def apply_rotary(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if has_native_op("rope"):
+        module = native_module()
+        if module is not None and hasattr(module, "apply_rotary_forward"):
+            q_out, k_out = module.apply_rotary_forward(q, k, cos, sin)
+            return q_out, k_out
+
+    cos_b = cos.view(1, 1, cos.shape[0], cos.shape[1])
+    sin_b = sin.view(1, 1, sin.shape[0], sin.shape[1])
+
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    return (q * cos_b) + (rotate_half(q) * sin_b), (k * cos_b) + (rotate_half(k) * sin_b)

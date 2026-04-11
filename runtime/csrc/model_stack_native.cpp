@@ -1,11 +1,12 @@
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <torch/extension.h>
 
+#include <cmath>
 #include <map>
 #include <string>
 #include <vector>
 
 namespace py = pybind11;
+namespace torch_ext = torch;
 
 namespace {
 
@@ -13,8 +14,8 @@ constexpr int kAbiVersion = MODEL_STACK_ABI_VERSION;
 
 std::map<std::string, bool> NativeOpMap() {
   return {
-      {"rms_norm", false},
-      {"rope", false},
+      {"rms_norm", true},
+      {"rope", true},
       {"kv_cache_append", false},
       {"attention_decode", false},
       {"attention_prefill", false},
@@ -30,7 +31,7 @@ py::dict RuntimeInfo() {
 #else
   info["compiled_with_cuda"] = false;
 #endif
-  info["native_ops"] = std::vector<std::string>{};
+  info["native_ops"] = std::vector<std::string>{"rms_norm", "rope"};
   info["planned_ops"] = std::vector<std::string>{
       "rms_norm", "rope", "kv_cache_append", "attention_decode",
       "attention_prefill", "sampling"};
@@ -43,15 +44,71 @@ bool HasOp(const std::string& name) {
   return it != ops.end() && it->second;
 }
 
-[[noreturn]] void RaiseNotImplemented(const char* message) {
-  PyErr_SetString(PyExc_NotImplementedError, message);
-  throw py::error_already_set();
+torch::Tensor RmsNormForward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& weight,
+    double eps) {
+  TORCH_CHECK(x.defined(), "rms_norm_forward: x must be defined");
+  TORCH_CHECK(x.dim() >= 1, "rms_norm_forward: x must have at least one dimension");
+  TORCH_CHECK(std::isfinite(eps) && eps > 0.0, "rms_norm_forward: eps must be positive and finite");
+
+  const auto input_dtype = x.scalar_type();
+  auto xf = x.to(torch::kFloat32);
+  auto variance = xf.pow(2).mean(-1, true);
+  auto normalized = xf * torch::rsqrt(variance + eps);
+  auto out = normalized.to(input_dtype);
+
+  if (weight.has_value()) {
+    auto w = weight.value();
+    TORCH_CHECK(
+        w.defined(),
+        "rms_norm_forward: weight optional was provided but undefined");
+    TORCH_CHECK(
+        w.dim() == 1,
+        "rms_norm_forward: weight must be 1D for the current native path");
+    TORCH_CHECK(
+        w.size(0) == x.size(-1),
+        "rms_norm_forward: weight size must match the last dimension of x");
+    out = out * w.to(x.device(), input_dtype);
+  }
+
+  return out;
 }
 
-py::object RmsNormForward(py::object /*x*/, py::object /*weight*/, double /*eps*/) {
-  RaiseNotImplemented(
-      "Native RMSNorm is not compiled yet. Build the CUDA/C++ kernel and enable "
-      "the op before routing tensors here.");
+std::vector<torch::Tensor> ApplyRotaryForward(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin) {
+  TORCH_CHECK(q.defined() && k.defined(), "apply_rotary_forward: q and k must be defined");
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4, "apply_rotary_forward: q and k must be rank-4");
+  TORCH_CHECK(q.size(0) == k.size(0), "apply_rotary_forward: q and k batch size mismatch");
+  TORCH_CHECK(q.size(2) == k.size(2), "apply_rotary_forward: q and k sequence length mismatch");
+  TORCH_CHECK(q.size(3) == k.size(3), "apply_rotary_forward: q and k head_dim mismatch");
+  TORCH_CHECK(cos.dim() == 2 && sin.dim() == 2, "apply_rotary_forward: cos and sin must be rank-2");
+  TORCH_CHECK(
+      cos.sizes() == sin.sizes(),
+      "apply_rotary_forward: cos and sin must have the same shape");
+  TORCH_CHECK(
+      cos.size(0) == q.size(2) && cos.size(1) == q.size(3),
+      "apply_rotary_forward: cos/sin shape must match (T, Dh)");
+  TORCH_CHECK(
+      q.size(3) % 2 == 0,
+      "apply_rotary_forward: head_dim must be even");
+
+  auto cos_b = cos.view({1, 1, cos.size(0), cos.size(1)});
+  auto sin_b = sin.view({1, 1, sin.size(0), sin.size(1)});
+  const auto half = q.size(3) / 2;
+
+  auto rotate_half = [half](const torch::Tensor& x) {
+    auto x1 = x.slice(-1, 0, half);
+    auto x2 = x.slice(-1, half, x.size(-1));
+    return torch::cat({-x2, x1}, -1);
+  };
+
+  auto q_out = (q * cos_b) + (rotate_half(q) * sin_b);
+  auto k_out = (k * cos_b) + (rotate_half(k) * sin_b);
+  return {q_out, k_out};
 }
 
 }  // namespace
@@ -62,4 +119,6 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("has_op", &HasOp, py::arg("name"));
   m.def("rms_norm_forward", &RmsNormForward, py::arg("x"), py::arg("weight") = py::none(),
         py::arg("eps") = 1e-6);
+  m.def("apply_rotary_forward", &ApplyRotaryForward, py::arg("q"), py::arg("k"), py::arg("cos"),
+        py::arg("sin"));
 }
