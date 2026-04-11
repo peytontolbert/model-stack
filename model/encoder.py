@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from specs.config import ModelConfig
 from blocks.encoder_block import EncoderBlock
+from blocks.native_fusion import apply_native_norm
 from blocks.schedules import drop_path_linear
 from blocks.init import init_transformer_stack
 
@@ -32,7 +33,6 @@ class EncoderModel(nn.Module):
         x = self.embed(input_ids)
         for blk in self.blocks:
             x = blk(x, padding_mask)
-        x = self.norm(x)
+        x = apply_native_norm(x, self.norm)
         return x
-
 

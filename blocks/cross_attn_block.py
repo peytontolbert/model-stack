@@ -7,6 +7,7 @@ from tensor.mlp import MLP
 from tensor.regularization import StochasticDepth
 
 from .config import BlockConfig, build_block_config_from_model
+from .native_fusion import can_apply_native_norm, fused_add_norm
 from attn.factory import build_attention
 
 
@@ -38,14 +39,23 @@ class CrossAttentionBlock(nn.Module):
     ) -> torch.Tensor:
         if self.bc.norm_policy == "prenorm":
             a = self.cross.forward(self.n1(x), enc, enc, enc_mask)
-            x = x + self.bc.residual_scale * self.drop_path(self.resid_dropout(a))
-            m = self.mlp(self.n2(x))
+            if can_apply_native_norm(self.n2, self.training):
+                x, mlp_in = fused_add_norm(x, a, self.n2, self.bc.residual_scale)
+            else:
+                x = x + self.bc.residual_scale * self.drop_path(self.resid_dropout(a))
+                mlp_in = self.n2(x)
+            m = self.mlp(mlp_in)
             x = x + self.bc.residual_scale * self.drop_path(self.resid_dropout(m))
             return x
         a = self.cross.forward(x, enc, enc, enc_mask)
-        x = self.n1(x + self.bc.residual_scale * self.drop_path(self.resid_dropout(a)))
+        if can_apply_native_norm(self.n1, self.training):
+            _, x = fused_add_norm(x, a, self.n1, self.bc.residual_scale)
+        else:
+            x = self.n1(x + self.bc.residual_scale * self.drop_path(self.resid_dropout(a)))
         m = self.mlp(x)
-        x = self.n2(x + self.bc.residual_scale * self.drop_path(self.resid_dropout(m)))
+        if can_apply_native_norm(self.n2, self.training):
+            _, x = fused_add_norm(x, m, self.n2, self.bc.residual_scale)
+        else:
+            x = self.n2(x + self.bc.residual_scale * self.drop_path(self.resid_dropout(m)))
         return x
-
 

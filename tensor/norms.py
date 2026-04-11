@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from runtime.ops import layer_norm as runtime_layer_norm
 from runtime.ops import rms_norm as runtime_rms_norm
 from .numerics import chunked_norm
 
@@ -123,16 +124,7 @@ def layer_norm(
     dim: int | tuple[int, ...] = -1,
 ) -> torch.Tensor:
     """Functional LayerNorm with axis support and fp32 accumulation."""
-    dims = _to_tuple_dims(dim, x.ndim)
-    xf = x.float()
-    mu = xf.mean(dim=dims, keepdim=True)
-    var = xf.var(dim=dims, unbiased=False, keepdim=True)
-    y = (xf - mu) / torch.sqrt(var + eps)
-    if weight is not None:
-        y = y * _reshape_param_for_dims(weight, x, dims)
-    if bias is not None:
-        y = y + _reshape_param_for_dims(bias, x, dims)
-    return y.to(dtype=x.dtype)
+    return runtime_layer_norm(x, weight=weight, bias=bias, eps=eps, dim=dim)
 
 
 def mean_only_layer_norm(

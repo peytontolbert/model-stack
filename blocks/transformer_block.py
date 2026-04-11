@@ -8,7 +8,7 @@ from tensor.positional import build_alibi_bias, build_relative_position_indices,
 from tensor.masking import to_additive_mask
 
 from .config import BlockConfig, build_block_config_from_model
-from .native_fusion import can_fuse_add_rms_norm, fused_add_rms_norm
+from .native_fusion import can_apply_native_norm, fused_add_norm
 
 
 class TransformerBlock(nn.Module):
@@ -69,8 +69,8 @@ class TransformerBlock(nn.Module):
                 attn_mask = add + rpb
         if self.bc.norm_policy == "prenorm":
             a = self.attn.forward(self.n1(x), None, None, attn_mask, cache, position_embeddings=position_embeddings, position_ids=position_ids)
-            if can_fuse_add_rms_norm(self.n2, self.training):
-                x, mlp_in = fused_add_rms_norm(x, a, self.n2, self.bc.residual_scale)
+            if can_apply_native_norm(self.n2, self.training):
+                x, mlp_in = fused_add_norm(x, a, self.n2, self.bc.residual_scale)
             else:
                 x = x + self.bc.residual_scale * self.drop_path(self.resid_dropout(a))
                 mlp_in = self.n2(x)
@@ -79,13 +79,13 @@ class TransformerBlock(nn.Module):
             return x
         # post-norm
         a = self.attn.forward(x, None, None, attn_mask, cache, position_embeddings=position_embeddings, position_ids=position_ids)
-        if can_fuse_add_rms_norm(self.n1, self.training):
-            _, x = fused_add_rms_norm(x, a, self.n1, self.bc.residual_scale)
+        if can_apply_native_norm(self.n1, self.training):
+            _, x = fused_add_norm(x, a, self.n1, self.bc.residual_scale)
         else:
             x = self.n1(x + self.bc.residual_scale * self.drop_path(self.resid_dropout(a)))
         m = self.mlp(x)
-        if can_fuse_add_rms_norm(self.n2, self.training):
-            _, x = fused_add_rms_norm(x, m, self.n2, self.bc.residual_scale)
+        if can_apply_native_norm(self.n2, self.training):
+            _, x = fused_add_norm(x, m, self.n2, self.bc.residual_scale)
         else:
             x = self.n2(x + self.bc.residual_scale * self.drop_path(self.resid_dropout(m)))
         return x

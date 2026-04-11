@@ -55,6 +55,25 @@ def _rms_norm_reference(
     return y.to(dtype=x.dtype)
 
 
+def _layer_norm_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    eps: float = 1e-5,
+    dim: int | tuple[int, ...] = -1,
+) -> torch.Tensor:
+    dims = _to_tuple_dims(dim, x.ndim)
+    xf = x.float()
+    mu = xf.mean(dim=dims, keepdim=True)
+    var = xf.var(dim=dims, unbiased=False, keepdim=True)
+    y = (xf - mu) / torch.sqrt(var + eps)
+    if weight is not None:
+        y = y * _reshape_param_for_dims(weight, x, dims)
+    if bias is not None:
+        y = y + _reshape_param_for_dims(bias, x, dims)
+    return y.to(dtype=x.dtype)
+
+
 def rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor | None = None,
@@ -66,6 +85,20 @@ def rms_norm(
         if module is not None and hasattr(module, "rms_norm_forward"):
             return module.rms_norm_forward(x, weight, eps)
     return _rms_norm_reference(x, weight=weight, eps=eps, dim=dim)
+
+
+def layer_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    eps: float = 1e-5,
+    dim: int | tuple[int, ...] = -1,
+) -> torch.Tensor:
+    if dim == -1 and has_native_op("layer_norm"):
+        module = native_module()
+        if module is not None and hasattr(module, "layer_norm_forward"):
+            return module.layer_norm_forward(x, weight, bias, eps)
+    return _layer_norm_reference(x, weight=weight, bias=bias, eps=eps, dim=dim)
 
 
 def add_rms_norm(
@@ -89,6 +122,31 @@ def add_rms_norm(
             return combined, normalized
     combined = x + (update * float(residual_scale))
     return combined, _rms_norm_reference(combined, weight=weight, eps=eps, dim=-1)
+
+
+def add_layer_norm(
+    x: torch.Tensor,
+    update: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    *,
+    residual_scale: float = 1.0,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if has_native_op("add_layer_norm"):
+        module = native_module()
+        if module is not None and hasattr(module, "add_layer_norm_forward"):
+            combined, normalized = module.add_layer_norm_forward(
+                x,
+                update,
+                weight,
+                bias,
+                float(residual_scale),
+                float(eps),
+            )
+            return combined, normalized
+    combined = x + (update * float(residual_scale))
+    return combined, _layer_norm_reference(combined, weight=weight, bias=bias, eps=eps, dim=-1)
 
 
 def apply_rotary(

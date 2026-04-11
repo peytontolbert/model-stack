@@ -4,6 +4,7 @@
 #include <ATen/ops/embedding.h>
 #include <ATen/ops/gelu.h>
 #include <ATen/ops/index_select.h>
+#include <ATen/ops/layer_norm.h>
 #include <ATen/ops/linear.h>
 #include <ATen/ops/relu.h>
 #include <ATen/ops/silu.h>
@@ -32,6 +33,20 @@ std::vector<torch::Tensor> CudaAddRmsNormForward(
     double residual_scale,
     double eps);
 bool HasCudaAddRmsNormKernel();
+torch::Tensor CudaLayerNormForward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& weight,
+    const c10::optional<torch::Tensor>& bias,
+    double eps);
+bool HasCudaLayerNormKernel();
+std::vector<torch::Tensor> CudaAddLayerNormForward(
+    const torch::Tensor& x,
+    const torch::Tensor& update,
+    const c10::optional<torch::Tensor>& weight,
+    const c10::optional<torch::Tensor>& bias,
+    double residual_scale,
+    double eps);
+bool HasCudaAddLayerNormKernel();
 torch::Tensor CublasLtLinearForward(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -67,6 +82,12 @@ bool HasCudaRmsNormKernel() {
 bool HasCudaAddRmsNormKernel() {
   return false;
 }
+bool HasCudaLayerNormKernel() {
+  return false;
+}
+bool HasCudaAddLayerNormKernel() {
+  return false;
+}
 bool HasCublasLtLinearBackend() {
   return false;
 }
@@ -96,6 +117,8 @@ std::map<std::string, bool> NativeOpMap() {
       {"qkv_projection", true},
       {"rms_norm", true},
       {"add_rms_norm", true},
+      {"layer_norm", true},
+      {"add_layer_norm", true},
       {"rope", true},
       {"kv_cache_append", true},
       {"kv_cache_write", true},
@@ -179,9 +202,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "add_rms_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "add_rms_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
+      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
       "attention_prefill", "sampling"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
@@ -195,6 +218,12 @@ py::dict RuntimeInfo() {
   }
   if (HasCudaAddRmsNormKernel()) {
     cuda_backend_ops.push_back("add_rms_norm");
+  }
+  if (HasCudaLayerNormKernel()) {
+    cuda_backend_ops.push_back("layer_norm");
+  }
+  if (HasCudaAddLayerNormKernel()) {
+    cuda_backend_ops.push_back("add_layer_norm");
   }
   if (HasCudaRopeKernel()) {
     cuda_backend_ops.push_back("rope");
@@ -259,6 +288,50 @@ torch::Tensor RmsNormForward(
   return out;
 }
 
+torch::Tensor LayerNormReference(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& weight,
+    const c10::optional<torch::Tensor>& bias,
+    double eps) {
+  TORCH_CHECK(x.defined(), "layer_norm_forward: x must be defined");
+  TORCH_CHECK(x.dim() >= 1, "layer_norm_forward: x must have at least one dimension");
+  TORCH_CHECK(std::isfinite(eps) && eps > 0.0, "layer_norm_forward: eps must be positive and finite");
+
+  auto xf = x.to(torch::kFloat32);
+  auto mean = xf.mean(-1, true);
+  auto centered = xf - mean;
+  auto var = centered.pow(2).mean(-1, true);
+  auto normalized = centered * torch::rsqrt(var + eps);
+  auto out = normalized.to(x.scalar_type());
+
+  if (weight.has_value() && weight.value().defined()) {
+    auto w = weight.value();
+    TORCH_CHECK(w.dim() == 1, "layer_norm_forward: weight must be rank-1");
+    TORCH_CHECK(w.size(0) == x.size(-1), "layer_norm_forward: weight size mismatch");
+    out = out * w.to(x.device(), x.scalar_type());
+  }
+  if (bias.has_value() && bias.value().defined()) {
+    auto b = bias.value();
+    TORCH_CHECK(b.dim() == 1, "layer_norm_forward: bias must be rank-1");
+    TORCH_CHECK(b.size(0) == x.size(-1), "layer_norm_forward: bias size mismatch");
+    out = out + b.to(x.device(), x.scalar_type());
+  }
+  return out;
+}
+
+torch::Tensor LayerNormForward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& weight,
+    const c10::optional<torch::Tensor>& bias,
+    double eps) {
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && HasCudaLayerNormKernel()) {
+    return CudaLayerNormForward(x, weight, bias, eps);
+  }
+#endif
+  return LayerNormReference(x, weight, bias, eps);
+}
+
 std::vector<torch::Tensor> AddRmsNormForward(
     const torch::Tensor& x,
     const torch::Tensor& update,
@@ -281,6 +354,32 @@ std::vector<torch::Tensor> AddRmsNormForward(
 
   auto combined = x + (update * residual_scale);
   auto normalized = RmsNormForward(combined, weight, eps);
+  return {combined, normalized};
+}
+
+std::vector<torch::Tensor> AddLayerNormForward(
+    const torch::Tensor& x,
+    const torch::Tensor& update,
+    const c10::optional<torch::Tensor>& weight,
+    const c10::optional<torch::Tensor>& bias,
+    double residual_scale,
+    double eps) {
+  TORCH_CHECK(x.defined() && update.defined(), "add_layer_norm_forward: x and update must be defined");
+  TORCH_CHECK(x.dim() >= 1 && update.dim() >= 1, "add_layer_norm_forward: x and update must have rank >= 1");
+  TORCH_CHECK(x.sizes() == update.sizes(), "add_layer_norm_forward: x and update shape mismatch");
+  TORCH_CHECK(x.scalar_type() == update.scalar_type(), "add_layer_norm_forward: x and update dtype mismatch");
+  TORCH_CHECK(x.device() == update.device(), "add_layer_norm_forward: x and update device mismatch");
+  TORCH_CHECK(std::isfinite(residual_scale), "add_layer_norm_forward: residual_scale must be finite");
+  TORCH_CHECK(std::isfinite(eps) && eps > 0.0, "add_layer_norm_forward: eps must be positive and finite");
+
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && update.is_cuda() && HasCudaAddLayerNormKernel()) {
+    return CudaAddLayerNormForward(x, update, weight, bias, residual_scale, eps);
+  }
+#endif
+
+  auto combined = x + (update * residual_scale);
+  auto normalized = LayerNormReference(combined, weight, bias, eps);
   return {combined, normalized};
 }
 
@@ -654,6 +753,11 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("eps") = 1e-6);
   m.def("add_rms_norm_forward", &AddRmsNormForward, py::arg("x"), py::arg("update"),
         py::arg("weight") = py::none(), py::arg("residual_scale") = 1.0, py::arg("eps") = 1e-6);
+  m.def("layer_norm_forward", &LayerNormForward, py::arg("x"), py::arg("weight") = py::none(),
+        py::arg("bias") = py::none(), py::arg("eps") = 1e-5);
+  m.def("add_layer_norm_forward", &AddLayerNormForward, py::arg("x"), py::arg("update"),
+        py::arg("weight") = py::none(), py::arg("bias") = py::none(), py::arg("residual_scale") = 1.0,
+        py::arg("eps") = 1e-5);
   m.def("apply_rotary_forward", &ApplyRotaryForward, py::arg("q"), py::arg("k"), py::arg("cos"),
         py::arg("sin"));
   m.def("kv_cache_append_forward", &KvCacheAppendForward, py::arg("k_cache") = py::none(),

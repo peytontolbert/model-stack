@@ -9,7 +9,7 @@ from tensor.masking import to_additive_mask
 from tensor.positional import build_alibi_bias, build_relative_position_indices, relative_position_bias_from_table
 
 from .config import BlockConfig
-from .native_fusion import can_fuse_add_rms_norm, fused_add_rms_norm
+from .native_fusion import can_apply_native_norm, fused_add_norm
 
 
 class CausalSelfAttentionBlockBase(nn.Module):
@@ -66,8 +66,8 @@ class CausalSelfAttentionBlockBase(nn.Module):
         attn_mask = self._apply_pos_bias(x, base_mask)
         if self.bc.norm_policy == "prenorm":
             a = self.attn.forward(self.n1(x), None, None, attn_mask, cache)
-            if can_fuse_add_rms_norm(self.n2, self.training):
-                x, mlp_in = fused_add_rms_norm(x, a, self.n2, self.bc.residual_scale)
+            if can_apply_native_norm(self.n2, self.training):
+                x, mlp_in = fused_add_norm(x, a, self.n2, self.bc.residual_scale)
             else:
                 x = x + self.bc.residual_scale * self.drop_path(self.resid_dropout(a))
                 mlp_in = self.n2(x)
@@ -75,14 +75,13 @@ class CausalSelfAttentionBlockBase(nn.Module):
             x = x + self.bc.residual_scale * self.drop_path(self.resid_dropout(m))
             return x
         a = self.attn.forward(x, None, None, attn_mask, cache)
-        if can_fuse_add_rms_norm(self.n1, self.training):
-            _, x = fused_add_rms_norm(x, a, self.n1, self.bc.residual_scale)
+        if can_apply_native_norm(self.n1, self.training):
+            _, x = fused_add_norm(x, a, self.n1, self.bc.residual_scale)
         else:
             x = self.n1(x + self.bc.residual_scale * self.drop_path(self.resid_dropout(a)))
         m = self.mlp(x)
-        if can_fuse_add_rms_norm(self.n2, self.training):
-            _, x = fused_add_rms_norm(x, m, self.n2, self.bc.residual_scale)
+        if can_apply_native_norm(self.n2, self.training):
+            _, x = fused_add_norm(x, m, self.n2, self.bc.residual_scale)
         else:
             x = self.n2(x + self.bc.residual_scale * self.drop_path(self.resid_dropout(m)))
         return x
-

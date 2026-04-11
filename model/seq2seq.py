@@ -4,6 +4,7 @@ import torch.nn as nn
 from specs.config import ModelConfig
 from blocks.encoder_block import EncoderBlock
 from blocks.decoder_block import DecoderBlock
+from blocks.native_fusion import apply_native_norm
 from blocks.schedules import drop_path_linear
 from blocks.init import init_transformer_stack
 
@@ -48,7 +49,7 @@ class EncoderDecoderLM(nn.Module):
         x = self.enc_embed(input_ids)
         for blk in self.encoder:
             x = blk(x, padding_mask)
-        return self.enc_norm(x)
+        return apply_native_norm(x, self.enc_norm)
 
     def decode(
         self,
@@ -66,7 +67,7 @@ class EncoderDecoderLM(nn.Module):
             for i, blk in enumerate(self.decoder):
                 layer_cache = cache.layer(i)
                 x = blk(x, memory, self_mask, memory_mask, layer_cache)
-        return self.dec_norm(x)
+        return apply_native_norm(x, self.dec_norm)
 
     def forward(
         self,
@@ -79,5 +80,4 @@ class EncoderDecoderLM(nn.Module):
         mem = self.encode(enc_input_ids, enc_padding_mask)
         x = self.decode(dec_input_ids, mem, dec_self_mask, enc_padding_mask, cache)
         return self.lm_head(x)
-
 

@@ -6,6 +6,7 @@ from runtime.ops import linear as runtime_linear
 from specs.config import ModelConfig
 from compress import apply_compression
 from blocks.factory import build_block_stack
+from blocks.native_fusion import apply_native_norm
 from tensor.norms import RMSNorm
 from tensor.masking import build_padding_mask, broadcast_mask, combine_masks, to_additive_mask, create_causal_mask, lengths_from_attention_mask
 from tensor.positional import RotaryEmbeddingHF
@@ -131,7 +132,7 @@ class CausalLM(nn.Module):
             for i, blk in enumerate(self.blocks):
                 layer_cache = cache.layer(i)
                 x = blk(x, mask, layer_cache, (cos, sin), position_ids)
-        x = self.norm(x)
+        x = apply_native_norm(x, self.norm)
         logits = runtime_linear(x, self.lm_head.weight, self.lm_head.bias)
         if return_dict:
             return {"logits": logits, "last_hidden_state": x}

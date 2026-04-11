@@ -7,6 +7,7 @@ from tensor.mlp import MLP
 from tensor.regularization import StochasticDepth
 
 from .config import BlockConfig, build_block_config_from_model
+from .native_fusion import apply_native_norm
 from attn.factory import build_attention
 
 
@@ -29,10 +30,9 @@ class ParallelTransformerBlock(nn.Module):
         self.drop_path = StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None, cache=None) -> torch.Tensor:
-        y = self.n(x)
+        y = apply_native_norm(x, self.n)
         a = self.attn.forward(y, None, None, mask, cache)
         m = self.mlp(y)
         out = x + self.drop_path(self.resid_dropout(a)) + self.drop_path(self.resid_dropout(m))
         return out
-
 
