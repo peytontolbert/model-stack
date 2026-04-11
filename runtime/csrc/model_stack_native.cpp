@@ -2,8 +2,11 @@
 #include <ATen/TensorIndexing.h>
 #include <ATen/ops/_unique2.h>
 #include <ATen/ops/embedding.h>
+#include <ATen/ops/gelu.h>
 #include <ATen/ops/index_select.h>
 #include <ATen/ops/linear.h>
+#include <ATen/ops/relu.h>
+#include <ATen/ops/silu.h>
 
 #include <algorithm>
 #include <cctype>
@@ -24,6 +27,7 @@ std::map<std::string, bool> NativeOpMap() {
   return {
       {"embedding", true},
       {"linear", true},
+      {"mlp", true},
       {"qkv_projection", true},
       {"rms_norm", true},
       {"rope", true},
@@ -67,6 +71,20 @@ std::string ResolveLinearBackend(const std::string& requested) {
   return candidate;
 }
 
+torch::Tensor ApplyActivation(const torch::Tensor& x, const std::string& activation) {
+  const auto act = NormalizeBackendName(activation);
+  if (act == "gelu" || act == "geglu") {
+    return at::gelu(x, "none");
+  }
+  if (act == "silu" || act == "swish" || act == "swiglu" || act == "gated-silu") {
+    return at::silu(x);
+  }
+  if (act == "relu" || act == "reglu") {
+    return at::relu(x);
+  }
+  return at::gelu(x, "none");
+}
+
 py::dict RuntimeInfo() {
   py::dict info;
   info["abi_version"] = kAbiVersion;
@@ -76,9 +94,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "embedding", "linear", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "embedding", "linear", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "attention_decode",
+      "embedding", "linear", "mlp", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "attention_decode",
       "attention_prefill", "sampling"};
   info["linear_backend_default"] = "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
@@ -339,6 +357,31 @@ torch::Tensor LinearForward(
   return at::linear(x, weight, bias);
 }
 
+torch::Tensor MlpForward(
+    const torch::Tensor& x,
+    const torch::Tensor& w_in_weight,
+    const c10::optional<torch::Tensor>& w_in_bias,
+    const torch::Tensor& w_out_weight,
+    const c10::optional<torch::Tensor>& w_out_bias,
+    const std::string& activation,
+    bool gated,
+    const std::string& backend) {
+  const auto resolved_backend = ResolveLinearBackend(backend);
+  (void)resolved_backend;
+  auto hidden = at::linear(x, w_in_weight, w_in_bias);
+  torch::Tensor projected;
+  if (gated) {
+    TORCH_CHECK(hidden.size(-1) % 2 == 0, "mlp_forward: gated projection width must be even");
+    const auto split = hidden.size(-1) / 2;
+    auto a = hidden.slice(-1, 0, split);
+    auto b = hidden.slice(-1, split, hidden.size(-1));
+    projected = ApplyActivation(a, activation) * b;
+  } else {
+    projected = ApplyActivation(hidden, activation);
+  }
+  return at::linear(projected, w_out_weight, w_out_bias);
+}
+
 std::vector<torch::Tensor> QkvProjectionForward(
     const torch::Tensor& x,
     const torch::Tensor& q_weight,
@@ -397,6 +440,9 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("penalty"));
   m.def("linear_forward", &LinearForward, py::arg("x"), py::arg("weight"), py::arg("bias") = py::none(),
         py::arg("backend") = "auto");
+  m.def("mlp_forward", &MlpForward, py::arg("x"), py::arg("w_in_weight"), py::arg("w_in_bias") = py::none(),
+        py::arg("w_out_weight"), py::arg("w_out_bias") = py::none(), py::arg("activation") = "gelu",
+        py::arg("gated") = false, py::arg("backend") = "auto");
   m.def("qkv_projection_forward", &QkvProjectionForward, py::arg("x"), py::arg("q_weight"),
         py::arg("q_bias") = py::none(), py::arg("k_weight"), py::arg("k_bias") = py::none(),
         py::arg("v_weight"), py::arg("v_bias") = py::none(), py::arg("backend") = "auto");

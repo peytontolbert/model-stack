@@ -273,6 +273,52 @@ def qkv_projection(
     )
 
 
+def mlp(
+    x: torch.Tensor,
+    w_in_weight: torch.Tensor,
+    w_in_bias: torch.Tensor | None,
+    w_out_weight: torch.Tensor,
+    w_out_bias: torch.Tensor | None,
+    *,
+    activation: str,
+    gated: bool,
+    backend: str | None = None,
+) -> torch.Tensor:
+    if has_native_op("mlp"):
+        module = native_module()
+        if module is not None and hasattr(module, "mlp_forward"):
+            return module.mlp_forward(
+                x,
+                w_in_weight,
+                w_in_bias,
+                w_out_weight,
+                w_out_bias,
+                str(activation),
+                bool(gated),
+                resolve_linear_backend(backend),
+            )
+    hidden = linear(x, w_in_weight, w_in_bias, backend=backend)
+    act = str(activation).lower()
+    if gated:
+        a, b = hidden.chunk(2, dim=-1)
+        if act in ("swiglu", "gated-silu"):
+            hidden = F.silu(a) * b
+        elif act == "geglu":
+            hidden = F.gelu(a) * b
+        elif act == "reglu":
+            hidden = F.relu(a) * b
+        else:
+            hidden = F.silu(a) * b
+    else:
+        if act == "gelu":
+            hidden = F.gelu(hidden)
+        elif act in ("silu", "swish"):
+            hidden = F.silu(hidden)
+        else:
+            hidden = F.gelu(hidden)
+    return linear(hidden, w_out_weight, w_out_bias, backend=backend)
+
+
 def embedding(
     weight: torch.Tensor,
     indices: torch.Tensor,

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from runtime.ops import linear as runtime_linear
+from runtime.ops import linear as runtime_linear, mlp as runtime_mlp
 from .activations import gelu, silu
 
 
@@ -45,6 +45,16 @@ class MLP(nn.Module):
         return gelu(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not (self.training and not isinstance(self.dropout, nn.Identity)):
+            return runtime_mlp(
+                x,
+                self.w_in.weight,
+                self.w_in.bias,
+                self.w_out.weight,
+                self.w_out.bias,
+                activation=self.activation_name,
+                gated=self.gated,
+            )
         if self.gated:
             x_proj = runtime_linear(x, self.w_in.weight, self.w_in.bias)
             a, b = x_proj.chunk(2, dim=-1)
@@ -61,4 +71,3 @@ class MLP(nn.Module):
             x = self._act(runtime_linear(x, self.w_in.weight, self.w_in.bias))
         x = self.dropout(x)
         return runtime_linear(x, self.w_out.weight, self.w_out.bias)
-
