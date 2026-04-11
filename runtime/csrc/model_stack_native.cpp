@@ -40,6 +40,14 @@ std::vector<torch::Tensor> CudaApplyRotaryForward(
     const torch::Tensor& cos,
     const torch::Tensor& sin);
 bool HasCudaRopeKernel();
+torch::Tensor CudaAttentionForward(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    const c10::optional<double>& scale);
+bool HasCudaAttentionKernel();
 #else
 bool HasCudaRmsNormKernel() {
   return false;
@@ -51,6 +59,9 @@ bool HasCudaGatedActivationKernel() {
   return false;
 }
 bool HasCudaRopeKernel() {
+  return false;
+}
+bool HasCudaAttentionKernel() {
   return false;
 }
 #endif
@@ -164,6 +175,9 @@ py::dict RuntimeInfo() {
   }
   if (HasCudaRopeKernel()) {
     cuda_backend_ops.push_back("rope");
+  }
+  if (HasCudaAttentionKernel()) {
+    cuda_backend_ops.push_back("attention");
   }
   if (HasCublasLtLinearBackend()) {
     cuda_backend_ops.push_back("linear");
@@ -310,6 +324,12 @@ torch::Tensor NativeAttentionForward(
   TORCH_CHECK(q.size(1) == k.size(1) && q.size(1) == v.size(1), "attention_forward: head mismatch");
   TORCH_CHECK(k.size(2) == v.size(2), "attention_forward: source-length mismatch");
   TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3), "attention_forward: head_dim mismatch");
+
+#if MODEL_STACK_WITH_CUDA
+  if (q.is_cuda() && k.is_cuda() && v.is_cuda() && HasCudaAttentionKernel()) {
+    return CudaAttentionForward(q, k, v, attn_mask, is_causal, scale);
+  }
+#endif
 
   const double scale_value = scale.has_value() ? scale.value() : (1.0 / std::sqrt(static_cast<double>(q.size(3))));
   auto scores = torch::matmul(q, k.transpose(-2, -1)) * scale_value;
