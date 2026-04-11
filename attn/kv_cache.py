@@ -208,6 +208,10 @@ class _LayerCacheView:
         for b in range(B):
             self.parent.append(self.layer_idx, b, k[b], v[b])
 
+    def append_and_read(self, k: torch.Tensor, v: torch.Tensor, start: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        self.append(k, v)
+        return self.read(int(start), self.length())
+
     def read(self, start: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
         Ks: list[torch.Tensor] = []
         Vs: list[torch.Tensor] = []

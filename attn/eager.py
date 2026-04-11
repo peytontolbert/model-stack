@@ -227,14 +227,19 @@ class EagerAttention(nn.Module):
                 else:
                     qh, kh_new = apply_rotary(qh, kh_new, self._rope_cos[:T], self._rope_sin[:T])
 
-        # Read previously cached KV (already RoPE-applied) and concatenate
+        appended_to_cache = False
+        # Read previously cached KV (already RoPE-applied).
         if cache is not None:
-            k_old, v_old = cache.read(0, cache.length())  # (B, Hk, Sold, Dh)
-            if k_old is not None and k_old.shape[2] > 0:
-                kh_all = torch.cat([k_old, kh_new], dim=2)
-                vh_all = torch.cat([v_old, vh_new], dim=2)
+            if T > 0 and hasattr(cache, "append_and_read"):
+                kh_all, vh_all = cache.append_and_read(kh_new, vh_new, 0)
+                appended_to_cache = True
             else:
-                kh_all, vh_all = kh_new, vh_new
+                k_old, v_old = cache.read(0, cache.length())  # (B, Hk, Sold, Dh)
+                if k_old is not None and k_old.shape[2] > 0:
+                    kh_all = torch.cat([k_old, kh_new], dim=2)
+                    vh_all = torch.cat([v_old, vh_new], dim=2)
+                else:
+                    kh_all, vh_all = kh_new, vh_new
         else:
             kh_all, vh_all = kh_new, vh_new
 
@@ -320,7 +325,7 @@ class EagerAttention(nn.Module):
                 raise
 
         # Append newly produced KV to cache (stored with Hk heads)
-        if cache is not None and T > 0:
+        if cache is not None and T > 0 and not appended_to_cache:
             cache.append(kh_new, vh_new)
 
         if packed_backend is not None:
