@@ -80,3 +80,16 @@ def has_native_op(name: str) -> bool:
         return bool(module.has_op(name))
     except Exception:
         return False
+
+
+def resolve_linear_backend(requested: str | None = None) -> str:
+    module = native_module()
+    candidate = "auto" if requested is None else str(requested)
+    if module is not None and hasattr(module, "resolve_linear_backend"):
+        try:
+            return str(module.resolve_linear_backend(candidate))
+        except Exception:
+            pass
+    if candidate.strip().lower() in {"", "auto"}:
+        return "aten"
+    return candidate.strip().lower()

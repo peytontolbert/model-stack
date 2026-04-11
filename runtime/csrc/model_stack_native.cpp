@@ -5,7 +5,10 @@
 #include <ATen/ops/index_select.h>
 #include <ATen/ops/linear.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -21,6 +24,7 @@ std::map<std::string, bool> NativeOpMap() {
   return {
       {"embedding", true},
       {"linear", true},
+      {"qkv_projection", true},
       {"rms_norm", true},
       {"rope", true},
       {"kv_cache_append", true},
@@ -28,6 +32,39 @@ std::map<std::string, bool> NativeOpMap() {
       {"attention_prefill", true},
       {"sampling", true},
   };
+}
+
+std::vector<std::string> SupportedLinearBackends() {
+  return {"aten"};
+}
+
+std::vector<std::string> PlannedLinearBackends() {
+  return {"cublaslt"};
+}
+
+std::string NormalizeBackendName(const std::string& name) {
+  std::string out = name;
+  std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return out;
+}
+
+std::string ResolveLinearBackend(const std::string& requested) {
+  std::string candidate = NormalizeBackendName(requested);
+  if (candidate.empty() || candidate == "auto") {
+    const char* env_value = std::getenv("MODEL_STACK_LINEAR_BACKEND");
+    candidate = env_value != nullptr ? NormalizeBackendName(env_value) : "aten";
+    if (candidate.empty() || candidate == "auto") {
+      candidate = "aten";
+    }
+  }
+  TORCH_CHECK(
+      candidate == "aten",
+      "Unsupported linear backend request: ",
+      candidate,
+      " (supported backends: aten; planned backends: cublaslt)");
+  return candidate;
 }
 
 py::dict RuntimeInfo() {
@@ -39,10 +76,13 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "embedding", "linear", "rms_norm", "rope", "kv_cache_append", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "embedding", "linear", "rms_norm", "rope", "kv_cache_append", "attention_decode",
+      "embedding", "linear", "qkv_projection", "rms_norm", "rope", "kv_cache_append", "attention_decode",
       "attention_prefill", "sampling"};
+  info["linear_backend_default"] = "aten";
+  info["linear_backends_supported"] = SupportedLinearBackends();
+  info["linear_backends_planned"] = PlannedLinearBackends();
   return info;
 }
 
@@ -283,7 +323,8 @@ torch::Tensor RepetitionPenaltyForward(
 torch::Tensor LinearForward(
     const torch::Tensor& x,
     const torch::Tensor& weight,
-    const c10::optional<torch::Tensor>& bias) {
+    const c10::optional<torch::Tensor>& bias,
+    const std::string& backend) {
   TORCH_CHECK(x.defined() && weight.defined(), "linear_forward: x and weight must be defined");
   TORCH_CHECK(x.dim() >= 2, "linear_forward: x must have rank >= 2");
   TORCH_CHECK(weight.dim() == 2, "linear_forward: weight must be rank-2");
@@ -293,7 +334,27 @@ torch::Tensor LinearForward(
     TORCH_CHECK(b.dim() == 1, "linear_forward: bias must be rank-1");
     TORCH_CHECK(b.size(0) == weight.size(0), "linear_forward: bias size mismatch");
   }
+  const auto resolved_backend = ResolveLinearBackend(backend);
+  (void)resolved_backend;
   return at::linear(x, weight, bias);
+}
+
+std::vector<torch::Tensor> QkvProjectionForward(
+    const torch::Tensor& x,
+    const torch::Tensor& q_weight,
+    const c10::optional<torch::Tensor>& q_bias,
+    const torch::Tensor& k_weight,
+    const c10::optional<torch::Tensor>& k_bias,
+    const torch::Tensor& v_weight,
+    const c10::optional<torch::Tensor>& v_bias,
+    const std::string& backend) {
+  const auto resolved_backend = ResolveLinearBackend(backend);
+  (void)resolved_backend;
+  return {
+      at::linear(x, q_weight, q_bias),
+      at::linear(x, k_weight, k_bias),
+      at::linear(x, v_weight, v_bias),
+  };
 }
 
 torch::Tensor EmbeddingForward(
@@ -307,12 +368,17 @@ torch::Tensor EmbeddingForward(
   return at::embedding(weight, indices.to(torch::kLong), padding_idx, false, false);
 }
 
+std::string ResolveLinearBackendPy(const std::string& requested) {
+  return ResolveLinearBackend(requested);
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_model_stack_native, m) {
   m.doc() = "Model-stack native C++/CUDA extension boundary.";
   m.def("runtime_info", &RuntimeInfo);
   m.def("has_op", &HasOp, py::arg("name"));
+  m.def("resolve_linear_backend", &ResolveLinearBackendPy, py::arg("requested") = "auto");
   m.def("rms_norm_forward", &RmsNormForward, py::arg("x"), py::arg("weight") = py::none(),
         py::arg("eps") = 1e-6);
   m.def("apply_rotary_forward", &ApplyRotaryForward, py::arg("q"), py::arg("k"), py::arg("cos"),
@@ -329,7 +395,11 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("sample_next_token_forward", &SampleNextTokenForward, py::arg("logits"), py::arg("do_sample"));
   m.def("repetition_penalty_forward", &RepetitionPenaltyForward, py::arg("logits"), py::arg("token_ids"),
         py::arg("penalty"));
-  m.def("linear_forward", &LinearForward, py::arg("x"), py::arg("weight"), py::arg("bias") = py::none());
+  m.def("linear_forward", &LinearForward, py::arg("x"), py::arg("weight"), py::arg("bias") = py::none(),
+        py::arg("backend") = "auto");
+  m.def("qkv_projection_forward", &QkvProjectionForward, py::arg("x"), py::arg("q_weight"),
+        py::arg("q_bias") = py::none(), py::arg("k_weight"), py::arg("k_bias") = py::none(),
+        py::arg("v_weight"), py::arg("v_bias") = py::none(), py::arg("backend") = "auto");
   m.def("embedding_forward", &EmbeddingForward, py::arg("weight"), py::arg("indices"),
         py::arg("padding_idx") = -1);
 }

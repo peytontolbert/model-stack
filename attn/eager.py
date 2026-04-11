@@ -3,7 +3,7 @@ import os
 import torch
 import torch.nn as nn
 
-from runtime.ops import linear as runtime_linear
+from runtime.ops import linear as runtime_linear, qkv_projection as runtime_qkv_projection
 from specs.config import ModelConfig
 from .interfaces import Attention, KVCache
 from .backends import scaled_dot_product_attention, select_attention_backend
@@ -100,9 +100,20 @@ class EagerAttention(nn.Module):
         B, T, D = x.shape
         device, dtype = x.device, x.dtype
 
-        q_lin = runtime_linear(x, self.w_q.weight, self.w_q.bias)
-        k_lin = runtime_linear(x if k is None else k, self.w_k.weight, self.w_k.bias)
-        v_lin = runtime_linear(x if v is None else v, self.w_v.weight, self.w_v.bias)
+        if k is None and v is None:
+            q_lin, k_lin, v_lin = runtime_qkv_projection(
+                x,
+                self.w_q.weight,
+                self.w_q.bias,
+                self.w_k.weight,
+                self.w_k.bias,
+                self.w_v.weight,
+                self.w_v.bias,
+            )
+        else:
+            q_lin = runtime_linear(x, self.w_q.weight, self.w_q.bias)
+            k_lin = runtime_linear(x if k is None else k, self.w_k.weight, self.w_k.bias)
+            v_lin = runtime_linear(x if v is None else v, self.w_v.weight, self.w_v.bias)
 
         qh = split_heads(q_lin, self.n_heads)          # (B, H, T, Dh)
         kh_new = split_heads(k_lin, self.n_kv_heads)   # (B, Hk, T, Dh)
@@ -218,4 +229,3 @@ class EagerAttention(nn.Module):
             cache.append(kh_new, vh_new)
 
         return runtime_linear(y, self.w_o.weight, self.w_o.bias)
-

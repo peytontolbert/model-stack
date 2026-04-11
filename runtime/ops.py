@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from runtime.native import has_native_op, native_module
+from runtime.native import has_native_op, native_module, resolve_linear_backend
 
 
 def _to_tuple_dims(dim: int | tuple[int, ...], ndim: int) -> tuple[int, ...]:
@@ -231,12 +231,46 @@ def linear(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
+    *,
+    backend: str | None = None,
 ) -> torch.Tensor:
     if has_native_op("linear"):
         module = native_module()
         if module is not None and hasattr(module, "linear_forward"):
-            return module.linear_forward(x, weight, bias)
+            return module.linear_forward(x, weight, bias, resolve_linear_backend(backend))
     return F.linear(x, weight, bias)
+
+
+def qkv_projection(
+    x: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor | None,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor | None,
+    v_weight: torch.Tensor,
+    v_bias: torch.Tensor | None,
+    *,
+    backend: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if has_native_op("qkv_projection"):
+        module = native_module()
+        if module is not None and hasattr(module, "qkv_projection_forward"):
+            q, k, v = module.qkv_projection_forward(
+                x,
+                q_weight,
+                q_bias,
+                k_weight,
+                k_bias,
+                v_weight,
+                v_bias,
+                resolve_linear_backend(backend),
+            )
+            return q, k, v
+    return (
+        linear(x, q_weight, q_bias, backend=backend),
+        linear(x, k_weight, k_bias, backend=backend),
+        linear(x, v_weight, v_bias, backend=backend),
+    )
 
 
 def embedding(
