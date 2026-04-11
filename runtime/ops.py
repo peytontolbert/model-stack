@@ -206,6 +206,27 @@ def sample_next_token(logits: torch.Tensor, do_sample: bool) -> torch.Tensor:
     return torch.argmax(logits, dim=-1, keepdim=True)
 
 
+def repetition_penalty(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    penalty: float,
+) -> torch.Tensor:
+    if has_native_op("sampling"):
+        module = native_module()
+        if module is not None and hasattr(module, "repetition_penalty_forward"):
+            return module.repetition_penalty_forward(logits, token_ids, float(penalty))
+    out = logits.clone()
+    if float(penalty) == 1.0 or token_ids.numel() == 0:
+        return out
+    for b in range(token_ids.shape[0]):
+        idx = torch.unique(token_ids[b].to(torch.long))
+        if idx.numel() == 0:
+            continue
+        values = out[b, idx]
+        out[b, idx] = torch.where(values > 0, values / float(penalty), values * float(penalty))
+    return out
+
+
 def linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -216,3 +237,15 @@ def linear(
         if module is not None and hasattr(module, "linear_forward"):
             return module.linear_forward(x, weight, bias)
     return F.linear(x, weight, bias)
+
+
+def embedding(
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+    padding_idx: int | None = None,
+) -> torch.Tensor:
+    if has_native_op("embedding"):
+        module = native_module()
+        if module is not None and hasattr(module, "embedding_forward"):
+            return module.embedding_forward(weight, indices, -1 if padding_idx is None else int(padding_idx))
+    return F.embedding(indices, weight, padding_idx=padding_idx)

@@ -1,4 +1,8 @@
 #include <torch/extension.h>
+#include <ATen/TensorIndexing.h>
+#include <ATen/ops/_unique2.h>
+#include <ATen/ops/embedding.h>
+#include <ATen/ops/index_select.h>
 #include <ATen/ops/linear.h>
 
 #include <cmath>
@@ -15,6 +19,7 @@ constexpr int kAbiVersion = MODEL_STACK_ABI_VERSION;
 
 std::map<std::string, bool> NativeOpMap() {
   return {
+      {"embedding", true},
       {"linear", true},
       {"rms_norm", true},
       {"rope", true},
@@ -34,9 +39,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "linear", "rms_norm", "rope", "kv_cache_append", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "rms_norm", "rope", "kv_cache_append", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "linear", "rms_norm", "rope", "kv_cache_append", "attention_decode",
+      "embedding", "linear", "rms_norm", "rope", "kv_cache_append", "attention_decode",
       "attention_prefill", "sampling"};
   return info;
 }
@@ -244,6 +249,37 @@ torch::Tensor SampleNextTokenForward(const torch::Tensor& logits, bool do_sample
   return std::get<1>(torch::max(logits, -1, true));
 }
 
+torch::Tensor RepetitionPenaltyForward(
+    const torch::Tensor& logits,
+    const torch::Tensor& token_ids,
+    double penalty) {
+  TORCH_CHECK(logits.defined() && token_ids.defined(), "repetition_penalty_forward: tensors must be defined");
+  TORCH_CHECK(logits.dim() == 2, "repetition_penalty_forward: logits must be rank-2 (B, V)");
+  TORCH_CHECK(token_ids.dim() == 2, "repetition_penalty_forward: token_ids must be rank-2 (B, T)");
+  TORCH_CHECK(logits.size(0) == token_ids.size(0), "repetition_penalty_forward: batch mismatch");
+  TORCH_CHECK(std::isfinite(penalty) && penalty > 0.0, "repetition_penalty_forward: penalty must be positive and finite");
+
+  auto out = logits.clone();
+  if (penalty == 1.0 || token_ids.size(1) == 0) {
+    return out;
+  }
+
+  for (int64_t b = 0; b < token_ids.size(0); ++b) {
+    auto row_ids = token_ids[b].to(torch::kLong).reshape({-1});
+    auto unique_result = at::_unique2(row_ids, true, false, false);
+    auto unique_ids = std::get<0>(unique_result);
+    if (unique_ids.numel() == 0) {
+      continue;
+    }
+    auto row = out[b];
+    auto values = at::index_select(row, 0, unique_ids);
+    auto positive = values > 0;
+    auto adjusted = torch::where(positive, values / penalty, values * penalty);
+    row.index_put_({at::indexing::TensorIndex(unique_ids)}, adjusted);
+  }
+  return out;
+}
+
 torch::Tensor LinearForward(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -258,6 +294,17 @@ torch::Tensor LinearForward(
     TORCH_CHECK(b.size(0) == weight.size(0), "linear_forward: bias size mismatch");
   }
   return at::linear(x, weight, bias);
+}
+
+torch::Tensor EmbeddingForward(
+    const torch::Tensor& weight,
+    const torch::Tensor& indices,
+    int64_t padding_idx) {
+  TORCH_CHECK(weight.defined() && indices.defined(), "embedding_forward: weight and indices must be defined");
+  TORCH_CHECK(weight.dim() == 2, "embedding_forward: weight must be rank-2");
+  TORCH_CHECK(indices.scalar_type() == torch::kLong || indices.scalar_type() == torch::kInt,
+              "embedding_forward: indices must be int32 or int64");
+  return at::embedding(weight, indices.to(torch::kLong), padding_idx, false, false);
 }
 
 }  // namespace
@@ -280,5 +327,9 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("presence_frequency_penalty_forward", &PresenceFrequencyPenaltyForward, py::arg("logits"),
         py::arg("counts"), py::arg("alpha_presence"), py::arg("alpha_frequency"));
   m.def("sample_next_token_forward", &SampleNextTokenForward, py::arg("logits"), py::arg("do_sample"));
+  m.def("repetition_penalty_forward", &RepetitionPenaltyForward, py::arg("logits"), py::arg("token_ids"),
+        py::arg("penalty"));
   m.def("linear_forward", &LinearForward, py::arg("x"), py::arg("weight"), py::arg("bias") = py::none());
+  m.def("embedding_forward", &EmbeddingForward, py::arg("weight"), py::arg("indices"),
+        py::arg("padding_idx") = -1);
 }

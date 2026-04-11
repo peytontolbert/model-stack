@@ -30,6 +30,7 @@ def runtime_status() -> NativeRuntimeStatus:
         )
 
     try:
+        import torch  # noqa: F401
         module = importlib.import_module(NATIVE_MODULE_NAME)
     except Exception as exc:
         return NativeRuntimeStatus(

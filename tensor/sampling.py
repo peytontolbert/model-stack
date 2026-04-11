@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from runtime.ops import (
     presence_frequency_penalty as runtime_presence_frequency_penalty,
+    repetition_penalty as runtime_repetition_penalty,
     sample_next_token as runtime_sample_next_token,
     temperature as runtime_temperature,
     topk_mask as runtime_topk_mask,
@@ -19,6 +20,14 @@ def apply_repetition_penalty(logits: torch.Tensor, freq_counts: torch.Tensor, pr
     while penalty.ndim < logits.ndim:
         penalty = penalty.unsqueeze(-1)
     return logits - penalty
+
+
+def apply_transformers_repetition_penalty(
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    penalty: float,
+) -> torch.Tensor:
+    return runtime_repetition_penalty(logits, input_ids, penalty)
 
 
 def apply_min_p_mask(logits: torch.Tensor, p_min: float, dim: int = -1) -> torch.Tensor:
@@ -239,4 +248,3 @@ def gumbel_softmax(logits: torch.Tensor, tau: float, hard: bool = False, dim: in
         y_hard = torch.zeros_like(y).scatter(dim, idx, 1.0)
         y = (y_hard - y).detach() + y
     return y
-

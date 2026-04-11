@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+from runtime.ops import embedding as runtime_embedding
 from runtime.ops import linear as runtime_linear
 from specs.config import ModelConfig
 from compress import apply_compression
@@ -66,7 +67,11 @@ class CausalLM(nn.Module):
     ):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-        x = inputs_embeds if inputs_embeds is not None else self.embed(input_ids)
+        x = (
+            inputs_embeds
+            if inputs_embeds is not None
+            else runtime_embedding(self.embed.weight, input_ids, self.embed.padding_idx)
+        )
         B, T, _ = x.shape
         # position ids: prefer provided, else derive from cache_position if available, else 0..T-1
         if position_ids is None:
@@ -153,96 +158,29 @@ class CausalLM(nn.Module):
         attention_mask: torch.Tensor | None = None,
         return_dict: bool = True,
     ):
-        # Full recompute each step for HF parity; no KV cache
-        import os, traceback
-        trace = (os.getenv("GEN_TRACE", "0") == "1")
-        device = next(self.parameters()).device
-        seq = input_ids.to(device)
-        attn = attention_mask.to(device) if attention_mask is not None else None
-        eos_id = (int(eos_token_id) if isinstance(eos_token_id, int) else (int(eos_token_id[0]) if isinstance(eos_token_id, (list, tuple)) and eos_token_id else None))
-       # if trace:
-       #     try:
-       #         print(f"[gen] start: device={device} dtype={next(self.parameters()).dtype} init_len={seq.shape[1]}")
-        #    except Exception:
-        #        pass
-        for step in range(int(max_new_tokens)):
-            try:
-                out = self(input_ids=seq, attention_mask=attn, return_dict=True)
-            except Exception:
-            #    if trace:
-            #        print(f"[gen] exception in forward at step={step} seq_len={seq.shape[1]}")
-            #        traceback.print_exc()
-                raise
-            logits = out["logits"][:, -1, :]
-            # Apply repetition / presence / frequency penalties (non-Transformers implementation)
-            try:
-                # seq shape: (B, T)
-                B = int(seq.shape[0])
-                V = int(logits.shape[-1])
-                for b in range(B):
-                    prev = seq[b]  # (T,)
-                    if prev.numel() > 0:
-                        # Repetition penalty (>1.0 discourages repeated tokens)
-                        if repetition_penalty is not None and float(repetition_penalty) != 1.0:
-                            rp = float(repetition_penalty)
-                            # For tokens present in prev, scale logits: positive -> /= rp, negative -> *= rp
-                            uniq = torch.unique(prev)
-                            idx = uniq.to(logits.device)
-                            vals = logits[b, idx]
-                            pos = vals > 0
-                            vals = torch.where(pos, vals / rp, vals * rp)
-                            logits[b, idx] = vals
-                        # Presence/frequency penalties (OpenAI-style)
-                        pp = float(presence_penalty or 0.0)
-                        fp = float(frequency_penalty or 0.0)
-                        if (pp != 0.0) or (fp != 0.0):
-                            # token counts in previous sequence
-                            counts = torch.bincount(prev.to(torch.long), minlength=V).to(logits.device, logits.dtype)
-                            # presence: subtract pp if token count > 0
-                            if pp != 0.0:
-                                pres_mask = (counts > 0).to(logits.dtype)
-                                logits[b, :] = logits[b, :] - (pp * pres_mask)
-                            # frequency: subtract fp * count
-                            if fp != 0.0:
-                                logits[b, :] = logits[b, :] - (fp * counts)
-            except Exception:
-                # Penalties are best-effort; ignore on failure to keep generation robust
-                pass
-            # Apply simple sampling policies
-            if do_sample:
-                x = logits.float()
-                if temperature is not None and float(temperature) != 1.0:
-                    x = x / float(max(1e-8, temperature))
-                if top_k is not None and int(top_k) > 0:
-                    kth = torch.topk(x, k=int(top_k), dim=-1).values[:, -1].unsqueeze(-1)
-                    x = torch.where(x < kth, torch.full_like(x, float('-inf')), x)
-                if top_p is not None and float(top_p) < 1.0:
-                    probs = torch.softmax(x, dim=-1)
-                    sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
-                    cumsum = torch.cumsum(sorted_probs, dim=-1)
-                    mask = cumsum > float(top_p)
-                    # keep at least one
-                    mask[:, 0] = False
-                    sorted_probs = torch.where(mask, torch.zeros_like(sorted_probs), sorted_probs)
-                    probs = torch.zeros_like(probs).scatter(-1, sorted_idx, sorted_probs)
-                    nxt = torch.multinomial(probs, num_samples=1)
-                else:
-                    probs = torch.softmax(x, dim=-1)
-                    nxt = torch.multinomial(probs, num_samples=1)
-            else:
-                nxt = torch.argmax(logits, dim=-1, keepdim=True)
-            #if trace:
-            #    try:
-            #        print(f"[gen] step={step} seq_len={seq.shape[1]} logits_dtype={logits.dtype} next_id={int(nxt[0,0].item())}")
-            #    except Exception:
-            #        pass
-            seq = torch.cat([seq, nxt], dim=1)
-            if attn is not None:
-                ones = torch.ones_like(nxt, device=attn.device, dtype=attn.dtype)
-                attn = torch.cat([attn, ones], dim=1)
-            if eos_id is not None and int(nxt[0, 0].item()) == int(eos_id):
-                break
+        eos_id = (
+            int(eos_token_id)
+            if isinstance(eos_token_id, int)
+            else (int(eos_token_id[0]) if isinstance(eos_token_id, (list, tuple)) and eos_token_id else None)
+        )
+        cfg = GenerationConfig(
+            max_new_tokens=int(max_new_tokens),
+            do_sample=bool(do_sample),
+            temperature=float(temperature),
+            top_k=(int(top_k) if top_k is not None else None),
+            top_p=(float(top_p) if top_p is not None else None),
+            eos_id=eos_id,
+            no_repeat_ngram=0,
+            repetition_penalty=float(repetition_penalty),
+            presence_penalty=float(presence_penalty),
+            frequency_penalty=float(frequency_penalty),
+        )
+        seq = engine_generate(
+            self,
+            input_ids.to(next(self.parameters()).device),
+            attention_mask=(attention_mask.to(next(self.parameters()).device) if attention_mask is not None else None),
+            config=cfg,
+        )
         if return_dict:
             return {"sequences": seq}
         return seq
-

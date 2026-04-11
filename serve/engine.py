@@ -4,6 +4,7 @@ from typing import Optional, Callable
 import torch
 
 from tensor.sampling import (
+    apply_transformers_repetition_penalty,
     apply_temperature,
     apply_topk_mask,
     apply_topp_mask,
@@ -24,6 +25,7 @@ class GenerationConfig:
     top_p: Optional[float] = None
     eos_id: Optional[int] = None
     no_repeat_ngram: int = 0
+    repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     # Optional sliding-window length for KV cache eviction during generation
@@ -36,6 +38,8 @@ def _apply_sampling_policies(
     cfg: GenerationConfig,
 ) -> torch.Tensor:
     x = logits
+    if cfg.repetition_penalty is not None and float(cfg.repetition_penalty) != 1.0:
+        x = apply_transformers_repetition_penalty(x, input_ids, float(cfg.repetition_penalty))
     # Only apply temperature/top-k/top-p when sampling is enabled
     if getattr(cfg, "do_sample", False):
         if cfg.temperature is not None and cfg.temperature != 1.0:
@@ -87,17 +91,25 @@ def generate(
     except Exception:
         pass
     seq = input_ids
-    # Initialize a simple KV cache for efficient decoding
-    try:
-        dev = next(model.parameters()).device
-        dt = next(model.parameters()).dtype
-        n_layers = len(getattr(model, "blocks"))
-        # Prefer explicit head_dim; else derive
-        head_dim = int(getattr(model.cfg, "head_dim", None) or (int(model.cfg.d_model) // int(model.cfg.n_heads)))
-        n_kv = int(getattr(getattr(model.blocks[0], "attn"), "n_kv_heads"))
-        cache = init_kv_cache(batch=seq.shape[0], n_layers=n_layers, n_kv_heads=n_kv, head_dim=head_dim, pagesize=128, dtype=dt, device=dev)
-    except Exception:
-        cache = None
+    if cache is None:
+        try:
+            dev = next(model.parameters()).device
+            dt = next(model.parameters()).dtype
+            n_layers = len(getattr(model, "blocks"))
+            # Prefer explicit head_dim; else derive
+            head_dim = int(getattr(model.cfg, "head_dim", None) or (int(model.cfg.d_model) // int(model.cfg.n_heads)))
+            n_kv = int(getattr(getattr(model.blocks[0], "attn"), "n_kv_heads"))
+            cache = init_kv_cache(
+                batch=seq.shape[0],
+                n_layers=n_layers,
+                n_kv_heads=n_kv,
+                head_dim=head_dim,
+                pagesize=128,
+                dtype=dt,
+                device=dev,
+            )
+        except Exception:
+            cache = None
 
     if trace:
         try:
@@ -105,33 +117,33 @@ def generate(
             print(f"[engine] start: device={p.device} dtype={p.dtype} init_len={seq.shape[1]} do_sample={getattr(cfg,'do_sample',False)}")
         except Exception:
             pass
-    for step in range(int(cfg.max_new_tokens)):
-        # Greedy step with last token and KV cache if available
-        # Compute absolute position ids for the next token
+    next_logits = None
+    if cache is not None:
         try:
-            # Absolute position id for the new token (L-1)
-            pos_ids = torch.arange(seq.shape[1] - 1, seq.shape[1], device=seq.device, dtype=torch.long)
-            pos_ids = pos_ids.view(1, 1).expand(seq.shape[0], -1)
-            cache_pos = pos_ids.view(-1)  # (B,)
-        except Exception:
-            pos_ids = None
-            cache_pos = None
-        try:
-            logits = model(
-                seq[:, -1:].contiguous(),
-                attn_mask=None,
-                attention_mask=attention_mask,
-                cache=cache,
-                position_ids=pos_ids,
-                cache_position=cache_pos,
-                return_dict=False,
-            )
+            logits = model(seq.contiguous(), attn_mask=None, attention_mask=attention_mask, cache=cache, return_dict=False)
+            next_logits = logits[:, -1, :]
         except Exception:
             if trace:
-                print(f"[engine] exception in model forward at step={step} seq_len={seq.shape[1]}")
+                print(f"[engine] exception in prompt prefill seq_len={seq.shape[1]}")
                 traceback.print_exc()
-            raise
-        next_logits = logits[:, -1, :]
+            cache = None
+
+    for step in range(int(cfg.max_new_tokens)):
+        if next_logits is None:
+            try:
+                logits = model(
+                    seq.contiguous(),
+                    attn_mask=None,
+                    attention_mask=attention_mask,
+                    cache=None,
+                    return_dict=False,
+                )
+            except Exception:
+                if trace:
+                    print(f"[engine] exception in model forward at step={step} seq_len={seq.shape[1]}")
+                    traceback.print_exc()
+                raise
+            next_logits = logits[:, -1, :]
         sampled_logits = _apply_sampling_policies(next_logits, seq, cfg)
         if sampler is not None:
             next_id = sampler(sampled_logits)
@@ -149,13 +161,37 @@ def generate(
         if attention_mask is not None:
             ones = torch.ones(next_id.shape[0], 1, device=attention_mask.device, dtype=attention_mask.dtype)
             attention_mask = torch.cat([attention_mask, ones], dim=1)
-        # Apply sliding-window cache eviction if configured
-        try:
-            if cache is not None and getattr(cfg, "sliding_window", None):
-                kv_cache_evict(cache, int(cfg.sliding_window), policy="sliding-window")
-        except Exception:
-            pass
         if cfg.eos_id is not None:
             if (next_id == int(cfg.eos_id)).all():
                 break
+        next_logits = None
+        if cache is not None:
+            try:
+                pos_ids = torch.arange(seq.shape[1] - 1, seq.shape[1], device=seq.device, dtype=torch.long)
+                pos_ids = pos_ids.view(1, 1).expand(seq.shape[0], -1)
+                cache_pos = pos_ids.view(-1)
+            except Exception:
+                pos_ids = None
+                cache_pos = None
+            try:
+                logits = model(
+                    seq[:, -1:].contiguous(),
+                    attn_mask=None,
+                    attention_mask=attention_mask,
+                    cache=cache,
+                    position_ids=pos_ids,
+                    cache_position=cache_pos,
+                    return_dict=False,
+                )
+                next_logits = logits[:, -1, :]
+            except Exception:
+                if trace:
+                    print(f"[engine] exception in decode step={step} seq_len={seq.shape[1]}")
+                    traceback.print_exc()
+                cache = None
+            try:
+                if cache is not None and getattr(cfg, "sliding_window", None):
+                    kv_cache_evict(cache, int(cfg.sliding_window), policy="sliding-window")
+            except Exception:
+                pass
     return seq
