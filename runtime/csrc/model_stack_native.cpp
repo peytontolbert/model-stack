@@ -233,7 +233,7 @@ py::dict RuntimeInfo() {
   info["linear_backends_supported"] = SupportedLinearBackends();
   info["linear_backends_planned"] = PlannedLinearBackends();
   info["cublaslt_linear_dtypes"] = HasCublasLtLinearBackend()
-      ? std::vector<std::string>{"float32", "float16"}
+      ? std::vector<std::string>{"float32", "float16", "bfloat16"}
       : std::vector<std::string>{};
   std::vector<std::string> cuda_backend_ops;
   if (HasCudaRmsNormKernel()) {
@@ -951,7 +951,7 @@ torch::Tensor MlpForward(
     const std::string& backend) {
   const auto normalized_backend = NormalizeBackendName(backend);
   const bool auto_backend = normalized_backend.empty() || normalized_backend == "auto";
-  if (auto_backend && gated && x.is_cuda() && x.scalar_type() != torch::kFloat32) {
+  if (auto_backend && gated && x.is_cuda() && x.scalar_type() == torch::kFloat16) {
     auto hidden = at::linear(x, w_in_weight, w_in_bias);
     torch::Tensor projected;
     if (hidden.size(-1) % 2 != 0) {

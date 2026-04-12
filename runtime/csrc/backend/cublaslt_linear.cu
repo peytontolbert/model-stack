@@ -43,7 +43,7 @@ inline void CheckCublas(cublasStatus_t status, const char* msg) {
 }
 
 bool IsSupportedLinearDtype(torch::ScalarType dtype) {
-  return dtype == torch::kFloat32 || dtype == torch::kFloat16;
+  return dtype == torch::kFloat32 || dtype == torch::kFloat16 || dtype == torch::kBFloat16;
 }
 
 cudaDataType_t ToCudaDataType(torch::ScalarType dtype) {
@@ -81,7 +81,7 @@ torch::Tensor RunCublasLtLinear(
 
   const auto scale_type = CUDA_R_32F;
   const auto data_type = ToCudaDataType(x_2d.scalar_type());
-  const auto compute_type = CUBLAS_COMPUTE_32F_PEDANTIC;
+  const auto compute_type = CUBLAS_COMPUTE_32F;
   const float alpha = 1.0f;
   const float beta = 0.0f;
   cublasOperation_t trans_a = CUBLAS_OP_T;
