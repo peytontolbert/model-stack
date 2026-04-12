@@ -33,6 +33,11 @@ std::vector<torch::Tensor> CudaAddRmsNormForward(
     double residual_scale,
     double eps);
 bool HasCudaAddRmsNormKernel();
+torch::Tensor CudaResidualAddForward(
+    const torch::Tensor& x,
+    const torch::Tensor& update,
+    double residual_scale);
+bool HasCudaResidualAddKernel();
 torch::Tensor CudaLayerNormForward(
     const torch::Tensor& x,
     const c10::optional<torch::Tensor>& weight,
@@ -80,6 +85,9 @@ bool HasCudaRmsNormKernel() {
   return false;
 }
 bool HasCudaAddRmsNormKernel() {
+  return false;
+}
+bool HasCudaResidualAddKernel() {
   return false;
 }
 bool HasCudaLayerNormKernel() {
@@ -131,6 +139,7 @@ std::map<std::string, bool> NativeOpMap() {
       {"decode_positions", true},
       {"rms_norm", true},
       {"add_rms_norm", true},
+      {"residual_add", true},
       {"layer_norm", true},
       {"add_layer_norm", true},
       {"rope", true},
@@ -216,9 +225,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
+      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
       "attention_prefill", "sampling"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
@@ -232,6 +241,9 @@ py::dict RuntimeInfo() {
   }
   if (HasCudaAddRmsNormKernel()) {
     cuda_backend_ops.push_back("add_rms_norm");
+  }
+  if (HasCudaResidualAddKernel()) {
+    cuda_backend_ops.push_back("residual_add");
   }
   if (HasCudaLayerNormKernel()) {
     cuda_backend_ops.push_back("layer_norm");
@@ -375,6 +387,26 @@ std::vector<torch::Tensor> AddRmsNormForward(
   auto combined = x + (update * residual_scale);
   auto normalized = RmsNormForward(combined, weight, eps);
   return {combined, normalized};
+}
+
+torch::Tensor ResidualAddForward(
+    const torch::Tensor& x,
+    const torch::Tensor& update,
+    double residual_scale) {
+  TORCH_CHECK(x.defined() && update.defined(), "residual_add_forward: x and update must be defined");
+  TORCH_CHECK(x.dim() >= 1 && update.dim() >= 1, "residual_add_forward: x and update must have rank >= 1");
+  TORCH_CHECK(x.sizes() == update.sizes(), "residual_add_forward: x and update shape mismatch");
+  TORCH_CHECK(x.scalar_type() == update.scalar_type(), "residual_add_forward: x and update dtype mismatch");
+  TORCH_CHECK(x.device() == update.device(), "residual_add_forward: x and update device mismatch");
+  TORCH_CHECK(std::isfinite(residual_scale), "residual_add_forward: residual_scale must be finite");
+
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && update.is_cuda() && HasCudaResidualAddKernel()) {
+    return CudaResidualAddForward(x, update, residual_scale);
+  }
+#endif
+
+  return x + (update * residual_scale);
 }
 
 std::vector<torch::Tensor> AddLayerNormForward(
@@ -1147,6 +1179,8 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("eps") = 1e-6);
   m.def("add_rms_norm_forward", &AddRmsNormForward, py::arg("x"), py::arg("update"),
         py::arg("weight") = py::none(), py::arg("residual_scale") = 1.0, py::arg("eps") = 1e-6);
+  m.def("residual_add_forward", &ResidualAddForward, py::arg("x"), py::arg("update"),
+        py::arg("residual_scale") = 1.0);
   m.def("layer_norm_forward", &LayerNormForward, py::arg("x"), py::arg("weight") = py::none(),
         py::arg("bias") = py::none(), py::arg("eps") = 1e-5);
   m.def("add_layer_norm_forward", &AddLayerNormForward, py::arg("x"), py::arg("update"),

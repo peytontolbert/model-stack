@@ -8,7 +8,7 @@ from tensor.positional import build_alibi_bias, build_relative_position_indices,
 from tensor.masking import to_additive_mask
 
 from .config import BlockConfig, build_block_config_from_model
-from .native_fusion import can_apply_native_norm, fused_add_norm
+from .native_fusion import apply_residual_update, can_apply_native_norm, fused_add_norm
 
 
 class TransformerBlock(nn.Module):
@@ -72,22 +72,50 @@ class TransformerBlock(nn.Module):
             if can_apply_native_norm(self.n2, self.training):
                 x, mlp_in = fused_add_norm(x, a, self.n2, self.bc.residual_scale)
             else:
-                x = x + self.bc.residual_scale * self.drop_path(self.resid_dropout(a))
+                x = apply_residual_update(
+                    x,
+                    a,
+                    residual_scale=self.bc.residual_scale,
+                    resid_dropout=self.resid_dropout,
+                    drop_path=self.drop_path,
+                )
                 mlp_in = self.n2(x)
             m = self.mlp(mlp_in)
-            x = x + self.bc.residual_scale * self.drop_path(self.resid_dropout(m))
+            x = apply_residual_update(
+                x,
+                m,
+                residual_scale=self.bc.residual_scale,
+                resid_dropout=self.resid_dropout,
+                drop_path=self.drop_path,
+            )
             return x
         # post-norm
         a = self.attn.forward(x, None, None, attn_mask, cache, position_embeddings=position_embeddings, position_ids=position_ids)
         if can_apply_native_norm(self.n1, self.training):
             _, x = fused_add_norm(x, a, self.n1, self.bc.residual_scale)
         else:
-            x = self.n1(x + self.bc.residual_scale * self.drop_path(self.resid_dropout(a)))
+            x = self.n1(
+                apply_residual_update(
+                    x,
+                    a,
+                    residual_scale=self.bc.residual_scale,
+                    resid_dropout=self.resid_dropout,
+                    drop_path=self.drop_path,
+                )
+            )
         m = self.mlp(x)
         if can_apply_native_norm(self.n2, self.training):
             _, x = fused_add_norm(x, m, self.n2, self.bc.residual_scale)
         else:
-            x = self.n2(x + self.bc.residual_scale * self.drop_path(self.resid_dropout(m)))
+            x = self.n2(
+                apply_residual_update(
+                    x,
+                    m,
+                    residual_scale=self.bc.residual_scale,
+                    resid_dropout=self.resid_dropout,
+                    drop_path=self.drop_path,
+                )
+            )
         return x
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None, cache=None, position_embeddings=None, position_ids=None) -> torch.Tensor:

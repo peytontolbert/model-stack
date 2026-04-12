@@ -124,6 +124,23 @@ def add_rms_norm(
     return combined, _rms_norm_reference(combined, weight=weight, eps=eps, dim=-1)
 
 
+def residual_add(
+    x: torch.Tensor,
+    update: torch.Tensor,
+    *,
+    residual_scale: float = 1.0,
+) -> torch.Tensor:
+    if has_native_op("residual_add"):
+        module = native_module()
+        if module is not None and hasattr(module, "residual_add_forward"):
+            return module.residual_add_forward(
+                x,
+                update,
+                float(residual_scale),
+            )
+    return x + (update * float(residual_scale))
+
+
 def add_layer_norm(
     x: torch.Tensor,
     update: torch.Tensor,

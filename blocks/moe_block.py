@@ -10,6 +10,7 @@ from .config import BlockConfig, build_block_config_from_model
 from .transformer_block import TransformerBlock
 from attn.factory import build_attention
 from tensor.mlp import MLP
+from .native_fusion import apply_residual_update, can_apply_native_norm, fused_add_norm
 
 
 class MoEMLP(nn.Module):
@@ -52,14 +53,51 @@ class MoEBlock(TransformerBlock):
     def _forward_core(self, x: torch.Tensor, mask: torch.Tensor | None, cache=None) -> torch.Tensor:
         if self.bc.norm_policy == "prenorm":
             a = self.attn.forward(self.n1(x), None, None, mask, cache)
-            x = x + self.drop_path(self.resid_dropout(a))
-            m, _ = self.moe(self.n2(x))
-            x = x + self.drop_path(self.resid_dropout(m))
+            if can_apply_native_norm(self.n2, self.training):
+                x, moe_in = fused_add_norm(x, a, self.n2, 1.0)
+            else:
+                x = apply_residual_update(
+                    x,
+                    a,
+                    residual_scale=1.0,
+                    resid_dropout=self.resid_dropout,
+                    drop_path=self.drop_path,
+                )
+                moe_in = self.n2(x)
+            m, _ = self.moe(moe_in)
+            x = apply_residual_update(
+                x,
+                m,
+                residual_scale=1.0,
+                resid_dropout=self.resid_dropout,
+                drop_path=self.drop_path,
+            )
             return x
         a = self.attn.forward(x, None, None, mask, cache)
-        x = self.n1(x + self.drop_path(self.resid_dropout(a)))
+        if can_apply_native_norm(self.n1, self.training):
+            _, x = fused_add_norm(x, a, self.n1, 1.0)
+        else:
+            x = self.n1(
+                apply_residual_update(
+                    x,
+                    a,
+                    residual_scale=1.0,
+                    resid_dropout=self.resid_dropout,
+                    drop_path=self.drop_path,
+                )
+            )
         m, _ = self.moe(x)
-        x = self.n2(x + self.drop_path(self.resid_dropout(m)))
+        if can_apply_native_norm(self.n2, self.training):
+            _, x = fused_add_norm(x, m, self.n2, 1.0)
+        else:
+            x = self.n2(
+                apply_residual_update(
+                    x,
+                    m,
+                    residual_scale=1.0,
+                    resid_dropout=self.resid_dropout,
+                    drop_path=self.drop_path,
+                )
+            )
         return x
-
 

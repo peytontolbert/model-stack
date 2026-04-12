@@ -26,6 +26,7 @@ def native_extensions():
         extension_cls = CUDAExtension
         sources.append("runtime/csrc/backend/cuda_rms_norm.cu")
         sources.append("runtime/csrc/backend/cuda_add_rms_norm.cu")
+        sources.append("runtime/csrc/backend/cuda_residual_add.cu")
         sources.append("runtime/csrc/backend/cuda_layer_norm.cu")
         sources.append("runtime/csrc/backend/cuda_attention.cu")
         sources.append("runtime/csrc/backend/cuda_kv_cache.cu")

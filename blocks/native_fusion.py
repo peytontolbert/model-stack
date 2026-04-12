@@ -6,6 +6,7 @@ import torch.nn as nn
 from runtime.ops import add_layer_norm as runtime_add_layer_norm
 from runtime.ops import add_rms_norm as runtime_add_rms_norm
 from runtime.ops import layer_norm as runtime_layer_norm
+from runtime.ops import residual_add as runtime_residual_add
 from runtime.ops import rms_norm as runtime_rms_norm
 from tensor.norms import RMSNorm
 
@@ -47,3 +48,15 @@ def fused_add_norm(
         )
     combined = x + (update * float(residual_scale))
     return combined, norm(combined)
+
+
+def apply_residual_update(
+    x: torch.Tensor,
+    update: torch.Tensor,
+    *,
+    residual_scale: float,
+    resid_dropout,
+    drop_path,
+) -> torch.Tensor:
+    residual = drop_path(resid_dropout(update))
+    return runtime_residual_add(x, residual, residual_scale=float(residual_scale))
