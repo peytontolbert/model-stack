@@ -190,6 +190,15 @@ std::string ResolveLinearBackend(const std::string& requested) {
   return candidate;
 }
 
+bool ForceReferenceGatedMlpFp16() {
+  const char* env_value = std::getenv("MODEL_STACK_MLP_FP16_REFERENCE");
+  if (env_value == nullptr) {
+    return false;
+  }
+  const auto normalized = NormalizeBackendName(env_value);
+  return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+}
+
 torch::Tensor ApplyActivation(const torch::Tensor& x, const std::string& activation) {
   const auto act = NormalizeBackendName(activation);
   if (act == "gelu" || act == "geglu") {
@@ -918,7 +927,8 @@ torch::Tensor MlpForward(
     const std::string& backend) {
   const auto normalized_backend = NormalizeBackendName(backend);
   const bool auto_backend = normalized_backend.empty() || normalized_backend == "auto";
-  if (auto_backend && gated && x.is_cuda() && x.scalar_type() == torch::kFloat16) {
+  if (auto_backend && gated && x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+      ForceReferenceGatedMlpFp16()) {
     return ReferenceMlpForward(x, w_in_weight, w_in_bias, w_out_weight, w_out_bias, activation, gated);
   }
   const auto resolved_backend = ResolveLinearBackend(backend);
