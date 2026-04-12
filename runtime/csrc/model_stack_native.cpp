@@ -123,6 +123,8 @@ std::map<std::string, bool> NativeOpMap() {
       {"merge_heads", true},
       {"head_output_projection", true},
       {"prepare_attention_mask", true},
+      {"resolve_position_ids", true},
+      {"create_causal_mask", true},
       {"token_counts", true},
       {"append_tokens", true},
       {"decode_positions", true},
@@ -213,9 +215,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
+      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
       "attention_prefill", "sampling"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
@@ -544,6 +546,96 @@ torch::Tensor PrepareAttentionMaskForward(
   }
 
   return prepared;
+}
+
+torch::Tensor ResolvePositionIdsForward(
+    int64_t batch_size,
+    int64_t seq_len,
+    const torch::Tensor& reference,
+    const c10::optional<torch::Tensor>& attention_mask,
+    const c10::optional<torch::Tensor>& cache_position,
+    int64_t past_length) {
+  TORCH_CHECK(reference.defined(), "resolve_position_ids_forward: reference must be defined");
+  TORCH_CHECK(batch_size > 0 && seq_len >= 0, "resolve_position_ids_forward: invalid batch_size or seq_len");
+  auto options = torch::TensorOptions().dtype(torch::kLong).device(reference.device());
+  if (cache_position.has_value() && cache_position.value().defined()) {
+    return cache_position.value().to(options).view({1, -1}).expand({batch_size, -1});
+  }
+  if (past_length > 0) {
+    auto base = torch::arange(past_length, past_length + seq_len, options);
+    return base.view({1, -1}).expand({batch_size, -1});
+  }
+  if (attention_mask.has_value() && attention_mask.value().defined()) {
+    auto lengths = attention_mask.value().to(torch::kLong).sum(-1).view({batch_size, 1});
+    auto starts = (lengths - seq_len).clamp_min(0);
+    auto base = torch::arange(seq_len, options).view({1, seq_len});
+    return base + starts;
+  }
+  auto base = torch::arange(seq_len, options);
+  return base.view({1, -1}).expand({batch_size, -1});
+}
+
+torch::Tensor CreateCausalMaskForward(
+    const torch::Tensor& reference,
+    const c10::optional<torch::Tensor>& attention_mask,
+    const c10::optional<torch::Tensor>& cache_position,
+    const c10::optional<torch::Tensor>& position_ids) {
+  TORCH_CHECK(reference.defined(), "create_causal_mask_forward: reference must be defined");
+  TORCH_CHECK(reference.dim() == 3, "create_causal_mask_forward: reference must have shape (B, T, D)");
+  const auto batch_size = reference.size(0);
+  const auto tgt_len = reference.size(1);
+  auto device = reference.device();
+
+  int64_t src_len = tgt_len;
+  if (position_ids.has_value() && position_ids.value().defined()) {
+    try {
+      src_len = position_ids.value().to(torch::kLong).max().item<int64_t>() + 1;
+    } catch (...) {
+      src_len = std::max<int64_t>(tgt_len, 1);
+    }
+  } else if (cache_position.has_value() && cache_position.value().defined()) {
+    try {
+      src_len = cache_position.value().to(torch::kLong).max().item<int64_t>() + 1;
+    } catch (...) {
+      src_len = std::max<int64_t>(tgt_len, 1);
+    }
+  }
+  if (attention_mask.has_value() && attention_mask.value().defined() && attention_mask.value().size(-1) > src_len) {
+    src_len = attention_mask.value().size(-1);
+  }
+
+  torch::Tensor causal_bool;
+  if (position_ids.has_value() && position_ids.value().defined()) {
+    auto pos = position_ids.value().to(torch::kLong);
+    if (pos.dim() == 2) {
+      pos = pos[0];
+    }
+    auto qpos = pos.view({tgt_len, 1});
+    auto kpos = torch::arange(src_len, torch::TensorOptions().dtype(qpos.scalar_type()).device(device)).view({1, src_len});
+    causal_bool = kpos.gt(qpos).view({1, 1, tgt_len, src_len});
+  } else {
+    auto causal = torch::ones({src_len, src_len}, torch::TensorOptions().dtype(torch::kBool).device(device)).triu(1);
+    causal_bool = causal.slice(0, std::max<int64_t>(src_len - tgt_len, 0), src_len).view({1, 1, tgt_len, src_len});
+  }
+
+  torch::Tensor combined_bool = causal_bool;
+  if (attention_mask.has_value() && attention_mask.value().defined()) {
+    auto pad = attention_mask.value();
+    if (pad.size(-1) < src_len) {
+      auto pad_fill = torch::ones({pad.size(0), src_len - pad.size(-1)},
+                                  torch::TensorOptions().dtype(pad.scalar_type()).device(pad.device()));
+      pad = torch::cat({pad, pad_fill}, -1);
+    } else if (pad.size(-1) > src_len) {
+      pad = pad.slice(-1, 0, src_len);
+    }
+    auto pad_bool = pad.eq(0).view({batch_size, 1, 1, src_len});
+    combined_bool = combined_bool.logical_or(pad_bool);
+  }
+
+  auto masked = torch::full(combined_bool.sizes(), -std::numeric_limits<float>::infinity(),
+                            torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  auto zeros = torch::zeros(combined_bool.sizes(), torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  return torch::where(combined_bool, masked, zeros);
 }
 
 torch::Tensor NativeAttentionForward(
@@ -1014,6 +1106,12 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("kv_cache_write_forward", &KvCacheWriteForward, py::arg("cache"), py::arg("chunk"), py::arg("start"));
   m.def("prepare_attention_mask_forward", &PrepareAttentionMaskForward, py::arg("mask"), py::arg("batch_size"),
         py::arg("num_heads"), py::arg("tgt_len"), py::arg("src_len"), py::arg("position_ids") = py::none());
+  m.def("resolve_position_ids_forward", &ResolvePositionIdsForward, py::arg("batch_size"), py::arg("seq_len"),
+        py::arg("reference"), py::arg("attention_mask") = py::none(), py::arg("cache_position") = py::none(),
+        py::arg("past_length") = 0);
+  m.def("create_causal_mask_forward", &CreateCausalMaskForward, py::arg("reference"),
+        py::arg("attention_mask") = py::none(), py::arg("cache_position") = py::none(),
+        py::arg("position_ids") = py::none());
   m.def("attention_forward", &NativeAttentionForward, py::arg("q"), py::arg("k"), py::arg("v"),
         py::arg("attn_mask") = py::none(), py::arg("is_causal") = false, py::arg("scale") = py::none());
   m.def("temperature_forward", &TemperatureForward, py::arg("logits"), py::arg("tau"));

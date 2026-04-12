@@ -300,6 +300,95 @@ def prepare_attention_mask(
     return prepared
 
 
+def resolve_position_ids(
+    *,
+    batch_size: int,
+    seq_len: int,
+    reference: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    cache_position: torch.Tensor | None = None,
+    past_length: int = 0,
+) -> torch.Tensor:
+    if has_native_op("resolve_position_ids"):
+        module = native_module()
+        if module is not None and hasattr(module, "resolve_position_ids_forward"):
+            return module.resolve_position_ids_forward(
+                int(batch_size),
+                int(seq_len),
+                reference,
+                attention_mask,
+                cache_position,
+                int(past_length),
+            )
+    if cache_position is not None:
+        return cache_position.view(1, -1).expand(int(batch_size), -1).to(device=reference.device, dtype=torch.long)
+    if int(past_length) > 0:
+        base = torch.arange(int(past_length), int(past_length) + int(seq_len), device=reference.device, dtype=torch.long)
+        return base.view(1, -1).expand(int(batch_size), -1)
+    if attention_mask is not None:
+        lengths = attention_mask.to(torch.long).sum(dim=-1).view(int(batch_size), 1)
+        starts = (lengths - int(seq_len)).clamp_min(0)
+        base = torch.arange(int(seq_len), device=reference.device, dtype=torch.long).view(1, int(seq_len))
+        return base + starts
+    return torch.arange(int(seq_len), device=reference.device, dtype=torch.long).view(1, -1).expand(int(batch_size), -1)
+
+
+def create_causal_mask(
+    *,
+    reference: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    cache_position: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if has_native_op("create_causal_mask"):
+        module = native_module()
+        if module is not None and hasattr(module, "create_causal_mask_forward"):
+            return module.create_causal_mask_forward(reference, attention_mask, cache_position, position_ids)
+
+    batch_size, tgt_len, _ = reference.shape
+    src_len = tgt_len
+    if position_ids is not None:
+        try:
+            src_len = int(position_ids.max().item()) + 1
+        except Exception:
+            src_len = max(tgt_len, 1)
+    elif cache_position is not None:
+        try:
+            src_len = int(cache_position.max().item()) + 1
+        except Exception:
+            src_len = max(tgt_len, 1)
+    if attention_mask is not None and attention_mask.shape[-1] > src_len:
+        src_len = int(attention_mask.shape[-1])
+
+    if position_ids is not None:
+        pos = position_ids[0] if position_ids.dim() == 2 else position_ids
+        qpos = pos.view(int(tgt_len), 1)
+        kpos = torch.arange(int(src_len), device=reference.device, dtype=qpos.dtype).view(1, int(src_len))
+        causal_bool = (kpos > qpos).view(1, 1, int(tgt_len), int(src_len))
+    else:
+        causal = torch.triu(
+            torch.ones(int(src_len), int(src_len), device=reference.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        causal_bool = causal[-int(tgt_len):].view(1, 1, int(tgt_len), int(src_len))
+
+    combined_bool = causal_bool
+    if attention_mask is not None:
+        pad = attention_mask
+        if pad.shape[-1] < src_len:
+            pad_fill = torch.ones(pad.shape[0], int(src_len) - pad.shape[-1], dtype=pad.dtype, device=pad.device)
+            pad = torch.cat([pad, pad_fill], dim=-1)
+        elif pad.shape[-1] > src_len:
+            pad = pad[..., :int(src_len)]
+        combined_bool = combined_bool | pad.eq(0).view(int(batch_size), 1, 1, int(src_len))
+
+    return torch.where(
+        combined_bool,
+        torch.full(combined_bool.shape, float("-inf"), device=reference.device, dtype=torch.float32),
+        torch.zeros(combined_bool.shape, device=reference.device, dtype=torch.float32),
+    )
+
+
 def temperature(logits: torch.Tensor, tau: float) -> torch.Tensor:
     if has_native_op("sampling"):
         module = native_module()

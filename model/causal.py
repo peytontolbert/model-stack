@@ -1,14 +1,15 @@
 import torch
 import torch.nn as nn
 
+from runtime.ops import create_causal_mask as runtime_create_causal_mask
 from runtime.ops import embedding as runtime_embedding
 from runtime.ops import linear as runtime_linear
+from runtime.ops import resolve_position_ids as runtime_resolve_position_ids
 from specs.config import ModelConfig
 from compress import apply_compression
 from blocks.factory import build_block_stack
 from blocks.native_fusion import apply_native_norm
 from tensor.norms import RMSNorm
-from tensor.masking import build_padding_mask, broadcast_mask, combine_masks, to_additive_mask, create_causal_mask, lengths_from_attention_mask
 from tensor.positional import RotaryEmbeddingHF
 from serve.engine import generate as engine_generate
 from serve.engine import GenerationConfig
@@ -74,32 +75,28 @@ class CausalLM(nn.Module):
             else runtime_embedding(self.embed.weight, input_ids, self.embed.padding_idx)
         )
         B, T, _ = x.shape
-        # position ids: prefer provided, else derive from cache_position if available, else 0..T-1
+        past_len = 0
         if position_ids is None:
-            if cache_position is not None:
-                # cache_position should represent absolute positions for current tokens
-                position_ids = cache_position.view(1, -1).expand(B, -1)
-            elif cache is not None and hasattr(cache, "layer"):
+            if cache_position is None and cache is not None and hasattr(cache, "layer"):
                 try:
                     past_len = int(cache.layer(0).length())
                 except Exception:
                     past_len = 0
-                start = past_len
-                position_ids = torch.arange(start, start + T, device=x.device).view(1, -1).expand(B, -1)
-            else:
-                # Derive absolute positions from attention_mask if provided, else 0..T-1
-                if attention_mask is not None:
-                    try:
-                        lengths = lengths_from_attention_mask(attention_mask.to(torch.long))  # (B,)
-                        starts = (lengths - T).clamp_min(0).view(B, 1)
-                        base = torch.arange(T, device=x.device).view(1, T)
-                        position_ids = (base + starts).to(dtype=torch.long)
-                    except Exception:
-                        position_ids = torch.arange(T, device=x.device).unsqueeze(0).expand(B, -1)
-                else:
-                    position_ids = torch.arange(T, device=x.device).unsqueeze(0).expand(B, -1)
+            position_ids = runtime_resolve_position_ids(
+                batch_size=B,
+                seq_len=T,
+                reference=x,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                past_length=past_len,
+            )
         # HF-like additive mask (B,1,T,S)
-        mask = create_causal_mask(input_embeds=x, attention_mask=attention_mask, cache_position=cache_position, position_ids=position_ids)
+        mask = runtime_create_causal_mask(
+            reference=x,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            position_ids=position_ids,
+        )
         # Rotary embeddings
         head_dim = getattr(self.cfg, "head_dim", None) or int(self.cfg.d_model // self.cfg.n_heads)
         # Respect HF rope_scaling (e.g., LLaMA 3 uses linear scaling): stretch base_theta when type=="linear"
