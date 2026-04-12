@@ -5,7 +5,6 @@
 #include <ATen/ops/gelu.h>
 #include <ATen/ops/index_select.h>
 #include <ATen/ops/layer_norm.h>
-#include <ATen/ops/linear.h>
 #include <ATen/ops/relu.h>
 #include <ATen/ops/silu.h>
 
@@ -16,6 +15,8 @@
 #include <map>
 #include <string>
 #include <vector>
+
+#include "reference/aten_reference.h"
 
 namespace py = pybind11;
 namespace torch_ext = torch;
@@ -743,38 +744,7 @@ torch::Tensor NativeAttentionForward(
     return CudaAttentionForward(q, k, v, attn_mask, is_causal, scale);
   }
 #endif
-
-  auto k_all = k;
-  auto v_all = v;
-  if (q.size(1) != k.size(1)) {
-    const auto repeat = q.size(1) / k.size(1);
-    auto head_index = torch::arange(k.size(1), torch::TensorOptions().dtype(torch::kLong).device(k.device()))
-                          .repeat_interleave(repeat);
-    k_all = at::index_select(k, 1, head_index);
-    v_all = at::index_select(v, 1, head_index);
-  }
-
-  const double scale_value = scale.has_value() ? scale.value() : (1.0 / std::sqrt(static_cast<double>(q.size(3))));
-  auto scores = torch::matmul(q, k_all.transpose(-2, -1)) * scale_value;
-
-  if (attn_mask.has_value() && attn_mask.value().defined()) {
-    auto mask = attn_mask.value();
-    if (mask.scalar_type() == torch::kBool) {
-      scores = scores.masked_fill(mask, -std::numeric_limits<float>::infinity());
-    } else {
-      scores = scores + mask.to(scores.scalar_type());
-    }
-  }
-
-  if (is_causal) {
-    auto tgt = q.size(2);
-    auto src = k_all.size(2);
-    auto causal = torch::ones({tgt, src}, torch::TensorOptions().dtype(torch::kBool).device(q.device())).triu(1);
-    scores = scores.masked_fill(causal.view({1, 1, tgt, src}), -std::numeric_limits<float>::infinity());
-  }
-
-  auto probs = torch::softmax(scores.to(torch::kFloat32), -1).to(q.scalar_type());
-  return torch::matmul(probs, v_all);
+  return ReferenceAttentionForward(q, k, v, attn_mask, is_causal, scale);
 }
 
 torch::Tensor TemperatureForward(const torch::Tensor& logits, double tau) {
@@ -919,9 +889,6 @@ torch::Tensor LinearForward(
     const torch::Tensor& weight,
     const c10::optional<torch::Tensor>& bias,
     const std::string& backend) {
-  auto AtenLinearForward = [&]() {
-    return at::linear(x, weight, bias);
-  };
   TORCH_CHECK(x.defined() && weight.defined(), "linear_forward: x and weight must be defined");
   TORCH_CHECK(x.dim() >= 2, "linear_forward: x must have rank >= 2");
   TORCH_CHECK(weight.dim() == 2, "linear_forward: weight must be rank-2");
@@ -937,7 +904,7 @@ torch::Tensor LinearForward(
     return CublasLtLinearForward(x, weight, bias);
   }
 #endif
-  return AtenLinearForward();
+  return ReferenceLinearForward(x, weight, bias);
 }
 
 torch::Tensor MlpForward(
@@ -952,16 +919,7 @@ torch::Tensor MlpForward(
   const auto normalized_backend = NormalizeBackendName(backend);
   const bool auto_backend = normalized_backend.empty() || normalized_backend == "auto";
   if (auto_backend && gated && x.is_cuda() && x.scalar_type() == torch::kFloat16) {
-    auto hidden = at::linear(x, w_in_weight, w_in_bias);
-    torch::Tensor projected;
-    if (hidden.size(-1) % 2 != 0) {
-      TORCH_CHECK(false, "mlp_forward: gated projection width must be even");
-    }
-    const auto split = hidden.size(-1) / 2;
-    auto a = hidden.slice(-1, 0, split);
-    auto b = hidden.slice(-1, split, hidden.size(-1));
-    projected = ApplyActivation(a, activation) * b;
-    return at::linear(projected, w_out_weight, w_out_bias);
+    return ReferenceMlpForward(x, w_in_weight, w_in_bias, w_out_weight, w_out_bias, activation, gated);
   }
   const auto resolved_backend = ResolveLinearBackend(backend);
   auto hidden = LinearForward(x, w_in_weight, w_in_bias, resolved_backend);

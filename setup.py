@@ -17,7 +17,7 @@ def native_extensions():
     from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
 
     use_cuda = CUDA_HOME is not None and env_enabled("MODEL_STACK_BUILD_CUDA", "1")
-    sources = ["runtime/csrc/model_stack_native.cpp"]
+    sources = ["runtime/csrc/model_stack_native.cpp", "runtime/csrc/reference/aten_reference.cpp"]
     define_macros = [("MODEL_STACK_ABI_VERSION", "1")]
     extra_compile_args = {"cxx": ["-O3", "-std=c++17"]}
 

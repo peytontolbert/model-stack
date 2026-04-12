@@ -1,8 +1,9 @@
 #include <torch/extension.h>
-#include <ATen/ops/scaled_dot_product_attention.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+
+#include "../reference/aten_reference.h"
 
 #include <cuda_runtime.h>
 
@@ -150,7 +151,7 @@ bool UseCudaAttentionKernel(
   if (!q.is_cuda() || !k.is_cuda() || !v.is_cuda()) {
     return false;
   }
-  if (!(q.scalar_type() == torch::kFloat32 || q.scalar_type() == torch::kFloat16)) {
+  if (!(q.scalar_type() == torch::kFloat32 || q.scalar_type() == torch::kFloat16 || q.scalar_type() == torch::kBFloat16)) {
     return false;
   }
   if (q.scalar_type() != k.scalar_type() || q.scalar_type() != v.scalar_type()) {
@@ -192,32 +193,8 @@ torch::Tensor CudaAttentionForward(
     const c10::optional<torch::Tensor>& attn_mask,
     bool is_causal,
     const c10::optional<double>& scale) {
-  auto k_all = k;
-  auto v_all = v;
-  if (q.size(1) != k.size(1)) {
-    const auto repeat = q.size(1) / k.size(1);
-    auto head_index = torch::arange(k.size(1), torch::TensorOptions().dtype(torch::kLong).device(k.device()))
-                          .repeat_interleave(repeat);
-    k_all = torch::index_select(k, 1, head_index);
-    v_all = torch::index_select(v, 1, head_index);
-  }
-
   if (!UseCudaAttentionKernel(q, k, v, attn_mask)) {
-    const double scale_value = scale.has_value() ? scale.value() : (1.0 / std::sqrt(static_cast<double>(q.size(3))));
-    auto scores = torch::matmul(q, k_all.transpose(2, 3)) * scale_value;
-    if (attn_mask.has_value() && attn_mask.value().defined()) {
-      if (attn_mask.value().scalar_type() == torch::kBool) {
-        scores = scores.masked_fill(attn_mask.value(), -INFINITY);
-      } else {
-        scores = scores + attn_mask.value().to(scores.scalar_type());
-      }
-    }
-    if (is_causal) {
-      auto causal = torch::ones({q.size(2), k_all.size(2)}, torch::TensorOptions().dtype(torch::kBool).device(q.device())).triu(1);
-      scores = scores.masked_fill(causal.view({1, 1, q.size(2), k_all.size(2)}), -INFINITY);
-    }
-    auto probs = torch::softmax(scores.to(torch::kFloat32), -1).to(q.scalar_type());
-    return torch::matmul(probs, v_all);
+    return ReferenceAttentionForward(q, k, v, attn_mask, is_causal, scale);
   }
 
   c10::cuda::CUDAGuard device_guard{q.device()};
@@ -253,7 +230,9 @@ torch::Tensor CudaAttentionForward(
   const dim3 threads(kThreads);
   auto stream = c10::cuda::getCurrentCUDAStream(q.get_device());
 
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
       q_contig.scalar_type(),
       "model_stack_cuda_attention_forward",
       [&] {
