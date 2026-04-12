@@ -58,6 +58,10 @@ torch::Tensor CublasLtLinearForward(
     const torch::Tensor& weight,
     const c10::optional<torch::Tensor>& bias);
 bool HasCublasLtLinearBackend();
+torch::Tensor CudaActivationForward(
+    const torch::Tensor& x,
+    const std::string& activation);
+bool HasCudaActivationKernel();
 torch::Tensor CudaGatedActivationForward(
     const torch::Tensor& x,
     const std::string& activation);
@@ -98,6 +102,9 @@ bool HasCudaAddLayerNormKernel() {
   return false;
 }
 bool HasCublasLtLinearBackend() {
+  return false;
+}
+bool HasCudaActivationKernel() {
   return false;
 }
 bool HasCudaGatedActivationKernel() {
@@ -201,6 +208,11 @@ bool ForceReferenceGatedMlpFp16() {
 
 torch::Tensor ApplyActivation(const torch::Tensor& x, const std::string& activation) {
   const auto act = NormalizeBackendName(activation);
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && HasCudaActivationKernel()) {
+    return CudaActivationForward(x, act);
+  }
+#endif
   if (act == "gelu" || act == "geglu") {
     return at::gelu(x, "none");
   }
@@ -273,6 +285,9 @@ py::dict RuntimeInfo() {
   if (HasCublasLtLinearBackend()) {
     cuda_backend_ops.push_back("linear");
     cuda_backend_ops.push_back("qkv_projection");
+  }
+  if (HasCudaActivationKernel()) {
+    cuda_backend_ops.push_back("activation");
   }
   if (HasCudaGatedActivationKernel()) {
     cuda_backend_ops.push_back("gated_activation");
