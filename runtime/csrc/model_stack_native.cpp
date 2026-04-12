@@ -468,7 +468,7 @@ std::vector<torch::Tensor> ApplyRotaryForward(
 
 #if MODEL_STACK_WITH_CUDA
   if (q.is_cuda() && k.is_cuda() && cos.is_cuda() && sin.is_cuda() &&
-      q.scalar_type() != torch::kBFloat16 && HasCudaRopeKernel()) {
+      HasCudaRopeKernel()) {
     return CudaApplyRotaryForward(q, k, cos, sin);
   }
 #endif
