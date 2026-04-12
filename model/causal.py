@@ -5,12 +5,12 @@ from runtime.ops import create_causal_mask as runtime_create_causal_mask
 from runtime.ops import embedding as runtime_embedding
 from runtime.ops import linear as runtime_linear
 from runtime.ops import resolve_position_ids as runtime_resolve_position_ids
+from runtime.ops import resolve_rotary_embedding as runtime_resolve_rotary_embedding
 from specs.config import ModelConfig
 from compress import apply_compression
 from blocks.factory import build_block_stack
 from blocks.native_fusion import apply_native_norm
 from tensor.norms import RMSNorm
-from tensor.positional import RotaryEmbeddingHF
 from serve.engine import generate as engine_generate
 from serve.engine import GenerationConfig
 
@@ -109,18 +109,13 @@ class CausalLM(nn.Module):
         except Exception:
             pass
         attn_scale = float(getattr(self.cfg, "rope_attention_scaling", 1.0) or 1.0)
-        rope = RotaryEmbeddingHF(
+        cos, sin = runtime_resolve_rotary_embedding(
+            reference=x,
             head_dim=head_dim,
             base_theta=rope_theta,
             attention_scaling=attn_scale,
-            device=x.device,
-            scaling_type=getattr(self.cfg, "rope_scaling_type", None),
-            scaling_factor=getattr(self.cfg, "rope_scaling_factor", None),
-            original_max_position_embeddings=getattr(self.cfg, "rope_scaling_original_max_position_embeddings", None),
-            low_freq_factor=getattr(self.cfg, "rope_scaling_low_freq_factor", None),
-            high_freq_factor=getattr(self.cfg, "rope_scaling_high_freq_factor", None),
+            position_ids=position_ids,
         )
-        cos, sin = rope.forward(x, position_ids=position_ids)
 
         if cache is None:
             for blk in self.blocks:

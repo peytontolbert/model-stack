@@ -389,6 +389,53 @@ def create_causal_mask(
     )
 
 
+def resolve_rotary_embedding(
+    *,
+    reference: torch.Tensor,
+    head_dim: int,
+    base_theta: float,
+    attention_scaling: float = 1.0,
+    position_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if has_native_op("resolve_rotary_embedding"):
+        module = native_module()
+        if module is not None and hasattr(module, "resolve_rotary_embedding_forward"):
+            return module.resolve_rotary_embedding_forward(
+                reference,
+                int(head_dim),
+                float(base_theta),
+                float(attention_scaling),
+                position_ids,
+            )
+
+    seq_len = int(reference.shape[1])
+    needed = seq_len
+    gather_pos = None
+    if position_ids is not None:
+        gather_pos = position_ids[0] if position_ids.dim() == 2 else position_ids
+        if gather_pos.numel() > 0:
+            needed = int(gather_pos.max().item()) + 1
+    t = torch.arange(needed, device=reference.device, dtype=torch.float32)
+    inv_idx = torch.arange(0, int(head_dim), 2, device=reference.device, dtype=torch.int64).float()
+    inv_freq = 1.0 / (float(base_theta) ** (inv_idx / float(head_dim)))
+    freqs = torch.einsum("t,d->td", t, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos()
+    sin = emb.sin()
+    if float(attention_scaling) != 1.0:
+        cos = cos * float(attention_scaling)
+        sin = sin * float(attention_scaling)
+    cos = cos.to(dtype=reference.dtype)
+    sin = sin.to(dtype=reference.dtype)
+    if gather_pos is not None:
+        cos = cos.index_select(0, gather_pos.reshape(-1).to(torch.long)).view(seq_len, int(head_dim))
+        sin = sin.index_select(0, gather_pos.reshape(-1).to(torch.long)).view(seq_len, int(head_dim))
+    else:
+        cos = cos[:seq_len]
+        sin = sin[:seq_len]
+    return cos, sin
+
+
 def temperature(logits: torch.Tensor, tau: float) -> torch.Tensor:
     if has_native_op("sampling"):
         module = native_module()

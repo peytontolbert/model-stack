@@ -125,6 +125,7 @@ std::map<std::string, bool> NativeOpMap() {
       {"prepare_attention_mask", true},
       {"resolve_position_ids", true},
       {"create_causal_mask", true},
+      {"resolve_rotary_embedding", true},
       {"token_counts", true},
       {"append_tokens", true},
       {"decode_positions", true},
@@ -215,9 +216,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
+      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode", "attention_prefill", "sampling"};
   info["planned_ops"] = std::vector<std::string>{
-      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
+      "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "attention_decode",
       "attention_prefill", "sampling"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
@@ -636,6 +637,58 @@ torch::Tensor CreateCausalMaskForward(
                             torch::TensorOptions().dtype(torch::kFloat32).device(device));
   auto zeros = torch::zeros(combined_bool.sizes(), torch::TensorOptions().dtype(torch::kFloat32).device(device));
   return torch::where(combined_bool, masked, zeros);
+}
+
+std::vector<torch::Tensor> ResolveRotaryEmbeddingForward(
+    const torch::Tensor& reference,
+    int64_t head_dim,
+    double base_theta,
+    double attention_scaling,
+    const c10::optional<torch::Tensor>& position_ids) {
+  TORCH_CHECK(reference.defined(), "resolve_rotary_embedding_forward: reference must be defined");
+  TORCH_CHECK(reference.dim() == 3, "resolve_rotary_embedding_forward: reference must have shape (B, T, D)");
+  TORCH_CHECK(head_dim > 0 && head_dim % 2 == 0, "resolve_rotary_embedding_forward: head_dim must be positive and even");
+  TORCH_CHECK(std::isfinite(base_theta) && base_theta > 0.0,
+              "resolve_rotary_embedding_forward: base_theta must be positive and finite");
+  TORCH_CHECK(std::isfinite(attention_scaling),
+              "resolve_rotary_embedding_forward: attention_scaling must be finite");
+
+  const auto seq_len = reference.size(1);
+  auto device = reference.device();
+  int64_t needed = seq_len;
+  torch::Tensor gather_pos;
+  if (position_ids.has_value() && position_ids.value().defined()) {
+    gather_pos = position_ids.value().to(torch::TensorOptions().dtype(torch::kLong).device(device));
+    if (gather_pos.dim() == 2) {
+      gather_pos = gather_pos[0];
+    }
+    if (gather_pos.numel() > 0) {
+      needed = gather_pos.max().item<int64_t>() + 1;
+    }
+  }
+
+  auto t = torch::arange(needed, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  auto idx = torch::arange(0, head_dim, 2, torch::TensorOptions().dtype(torch::kInt64).device(device)).to(torch::kFloat32);
+  auto inv_freq = torch::pow(torch::full({idx.size(0)}, base_theta, torch::TensorOptions().dtype(torch::kFloat32).device(device)),
+                             -(idx / static_cast<double>(head_dim)));
+  auto freqs = torch::einsum("t,d->td", {t, inv_freq});
+  auto emb = torch::cat({freqs, freqs}, -1);
+  auto cos = torch::cos(emb);
+  auto sin = torch::sin(emb);
+  if (attention_scaling != 1.0) {
+    cos = cos * attention_scaling;
+    sin = sin * attention_scaling;
+  }
+  cos = cos.to(reference.scalar_type());
+  sin = sin.to(reference.scalar_type());
+  if (gather_pos.defined()) {
+    cos = at::index_select(cos, 0, gather_pos.reshape({-1})).view({seq_len, head_dim});
+    sin = at::index_select(sin, 0, gather_pos.reshape({-1})).view({seq_len, head_dim});
+  } else {
+    cos = cos.slice(0, 0, seq_len);
+    sin = sin.slice(0, 0, seq_len);
+  }
+  return {cos, sin};
 }
 
 torch::Tensor NativeAttentionForward(
@@ -1111,6 +1164,9 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("past_length") = 0);
   m.def("create_causal_mask_forward", &CreateCausalMaskForward, py::arg("reference"),
         py::arg("attention_mask") = py::none(), py::arg("cache_position") = py::none(),
+        py::arg("position_ids") = py::none());
+  m.def("resolve_rotary_embedding_forward", &ResolveRotaryEmbeddingForward, py::arg("reference"),
+        py::arg("head_dim"), py::arg("base_theta"), py::arg("attention_scaling") = 1.0,
         py::arg("position_ids") = py::none());
   m.def("attention_forward", &NativeAttentionForward, py::arg("q"), py::arg("k"), py::arg("v"),
         py::arg("attn_mask") = py::none(), py::arg("is_causal") = false, py::arg("scale") = py::none());
