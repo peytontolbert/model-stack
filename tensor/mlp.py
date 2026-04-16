@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+from runtime.ops import gated_activation as runtime_gated_activation
 from runtime.ops import linear as runtime_linear, mlp as runtime_mlp
 from .activations import gelu, silu
 
@@ -60,13 +60,13 @@ class MLP(nn.Module):
             a, b = x_proj.chunk(2, dim=-1)
             name = self.activation_name.lower()
             if name in ("swiglu", "gated-silu"):
-                x = silu(a) * b
+                x = runtime_gated_activation(a, b, "silu")
             elif name == "geglu":
-                x = F.gelu(a) * b
+                x = runtime_gated_activation(a, b, "gelu")
             elif name == "reglu":
-                x = F.relu(a) * b
+                x = runtime_gated_activation(a, b, "relu")
             else:
-                x = silu(a) * b
+                x = runtime_gated_activation(a, b, "silu")
         else:
             x = self._act(runtime_linear(x, self.w_in.weight, self.w_in.bias))
         x = self.dropout(x)

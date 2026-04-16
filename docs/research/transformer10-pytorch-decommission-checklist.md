@@ -123,6 +123,7 @@ Complete when:
 Complete when:
 
 - `apply_rotary` hot path is runtime-backed
+- file remains only as a compatibility shim over `runtime/positional.py`
 - optional cache builders may remain if they are not performance-critical
 
 ## `tensor/mlp.py`
@@ -137,8 +138,8 @@ Complete when:
 
 Complete when:
 
-- serving sampler is runtime-backed
-- Python version remains only as reference or test helper
+- serving sampler is runtime-backed for temperature, token counting, penalties, top-k/top-p masking, and next-token selection on the intended path
+- file remains only as a compatibility shim over `runtime/sampling.py`
 
 ## `serve/engine.py`
 
@@ -154,7 +155,9 @@ Complete when:
 Complete when:
 
 - runtime object construction yields runtime handles, not a torch-model-plus-python-cache bundle
+- model-directory and factory-spec config/build/load flow is runtime-owned rather than duplicated in serving or eval callers
 - cache allocation is runtime-backed
+- request/config coercion and serving health payloads are runtime-backed
 
 ## `tensor/shard.py`
 
@@ -186,6 +189,12 @@ Complete when:
 - runtime owns sampler
 - runtime owns collectives-facing execution helpers that matter to serving/training hot paths
 
+Remaining runtime-adjacent `tensor/` ownership to remove:
+
+- `tensor/masking.py` still backs parts of runtime/block mask preparation
+- `tensor/norms.py` still owns the authoritative `RMSNorm` module type
+- `tensor/mlp.py` still owns the eager MLP module used by block/model construction
+
 ## `attn/` is decommissioned from hot path when:
 
 - runtime owns attention
@@ -194,11 +203,17 @@ Complete when:
 
 ## `blocks/` is decommissioned from hot path when:
 
+- runtime owns block-stack orchestration
+- runtime owns shared mask shaping for encoder, cross-attention, and patterned self-attention block paths
+- runtime owns shared attention-bias composition for block forward paths
+- runtime owns fused residual/norm helpers used by block forward paths
 - blocks no longer perform heavy eager tensor math internally
 
 ## `model/` is decommissioned from hot path when:
 
 - it composes runtime-backed primitives instead of owning execution-heavy modules
+- model-dir load/build entrypoints used by serving and eval have moved behind runtime-owned loaders or compatibility shims
+- HF snapshot/bootstrap/import helpers have moved behind runtime-owned loaders or compatibility shims
 
 ## `serve/` is decommissioned from hot path when:
 

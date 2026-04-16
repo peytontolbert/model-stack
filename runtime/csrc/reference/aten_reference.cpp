@@ -97,7 +97,7 @@ torch::Tensor ReferenceAttentionForward(
     }
   }
 
-  if (is_causal) {
+  if (is_causal && q.size(2) > 1) {
     const auto tgt = q.size(2);
     const auto src = k_all.size(2);
     auto causal = torch::ones({tgt, src}, torch::TensorOptions().dtype(torch::kBool).device(q.device())).triu(1);

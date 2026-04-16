@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from specs.config import ModelConfig
-from tensor.masking import build_sliding_window_causal_mask, broadcast_mask
+from runtime.blocks import prepare_local_attention_mask
 
 from .config import BlockConfig, build_block_config_from_model
 from .shared import CausalSelfAttentionBlockBase
@@ -12,18 +12,15 @@ from attn.factory import build_attention
 class LocalAttentionBlock(CausalSelfAttentionBlockBase):
     def __init__(self, cfg: ModelConfig, window_size: int = 128, block_cfg: BlockConfig | None = None, drop_path: float = 0.0):
         bc = block_cfg or build_block_config_from_model(cfg)
-        self.cfg = cfg
-        self.bc = bc
         self.window_size = int(window_size)
-        self.attn = build_attention(cfg, n_kv_heads=bc.n_kv_heads if bc.n_kv_heads is not None else cfg.n_heads, attn_dropout=bc.attn_dropout, use_rope=bc.use_rope, rope_theta=bc.rope_theta)
         super().__init__(cfg, bc, drop_path)
+        self.attn = build_attention(cfg, n_kv_heads=bc.n_kv_heads if bc.n_kv_heads is not None else cfg.n_heads, attn_dropout=bc.attn_dropout, use_rope=bc.use_rope, rope_theta=bc.rope_theta)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None, cache=None) -> torch.Tensor:
-        B, T, _ = x.shape
-        local = build_sliding_window_causal_mask(T, self.window_size, device=x.device, dtype=torch.bool)
-        base = broadcast_mask(batch_size=B, num_heads=self.cfg.n_heads, tgt_len=T, src_len=T, causal_mask=local)
-        if mask is not None:
-            base = base | mask
+        base = prepare_local_attention_mask(
+            x,
+            mask,
+            num_heads=self.cfg.n_heads,
+            window_size=self.window_size,
+        )
         return super().forward(x, base, cache)
-
-

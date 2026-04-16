@@ -4,6 +4,9 @@ import torch.nn as nn
 from specs.config import ModelConfig
 from blocks.llama_block import LlamaBlock
 from blocks.init import init_transformer_stack
+from runtime.blocks import apply_native_norm
+from runtime.ops import embedding as runtime_embedding
+from runtime.ops import linear as runtime_linear
 
 
 class ExampleTransformerLM(nn.Module):
@@ -24,11 +27,9 @@ class ExampleTransformerLM(nn.Module):
         init_transformer_stack(self.blocks, recipe=("llama" if block == "llama" else "gpt"))
 
     def forward(self, input_ids: torch.Tensor, attn_mask: torch.Tensor | None = None, cache=None) -> torch.Tensor:
-        x = self.embed(input_ids)
+        x = runtime_embedding(self.embed.weight, input_ids, self.embed.padding_idx)
         for i, blk in enumerate(self.blocks):
             c = None if cache is None else cache.layer(i)
             x = blk(x, attn_mask, c)
-        x = self.norm(x)
-        return self.lm_head(x)
-
-
+        x = apply_native_norm(x, self.norm)
+        return runtime_linear(x, self.lm_head.weight, self.lm_head.bias)

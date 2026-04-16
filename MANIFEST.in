@@ -1,5 +1,9 @@
 global-include *.md *.txt *.json *.yml *.yaml
+prune other_repos
+prune checkpoints
+prune build
+prune model_stack.egg-info
+prune examples/program_conditioned_adapter/smoke_repo/checkpoints
+prune examples/repo_grounded_adapters/smoke_repo/checkpoints
 recursive-exclude **/artifacts *.*
 recursive-exclude **/datasets *.*
-
-

@@ -21,6 +21,7 @@ Quickstart
    {
      "input_ids": [[1, 2, 3]],
      "max_new_tokens": 64,
+     "do_sample": true,
      "temperature": 0.8,
      "top_p": 0.9
    }
@@ -31,7 +32,15 @@ Response:
 
 Implementation notes
 
-- serve/engine.py implements decoding with sampling policies using tensor.sampling utilities.
-- serve/runtime.py loads a model from MODEL_DIR and allocates KV caches sized to batch.
-- attn/kv_cache.py provides a per-layer batched paged KV cache with layer(i) accessor used by model.CausalLM.
+- runtime/generation.py now owns `GenerationConfig`, the decode session, and the generation loop.
+- serve/engine.py and serve/generate.py are compatibility wrappers that preserve the old API surface while delegating generation config construction and decode execution to runtime-owned helpers.
+- model/generate.py is also a compatibility shim over runtime-owned generation helpers rather than a separate eager decode implementation.
+- runtime/modeling.py now owns model-directory and factory-spec model loading, runtime model preparation, and device/dtype resolution for runtime-facing callers.
+- serve/runtime.py loads a model from MODEL_DIR through `runtime/modeling.py` and owns request/config coercion, health payloads, and KV cache allocation through `runtime.cache`.
+- serve/api.py is now mostly transport glue around runtime-owned helpers, including request-side sampling-mode inference and attention-mask/cache-backend passthrough.
+- runtime/blocks.py now owns block-stack execution, generic and patterned block mask shaping, attention-bias composition, and the fused residual/norm branch helpers used by model forward paths.
+- runtime/cache.py owns cache-spec derivation, backend resolution, native paged-cache construction, the per-layer `layer(i)` view, and runtime-level eviction helpers.
+- runtime/kv_cache.py now owns the concrete paged and contiguous cache implementations.
+- attn/kv_cache.py is only a compatibility shim that re-exports the runtime-owned cache APIs.
+- blocks/native_fusion.py is only a compatibility shim that re-exports the runtime-owned block helpers.
 - attn/eager.py uses the KV cache when provided: reads historical K/V, concatenates with new, and appends new pages.

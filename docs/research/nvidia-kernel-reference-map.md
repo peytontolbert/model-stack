@@ -164,7 +164,7 @@ Top files:
 
 Why it matters:
 
-- `model/causal.py` still uses `nn.Embedding`.
+- `model/causal.py`, `model/encoder.py`, and `model/seq2seq.py` now route the hot-path embedding call through `runtime.ops.embedding`; `cuEmbed` remains a useful reference for improving that CUDA backend.
 - `embedding_lookup_kernels.cuh` is a good example of a memory-level-parallelism design rather than a compute-heavy kernel.
 - It is readable enough to adapt directly for a vocab embedding path.
 

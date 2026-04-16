@@ -12,91 +12,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-
-def _build_local_from_hf_config(model_id_or_dir: str, dtype: torch.dtype) -> torch.nn.Module:
-    from transformers import AutoConfig  # type: ignore
-    from specs.config import ModelConfig
-    from model.factory import build_causal_lm
-
-    cfg_hf = AutoConfig.from_pretrained(model_id_or_dir)
-    d_model = int(getattr(cfg_hf, "hidden_size"))
-    n_layers = int(getattr(cfg_hf, "num_hidden_layers"))
-    n_heads = int(getattr(cfg_hf, "num_attention_heads"))
-    head_dim = int(getattr(cfg_hf, "head_dim", max(1, d_model // max(1, n_heads))))
-    n_kv_heads = int(getattr(cfg_hf, "num_key_value_heads", n_heads))
-    d_ff = int(getattr(cfg_hf, "intermediate_size"))
-    vocab_size = int(getattr(cfg_hf, "vocab_size"))
-    rms_eps = float(getattr(cfg_hf, "rms_norm_eps", 1e-6))
-    # Prefer rope_parameters dict when available (HF LLaMA uses it)
-    rope_theta = None
-    try:
-        rp = getattr(cfg_hf, "rope_parameters", None)
-        if isinstance(rp, dict) and "rope_theta" in rp:
-            rope_theta = float(rp["rope_theta"])
-    except Exception:
-        rope_theta = None
-    # Parse rope_scaling from HF config when present
-    rope_scaling = getattr(cfg_hf, "rope_scaling", None)
-    rs_type = None
-    rs_factor = None
-    rs_orig = None
-    rs_low = None
-    rs_high = None
-    try:
-        if isinstance(rope_scaling, dict):
-            rs_type = rope_scaling.get("type")
-            # Common HF keys: factor, original_max_position_embeddings, low_freq_factor, high_freq_factor
-            if "factor" in rope_scaling and rope_scaling["factor"] is not None:
-                rs_factor = float(rope_scaling["factor"])  # type: ignore
-            if "original_max_position_embeddings" in rope_scaling and rope_scaling["original_max_position_embeddings"] is not None:
-                rs_orig = int(rope_scaling["original_max_position_embeddings"])  # type: ignore
-            if "low_freq_factor" in rope_scaling and rope_scaling["low_freq_factor"] is not None:
-                rs_low = float(rope_scaling["low_freq_factor"])  # type: ignore
-            if "high_freq_factor" in rope_scaling and rope_scaling["high_freq_factor"] is not None:
-                rs_high = float(rope_scaling["high_freq_factor"])  # type: ignore
-    except Exception:
-        rs_type = rs_type or None
-        rs_factor = rs_factor or None
-        rs_orig = rs_orig or None
-        rs_low = rs_low or None
-        rs_high = rs_high or None
-
-    mc = ModelConfig(
-        d_model=d_model,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        d_ff=d_ff,
-        vocab_size=vocab_size,
-        attn_impl="sdpa",
-        rope_theta=float(rope_theta if rope_theta is not None else getattr(cfg_hf, "rope_theta", 1e6)),
-        dtype=("bfloat16" if dtype == torch.bfloat16 else ("float16" if dtype == torch.float16 else "float32")),
-        rms_norm_eps=rms_eps,
-        head_dim=head_dim,
-        rope_scaling_type=rs_type,
-        rope_scaling_factor=rs_factor,
-        rope_scaling_original_max_position_embeddings=rs_orig,
-        rope_scaling_low_freq_factor=rs_low,
-        rope_scaling_high_freq_factor=rs_high,
-    )
-    # Derive HF rotary attention scaling factor when available (helps parity for scaled RoPE)
-    try:
-        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding  # type: ignore
-        class _TmpCfg:
-            hidden_size = d_model
-            num_attention_heads = n_heads
-            head_dim = head_dim
-            max_position_embeddings = int(getattr(cfg_hf, "max_position_embeddings", int(args.seq)))
-            rope_parameters = {
-                "rope_type": getattr(cfg_hf, "rope_type", "default") if hasattr(cfg_hf, "rope_type") else "default",
-                "rope_theta": float(rope_theta if rope_theta is not None else getattr(cfg_hf, "rope_theta", 1e6)),
-            }
-        emb = LlamaRotaryEmbedding(config=_TmpCfg())
-        setattr(mc, "rope_attention_scaling", float(getattr(emb, "attention_scaling", 1.0)))
-    except Exception:
-        pass
-    # Pass GQA head count override to blocks
-    model = build_causal_lm(mc, block="llama", n_kv_heads=n_kv_heads)
-    return model
+from runtime.checkpoint import build_local_llama_from_hf_config, load_hf_llama_weights_into_local
 
 
 def _max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -220,7 +136,7 @@ def main() -> None:
         hf.eval()
 
     # Build local and load weights (try target device, fallback to CPU on OOM)
-    local = _build_local_from_hf_config(hf_src, dtype=dtype)
+    local = build_local_llama_from_hf_config(hf_src, dtype=dtype, seq_len=int(args.seq))
     local_dev = dev
     try:
         local = local.to(local_dev).eval()
@@ -230,7 +146,6 @@ def main() -> None:
             local = local.to(local_dev).eval()
         else:
             raise
-    from model.hf_llama_loader import load_hf_llama_weights_into_local
     load_hf_llama_weights_into_local(local, weights_dir)
 
     # Deterministic input
@@ -271,5 +186,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

@@ -93,3 +93,63 @@ def resolve_linear_backend(requested: str | None = None) -> str:
     if candidate.strip().lower() in {"", "auto"}:
         return "aten"
     return candidate.strip().lower()
+
+
+def native_paged_kv_cache_available() -> bool:
+    module = native_module()
+    if module is None:
+        return False
+    return bool(hasattr(module, "PagedKvCacheState") or hasattr(module, "PagedKvLayerState"))
+
+
+def create_native_paged_kv_cache_state(
+    *,
+    batch: int,
+    n_layers: int,
+    n_kv_heads: int,
+    head_dim: int,
+    pagesize: int,
+    dtype,
+    device,
+) -> tuple[Any | None, list[Any] | None]:
+    module = native_module()
+    if module is None:
+        return None, None
+
+    import torch
+
+    example = torch.empty(
+        0,
+        int(n_kv_heads),
+        max(int(pagesize), 1),
+        int(head_dim),
+        dtype=dtype,
+        device=device,
+    )
+    if hasattr(module, "PagedKvCacheState"):
+        return (
+            module.PagedKvCacheState(
+                int(batch),
+                int(n_layers),
+                int(n_kv_heads),
+                int(head_dim),
+                max(int(pagesize), 1),
+                example,
+            ),
+            None,
+        )
+    if hasattr(module, "PagedKvLayerState"):
+        return (
+            None,
+            [
+                module.PagedKvLayerState(
+                    int(batch),
+                    int(n_kv_heads),
+                    int(head_dim),
+                    max(int(pagesize), 1),
+                    example,
+                )
+                for _ in range(int(n_layers))
+            ],
+        )
+    return None, None

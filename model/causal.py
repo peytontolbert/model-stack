@@ -6,13 +6,19 @@ from runtime.ops import embedding as runtime_embedding
 from runtime.ops import linear as runtime_linear
 from runtime.ops import resolve_position_ids as runtime_resolve_position_ids
 from runtime.ops import resolve_rotary_embedding as runtime_resolve_rotary_embedding
+from runtime.blocks import (
+    apply_native_norm,
+    execute_block_stack,
+    prepare_attention_mask_for_heads as runtime_prepare_attention_mask_for_heads,
+    stack_native_execution_info,
+)
 from specs.config import ModelConfig
 from compress import apply_compression
 from blocks.factory import build_block_stack
-from blocks.native_fusion import apply_native_norm
+from runtime.generation import build_generation_config as runtime_build_generation_config
+from runtime.generation import resolve_generation_sampling_mode as runtime_resolve_generation_sampling_mode
 from tensor.norms import RMSNorm
 from serve.engine import generate as engine_generate
-from serve.engine import GenerationConfig
 
 
 class CausalLM(nn.Module):
@@ -69,12 +75,17 @@ class CausalLM(nn.Module):
     ):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        if attention_mask is None:
+            attention_mask = attn_mask
         x = (
             inputs_embeds
             if inputs_embeds is not None
             else runtime_embedding(self.embed.weight, input_ids, self.embed.padding_idx)
         )
         B, T, _ = x.shape
+        token_attention_mask = None
+        if attention_mask is not None and attention_mask.ndim == 2 and tuple(attention_mask.shape) == (B, T):
+            token_attention_mask = attention_mask
         past_len = 0
         if position_ids is None:
             if cache_position is None and cache is not None and hasattr(cache, "layer"):
@@ -86,17 +97,28 @@ class CausalLM(nn.Module):
                 batch_size=B,
                 seq_len=T,
                 reference=x,
-                attention_mask=attention_mask,
+                attention_mask=token_attention_mask,
                 cache_position=cache_position,
                 past_length=past_len,
             )
-        # HF-like additive mask (B,1,T,S)
-        mask = runtime_create_causal_mask(
-            reference=x,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            position_ids=position_ids,
-        )
+        # Token-presence masks use the runtime causal-mask builder; explicit attention
+        # masks (prefix/full additive/bool masks) are already authoritative.
+        if attention_mask is not None and token_attention_mask is None:
+            src_len = int(attention_mask.shape[-1])
+            mask = runtime_prepare_attention_mask_for_heads(
+                attention_mask,
+                batch_size=B,
+                num_heads=self.cfg.n_heads,
+                tgt_len=T,
+                src_len=src_len,
+            )
+        else:
+            mask = runtime_create_causal_mask(
+                reference=x,
+                attention_mask=token_attention_mask,
+                cache_position=cache_position,
+                position_ids=position_ids,
+            )
         # Rotary embeddings
         head_dim = getattr(self.cfg, "head_dim", None) or int(self.cfg.d_model // self.cfg.n_heads)
         # Respect HF rope_scaling (e.g., LLaMA 3 uses linear scaling): stretch base_theta when type=="linear"
@@ -117,13 +139,14 @@ class CausalLM(nn.Module):
             position_ids=position_ids,
         )
 
-        if cache is None:
-            for blk in self.blocks:
-                x = blk(x, mask, None, (cos, sin), position_ids)
-        else:
-            for i, blk in enumerate(self.blocks):
-                layer_cache = cache.layer(i)
-                x = blk(x, mask, layer_cache, (cos, sin), position_ids)
+        x = execute_block_stack(
+            self.blocks,
+            x,
+            mask,
+            cache,
+            position_embeddings=(cos, sin),
+            position_ids=position_ids,
+        )
         x = apply_native_norm(x, self.norm)
         logits = runtime_linear(x, self.lm_head.weight, self.lm_head.bias)
         if return_dict:
@@ -133,15 +156,24 @@ class CausalLM(nn.Module):
     def get_output_embeddings(self):
         return self.lm_head
 
+    def native_execution_info(self) -> dict[str, object]:
+        blocks = stack_native_execution_info(self.blocks)
+        return {
+            "model_type": type(self).__name__,
+            "n_layers": len(blocks),
+            "blocks": blocks,
+            "all_blocks_native_inference_path": bool(all(block["fully_native_inference_path"] for block in blocks)),
+        }
+
     @torch.no_grad()
     def generate(
         self,
         input_ids: torch.Tensor,
         *,
         max_new_tokens: int = 128,
-        do_sample: bool = False,
+        do_sample: bool | None = None,
         temperature: float = 1.0,
-        top_p: float = 1.0,
+        top_p: float | None = 1.0,
         top_k: int | None = None,
         eos_token_id: int | list[int] | None = None,
         no_repeat_ngram_size: int = 0,
@@ -149,30 +181,46 @@ class CausalLM(nn.Module):
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
         attention_mask: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+        sliding_window: int | None = None,
+        cache_backend: str | None = None,
         return_dict: bool = True,
     ):
+        resolved_attention_mask = attention_mask if attention_mask is not None else attn_mask
+        resolved_do_sample = runtime_resolve_generation_sampling_mode(
+            do_sample=do_sample,
+            temperature=float(temperature),
+            top_k=top_k,
+            top_p=top_p,
+        )
         eos_id = (
             int(eos_token_id)
             if isinstance(eos_token_id, int)
             else (int(eos_token_id[0]) if isinstance(eos_token_id, (list, tuple)) and eos_token_id else None)
         )
-        cfg = GenerationConfig(
+        cfg = runtime_build_generation_config(
             max_new_tokens=int(max_new_tokens),
-            do_sample=bool(do_sample),
+            do_sample=resolved_do_sample,
             temperature=float(temperature),
             top_k=(int(top_k) if top_k is not None else None),
             top_p=(float(top_p) if top_p is not None else None),
             eos_id=eos_id,
-            no_repeat_ngram=0,
+            no_repeat_ngram=int(no_repeat_ngram_size),
             repetition_penalty=float(repetition_penalty),
             presence_penalty=float(presence_penalty),
             frequency_penalty=float(frequency_penalty),
+            sliding_window=(int(sliding_window) if sliding_window is not None else None),
         )
         seq = engine_generate(
             self,
             input_ids.to(next(self.parameters()).device),
-            attention_mask=(attention_mask.to(next(self.parameters()).device) if attention_mask is not None else None),
+            attention_mask=(
+                resolved_attention_mask.to(next(self.parameters()).device)
+                if resolved_attention_mask is not None
+                else None
+            ),
             config=cfg,
+            cache_backend=cache_backend,
         )
         if return_dict:
             return {"sequences": seq}

@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from runtime.ops import linear as runtime_linear
+
 
 class BottleneckAdapter(nn.Module):
     def __init__(self, hidden_size: int, bottleneck: int, dropout_p: float = 0.0, scale: float = 1.0):
@@ -11,7 +13,8 @@ class BottleneckAdapter(nn.Module):
         self.scale = float(scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.up(self.down(x))
+        y = runtime_linear(x, self.down.weight, self.down.bias)
+        y = runtime_linear(y, self.up.weight, self.up.bias)
         y = self.dropout(y)
         return self.scale * y
 
@@ -70,5 +73,4 @@ def attach_adapters_to_block(block: nn.Module, bottleneck: int | None = None, ia
                 return old_mlp(scaler(x))
             block.mlp.forward = new_mlp  # type: ignore
     return block
-
 

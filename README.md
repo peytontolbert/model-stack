@@ -2,6 +2,27 @@
 
 This repository is a modular, production‑oriented model stack that cleanly separates the concerns required to train, serve, and evaluate large language models. It defines stable contracts (versioned configs, tensor/shape specs, KV‑cache API, kernel registry, checkpoints, and streaming data) and organizes implementations into focused domains (attention, blocks, data, training, serving, evaluation, kernels, distribution, export, and observability), with supporting areas for compression, autotuning, interpretability, governance, RAG, and packaging. The split enables swappable implementations, targeted performance work, and reproducible artifacts without churn across the rest of the system.
 
+### Native CUDA Build
+
+The runtime C++/CUDA extension is optional and is only built when explicitly enabled:
+
+```bash
+MODEL_STACK_BUILD_NATIVE=1 \
+MODEL_STACK_BUILD_CUDA=1 \
+MODEL_STACK_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0+PTX" \
+python setup.py build_ext --inplace
+```
+
+Build environment notes:
+
+- `MODEL_STACK_CUDA_ARCH_LIST` is a repo-local alias for `TORCH_CUDA_ARCH_LIST`. If `TORCH_CUDA_ARCH_LIST` is already set, PyTorch's value wins.
+- `MODEL_STACK_MAX_JOBS` is a repo-local alias for PyTorch/Ninja's `MAX_JOBS`.
+- `MODEL_STACK_USE_NINJA=0` disables the Ninja backend if you need the slower setuptools fallback.
+- The patched `setup.py` validates CUDA 13.x architecture targets and rejects pre-Turing entries (`< 7.5`), matching NVIDIA's CUDA 13 release notes.
+- On Windows with CUDA 13.1 or newer, install the NVIDIA driver separately; it is no longer bundled with the CUDA Toolkit installer.
+
+If you do not set an architecture list explicitly, PyTorch's extension tooling defaults to building for the visible GPU architectures plus PTX. For reproducible CI or wheel builds, set `MODEL_STACK_CUDA_ARCH_LIST` or `TORCH_CUDA_ARCH_LIST` explicitly.
+
 Current constellation (by plane)
 Foundations (math, shapes, kernels)
 

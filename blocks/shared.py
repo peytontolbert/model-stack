@@ -5,11 +5,9 @@ from specs.config import ModelConfig
 from tensor.norms import RMSNorm
 from tensor.mlp import MLP
 from tensor.regularization import StochasticDepth
-from tensor.masking import to_additive_mask
-from tensor.positional import build_alibi_bias, build_relative_position_indices, relative_position_bias_from_table
+from runtime.blocks import apply_attention_biases, execute_attention_mlp_block
 
 from .config import BlockConfig
-from .native_fusion import apply_residual_update, can_apply_native_norm, fused_add_norm
 
 
 class CausalSelfAttentionBlockBase(nn.Module):
@@ -37,79 +35,25 @@ class CausalSelfAttentionBlockBase(nn.Module):
             self.rpb_table = None
 
     def _apply_pos_bias(self, x: torch.Tensor, base_mask: torch.Tensor | None) -> torch.Tensor | None:
-        attn_mask = base_mask
-        B, T, _ = x.shape
-        if self.bc.use_alibi:
-            bias = build_alibi_bias(self.cfg.n_heads, seq_len=T, device=x.device).to(dtype=x.dtype)
-            if attn_mask is None:
-                attn_mask = bias
-            else:
-                if attn_mask.dtype == torch.bool:
-                    add = to_additive_mask(attn_mask)
-                else:
-                    add = attn_mask
-                attn_mask = add + bias
-        if self.rpb_table is not None:
-            idx = build_relative_position_indices(T, T, int(self.bc.rpb_max_distance), device=x.device)
-            rpb = relative_position_bias_from_table(idx, self.rpb_table).to(dtype=x.dtype)
-            if attn_mask is None:
-                attn_mask = rpb
-            else:
-                if attn_mask.dtype == torch.bool:
-                    add = to_additive_mask(attn_mask)
-                else:
-                    add = attn_mask
-                attn_mask = add + rpb
-        return attn_mask
+        return apply_attention_biases(
+            x,
+            base_mask,
+            num_heads=self.cfg.n_heads,
+            use_alibi=bool(self.bc.use_alibi),
+            rpb_table=self.rpb_table,
+            rpb_max_distance=(int(self.bc.rpb_max_distance) if self.rpb_table is not None else None),
+        )
 
     def forward(self, x: torch.Tensor, base_mask: torch.Tensor | None = None, cache=None) -> torch.Tensor:
         attn_mask = self._apply_pos_bias(x, base_mask)
-        if self.bc.norm_policy == "prenorm":
-            a = self.attn.forward(self.n1(x), None, None, attn_mask, cache)
-            if can_apply_native_norm(self.n2, self.training):
-                x, mlp_in = fused_add_norm(x, a, self.n2, self.bc.residual_scale)
-            else:
-                x = apply_residual_update(
-                    x,
-                    a,
-                    residual_scale=self.bc.residual_scale,
-                    resid_dropout=self.resid_dropout,
-                    drop_path=self.drop_path,
-                )
-                mlp_in = self.n2(x)
-            m = self.mlp(mlp_in)
-            x = apply_residual_update(
-                x,
-                m,
-                residual_scale=self.bc.residual_scale,
-                resid_dropout=self.resid_dropout,
-                drop_path=self.drop_path,
-            )
-            return x
-        a = self.attn.forward(x, None, None, attn_mask, cache)
-        if can_apply_native_norm(self.n1, self.training):
-            _, x = fused_add_norm(x, a, self.n1, self.bc.residual_scale)
-        else:
-            x = self.n1(
-                apply_residual_update(
-                    x,
-                    a,
-                    residual_scale=self.bc.residual_scale,
-                    resid_dropout=self.resid_dropout,
-                    drop_path=self.drop_path,
-                )
-            )
-        m = self.mlp(x)
-        if can_apply_native_norm(self.n2, self.training):
-            _, x = fused_add_norm(x, m, self.n2, self.bc.residual_scale)
-        else:
-            x = self.n2(
-                apply_residual_update(
-                    x,
-                    m,
-                    residual_scale=self.bc.residual_scale,
-                    resid_dropout=self.resid_dropout,
-                    drop_path=self.drop_path,
-                )
-            )
-        return x
+        return execute_attention_mlp_block(
+            x,
+            attn_fn=lambda y: self.attn.forward(y, None, None, attn_mask, cache),
+            mlp_fn=self.mlp,
+            n1=self.n1,
+            n2=self.n2,
+            resid_dropout=self.resid_dropout,
+            drop_path=self.drop_path,
+            residual_scale=self.bc.residual_scale,
+            norm_policy=self.bc.norm_policy,
+        )

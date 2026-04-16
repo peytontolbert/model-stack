@@ -39,7 +39,7 @@ def bench_kvcache(pagesizes: Iterable[int], batch: int, n_layers: int, n_kv_head
                     k = torch.randn(Hk, 1, D, device=device, dtype=dtype)
                     v = torch.randn(Hk, 1, D, device=device, dtype=dtype)
                     cache.append(0, b, k, v)
-                _ = cache.slice(0, 0, cache.lengths[0][0])
+                _ = cache.slice(0, 0, 0, int(cache.layer_lengths(0)[0].item()))
                 return 0
             dt = _time_callable(step, warmup=10, repeat=max(1, int(seq))) / max(1, int(seq))
             results.append((f"pagesize={ps}", dt))
@@ -47,6 +47,4 @@ def bench_kvcache(pagesizes: Iterable[int], batch: int, n_layers: int, n_kv_head
             continue
     results.sort(key=lambda x: x[1])
     return results
-
-
 

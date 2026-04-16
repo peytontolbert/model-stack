@@ -1,10 +1,13 @@
 import torch
 import torch.nn as nn
 
+from runtime.blocks import apply_native_norm, execute_decoder_stack, execute_encoder_stack
+from runtime.ops import embedding as runtime_embedding
+from runtime.ops import linear as runtime_linear
 from specs.config import ModelConfig
+from compress import apply_compression
 from blocks.encoder_block import EncoderBlock
 from blocks.decoder_block import DecoderBlock
-from blocks.native_fusion import apply_native_norm
 from blocks.schedules import drop_path_linear
 from blocks.init import init_transformer_stack
 
@@ -20,6 +23,7 @@ class EncoderDecoderLM(nn.Module):
         init_recipe_dec: str | None = None,
         tie_embeddings: bool = False,
         vocab_size: int | None = None,
+        compress: dict | None = None,
     ):
         super().__init__()
         self.cfg = cfg
@@ -44,11 +48,16 @@ class EncoderDecoderLM(nn.Module):
             init_transformer_stack(self.encoder, recipe=init_recipe_enc)
         if init_recipe_dec is not None:
             init_transformer_stack(self.decoder, recipe=init_recipe_dec)
+        if compress is not None:
+            lora_cfg = compress.get("lora") if isinstance(compress, dict) else None
+            quant_cfg = compress.get("quant") if isinstance(compress, dict) else None
+            self._compression_summary = apply_compression(self, lora=lora_cfg, quant=quant_cfg)
+        else:
+            self._compression_summary = None
 
     def encode(self, input_ids: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
-        x = self.enc_embed(input_ids)
-        for blk in self.encoder:
-            x = blk(x, padding_mask)
+        x = runtime_embedding(self.enc_embed.weight, input_ids, self.enc_embed.padding_idx)
+        x = execute_encoder_stack(self.encoder, x, padding_mask)
         return apply_native_norm(x, self.enc_norm)
 
     def decode(
@@ -59,14 +68,15 @@ class EncoderDecoderLM(nn.Module):
         memory_mask: torch.Tensor | None = None,
         cache=None,
     ) -> torch.Tensor:
-        x = self.dec_embed(input_ids)
-        if cache is None:
-            for blk in self.decoder:
-                x = blk(x, memory, self_mask, memory_mask, None)
-        else:
-            for i, blk in enumerate(self.decoder):
-                layer_cache = cache.layer(i)
-                x = blk(x, memory, self_mask, memory_mask, layer_cache)
+        x = runtime_embedding(self.dec_embed.weight, input_ids, self.dec_embed.padding_idx)
+        x = execute_decoder_stack(
+            self.decoder,
+            x,
+            memory,
+            self_mask,
+            memory_mask,
+            cache,
+        )
         return apply_native_norm(x, self.dec_norm)
 
     def forward(
@@ -79,5 +89,4 @@ class EncoderDecoderLM(nn.Module):
     ) -> torch.Tensor:
         mem = self.encode(enc_input_ids, enc_padding_mask)
         x = self.decode(dec_input_ids, mem, dec_self_mask, enc_padding_mask, cache)
-        return self.lm_head(x)
-
+        return runtime_linear(x, self.lm_head.weight, self.lm_head.bias)

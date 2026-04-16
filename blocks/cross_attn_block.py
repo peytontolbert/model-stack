@@ -5,9 +5,9 @@ from specs.config import ModelConfig
 from tensor.norms import RMSNorm
 from tensor.mlp import MLP
 from tensor.regularization import StochasticDepth
+from runtime.blocks import execute_attention_mlp_block, prepare_cross_attention_mask
 
 from .config import BlockConfig, build_block_config_from_model
-from .native_fusion import apply_residual_update, can_apply_native_norm, fused_add_norm
 from attn.factory import build_attention
 
 
@@ -37,52 +37,20 @@ class CrossAttentionBlock(nn.Module):
         attn_mask: torch.Tensor | None = None,
         enc_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.bc.norm_policy == "prenorm":
-            a = self.cross.forward(self.n1(x), enc, enc, enc_mask)
-            if can_apply_native_norm(self.n2, self.training):
-                x, mlp_in = fused_add_norm(x, a, self.n2, self.bc.residual_scale)
-            else:
-                x = apply_residual_update(
-                    x,
-                    a,
-                    residual_scale=self.bc.residual_scale,
-                    resid_dropout=self.resid_dropout,
-                    drop_path=self.drop_path,
-                )
-                mlp_in = self.n2(x)
-            m = self.mlp(mlp_in)
-            x = apply_residual_update(
-                x,
-                m,
-                residual_scale=self.bc.residual_scale,
-                resid_dropout=self.resid_dropout,
-                drop_path=self.drop_path,
-            )
-            return x
-        a = self.cross.forward(x, enc, enc, enc_mask)
-        if can_apply_native_norm(self.n1, self.training):
-            _, x = fused_add_norm(x, a, self.n1, self.bc.residual_scale)
-        else:
-            x = self.n1(
-                apply_residual_update(
-                    x,
-                    a,
-                    residual_scale=self.bc.residual_scale,
-                    resid_dropout=self.resid_dropout,
-                    drop_path=self.drop_path,
-                )
-            )
-        m = self.mlp(x)
-        if can_apply_native_norm(self.n2, self.training):
-            _, x = fused_add_norm(x, m, self.n2, self.bc.residual_scale)
-        else:
-            x = self.n2(
-                apply_residual_update(
-                    x,
-                    m,
-                    residual_scale=self.bc.residual_scale,
-                    resid_dropout=self.resid_dropout,
-                    drop_path=self.drop_path,
-                )
-            )
-        return x
+        prepared_enc_mask = prepare_cross_attention_mask(
+            x,
+            enc,
+            enc_mask,
+            num_heads=self.cfg.n_heads,
+        )
+        return execute_attention_mlp_block(
+            x,
+            attn_fn=lambda y: self.cross.forward(y, enc, enc, prepared_enc_mask),
+            mlp_fn=self.mlp,
+            n1=self.n1,
+            n2=self.n2,
+            resid_dropout=self.resid_dropout,
+            drop_path=self.drop_path,
+            residual_scale=self.bc.residual_scale,
+            norm_policy=self.bc.norm_policy,
+        )

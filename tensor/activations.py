@@ -1,5 +1,7 @@
 import torch
 import torch.nn.functional as F
+from runtime.ops import activation as runtime_activation
+from runtime.ops import gated_activation as runtime_gated_activation
 from .numerics import softplus_safe
 
 
@@ -9,7 +11,7 @@ def gelu(x: torch.Tensor, approx: str = "exact") -> torch.Tensor:
     approx: "exact" | "tanh" | "sigmoid"
     """
     if approx in ("exact", "none"):
-        return F.gelu(x)
+        return runtime_activation(x, "gelu")
     if approx in ("tanh", "fast"):
         # PyTorch tanh approximate path
         return F.gelu(x, approximate="tanh")
@@ -19,7 +21,7 @@ def gelu(x: torch.Tensor, approx: str = "exact") -> torch.Tensor:
 
 
 def silu(x: torch.Tensor) -> torch.Tensor:
-    return F.silu(x)
+    return runtime_activation(x, "silu")
 
 
 def identity(x: torch.Tensor) -> torch.Tensor:
@@ -36,11 +38,11 @@ def _apply_act(x: torch.Tensor, act: str, gelu_approx: str | None = None) -> tor
     if a in ("identity", "none"):
         return x
     if a in ("relu",):
-        return F.relu(x)
+        return runtime_activation(x, "relu")
     if a in ("relu2", "squared_relu", "squared-relu"):
         return relu2(x)
     if a in ("silu", "swish"):
-        return F.silu(x)
+        return runtime_activation(x, a)
     if a in ("gelu",):
         return gelu(x, approx=gelu_approx or "exact")
     if a in ("tanh_gelu", "tanh-gelu"):
@@ -60,6 +62,13 @@ def with_bias_act(
 ) -> torch.Tensor:
     if bias is not None:
         x = x + bias
+    if gate is not None:
+        a = act.lower()
+        if (
+            (a in ("relu", "silu", "swish", "gelu"))
+            and (a != "gelu" or (gelu_approx or "exact") in ("exact", "none"))
+        ):
+            return runtime_gated_activation(x, gate, a)
     x = _apply_act(x, act=act, gelu_approx=gelu_approx)
     if gate is not None:
         x = x * gate

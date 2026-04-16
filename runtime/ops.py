@@ -6,6 +6,15 @@ import torch.nn.functional as F
 from runtime.native import has_native_op, native_module, resolve_linear_backend
 
 
+def _should_use_eager_autograd_fallback(*tensors: torch.Tensor | None) -> bool:
+    if not torch.is_grad_enabled():
+        return False
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
+            return True
+    return False
+
+
 def _to_tuple_dims(dim: int | tuple[int, ...], ndim: int) -> tuple[int, ...]:
     if isinstance(dim, tuple):
         dims = dim
@@ -80,6 +89,8 @@ def rms_norm(
     eps: float = 1e-6,
     dim: int | tuple[int, ...] = -1,
 ) -> torch.Tensor:
+    if _should_use_eager_autograd_fallback(x, weight):
+        return _rms_norm_reference(x, weight=weight, eps=eps, dim=dim)
     if dim == -1 and has_native_op("rms_norm"):
         module = native_module()
         if module is not None and hasattr(module, "rms_norm_forward"):
@@ -94,6 +105,8 @@ def layer_norm(
     eps: float = 1e-5,
     dim: int | tuple[int, ...] = -1,
 ) -> torch.Tensor:
+    if _should_use_eager_autograd_fallback(x, weight, bias):
+        return _layer_norm_reference(x, weight=weight, bias=bias, eps=eps, dim=dim)
     if dim == -1 and has_native_op("layer_norm"):
         module = native_module()
         if module is not None and hasattr(module, "layer_norm_forward"):
@@ -109,6 +122,9 @@ def add_rms_norm(
     residual_scale: float = 1.0,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _should_use_eager_autograd_fallback(x, update, weight):
+        combined = x + (update * float(residual_scale))
+        return combined, _rms_norm_reference(combined, weight=weight, eps=eps, dim=-1)
     if has_native_op("add_rms_norm"):
         module = native_module()
         if module is not None and hasattr(module, "add_rms_norm_forward"):
@@ -130,6 +146,8 @@ def residual_add(
     *,
     residual_scale: float = 1.0,
 ) -> torch.Tensor:
+    if _should_use_eager_autograd_fallback(x, update):
+        return x + (update * float(residual_scale))
     if has_native_op("residual_add"):
         module = native_module()
         if module is not None and hasattr(module, "residual_add_forward"):
@@ -150,6 +168,9 @@ def add_layer_norm(
     residual_scale: float = 1.0,
     eps: float = 1e-5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _should_use_eager_autograd_fallback(x, update, weight, bias):
+        combined = x + (update * float(residual_scale))
+        return combined, _layer_norm_reference(combined, weight=weight, bias=bias, eps=eps, dim=-1)
     if has_native_op("add_layer_norm"):
         module = native_module()
         if module is not None and hasattr(module, "add_layer_norm_forward"):
@@ -172,6 +193,16 @@ def apply_rotary(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _should_use_eager_autograd_fallback(q, k, cos, sin):
+        cos_b = cos.view(1, 1, cos.shape[0], cos.shape[1])
+        sin_b = sin.view(1, 1, sin.shape[0], sin.shape[1])
+
+        def rotate_half(x: torch.Tensor) -> torch.Tensor:
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        return (q * cos_b) + (rotate_half(q) * sin_b), (k * cos_b) + (rotate_half(k) * sin_b)
     if has_native_op("rope"):
         module = native_module()
         if module is not None and hasattr(module, "apply_rotary_forward"):
@@ -221,6 +252,445 @@ def kv_cache_write(
     return cache
 
 
+def kv_cache_gather(
+    cache: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    if has_native_op("kv_cache_gather"):
+        module = native_module()
+        if module is not None and hasattr(module, "kv_cache_gather_forward"):
+            return module.kv_cache_gather_forward(cache, positions)
+    positions_long = positions.to(device=cache.device, dtype=torch.long)
+    if cache.dim() == 3:
+        return cache.index_select(1, positions_long)
+    if cache.dim() != 4:
+        raise ValueError("kv_cache_gather fallback requires cache to be rank-3 or rank-4")
+    if positions_long.dim() == 1:
+        return cache.index_select(2, positions_long)
+    if positions_long.dim() != 2 or positions_long.shape[0] != cache.shape[0]:
+        raise ValueError("kv_cache_gather fallback requires rank-2 positions to match cache batch size")
+    return torch.stack(
+        [cache[b].index_select(1, positions_long[b]) for b in range(cache.shape[0])],
+        dim=0,
+    )
+
+
+def paged_kv_gather(
+    pages: torch.Tensor,
+    block_table: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    if has_native_op("paged_kv_gather"):
+        module = native_module()
+        if module is not None and hasattr(module, "paged_kv_gather_forward"):
+            return module.paged_kv_gather_forward(pages, block_table, positions)
+    block_table_long = block_table.to(device=pages.device, dtype=torch.long)
+    positions_long = positions.to(device=pages.device, dtype=torch.long)
+    if pages.dim() != 4:
+        raise ValueError("paged_kv_gather fallback requires pages to be rank-4 (P,H,page_size,D)")
+    if block_table_long.dim() != 2:
+        raise ValueError("paged_kv_gather fallback requires block_table to be rank-2 (B,max_blocks)")
+    if positions_long.dim() not in (1, 2):
+        raise ValueError("paged_kv_gather fallback requires positions to be rank-1 or rank-2")
+    if positions_long.dim() == 2 and positions_long.shape[0] != block_table_long.shape[0]:
+        raise ValueError("paged_kv_gather fallback requires rank-2 positions to match block_table batch size")
+    gather_seq = int(positions_long.shape[0] if positions_long.dim() == 1 else positions_long.shape[1])
+    out = torch.empty(
+        block_table_long.shape[0],
+        pages.shape[1],
+        gather_seq,
+        pages.shape[3],
+        dtype=pages.dtype,
+        device=pages.device,
+    )
+    page_size = int(pages.shape[2])
+    for b in range(block_table_long.shape[0]):
+        for t in range(gather_seq):
+            pos = int(positions_long[t] if positions_long.dim() == 1 else positions_long[b, t])
+            block_idx = pos // page_size
+            page_offset = pos % page_size
+            page_id = int(block_table_long[b, block_idx])
+            out[b, :, t, :] = pages[page_id, :, page_offset, :]
+    return out
+
+
+def paged_kv_assign_blocks(
+    block_table: torch.Tensor,
+    block_ids: torch.Tensor,
+    starts: torch.Tensor,
+    total: int,
+    page_size: int,
+    next_page_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    if has_native_op("paged_kv_assign_blocks"):
+        module = native_module()
+        if module is not None and hasattr(module, "paged_kv_assign_blocks_forward"):
+            next_table, selected_table, next_page = module.paged_kv_assign_blocks_forward(
+                block_table,
+                block_ids,
+                starts,
+                int(total),
+                int(page_size),
+                int(next_page_id),
+            )
+            return next_table, selected_table, int(next_page)
+
+    block_table_long = block_table.to(device=block_table.device, dtype=torch.long).contiguous()
+    block_ids_long = block_ids.to(device=block_table.device, dtype=torch.long).contiguous().view(-1)
+    starts_long = starts.to(device=block_table.device, dtype=torch.long).contiguous().view(-1)
+    if block_table_long.dim() != 2:
+        raise ValueError("paged_kv_assign_blocks fallback requires block_table to be rank-2 (B,max_blocks)")
+    if block_ids_long.numel() != starts_long.numel():
+        raise ValueError("paged_kv_assign_blocks fallback requires block_ids and starts to have the same length")
+    if int(total) < 0:
+        raise ValueError("paged_kv_assign_blocks fallback requires total to be non-negative")
+    if int(page_size) <= 0:
+        raise ValueError("paged_kv_assign_blocks fallback requires page_size to be positive")
+    if int(next_page_id) < 0:
+        raise ValueError("paged_kv_assign_blocks fallback requires next_page_id to be non-negative")
+    if block_ids_long.numel() > 0:
+        if int(block_ids_long.min().item()) < 0 or int(block_ids_long.max().item()) >= block_table_long.shape[0]:
+            raise ValueError("paged_kv_assign_blocks fallback requires block_ids to be within block_table batch range")
+        if int(torch.unique(block_ids_long).numel()) != int(block_ids_long.numel()):
+            raise ValueError("paged_kv_assign_blocks fallback requires block_ids to be unique")
+    if starts_long.numel() > 0 and int(starts_long.min().item()) < 0:
+        raise ValueError("paged_kv_assign_blocks fallback requires starts to be non-negative")
+    if block_ids_long.numel() == 0 or int(total) == 0:
+        empty = torch.empty(block_ids_long.numel(), 0, dtype=torch.long, device=block_table_long.device)
+        return block_table_long, empty, int(next_page_id)
+
+    end_positions = starts_long + (int(total) - 1)
+    start_blocks = torch.div(starts_long, int(page_size), rounding_mode="floor")
+    end_blocks = torch.div(end_positions, int(page_size), rounding_mode="floor")
+    needed_blocks = int(end_blocks.max().item()) + 1
+
+    next_blocks = int(block_table_long.shape[1])
+    if next_blocks < needed_blocks:
+        next_blocks = max(1, next_blocks if next_blocks > 0 else 1)
+        while next_blocks < needed_blocks:
+            next_blocks *= 2
+        next_table = torch.full(
+            (block_table_long.shape[0], next_blocks),
+            -1,
+            dtype=torch.long,
+            device=block_table_long.device,
+        )
+        if block_table_long.numel() > 0:
+            next_table[:, : block_table_long.shape[1]].copy_(block_table_long)
+    else:
+        next_table = block_table_long.clone()
+
+    selected = next_table.index_select(0, block_ids_long).clone()
+    selected_prefix = selected[:, :needed_blocks].clone()
+    active_slots = torch.arange(needed_blocks, device=block_table_long.device, dtype=torch.long).view(1, needed_blocks)
+    active_mask = (active_slots >= start_blocks.view(-1, 1)) & (active_slots <= end_blocks.view(-1, 1))
+    missing_mask = active_mask & (selected_prefix < 0)
+    missing_count = int(missing_mask.sum().item())
+    if missing_count > 0:
+        new_ids = torch.arange(
+            int(next_page_id),
+            int(next_page_id) + missing_count,
+            device=block_table_long.device,
+            dtype=torch.long,
+        )
+        selected_prefix[missing_mask] = new_ids
+
+    selected[:, :needed_blocks] = selected_prefix
+    next_table.index_copy_(0, block_ids_long, selected)
+    return next_table, selected_prefix.clamp_min(0).contiguous(), int(next_page_id) + missing_count
+
+
+def paged_kv_reserve_pages(
+    pages: torch.Tensor,
+    used_pages: int,
+    needed_pages: int,
+) -> torch.Tensor:
+    if has_native_op("paged_kv_reserve_pages"):
+        module = native_module()
+        if module is not None and hasattr(module, "paged_kv_reserve_pages_forward"):
+            return module.paged_kv_reserve_pages_forward(pages, int(used_pages), int(needed_pages))
+
+    if pages.dim() != 4:
+        raise ValueError("paged_kv_reserve_pages fallback requires pages to be rank-4 (P,H,page_size,D)")
+    if int(used_pages) < 0:
+        raise ValueError("paged_kv_reserve_pages fallback requires used_pages to be non-negative")
+    if int(needed_pages) < 0:
+        raise ValueError("paged_kv_reserve_pages fallback requires needed_pages to be non-negative")
+    if int(used_pages) > int(pages.shape[0]):
+        raise ValueError("paged_kv_reserve_pages fallback requires used_pages to fit current capacity")
+    if int(needed_pages) <= int(pages.shape[0]):
+        return pages
+
+    new_cap = max(1, int(pages.shape[0]) if int(pages.shape[0]) > 0 else 1)
+    while new_cap < int(needed_pages):
+        new_cap *= 2
+    next_pages = torch.empty(
+        new_cap,
+        pages.shape[1],
+        pages.shape[2],
+        pages.shape[3],
+        dtype=pages.dtype,
+        device=pages.device,
+    )
+    if int(used_pages) > 0:
+        next_pages[: int(used_pages)].copy_(pages[: int(used_pages)])
+    return next_pages
+
+
+def paged_kv_read_last(
+    pages: torch.Tensor,
+    block_table: torch.Tensor,
+    lengths: torch.Tensor,
+    keep: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if has_native_op("paged_kv_read_last"):
+        module = native_module()
+        if module is not None and hasattr(module, "paged_kv_read_last_forward"):
+            return module.paged_kv_read_last_forward(pages, block_table, lengths, int(keep))
+
+    block_table_long = block_table.to(device=pages.device, dtype=torch.long).contiguous()
+    lengths_long = lengths.to(device=pages.device, dtype=torch.long).contiguous().view(-1)
+    if pages.dim() != 4:
+        raise ValueError("paged_kv_read_last fallback requires pages to be rank-4 (P,H,page_size,D)")
+    if block_table_long.dim() != 2:
+        raise ValueError("paged_kv_read_last fallback requires block_table to be rank-2 (B,max_blocks)")
+    if lengths_long.dim() != 1:
+        raise ValueError("paged_kv_read_last fallback requires lengths to be rank-1")
+    if block_table_long.shape[0] != lengths_long.shape[0]:
+        raise ValueError("paged_kv_read_last fallback requires block_table and lengths batch sizes to match")
+    if int(keep) < 0:
+        raise ValueError("paged_kv_read_last fallback requires keep to be non-negative")
+    kept_lengths = torch.clamp(lengths_long, min=0, max=int(keep))
+    max_keep = int(kept_lengths.max().item()) if kept_lengths.numel() > 0 else 0
+    out = torch.zeros(
+        block_table_long.shape[0],
+        pages.shape[1],
+        max_keep,
+        pages.shape[3],
+        dtype=pages.dtype,
+        device=pages.device,
+    )
+    if max_keep == 0 or block_table_long.shape[0] == 0:
+        return out, kept_lengths
+    page_size = int(pages.shape[2])
+    for b in range(block_table_long.shape[0]):
+        row_keep = int(kept_lengths[b].item())
+        live_len = int(lengths_long[b].item())
+        start = max(live_len - row_keep, 0)
+        for t in range(row_keep):
+            pos = start + t
+            block_idx = pos // page_size
+            page_offset = pos % page_size
+            page_id = int(block_table_long[b, block_idx])
+            out[b, :, t, :] = pages[page_id, :, page_offset, :]
+    return out, kept_lengths
+
+
+def paged_kv_read_range(
+    pages: torch.Tensor,
+    block_table: torch.Tensor,
+    lengths: torch.Tensor,
+    start: int,
+    end: int,
+) -> torch.Tensor:
+    if has_native_op("paged_kv_read_range"):
+        module = native_module()
+        if module is not None and hasattr(module, "paged_kv_read_range_forward"):
+            return module.paged_kv_read_range_forward(pages, block_table, lengths, int(start), int(end))
+
+    block_table_long = block_table.to(device=pages.device, dtype=torch.long).contiguous().clamp_min(0)
+    lengths_long = lengths.to(device=pages.device, dtype=torch.long).contiguous().view(-1)
+    if pages.dim() != 4:
+        raise ValueError("paged_kv_read_range fallback requires pages to be rank-4 (P,H,page_size,D)")
+    if block_table_long.dim() != 2:
+        raise ValueError("paged_kv_read_range fallback requires block_table to be rank-2 (B,max_blocks)")
+    if lengths_long.dim() != 1:
+        raise ValueError("paged_kv_read_range fallback requires lengths to be rank-1")
+    if block_table_long.shape[0] != lengths_long.shape[0]:
+        raise ValueError("paged_kv_read_range fallback requires block_table and lengths batch sizes to match")
+    if int(start) < 0:
+        raise ValueError("paged_kv_read_range fallback requires start to be non-negative")
+    if int(end) < int(start):
+        raise ValueError("paged_kv_read_range fallback requires end >= start")
+    gather_seq = int(end) - int(start)
+    out = torch.zeros(
+        block_table_long.shape[0],
+        pages.shape[1],
+        gather_seq,
+        pages.shape[3],
+        dtype=pages.dtype,
+        device=pages.device,
+    )
+    if gather_seq == 0 or block_table_long.shape[0] == 0:
+        return out
+    page_size = int(pages.shape[2])
+    for b in range(block_table_long.shape[0]):
+        live_len = int(lengths_long[b].item())
+        for t in range(gather_seq):
+            pos = int(start) + t
+            if pos >= live_len:
+                continue
+            block_idx = pos // page_size
+            page_offset = pos % page_size
+            page_id = int(block_table_long[b, block_idx])
+            out[b, :, t, :] = pages[page_id, :, page_offset, :]
+    return out
+
+
+def paged_kv_append(
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    block_table: torch.Tensor,
+    lengths: torch.Tensor,
+    page_count: int,
+    k_chunk: torch.Tensor,
+    v_chunk: torch.Tensor,
+    block_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    if has_native_op("paged_kv_append"):
+        module = native_module()
+        if module is not None and hasattr(module, "paged_kv_append_forward"):
+            next_k_pages, next_v_pages, next_block_table, next_lengths, next_page_count = module.paged_kv_append_forward(
+                k_pages, v_pages, block_table, lengths, int(page_count), k_chunk, v_chunk, block_ids
+            )
+            return next_k_pages, next_v_pages, next_block_table, next_lengths, int(next_page_count.item())
+
+    block_ids_long = block_ids.to(device=k_pages.device, dtype=torch.long).contiguous().view(-1)
+    lengths_long = lengths.to(device=k_pages.device, dtype=torch.long).contiguous().view(-1)
+    if block_ids_long.numel() == 0 or int(k_chunk.shape[2]) == 0:
+        return k_pages, v_pages, block_table.to(device=k_pages.device, dtype=torch.long).contiguous(), lengths_long, int(page_count)
+    starts_long = lengths_long.index_select(0, block_ids_long)
+    total = int(k_chunk.shape[2])
+    base = torch.arange(total, device=k_pages.device, dtype=torch.long).view(1, total)
+    positions = starts_long.view(-1, 1) + base
+    next_block_table, selected_block_table, next_page_count = paged_kv_assign_blocks(
+        block_table,
+        block_ids_long,
+        starts_long,
+        total,
+        int(k_pages.shape[2]),
+        int(page_count),
+    )
+    next_k_pages = paged_kv_reserve_pages(k_pages, int(page_count), int(next_page_count))
+    next_v_pages = paged_kv_reserve_pages(v_pages, int(page_count), int(next_page_count))
+    next_k_pages = paged_kv_write(next_k_pages, selected_block_table, positions, k_chunk)
+    next_v_pages = paged_kv_write(next_v_pages, selected_block_table, positions, v_chunk)
+    next_lengths = lengths_long.clone()
+    next_lengths.index_copy_(0, block_ids_long, starts_long + total)
+    return next_k_pages, next_v_pages, next_block_table, next_lengths, int(next_page_count)
+
+
+def paged_kv_compact(
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    block_table: torch.Tensor,
+    lengths: torch.Tensor,
+    keep: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if has_native_op("paged_kv_compact"):
+        module = native_module()
+        if module is not None and hasattr(module, "paged_kv_compact_forward"):
+            return module.paged_kv_compact_forward(k_pages, v_pages, block_table, lengths, int(keep))
+
+    block_table_long = block_table.to(device=k_pages.device, dtype=torch.long).contiguous()
+    block_table_safe = block_table_long.clamp_min(0)
+    lengths_long = lengths.to(device=k_pages.device, dtype=torch.long).contiguous().view(-1)
+    if k_pages.dim() != 4 or v_pages.dim() != 4:
+        raise ValueError("paged_kv_compact fallback requires k_pages and v_pages to be rank-4")
+    if k_pages.shape != v_pages.shape:
+        raise ValueError("paged_kv_compact fallback requires k_pages and v_pages shapes to match")
+    if block_table_long.dim() != 2:
+        raise ValueError("paged_kv_compact fallback requires block_table to be rank-2")
+    if lengths_long.dim() != 1:
+        raise ValueError("paged_kv_compact fallback requires lengths to be rank-1")
+    if block_table_long.shape[0] != lengths_long.shape[0]:
+        raise ValueError("paged_kv_compact fallback requires block_table and lengths batch sizes to match")
+    if int(keep) < 0:
+        raise ValueError("paged_kv_compact fallback requires keep to be non-negative")
+
+    kept_k, kept_lengths = paged_kv_read_last(k_pages, block_table_safe, lengths_long, int(keep))
+    kept_v, kept_lengths_v = paged_kv_read_last(v_pages, block_table_safe, lengths_long, int(keep))
+    if not torch.equal(kept_lengths, kept_lengths_v):
+        raise ValueError("paged_kv_compact fallback got mismatched kept lengths for K and V")
+
+    next_block_table = torch.empty(block_table_long.shape[0], 0, dtype=torch.long, device=block_table_long.device)
+    next_k_pages = torch.empty(0, k_pages.shape[1], k_pages.shape[2], k_pages.shape[3], dtype=k_pages.dtype, device=k_pages.device)
+    next_v_pages = torch.empty(0, v_pages.shape[1], v_pages.shape[2], v_pages.shape[3], dtype=v_pages.dtype, device=v_pages.device)
+    next_page_id = 0
+    unique_lengths = sorted({int(x) for x in kept_lengths.tolist() if int(x) > 0})
+    for length in unique_lengths:
+        group_ids = (kept_lengths == length).nonzero(as_tuple=False).flatten()
+        starts = torch.zeros(group_ids.numel(), dtype=torch.long, device=block_table_long.device)
+        next_block_table, selected_block_table, next_page_id_new = paged_kv_assign_blocks(
+            next_block_table,
+            group_ids,
+            starts,
+            int(length),
+            int(k_pages.shape[2]),
+            int(next_page_id),
+        )
+        next_k_pages = paged_kv_reserve_pages(next_k_pages, int(next_page_id), int(next_page_id_new))
+        next_v_pages = paged_kv_reserve_pages(next_v_pages, int(next_page_id), int(next_page_id_new))
+        positions = torch.arange(int(length), dtype=torch.long, device=block_table_long.device)
+        next_k_pages = paged_kv_write(
+            next_k_pages,
+            selected_block_table,
+            positions,
+            kept_k.index_select(0, group_ids)[:, :, : int(length), :].contiguous(),
+        )
+        next_v_pages = paged_kv_write(
+            next_v_pages,
+            selected_block_table,
+            positions,
+            kept_v.index_select(0, group_ids)[:, :, : int(length), :].contiguous(),
+        )
+        next_page_id = int(next_page_id_new)
+
+    return (
+        next_k_pages[:next_page_id].contiguous(),
+        next_v_pages[:next_page_id].contiguous(),
+        next_block_table,
+        kept_lengths,
+    )
+
+
+def paged_kv_write(
+    pages: torch.Tensor,
+    block_table: torch.Tensor,
+    positions: torch.Tensor,
+    values: torch.Tensor,
+) -> torch.Tensor:
+    if has_native_op("paged_kv_write"):
+        module = native_module()
+        if module is not None and hasattr(module, "paged_kv_write_forward"):
+            return module.paged_kv_write_forward(pages, block_table, positions, values)
+    block_table_long = block_table.to(device=pages.device, dtype=torch.long)
+    positions_long = positions.to(device=pages.device, dtype=torch.long)
+    values_contig = values.to(device=pages.device, dtype=pages.dtype)
+    if pages.dim() != 4:
+        raise ValueError("paged_kv_write fallback requires pages to be rank-4 (P,H,page_size,D)")
+    if block_table_long.dim() != 2:
+        raise ValueError("paged_kv_write fallback requires block_table to be rank-2 (B,max_blocks)")
+    if positions_long.dim() not in (1, 2):
+        raise ValueError("paged_kv_write fallback requires positions to be rank-1 or rank-2")
+    if values_contig.dim() != 4:
+        raise ValueError("paged_kv_write fallback requires values to be rank-4 (B,H,T,D)")
+    if positions_long.dim() == 2 and positions_long.shape[0] != values_contig.shape[0]:
+        raise ValueError("paged_kv_write fallback requires rank-2 positions to match values batch size")
+    if positions_long.shape[-1] != values_contig.shape[2]:
+        raise ValueError("paged_kv_write fallback requires positions length to match values T")
+    page_size = int(pages.shape[2])
+    pages_out = pages
+    for b in range(values_contig.shape[0]):
+        for t in range(values_contig.shape[2]):
+            pos = int(positions_long[t] if positions_long.dim() == 1 else positions_long[b, t])
+            block_idx = pos // page_size
+            page_offset = pos % page_size
+            page_id = int(block_table_long[b, block_idx])
+            pages_out[page_id, :, page_offset, :] = values_contig[b, :, t, :]
+    return pages_out
+
+
 def attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -231,6 +701,8 @@ def attention(
     scale: float | None = None,
 ) -> torch.Tensor:
     op_name = "attention_decode" if q.shape[2] == 1 else "attention_prefill"
+    if _should_use_eager_autograd_fallback(q, k, v, attn_mask):
+        op_name = ""
     if has_native_op(op_name):
         module = native_module()
         if module is not None and hasattr(module, "attention_forward"):
@@ -255,7 +727,7 @@ def attention(
             scores = scores.masked_fill(attn_mask, float("-inf"))
         else:
             scores = scores + attn_mask.to(dtype=scores.dtype)
-    if is_causal:
+    if is_causal and q.shape[2] > 1:
         causal = torch.triu(
             torch.ones(q.shape[2], k_all.shape[2], device=q.device, dtype=torch.bool),
             diagonal=1,
@@ -263,6 +735,39 @@ def attention(
         scores = scores.masked_fill(causal.view(1, 1, q.shape[2], k_all.shape[2]), float("-inf"))
     probs = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
     return torch.matmul(probs, v_all)
+
+
+def attention_plan_info(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    *,
+    is_causal: bool = False,
+) -> dict[str, object]:
+    module = native_module()
+    if module is not None and hasattr(module, "attention_plan_info"):
+        return dict(module.attention_plan_info(q, k, v, attn_mask, is_causal))
+    return {
+        "backend": "aten",
+        "kernel": "reference",
+        "phase": "decode" if q.shape[2] == 1 else "prefill",
+        "head_mode": "mha" if q.shape[1] == k.shape[1] else ("mqa" if k.shape[1] == 1 else "gqa"),
+        "mask_kind": (
+            "none"
+            if attn_mask is None
+            else ("bool" if attn_mask.dtype == torch.bool else "additive_same_dtype")
+        ),
+        "row_reduce_threads": 0,
+        "head_dim_bucket": int(q.shape[3]),
+        "batch": int(q.shape[0]),
+        "q_heads": int(q.shape[1]),
+        "kv_heads": int(k.shape[1]),
+        "q_len": int(q.shape[2]),
+        "kv_len": int(k.shape[2]),
+        "head_dim": int(q.shape[3]),
+        "causal": bool(is_causal),
+    }
 
 
 def prepare_attention_mask(
@@ -487,6 +992,86 @@ def topp_mask(logits: torch.Tensor, p: float) -> torch.Tensor:
     return mask.scatter(-1, sorted_idx, cutoff)
 
 
+def apply_sampling_mask(
+    logits: torch.Tensor,
+    *,
+    topk_mask: torch.Tensor | None = None,
+    topp_mask: torch.Tensor | None = None,
+    no_repeat_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if has_native_op("sampling"):
+        module = native_module()
+        if module is not None and hasattr(module, "apply_sampling_mask_forward"):
+            return module.apply_sampling_mask_forward(logits, topk_mask, topp_mask, no_repeat_mask)
+    mask = torch.zeros_like(logits, dtype=torch.bool)
+    if topk_mask is not None:
+        mask = mask | topk_mask
+    if topp_mask is not None:
+        mask = mask | topp_mask
+    if no_repeat_mask is not None:
+        mask = mask | no_repeat_mask
+    if not mask.any():
+        return logits
+    min_val = torch.finfo(logits.dtype).min if logits.dtype.is_floating_point else -1e9
+    return logits.masked_fill(mask, min_val)
+
+
+def sample_with_policies(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    *,
+    do_sample: bool,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    no_repeat_ngram: int = 0,
+    repetition_penalty: float = 1.0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+) -> torch.Tensor:
+    if has_native_op("sampling"):
+        module = native_module()
+        if module is not None and hasattr(module, "sample_with_policies_forward"):
+            return module.sample_with_policies_forward(
+                logits,
+                token_ids,
+                bool(do_sample),
+                float(temperature),
+                None if top_k is None else int(top_k),
+                None if top_p is None else float(top_p),
+                int(no_repeat_ngram),
+                float(repetition_penalty),
+                float(presence_penalty),
+                float(frequency_penalty),
+            )
+
+    temperature_fn = globals()["temperature"]
+    repetition_penalty_fn = globals()["repetition_penalty"]
+    x = logits
+    if float(repetition_penalty) != 1.0:
+        x = repetition_penalty_fn(x, token_ids, float(repetition_penalty))
+    if bool(do_sample) and float(temperature) != 1.0:
+        x = temperature_fn(x, float(temperature))
+    topk_mask_tensor = topk_mask(x, int(top_k)) if bool(do_sample) and top_k is not None else None
+    topp_mask_tensor = topp_mask(x, float(top_p)) if bool(do_sample) and top_p is not None else None
+    no_repeat_mask_tensor = (
+        no_repeat_ngram_mask(token_ids, vocab_size=x.shape[-1], n=int(no_repeat_ngram))
+        if int(no_repeat_ngram) > 0
+        else None
+    )
+    if topk_mask_tensor is not None or topp_mask_tensor is not None or no_repeat_mask_tensor is not None:
+        x = apply_sampling_mask(
+            x,
+            topk_mask=topk_mask_tensor,
+            topp_mask=topp_mask_tensor,
+            no_repeat_mask=no_repeat_mask_tensor,
+        )
+    if float(presence_penalty) != 0.0 or float(frequency_penalty) != 0.0:
+        counts = token_counts(token_ids, vocab_size=x.shape[-1], dtype=x.dtype)
+        x = presence_frequency_penalty(x, counts, float(presence_penalty), float(frequency_penalty))
+    return sample_next_token(x, bool(do_sample))
+
+
 def presence_frequency_penalty(
     logits: torch.Tensor,
     counts: torch.Tensor,
@@ -501,6 +1086,32 @@ def presence_frequency_penalty(
             )
     penalty = alpha_presence * (counts > 0).to(logits.dtype) + alpha_frequency * counts.to(logits.dtype)
     return logits - penalty
+
+
+def no_repeat_ngram_mask(
+    token_ids: torch.Tensor,
+    *,
+    vocab_size: int,
+    n: int,
+) -> torch.Tensor:
+    if has_native_op("sampling"):
+        module = native_module()
+        if module is not None and hasattr(module, "no_repeat_ngram_mask_forward"):
+            return module.no_repeat_ngram_mask_forward(token_ids, int(vocab_size), int(n))
+    mask = torch.zeros(token_ids.shape[0], int(vocab_size), dtype=torch.bool, device=token_ids.device)
+    if int(n) <= 0 or token_ids.shape[1] < int(n):
+        return mask
+    if int(n) == 1:
+        ones = torch.ones_like(token_ids, dtype=torch.bool)
+        return mask.scatter(1, token_ids.to(torch.long), ones)
+    for b in range(token_ids.shape[0]):
+        seq = token_ids[b].tolist()
+        recent = tuple(seq[-(int(n) - 1):])
+        for i in range(len(seq) - int(n) + 1):
+            if tuple(seq[i:i + int(n) - 1]) == recent:
+                nxt = seq[i + int(n) - 1]
+                mask[b, nxt] = True
+    return mask
 
 
 def token_counts(
@@ -590,6 +1201,8 @@ def linear(
     *,
     backend: str | None = None,
 ) -> torch.Tensor:
+    if _should_use_eager_autograd_fallback(x, weight, bias):
+        return F.linear(x, weight, bias)
     if has_native_op("linear"):
         module = native_module()
         if module is not None and hasattr(module, "linear_forward"):
@@ -613,6 +1226,14 @@ def split_heads(
     x: torch.Tensor,
     num_heads: int,
 ) -> torch.Tensor:
+    if _should_use_eager_autograd_fallback(x):
+        if x.ndim != 3:
+            raise ValueError("split_heads expects x with shape (B, T, D)")
+        bsz, seq, width = x.shape
+        if width % int(num_heads) != 0:
+            raise ValueError(f"Model dim {width} not divisible by heads {num_heads}")
+        head_dim = width // int(num_heads)
+        return x.view(bsz, seq, int(num_heads), head_dim).permute(0, 2, 1, 3).contiguous()
     if has_native_op("split_heads"):
         module = native_module()
         if module is not None and hasattr(module, "split_heads_forward"):
@@ -627,6 +1248,11 @@ def split_heads(
 
 
 def merge_heads(x: torch.Tensor) -> torch.Tensor:
+    if _should_use_eager_autograd_fallback(x):
+        if x.ndim != 4:
+            raise ValueError("merge_heads expects x with shape (B, H, T, Dh)")
+        bsz, heads, seq, head_dim = x.shape
+        return x.permute(0, 2, 1, 3).contiguous().view(bsz, seq, heads * head_dim)
     if has_native_op("merge_heads"):
         module = native_module()
         if module is not None and hasattr(module, "merge_heads_forward"):
@@ -648,6 +1274,20 @@ def qkv_projection(
     *,
     backend: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if _should_use_eager_autograd_fallback(
+        x,
+        q_weight,
+        q_bias,
+        k_weight,
+        k_bias,
+        v_weight,
+        v_bias,
+    ):
+        return (
+            linear(x, q_weight, q_bias, backend=backend),
+            linear(x, k_weight, k_bias, backend=backend),
+            linear(x, v_weight, v_bias, backend=backend),
+        )
     if has_native_op("qkv_projection"):
         module = native_module()
         if module is not None and hasattr(module, "qkv_projection_forward"):
@@ -716,6 +1356,13 @@ def qkv_packed_heads_projection(
     kv_heads: int,
     backend: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if _should_use_eager_autograd_fallback(x, packed_weight, packed_bias):
+        fused = linear(x, packed_weight, packed_bias, backend=backend)
+        return (
+            split_heads(fused[..., :q_size], q_heads),
+            split_heads(fused[..., q_size: q_size + k_size], kv_heads),
+            split_heads(fused[..., q_size + k_size: q_size + k_size + v_size], kv_heads),
+        )
     if has_native_op("qkv_packed_heads_projection"):
         module = native_module()
         if module is not None and hasattr(module, "qkv_packed_heads_projection_forward"):
@@ -752,6 +1399,30 @@ def qkv_heads_projection(
     kv_heads: int,
     backend: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if _should_use_eager_autograd_fallback(
+        x,
+        q_weight,
+        q_bias,
+        k_weight,
+        k_bias,
+        v_weight,
+        v_bias,
+    ):
+        q, k, v = qkv_projection(
+            x,
+            q_weight,
+            q_bias,
+            k_weight,
+            k_bias,
+            v_weight,
+            v_bias,
+            backend=backend,
+        )
+        return (
+            split_heads(q, q_heads),
+            split_heads(k, kv_heads),
+            split_heads(v, kv_heads),
+        )
     if has_native_op("qkv_heads_projection"):
         module = native_module()
         if module is not None and hasattr(module, "qkv_heads_projection_forward"):
@@ -792,11 +1463,56 @@ def head_output_projection(
     *,
     backend: str | None = None,
 ) -> torch.Tensor:
+    if _should_use_eager_autograd_fallback(x, weight, bias):
+        return linear(merge_heads(x), weight, bias, backend=backend)
     if has_native_op("head_output_projection"):
         module = native_module()
         if module is not None and hasattr(module, "head_output_projection_forward"):
             return module.head_output_projection_forward(x, weight, bias, str(backend or "auto"))
     return linear(merge_heads(x), weight, bias, backend=backend)
+
+
+def activation(
+    x: torch.Tensor,
+    activation: str,
+) -> torch.Tensor:
+    act = str(activation).lower()
+    if act not in {"gelu", "geglu", "silu", "swish", "swiglu", "gated-silu", "relu", "reglu"}:
+        raise ValueError(f"Unsupported activation: {activation}")
+    if _should_use_eager_autograd_fallback(x):
+        if act in {"gelu", "geglu"}:
+            return F.gelu(x)
+        if act in {"silu", "swish", "swiglu", "gated-silu"}:
+            return F.silu(x)
+        return F.relu(x)
+    if has_native_op("activation"):
+        module = native_module()
+        if module is not None and hasattr(module, "activation_forward"):
+            return module.activation_forward(x, act)
+    if act in {"gelu", "geglu"}:
+        return F.gelu(x)
+    if act in {"silu", "swish", "swiglu", "gated-silu"}:
+        return F.silu(x)
+    return F.relu(x)
+
+
+def gated_activation(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    activation: str,
+) -> torch.Tensor:
+    act = str(activation).lower()
+    if act not in {"gelu", "geglu", "silu", "swish", "swiglu", "gated-silu", "relu", "reglu"}:
+        raise ValueError(f"Unsupported activation: {activation}")
+    if x.shape != gate.shape:
+        raise ValueError(f"gated_activation requires x and gate to have the same shape, got {tuple(x.shape)} and {tuple(gate.shape)}")
+    if _should_use_eager_autograd_fallback(x, gate):
+        return globals()["activation"](x, act) * gate
+    if has_native_op("gated_activation"):
+        module = native_module()
+        if module is not None and hasattr(module, "gated_activation_forward"):
+            return module.gated_activation_forward(torch.cat([x, gate], dim=-1), act)
+    return globals()["activation"](x, act) * gate
 
 
 def mlp(
@@ -810,6 +1526,27 @@ def mlp(
     gated: bool,
     backend: str | None = None,
 ) -> torch.Tensor:
+    if _should_use_eager_autograd_fallback(x, w_in_weight, w_in_bias, w_out_weight, w_out_bias):
+        hidden = linear(x, w_in_weight, w_in_bias, backend=backend)
+        act = str(activation).lower()
+        if gated:
+            a, b = hidden.chunk(2, dim=-1)
+            if act in ("swiglu", "gated-silu"):
+                hidden = gated_activation(a, b, "silu")
+            elif act == "geglu":
+                hidden = gated_activation(a, b, "gelu")
+            elif act == "reglu":
+                hidden = gated_activation(a, b, "relu")
+            else:
+                hidden = gated_activation(a, b, "silu")
+        else:
+            if act in ("gelu",):
+                hidden = activation(hidden, "gelu")
+            elif act in ("silu", "swish"):
+                hidden = activation(hidden, "silu")
+            else:
+                hidden = activation(hidden, "gelu")
+        return linear(hidden, w_out_weight, w_out_bias, backend=backend)
     if has_native_op("mlp"):
         module = native_module()
         if module is not None and hasattr(module, "mlp_forward"):
@@ -827,21 +1564,9 @@ def mlp(
     act = str(activation).lower()
     if gated:
         a, b = hidden.chunk(2, dim=-1)
-        if act in ("swiglu", "gated-silu"):
-            hidden = F.silu(a) * b
-        elif act == "geglu":
-            hidden = F.gelu(a) * b
-        elif act == "reglu":
-            hidden = F.relu(a) * b
-        else:
-            hidden = F.silu(a) * b
+        hidden = gated_activation(a, b, act)
     else:
-        if act == "gelu":
-            hidden = F.gelu(hidden)
-        elif act in ("silu", "swish"):
-            hidden = F.silu(hidden)
-        else:
-            hidden = F.gelu(hidden)
+        hidden = activation(hidden, act)
     return linear(hidden, w_out_weight, w_out_bias, backend=backend)
 
 
@@ -850,6 +1575,8 @@ def embedding(
     indices: torch.Tensor,
     padding_idx: int | None = None,
 ) -> torch.Tensor:
+    if _should_use_eager_autograd_fallback(weight):
+        return F.embedding(indices, weight, padding_idx=padding_idx)
     if has_native_op("embedding"):
         module = native_module()
         if module is not None and hasattr(module, "embedding_forward"):

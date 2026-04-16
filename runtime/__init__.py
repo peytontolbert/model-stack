@@ -1,8 +1,116 @@
-from .native import has_native_op, native_available, runtime_info, runtime_status
+from __future__ import annotations
 
-__all__ = [
-    "has_native_op",
-    "native_available",
-    "runtime_info",
-    "runtime_status",
-]
+from importlib import import_module
+
+_EXPORTS = {
+    "KVCacheSpec": "runtime.cache",
+    "RuntimeLayerCacheView": "runtime.cache",
+    "RuntimeKVCacheMixin": "runtime.cache",
+    "allocate_model_kv_cache": "runtime.cache",
+    "create_kv_cache": "runtime.cache",
+    "evict_kv_cache": "runtime.cache",
+    "kv_cache_runtime_info": "runtime.cache",
+    "kv_cache_spec_from_config": "runtime.cache",
+    "kv_cache_spec_from_model": "runtime.cache",
+    "resolve_kv_cache_backend": "runtime.cache",
+    "apply_attention_biases": "runtime.blocks",
+    "apply_native_norm": "runtime.blocks",
+    "apply_residual_update": "runtime.blocks",
+    "activation": "runtime.ops",
+    "block_native_execution_info": "runtime.blocks",
+    "can_apply_native_norm": "runtime.blocks",
+    "combine_prepared_attention_masks": "runtime.blocks",
+    "default_block_sparse_pattern": "runtime.blocks",
+    "execute_attention_mlp_block": "runtime.blocks",
+    "execute_block_stack": "runtime.blocks",
+    "execute_decoder_stack": "runtime.blocks",
+    "execute_encoder_stack": "runtime.blocks",
+    "execute_parallel_attention_mlp_block": "runtime.blocks",
+    "fused_add_norm": "runtime.blocks",
+    "gated_activation": "runtime.ops",
+    "prepare_attention_mask_for_heads": "runtime.blocks",
+    "prepare_banded_attention_mask": "runtime.blocks",
+    "prepare_block_sparse_attention_mask": "runtime.blocks",
+    "prepare_cross_attention_mask": "runtime.blocks",
+    "prepare_dilated_attention_mask": "runtime.blocks",
+    "prepare_encoder_attention_mask": "runtime.blocks",
+    "prepare_local_attention_mask": "runtime.blocks",
+    "prepare_pattern_attention_mask": "runtime.blocks",
+    "prepare_prefix_lm_attention_mask": "runtime.blocks",
+    "prepare_segment_bidir_attention_mask": "runtime.blocks",
+    "prepare_strided_attention_mask": "runtime.blocks",
+    "prepare_window_pattern_attention_mask": "runtime.blocks",
+    "stack_native_execution_info": "runtime.blocks",
+    "ContiguousKVCache": "runtime.kv_cache",
+    "PagedKVCache": "runtime.kv_cache",
+    "init_kv_cache": "runtime.kv_cache",
+    "kv_cache_append": "runtime.kv_cache",
+    "kv_cache_evict": "runtime.kv_cache",
+    "kv_cache_slice": "runtime.kv_cache",
+    "GenerationConfig": "runtime.generation",
+    "RuntimeGenerationSession": "runtime.generation",
+    "apply_sampling_policies": "runtime.generation",
+    "build_generation_config": "runtime.generation",
+    "generate": "runtime.generation",
+    "greedy_generate": "runtime.generation",
+    "sample_generate": "runtime.generation",
+    "apply_no_repeat_ngram_mask": "runtime.sampling",
+    "apply_presence_frequency_penalty": "runtime.sampling",
+    "apply_temperature": "runtime.sampling",
+    "apply_topk_mask": "runtime.sampling",
+    "apply_topp_mask": "runtime.sampling",
+    "apply_transformers_repetition_penalty": "runtime.sampling",
+    "sample_next_token": "runtime.sampling",
+    "RotaryEmbeddingHF": "runtime.positional",
+    "apply_rotary": "runtime.positional",
+    "build_alibi_bias": "runtime.positional",
+    "build_relative_position_indices": "runtime.positional",
+    "build_rope_cache": "runtime.positional",
+    "relative_position_bias_from_table": "runtime.positional",
+    "rope_yarn_factors": "runtime.positional",
+    "RuntimeModelArtifacts": "runtime.modeling",
+    "build_causal_lm": "runtime.factory",
+    "build_encoder": "runtime.factory",
+    "build_local_llama_from_hf_config": "runtime.checkpoint",
+    "build_local_llama_from_snapshot": "runtime.checkpoint",
+    "build_model": "runtime.factory",
+    "build_registered_model": "runtime.factory",
+    "build_prefix_lm": "runtime.factory",
+    "build_seq2seq": "runtime.factory",
+    "ensure_snapshot": "runtime.checkpoint",
+    "get_model_builder": "runtime.factory",
+    "load_config": "runtime.checkpoint",
+    "load_hf_llama_weights_into_local": "runtime.checkpoint",
+    "load_model_dir": "runtime.loader",
+    "load_model_factory_spec": "runtime.loader",
+    "load_pretrained": "runtime.checkpoint",
+    "load_runtime_model": "runtime.loader",
+    "model_config_from_hf_llama_snapshot_config": "runtime.checkpoint",
+    "model_config_from_hf_llama_transformers_config": "runtime.checkpoint",
+    "prepare_model_for_runtime": "runtime.modeling",
+    "register_model": "runtime.factory",
+    "resolve_model_config": "runtime.modeling",
+    "resolve_model_device": "runtime.modeling",
+    "resolve_model_dtype": "runtime.modeling",
+    "save_pretrained": "runtime.checkpoint",
+    "has_native_op": "runtime.native",
+    "native_available": "runtime.native",
+    "runtime_info": "runtime.native",
+    "runtime_status": "runtime.native",
+}
+
+__all__ = sorted(_EXPORTS)
+
+
+def __getattr__(name: str):
+    module_name = _EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module 'runtime' has no attribute {name!r}")
+    module = import_module(module_name)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

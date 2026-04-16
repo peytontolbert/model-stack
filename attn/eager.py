@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 
 from runtime.ops import (
+    attention as runtime_attention,
+    apply_rotary as runtime_apply_rotary,
     head_output_projection as runtime_head_output_projection,
     linear as runtime_linear,
     pack_linear_weight as runtime_pack_linear_weight,
@@ -11,13 +13,13 @@ from runtime.ops import (
     prepare_attention_mask as runtime_prepare_attention_mask,
     qkv_packed_heads_projection as runtime_qkv_packed_heads_projection,
     qkv_heads_projection as runtime_qkv_heads_projection,
+    resolve_rotary_embedding as runtime_resolve_rotary_embedding,
     split_heads as runtime_split_heads,
 )
 from runtime.native import resolve_linear_backend
 from specs.config import ModelConfig
 from .interfaces import Attention, KVCache
-from .backends import scaled_dot_product_attention, select_attention_backend
-from tensor.positional import build_rope_cache, apply_rotary
+from .backends import _read_backend_from_env_or_file, scaled_dot_product_attention, select_attention_backend
 
 
 class EagerAttention(nn.Module):
@@ -135,10 +137,15 @@ class EagerAttention(nn.Module):
             self._packed_o_bias = packed_bias
         return self._packed_o_weight, self._packed_o_bias
 
-    def _ensure_rope_cache(self, seq_len: int, device, dtype):
+    def _ensure_rope_cache(self, seq_len: int, reference: torch.Tensor):
         if not self.use_rope:
             return
-        if self._rope_cos.numel() == 0 or self._rope_cos.shape[0] < seq_len or self._rope_cos.device != device:
+        if (
+            self._rope_cos.numel() == 0
+            or self._rope_cos.shape[0] < seq_len
+            or self._rope_cos.device != reference.device
+            or self._rope_cos.dtype != reference.dtype
+        ):
             # Apply simple HF-compatible scaling for linear interpolation by stretching base_theta
             base_theta = self.rope_theta
             st = (self.rope_scaling_type or "").lower() if isinstance(self.rope_scaling_type, str) else None
@@ -147,12 +154,14 @@ class EagerAttention(nn.Module):
                     base_theta = float(base_theta) * float(self.rope_scaling_factor)
                 except Exception:
                     base_theta = float(base_theta)
-            cos, sin = build_rope_cache(seq_len, self.head_dim, device=device, base_theta=base_theta)
-            if self.rope_attention_scaling != 1.0:
-                cos = cos * float(self.rope_attention_scaling)
-                sin = sin * float(self.rope_attention_scaling)
-            self._rope_cos = cos.to(dtype=dtype)
-            self._rope_sin = sin.to(dtype=dtype)
+            cos, sin = runtime_resolve_rotary_embedding(
+                reference=reference[:, :seq_len, :],
+                head_dim=self.head_dim,
+                base_theta=float(base_theta),
+                attention_scaling=float(self.rope_attention_scaling),
+            )
+            self._rope_cos = cos
+            self._rope_sin = sin
 
     def forward(
         self,
@@ -213,19 +222,19 @@ class EagerAttention(nn.Module):
                 cos, sin = position_embeddings
                 cos_t = cos[:T]
                 sin_t = sin[:T]
-                qh, kh_new = apply_rotary(qh, kh_new, cos_t, sin_t)
+                qh, kh_new = runtime_apply_rotary(qh, kh_new, cos_t, sin_t)
             else:
-                self._ensure_rope_cache(T, device, dtype)
+                self._ensure_rope_cache(T, x)
                 st = (self.rope_scaling_type or "").lower() if isinstance(self.rope_scaling_type, str) else None
                 if st == "yarn" and self.rope_scaling_factor is not None:
                     # Scale outputs per YaRN after applying rotary
-                    qh_rot, kh_rot = apply_rotary(qh, kh_new, self._rope_cos[:T], self._rope_sin[:T])
-                    from tensor.positional import rope_yarn_factors
+                    qh_rot, kh_rot = runtime_apply_rotary(qh, kh_new, self._rope_cos[:T], self._rope_sin[:T])
+                    from runtime.positional import rope_yarn_factors
                     sq, sk = rope_yarn_factors(T, self.rope_theta, float(self.rope_scaling_factor))
                     qh = qh_rot * float(sq)
                     kh_new = kh_rot * float(sk)
                 else:
-                    qh, kh_new = apply_rotary(qh, kh_new, self._rope_cos[:T], self._rope_sin[:T])
+                    qh, kh_new = runtime_apply_rotary(qh, kh_new, self._rope_cos[:T], self._rope_sin[:T])
 
         appended_to_cache = False
         # Read previously cached KV (already RoPE-applied).
@@ -276,37 +285,48 @@ class EagerAttention(nn.Module):
         else:
             # Choose backend; avoid double causal when explicit mask is provided
             is_causal_flag = add is None
-            backend = self.backend_override or select_attention_backend(
-                is_causal=is_causal_flag, dtype=dtype, seq=T, heads=self.n_heads, device=device
-            )
-            use_native_gqa = backend == "torch" and (self.attn_dropout_p if self.training else 0.0) == 0.0
-            if use_native_gqa:
+            forced_backend = self.backend_override or _read_backend_from_env_or_file()
+            # Default eval/inference prefers the repo-owned runtime attention path unless
+            # the caller explicitly forces a backend or dropout requires the legacy path.
+            use_runtime_attention = forced_backend is None and (self.attn_dropout_p if self.training else 0.0) == 0.0
+            if use_runtime_attention:
                 kh_backend, vh_backend = kh_all, vh_all
-            else:
-                kh_backend, vh_backend = _expanded_kv_heads()
-            mask_for_backend = add
-            # Some backends (torch SDPA) may expect float/bool mask with dtype matching q/k/v
-            if mask_for_backend is not None and backend == "torch" and mask_for_backend.dtype != qh.dtype:
-                mask_for_backend = mask_for_backend.to(dtype=qh.dtype)
-          #  if trace:
-           #     try:
-            #        print(f"[attn] backend={backend} causal={is_causal_flag} qdtype={qh.dtype} mdtype={(mask_for_backend.dtype if mask_for_backend is not None else None)} T={T} S={kh_all.shape[2]}")
-            #    except Exception:
-            #        pass
-            try:
-                out = scaled_dot_product_attention(
-                    qh, kh_backend, vh_backend,
+                mask_for_backend = add
+                out = runtime_attention(
+                    qh,
+                    kh_backend,
+                    vh_backend,
                     attn_mask=mask_for_backend,
-                    dropout_p=(self.attn_dropout_p if self.training else 0.0),
-                    backend=backend,
                     is_causal=is_causal_flag,
                     scale=float(self.scaling),
                 )
-            except Exception:
-                if trace:
-                    print("[attn] exception in SDPA/backend call")
-                    traceback.print_exc()
-                raise
+            else:
+                backend = forced_backend or select_attention_backend(
+                    is_causal=is_causal_flag, dtype=dtype, seq=T, heads=self.n_heads, device=device
+                )
+                use_native_gqa = backend == "torch" and (self.attn_dropout_p if self.training else 0.0) == 0.0
+                if use_native_gqa:
+                    kh_backend, vh_backend = kh_all, vh_all
+                else:
+                    kh_backend, vh_backend = _expanded_kv_heads()
+                mask_for_backend = add
+                # Some backends (torch SDPA) may expect float/bool mask with dtype matching q/k/v
+                if mask_for_backend is not None and backend == "torch" and mask_for_backend.dtype != qh.dtype:
+                    mask_for_backend = mask_for_backend.to(dtype=qh.dtype)
+                try:
+                    out = scaled_dot_product_attention(
+                        qh, kh_backend, vh_backend,
+                        attn_mask=mask_for_backend,
+                        dropout_p=(self.attn_dropout_p if self.training else 0.0),
+                        backend=backend,
+                        is_causal=is_causal_flag,
+                        scale=float(self.scaling),
+                    )
+                except Exception:
+                    if trace:
+                        print("[attn] exception in SDPA/backend call")
+                        traceback.print_exc()
+                    raise
 
         # Append newly produced KV to cache (stored with Hk heads)
         if cache is not None and T > 0 and not appended_to_cache:

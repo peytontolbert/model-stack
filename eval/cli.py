@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import importlib
-from typing import Optional
 
 import torch
 
-from specs.config import ModelConfig
-from model.factory import build_model
-from model.checkpoint import load_config, load_pretrained
 from data.loader import build_dataloader
+from runtime.loader import load_runtime_model as runtime_load_runtime_model
+from runtime.modeling import resolve_model_device
 from .loop import evaluate_lm_next_token
 from .bench import benchmark_forward, benchmark_generate
 from .calibration import evaluate_ece
@@ -20,23 +17,35 @@ from .memory import report_memory
 from .suite import run_basic_suite
 
 
-def _load_model_from_factory(spec: str) -> torch.nn.Module:
-    mod, fn = spec.split(":", 1)
-    m = importlib.import_module(mod)
-    fn = getattr(m, fn)
-    out = fn()
-    return out[0] if isinstance(out, tuple) else out
+def _generation_kwargs_from_args(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "do_sample": getattr(args, "do_sample", None),
+        "temperature": float(getattr(args, "temperature", 1.0)),
+        "top_k": getattr(args, "top_k", None),
+        "top_p": getattr(args, "top_p", None),
+        "eos_id": getattr(args, "eos_id", None),
+        "no_repeat_ngram": int(getattr(args, "no_repeat_ngram", 0)),
+        "repetition_penalty": float(getattr(args, "repetition_penalty", 1.0)),
+        "presence_penalty": float(getattr(args, "presence_penalty", 0.0)),
+        "frequency_penalty": float(getattr(args, "frequency_penalty", 0.0)),
+        "sliding_window": getattr(args, "sliding_window", None),
+        "cache_backend": getattr(args, "cache_backend", None),
+    }
+
+
+def _build_runtime_cache_factory(model: torch.nn.Module, *, device: torch.device):
+    try:
+        from serve.runtime import ModelRuntime  # type: ignore
+
+        rt = ModelRuntime.from_model(model, device=device)
+        return rt.allocate_cache
+    except Exception:
+        return None
 
 
 def cmd_ppl(args: argparse.Namespace) -> None:
-    if args.model_dir is not None:
-        cfg: ModelConfig = load_config(args.model_dir)
-        model = build_model(cfg)
-        model = load_pretrained(model, args.model_dir)
-    else:
-        model = _load_model_from_factory(args.model)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = model.to(device)
+    device = resolve_model_device(args.device)
+    model = _load_or_build(args, device=device)
 
     loader = build_dataloader(
         args.shards,
@@ -64,9 +73,8 @@ def cmd_ppl(args: argparse.Namespace) -> None:
 
 
 def cmd_bench_fwd(args: argparse.Namespace) -> None:
-    model = _load_or_build(args)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = model.to(device)
+    device = resolve_model_device(args.device)
+    model = _load_or_build(args, device=device)
     res = benchmark_forward(model, batch_size=args.batch_size, seq_len=args.seq_len, vocab_size=args.vocab_size, warmup_steps=args.warmup, steps=args.steps, device=device)
     payload = {"tokens_per_sec": res.tokens_per_sec, "latency_ms": res.latency_ms, "total_tokens": res.total_tokens, "total_time_s": res.total_time_s}
     if args.outdir:
@@ -77,18 +85,21 @@ def cmd_bench_fwd(args: argparse.Namespace) -> None:
 
 
 def cmd_bench_gen(args: argparse.Namespace) -> None:
-    model = _load_or_build(args)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = model.to(device)
-    # Optional KV cache factory via serve.runtime if desired
-    kvf = None
-    try:
-        from serve.runtime import ModelRuntime  # type: ignore
-        rt = ModelRuntime(model=model, cfg=ModelConfig(d_model=1, n_heads=1, n_layers=1, d_ff=1, vocab_size=max(args.vocab_size or 2, 2)), device=device, dtype=torch.bfloat16, kv_pagesize=512)  # type: ignore[arg-type]
-        kvf = rt.allocate_cache
-    except Exception:
-        kvf = None
-    res = benchmark_generate(model, batch_size=args.batch_size, seq_len=args.seq_len, max_new_tokens=args.max_new_tokens, vocab_size=args.vocab_size, warmup_steps=args.warmup, repeats=args.repeats, device=device, kv_cache_factory=kvf)
+    device = resolve_model_device(args.device)
+    model = _load_or_build(args, device=device)
+    kvf = _build_runtime_cache_factory(model, device=device)
+    res = benchmark_generate(
+        model,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        max_new_tokens=args.max_new_tokens,
+        vocab_size=args.vocab_size,
+        warmup_steps=args.warmup,
+        repeats=args.repeats,
+        device=device,
+        kv_cache_factory=kvf,
+        **_generation_kwargs_from_args(args),
+    )
     payload = {"tokens_per_sec": res.tokens_per_sec, "latency_ms": res.latency_ms, "total_tokens": res.total_tokens, "total_time_s": res.total_time_s}
     if args.outdir:
         write_json(args.outdir, "bench_generate", payload)
@@ -98,9 +109,8 @@ def cmd_bench_gen(args: argparse.Namespace) -> None:
 
 
 def cmd_ece(args: argparse.Namespace) -> None:
-    model = _load_or_build(args)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = model.to(device)
+    device = resolve_model_device(args.device)
+    model = _load_or_build(args, device=device)
     loader = build_dataloader(args.shards, batch_size=args.batch_size, seq_len=args.seq_len, num_workers=args.num_workers, drop_last=True, pin_memory=True, device=device, streaming=args.streaming, distributed=False, seed=args.seed, shuffle=False)
     res = evaluate_ece(model, loader, device=device, n_bins=args.n_bins, max_batches=args.max_batches)
     payload = {"ece": res.ece, "tokens": res.num_tokens}
@@ -124,13 +134,23 @@ def cmd_seq(args: argparse.Namespace) -> None:
 
 
 def cmd_latency(args: argparse.Namespace) -> None:
-    model = _load_or_build(args)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = model.to(device)
+    device = resolve_model_device(args.device)
+    model = _load_or_build(args, device=device)
     if args.mode == "forward":
         dist = latency_forward(model, repeats=args.repeats, batch_size=args.batch_size, seq_len=args.seq_len, vocab_size=args.vocab_size, device=device)
     else:
-        dist = latency_generate(model, repeats=args.repeats, batch_size=args.batch_size, seq_len=args.seq_len, max_new_tokens=args.max_new_tokens, vocab_size=args.vocab_size, device=device)
+        kvf = _build_runtime_cache_factory(model, device=device)
+        dist = latency_generate(
+            model,
+            repeats=args.repeats,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            max_new_tokens=args.max_new_tokens,
+            vocab_size=args.vocab_size,
+            device=device,
+            kv_cache_factory=kvf,
+            **_generation_kwargs_from_args(args),
+        )
     payload = {"p50_ms": dist.p50_ms, "p95_ms": dist.p95_ms, "p99_ms": dist.p99_ms, "samples": dist.samples}
     if args.outdir:
         write_json(args.outdir, "latency", payload)
@@ -139,9 +159,8 @@ def cmd_latency(args: argparse.Namespace) -> None:
 
 
 def cmd_mem(args: argparse.Namespace) -> None:
-    model = _load_or_build(args)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = model.to(device)
+    device = resolve_model_device(args.device)
+    model = _load_or_build(args, device=device)
     # Best-effort: simple forward for peak
     def _fwd():
         x = torch.randint(0, getattr(model, "vocab_size", 32000), (args.batch_size, args.seq_len), dtype=torch.long, device=device)
@@ -155,25 +174,44 @@ def cmd_mem(args: argparse.Namespace) -> None:
 
 
 def cmd_suite(args: argparse.Namespace) -> None:
-    model = _load_or_build(args)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = model.to(device)
+    device = resolve_model_device(args.device)
+    model = _load_or_build(args, device=device)
     loader = build_dataloader(args.shards, batch_size=args.batch_size, seq_len=args.seq_len, num_workers=args.num_workers, drop_last=True, pin_memory=True, device=device, streaming=args.streaming, distributed=False, seed=args.seed, shuffle=False)
-    res = run_basic_suite(model, loader, device=device)
+    kvf = _build_runtime_cache_factory(model, device=device)
+    res = run_basic_suite(
+        model,
+        loader,
+        device=device,
+        kv_cache_factory=kvf,
+        **_generation_kwargs_from_args(args),
+    )
     d = res.to_dict()
     if args.outdir:
         write_json(args.outdir, "suite", d)
     print(d)
 
 
-def _load_or_build(args: argparse.Namespace) -> torch.nn.Module:
-    if getattr(args, "model_dir", None):
-        cfg: ModelConfig = load_config(args.model_dir)
-        model = build_model(cfg)
-        model = load_pretrained(model, args.model_dir)
-    else:
-        model = _load_model_from_factory(args.model)
-    return model
+def _load_or_build(args: argparse.Namespace, *, device: str | torch.device | None = None) -> torch.nn.Module:
+    return runtime_load_runtime_model(
+        model_dir=getattr(args, "model_dir", None),
+        factory_spec=getattr(args, "model", None),
+        device=device,
+    ).model
+
+
+def _add_generation_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--do-sample", dest="do_sample", action="store_true", default=None)
+    parser.add_argument("--greedy", dest="do_sample", action="store_false", default=None)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--eos-id", type=int, default=None)
+    parser.add_argument("--no-repeat-ngram", type=int, default=0)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--presence-penalty", type=float, default=0.0)
+    parser.add_argument("--frequency-penalty", type=float, default=0.0)
+    parser.add_argument("--sliding-window", type=int, default=None)
+    parser.add_argument("--cache-backend", type=str, default=None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -221,6 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
     p3.add_argument("--device", type=str, default=None)
     p3.add_argument("--outdir", type=str, default=None)
     p3.add_argument("--viz-log-dir", type=str, default=None)
+    _add_generation_args(p3)
     p3.set_defaults(func=cmd_bench_gen)
 
     p4 = sub.add_parser("ece", help="Expected Calibration Error on token shards")
@@ -257,6 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     p6.add_argument("--vocab-size", type=int, default=None)
     p6.add_argument("--device", type=str, default=None)
     p6.add_argument("--outdir", type=str, default=None)
+    _add_generation_args(p6)
     p6.set_defaults(func=cmd_latency)
 
     p7 = sub.add_parser("mem", help="Model memory footprint and optional peak CUDA")
@@ -280,6 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
     p8.add_argument("--seed", type=int, default=1337)
     p8.add_argument("--streaming", action="store_true")
     p8.add_argument("--outdir", type=str, default=None)
+    _add_generation_args(p8)
     p8.set_defaults(func=cmd_suite)
 
     return p
@@ -293,5 +334,3 @@ def main(argv: Optional[list[str]] = None) -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
-

@@ -3,12 +3,10 @@ from __future__ import annotations
 import os
 from typing import Optional, List
 
-import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .runtime import ModelRuntime
-from .engine import generate as generate_tokens, GenerationConfig
 
 
 _runtime: Optional[ModelRuntime] = None
@@ -26,14 +24,19 @@ def get_runtime() -> ModelRuntime:
 
 class GenerateRequest(BaseModel):
     input_ids: List[List[int]] = Field(..., description="Batch of token id sequences: shape [B, T]")
+    attention_mask: Optional[List[List[int]]] = Field(default=None, description="Optional token mask: shape [B, T]")
     max_new_tokens: int = 64
+    do_sample: Optional[bool] = None
     temperature: float = 1.0
     top_k: Optional[int] = None
     top_p: Optional[float] = None
     eos_id: Optional[int] = None
     no_repeat_ngram: int = 0
+    repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    sliding_window: Optional[int] = None
+    cache_backend: Optional[str] = None
 
 
 class GenerateResponse(BaseModel):
@@ -46,8 +49,7 @@ app = FastAPI(title="Transformer Serve API")
 @app.get("/healthz")
 def healthz() -> dict:
     try:
-        rt = get_runtime()
-        return {"status": "ok", "device": str(rt.device), "dtype": str(rt.dtype)}
+        return get_runtime().health_info()
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -56,25 +58,30 @@ def healthz() -> dict:
 def generate(req: GenerateRequest) -> GenerateResponse:
     rt = get_runtime()
     try:
-        ids = torch.tensor(req.input_ids, dtype=torch.long, device=rt.device)
+        cfg = rt.build_generation_config(
+            max_new_tokens=req.max_new_tokens,
+            do_sample=req.do_sample,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            eos_id=req.eos_id,
+            no_repeat_ngram=req.no_repeat_ngram,
+            repetition_penalty=req.repetition_penalty,
+            presence_penalty=req.presence_penalty,
+            frequency_penalty=req.frequency_penalty,
+            sliding_window=req.sliding_window,
+        )
+        output_ids = rt.generate_token_lists(
+            req.input_ids,
+            config=cfg,
+            attention_mask=req.attention_mask,
+            cache_backend=req.cache_backend,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"invalid input_ids: {e}")
-    cache = rt.allocate_cache(batch_size=ids.shape[0])
-    cfg = GenerationConfig(
-        max_new_tokens=req.max_new_tokens,
-        temperature=req.temperature,
-        top_k=req.top_k,
-        top_p=req.top_p,
-        eos_id=req.eos_id,
-        no_repeat_ngram=req.no_repeat_ngram,
-        presence_penalty=req.presence_penalty,
-        frequency_penalty=req.frequency_penalty,
-    )
-    with torch.inference_mode():
-        out = generate_tokens(rt.model, ids, cache=cache, config=cfg)
-    return GenerateResponse(output_ids=out.tolist())
+        raise HTTPException(status_code=500, detail=str(e))
+    return GenerateResponse(output_ids=output_ids)
 
 
 # Optional entrypoint for `uvicorn serve.api:app --host 0.0.0.0 --port 8000`
-
-

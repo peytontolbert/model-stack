@@ -5,9 +5,9 @@ from specs.config import ModelConfig
 from tensor.norms import RMSNorm
 from tensor.mlp import MLP
 from tensor.regularization import StochasticDepth
+from runtime.blocks import execute_parallel_attention_mlp_block
 
 from .config import BlockConfig, build_block_config_from_model
-from .native_fusion import apply_native_norm, apply_residual_update
 from attn.factory import build_attention
 
 
@@ -30,21 +30,12 @@ class ParallelTransformerBlock(nn.Module):
         self.drop_path = StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None, cache=None) -> torch.Tensor:
-        y = apply_native_norm(x, self.n)
-        a = self.attn.forward(y, None, None, mask, cache)
-        m = self.mlp(y)
-        out = apply_residual_update(
+        return execute_parallel_attention_mlp_block(
             x,
-            a,
-            residual_scale=1.0,
+            attn_fn=lambda y: self.attn.forward(y, None, None, mask, cache),
+            mlp_fn=self.mlp,
+            norm=self.n,
             resid_dropout=self.resid_dropout,
             drop_path=self.drop_path,
-        )
-        out = apply_residual_update(
-            out,
-            m,
             residual_scale=1.0,
-            resid_dropout=self.resid_dropout,
-            drop_path=self.drop_path,
         )
-        return out

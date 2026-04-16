@@ -3,145 +3,14 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include "attention/cuda_attention_dispatch.cuh"
+#include "../descriptors/attention_desc.h"
+#include "../policy/attention_policy.h"
 #include "../reference/aten_reference.h"
 
-#include <cuda_runtime.h>
-
 #include <cmath>
-#include <limits>
 
 namespace {
-
-constexpr int kThreads = 256;
-
-template <typename scalar_t>
-__global__ void attention_forward_kernel(
-    const scalar_t* __restrict__ q,
-    const scalar_t* __restrict__ k,
-    const scalar_t* __restrict__ v,
-    const void* __restrict__ mask,
-    int mask_kind,
-    scalar_t* __restrict__ out,
-    int64_t batch,
-    int64_t q_heads,
-    int64_t kv_heads,
-    int64_t tq,
-    int64_t sk,
-    int64_t dh,
-    float scale,
-    bool is_causal) {
-  const int64_t row = static_cast<int64_t>(blockIdx.x);
-  const int64_t total_rows = batch * q_heads * tq;
-  if (row >= total_rows) {
-    return;
-  }
-
-  __shared__ float shared[kThreads];
-
-  const int64_t query_idx = row % tq;
-  const int64_t tmp = row / tq;
-  const int64_t head_idx = tmp % q_heads;
-  const int64_t batch_idx = tmp / q_heads;
-  const int64_t head_group = q_heads / kv_heads;
-  const int64_t kv_head_idx = head_idx / head_group;
-
-  const int64_t q_base = (((batch_idx * q_heads) + head_idx) * tq + query_idx) * dh;
-  const int64_t kv_base = ((batch_idx * kv_heads) + kv_head_idx) * sk * dh;
-  const int64_t mask_base = (((batch_idx * q_heads) + head_idx) * tq + query_idx) * sk;
-
-  float local_max = -INFINITY;
-  for (int64_t s = threadIdx.x; s < sk; s += blockDim.x) {
-    float score = 0.0f;
-    const int64_t k_base = kv_base + s * dh;
-    for (int64_t d = 0; d < dh; ++d) {
-      score += static_cast<float>(q[q_base + d]) * static_cast<float>(k[k_base + d]);
-    }
-    score *= scale;
-    if (mask_kind == 1) {
-      if (static_cast<const bool*>(mask)[mask_base + s]) {
-        score = -INFINITY;
-      }
-    } else if (mask_kind == 2) {
-      score += static_cast<float>(static_cast<const scalar_t*>(mask)[mask_base + s]);
-    } else if (mask_kind == 3) {
-      score += static_cast<const float*>(mask)[mask_base + s];
-    }
-    if (is_causal && s > query_idx) {
-      score = -INFINITY;
-    }
-    local_max = fmaxf(local_max, score);
-  }
-
-  shared[threadIdx.x] = local_max;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if (threadIdx.x < stride) {
-      shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
-    }
-    __syncthreads();
-  }
-  const float row_max = shared[0];
-
-  float local_sum = 0.0f;
-  for (int64_t s = threadIdx.x; s < sk; s += blockDim.x) {
-    float score = 0.0f;
-    const int64_t k_base = kv_base + s * dh;
-    for (int64_t d = 0; d < dh; ++d) {
-      score += static_cast<float>(q[q_base + d]) * static_cast<float>(k[k_base + d]);
-    }
-    score *= scale;
-    if (mask_kind == 1) {
-      if (static_cast<const bool*>(mask)[mask_base + s]) {
-        score = -INFINITY;
-      }
-    } else if (mask_kind == 2) {
-      score += static_cast<float>(static_cast<const scalar_t*>(mask)[mask_base + s]);
-    } else if (mask_kind == 3) {
-      score += static_cast<const float*>(mask)[mask_base + s];
-    }
-    if (is_causal && s > query_idx) {
-      score = -INFINITY;
-    }
-    local_sum += expf(score - row_max);
-  }
-
-  shared[threadIdx.x] = local_sum;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if (threadIdx.x < stride) {
-      shared[threadIdx.x] += shared[threadIdx.x + stride];
-    }
-    __syncthreads();
-  }
-  const float denom = fmaxf(shared[0], 1e-20f);
-
-  for (int64_t d = threadIdx.x; d < dh; d += blockDim.x) {
-    float acc = 0.0f;
-    for (int64_t s = 0; s < sk; ++s) {
-      float score = 0.0f;
-      const int64_t k_base = kv_base + s * dh;
-      for (int64_t kk = 0; kk < dh; ++kk) {
-        score += static_cast<float>(q[q_base + kk]) * static_cast<float>(k[k_base + kk]);
-      }
-      score *= scale;
-      if (mask_kind == 1) {
-        if (static_cast<const bool*>(mask)[mask_base + s]) {
-          score = -INFINITY;
-        }
-      } else if (mask_kind == 2) {
-        score += static_cast<float>(static_cast<const scalar_t*>(mask)[mask_base + s]);
-      } else if (mask_kind == 3) {
-        score += static_cast<const float*>(mask)[mask_base + s];
-      }
-      if (is_causal && s > query_idx) {
-        score = -INFINITY;
-      }
-      const float weight = expf(score - row_max) / denom;
-      acc += weight * static_cast<float>(v[kv_base + s * dh + d]);
-    }
-    out[q_base + d] = static_cast<scalar_t>(acc);
-  }
-}
 
 bool UseCudaAttentionKernel(
     const torch::Tensor& q,
@@ -180,6 +49,74 @@ bool UseCudaAttentionKernel(
   return true;
 }
 
+bool TryBuildAttentionDesc(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    t10::desc::AttentionDesc* out_desc) {
+  if (!UseCudaAttentionKernel(q, k, v, attn_mask)) {
+    return false;
+  }
+  *out_desc = t10::desc::AttentionDesc{
+      q.scalar_type(),
+      q.size(0),
+      q.size(1),
+      k.size(1),
+      q.size(2),
+      k.size(2),
+      q.size(3),
+      t10::desc::ResolveAttentionMaskKind(attn_mask, q.scalar_type()),
+      t10::desc::ResolveAttentionPhase(q.size(2)),
+      t10::desc::ResolveAttentionHeadMode(q.size(1), k.size(1)),
+      t10::desc::AttentionLayoutKind::kBHSD,
+      t10::desc::AttentionLayoutKind::kBHSD,
+      is_causal};
+  return true;
+}
+
+void LaunchAttentionKernel(
+    const torch::Tensor& q_contig,
+    const torch::Tensor& k_contig,
+    const torch::Tensor& v_contig,
+    const void* mask_ptr,
+    int mask_kind,
+    const torch::Tensor& out,
+    const t10::desc::AttentionDesc& desc,
+    const t10::policy::AttentionPlan& plan,
+    float scale_value,
+    cudaStream_t stream) {
+  switch (desc.phase) {
+    case t10::desc::AttentionPhase::kDecode:
+      t10::cuda::attention::LaunchPlannedAttentionDecodeDispatcher(
+          q_contig,
+          k_contig,
+          v_contig,
+          mask_ptr,
+          mask_kind,
+          out,
+          desc,
+          plan,
+          scale_value,
+          stream);
+      return;
+    default:
+      t10::cuda::attention::LaunchPlannedAttentionPrefillDispatcher(
+          q_contig,
+          k_contig,
+          v_contig,
+          mask_ptr,
+          mask_kind,
+          out,
+          desc,
+          plan,
+          scale_value,
+          stream);
+      return;
+  }
+}
+
 }  // namespace
 
 bool HasCudaAttentionKernel() {
@@ -193,9 +130,11 @@ torch::Tensor CudaAttentionForward(
     const c10::optional<torch::Tensor>& attn_mask,
     bool is_causal,
     const c10::optional<double>& scale) {
-  if (!UseCudaAttentionKernel(q, k, v, attn_mask)) {
+  t10::desc::AttentionDesc desc;
+  if (!TryBuildAttentionDesc(q, k, v, attn_mask, is_causal, &desc)) {
     return ReferenceAttentionForward(q, k, v, attn_mask, is_causal, scale);
   }
+  const auto plan = t10::policy::ResolveAttentionPlan(desc);
 
   c10::cuda::CUDAGuard device_guard{q.device()};
 
@@ -218,40 +157,21 @@ torch::Tensor CudaAttentionForward(
   }
 
   auto out = torch::empty_like(q_contig);
-  const auto batch = q_contig.size(0);
-  const auto q_heads = q_contig.size(1);
-  const auto kv_heads = k_contig.size(1);
-  const auto tq = q_contig.size(2);
-  const auto sk = k_contig.size(2);
-  const auto dh = q_contig.size(3);
   const float scale_value = static_cast<float>(
-      scale.has_value() ? scale.value() : (1.0 / std::sqrt(static_cast<double>(dh))));
-  const dim3 blocks(static_cast<unsigned int>(batch * q_heads * tq));
-  const dim3 threads(kThreads);
+      scale.has_value() ? scale.value() : (1.0 / std::sqrt(static_cast<double>(desc.head_dim))));
   auto stream = c10::cuda::getCurrentCUDAStream(q.get_device());
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      q_contig.scalar_type(),
-      "model_stack_cuda_attention_forward",
-      [&] {
-        attention_forward_kernel<scalar_t><<<blocks, threads, 0, stream.stream()>>>(
-            q_contig.data_ptr<scalar_t>(),
-            k_contig.data_ptr<scalar_t>(),
-            v_contig.data_ptr<scalar_t>(),
-            mask_ptr,
-            mask_kind,
-            out.data_ptr<scalar_t>(),
-            batch,
-            q_heads,
-            kv_heads,
-            tq,
-            sk,
-            dh,
-            scale_value,
-            is_causal);
-      });
+  LaunchAttentionKernel(
+      q_contig,
+      k_contig,
+      v_contig,
+      mask_ptr,
+      mask_kind,
+      out,
+      desc,
+      plan,
+      scale_value,
+      stream.stream());
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;

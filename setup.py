@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
+import subprocess
+from pathlib import Path
 
 from setuptools import setup
 
@@ -10,13 +13,109 @@ def env_enabled(name: str, default: str = "0") -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def env_value(name: str, default: str | None = None) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value or default
+
+
+_CUDA_VERSION_RE = re.compile(r"(?P<major>\d+)\.(?P<minor>\d+)(?:\.\d+)?")
+_CUDA_ARCH_RE = re.compile(
+    r"^(?P<major>\d+)(?:\.(?P<minor>\d+))?(?P<suffix>[a-z]*)?(?:\+ptx)?$",
+    re.IGNORECASE,
+)
+
+
+def _read_first_version(text: str) -> tuple[int, int] | None:
+    match = _CUDA_VERSION_RE.search(text)
+    if match is None:
+        return None
+    return int(match.group("major")), int(match.group("minor"))
+
+
+def detect_cuda_toolkit_version(cuda_home: str | None) -> tuple[int, int] | None:
+    if not cuda_home:
+        return None
+    root = Path(cuda_home)
+    version_json = root / "version.json"
+    if version_json.exists():
+        try:
+            version = _read_first_version(version_json.read_text(encoding="utf-8", errors="ignore"))
+            if version is not None:
+                return version
+        except OSError:
+            pass
+    version_txt = root / "version.txt"
+    if version_txt.exists():
+        try:
+            version = _read_first_version(version_txt.read_text(encoding="utf-8", errors="ignore"))
+            if version is not None:
+                return version
+        except OSError:
+            pass
+    nvcc = root / "bin" / "nvcc"
+    if nvcc.exists():
+        try:
+            out = subprocess.check_output([str(nvcc), "--version"], text=True, stderr=subprocess.STDOUT)
+            return _read_first_version(out)
+        except (OSError, subprocess.CalledProcessError):
+            pass
+    return None
+
+
+def _normalize_arch_list(arch_list: str) -> list[str]:
+    normalized = arch_list.replace(",", " ").replace(";", " ")
+    return [token for token in normalized.split() if token]
+
+
+def validate_cuda_arch_list(arch_list: str, cuda_version: tuple[int, int] | None) -> None:
+    if cuda_version is None or cuda_version < (13, 0):
+        return
+    unsupported: list[str] = []
+    for token in _normalize_arch_list(arch_list):
+        match = _CUDA_ARCH_RE.match(token)
+        if match is None:
+            continue
+        major = int(match.group("major"))
+        minor = int(match.group("minor") or "0")
+        if (major, minor) < (7, 5):
+            unsupported.append(token)
+    if unsupported:
+        archs = ", ".join(unsupported)
+        raise ValueError(
+            "CUDA Toolkit 13.x cannot offline-compile for pre-Turing architectures "
+            f"(got {archs} in TORCH_CUDA_ARCH_LIST / MODEL_STACK_CUDA_ARCH_LIST). "
+            "Use CUDA 12.x for Maxwell/Pascal/Volta targets, or target 7.5+ only."
+        )
+
+
+def configure_cuda_build_environment(cuda_home: str | None) -> tuple[int, int] | None:
+    model_stack_arches = env_value("MODEL_STACK_CUDA_ARCH_LIST")
+    torch_arches = env_value("TORCH_CUDA_ARCH_LIST")
+    if torch_arches is None and model_stack_arches is not None:
+        os.environ["TORCH_CUDA_ARCH_LIST"] = model_stack_arches
+        torch_arches = model_stack_arches
+
+    model_stack_max_jobs = env_value("MODEL_STACK_MAX_JOBS")
+    if env_value("MAX_JOBS") is None and model_stack_max_jobs is not None:
+        os.environ["MAX_JOBS"] = model_stack_max_jobs
+
+    cuda_version = detect_cuda_toolkit_version(cuda_home)
+    if torch_arches is not None:
+        validate_cuda_arch_list(torch_arches, cuda_version)
+    return cuda_version
+
+
 def native_extensions():
     if not env_enabled("MODEL_STACK_BUILD_NATIVE", "0"):
-        return []
+        return [], {}
 
     from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
 
     use_cuda = CUDA_HOME is not None and env_enabled("MODEL_STACK_BUILD_CUDA", "1")
+    cuda_version = configure_cuda_build_environment(CUDA_HOME if use_cuda else None)
     sources = ["runtime/csrc/model_stack_native.cpp", "runtime/csrc/reference/aten_reference.cpp"]
     define_macros = [("MODEL_STACK_ABI_VERSION", "1")]
     extra_compile_args = {"cxx": ["-O3", "-std=c++17"]}
@@ -28,17 +127,27 @@ def native_extensions():
         sources.append("runtime/csrc/backend/cuda_add_rms_norm.cu")
         sources.append("runtime/csrc/backend/cuda_residual_add.cu")
         sources.append("runtime/csrc/backend/cuda_layer_norm.cu")
+        sources.append("runtime/csrc/backend/cuda_embedding.cu")
+        sources.append("runtime/csrc/backend/cuda_sampling.cu")
+        sources.append("runtime/csrc/backend/cuda_append_tokens.cu")
+        sources.append("runtime/csrc/backend/cuda_decode_positions.cu")
         sources.append("runtime/csrc/backend/cuda_attention.cu")
+        sources.append("runtime/csrc/backend/attention/cuda_attention_decode_dispatch.cu")
+        sources.append("runtime/csrc/backend/attention/cuda_attention_prefill_dispatch.cu")
         sources.append("runtime/csrc/backend/cuda_kv_cache.cu")
         sources.append("runtime/csrc/backend/cuda_rope.cu")
         sources.append("runtime/csrc/backend/cuda_activation.cu")
         sources.append("runtime/csrc/backend/cuda_gated_activation.cu")
         sources.append("runtime/csrc/backend/cublaslt_linear.cu")
         define_macros.append(("MODEL_STACK_WITH_CUDA", "1"))
+        if cuda_version is not None:
+            define_macros.append(("MODEL_STACK_CUDA_VERSION_MAJOR", str(cuda_version[0])))
+            define_macros.append(("MODEL_STACK_CUDA_VERSION_MINOR", str(cuda_version[1])))
         extra_compile_args["nvcc"] = [
             "-O3",
             "-std=c++17",
             "--expt-relaxed-constexpr",
+            "-lineinfo",
         ]
     else:
         define_macros.append(("MODEL_STACK_WITH_CUDA", "0"))
@@ -49,7 +158,11 @@ def native_extensions():
         define_macros=define_macros,
         extra_compile_args=extra_compile_args,
     )
-    return [ext], {"build_ext": BuildExtension}
+    if hasattr(BuildExtension, "with_options"):
+        build_ext = BuildExtension.with_options(use_ninja=env_enabled("MODEL_STACK_USE_NINJA", "1"))
+    else:
+        build_ext = BuildExtension
+    return [ext], {"build_ext": build_ext}
 
 
 extensions, cmdclass = native_extensions() if env_enabled("MODEL_STACK_BUILD_NATIVE", "0") else ([], {})

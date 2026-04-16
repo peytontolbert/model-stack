@@ -2,15 +2,14 @@ import torch
 import torch.nn as nn
 
 from specs.config import ModelConfig
-from tensor.norms import RMSNorm
-from tensor.regularization import StochasticDepth
 from attn import topk_router, combine_expert_outputs, load_balance_loss
+from runtime.blocks import apply_attention_biases, execute_attention_mlp_block
+from runtime.ops import linear as runtime_linear
 
 from .config import BlockConfig, build_block_config_from_model
 from .transformer_block import TransformerBlock
 from attn.factory import build_attention
 from tensor.mlp import MLP
-from .native_fusion import apply_residual_update, can_apply_native_norm, fused_add_norm
 
 
 class MoEMLP(nn.Module):
@@ -26,7 +25,7 @@ class MoEMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         # router logits -> top-k assignments
-        logits = self.router(x)
+        logits = runtime_linear(x, self.router.weight, self.router.bias)
         routes = topk_router(logits, k=self.k)  # expected to return (indices, weights)
         expert_out = []
         for i, expert in enumerate(self.experts):
@@ -50,54 +49,38 @@ class MoEBlock(TransformerBlock):
         # Replace MLP with MoE
         self.moe = MoEMLP(cfg.d_model, cfg.d_ff, num_experts=num_experts, k=k, dropout_p=bc.mlp_dropout)
 
-    def _forward_core(self, x: torch.Tensor, mask: torch.Tensor | None, cache=None) -> torch.Tensor:
-        if self.bc.norm_policy == "prenorm":
-            a = self.attn.forward(self.n1(x), None, None, mask, cache)
-            if can_apply_native_norm(self.n2, self.training):
-                x, moe_in = fused_add_norm(x, a, self.n2, 1.0)
-            else:
-                x = apply_residual_update(
-                    x,
-                    a,
-                    residual_scale=1.0,
-                    resid_dropout=self.resid_dropout,
-                    drop_path=self.drop_path,
-                )
-                moe_in = self.n2(x)
-            m, _ = self.moe(moe_in)
-            x = apply_residual_update(
-                x,
-                m,
-                residual_scale=1.0,
-                resid_dropout=self.resid_dropout,
-                drop_path=self.drop_path,
-            )
-            return x
-        a = self.attn.forward(x, None, None, mask, cache)
-        if can_apply_native_norm(self.n1, self.training):
-            _, x = fused_add_norm(x, a, self.n1, 1.0)
-        else:
-            x = self.n1(
-                apply_residual_update(
-                    x,
-                    a,
-                    residual_scale=1.0,
-                    resid_dropout=self.resid_dropout,
-                    drop_path=self.drop_path,
-                )
-            )
-        m, _ = self.moe(x)
-        if can_apply_native_norm(self.n2, self.training):
-            _, x = fused_add_norm(x, m, self.n2, 1.0)
-        else:
-            x = self.n2(
-                apply_residual_update(
-                    x,
-                    m,
-                    residual_scale=1.0,
-                    resid_dropout=self.resid_dropout,
-                    drop_path=self.drop_path,
-                )
-            )
-        return x
-
+    def _forward_core(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None,
+        cache=None,
+        position_embeddings=None,
+        position_ids=None,
+    ) -> torch.Tensor:
+        attn_mask = apply_attention_biases(
+            x,
+            mask,
+            num_heads=self.cfg.n_heads,
+            use_alibi=bool(self.bc.use_alibi),
+            rpb_table=self.rpb_table,
+            rpb_max_distance=(int(self.bc.rpb_max_distance) if self.rpb_table is not None else None),
+        )
+        return execute_attention_mlp_block(
+            x,
+            attn_fn=lambda y: self.attn.forward(
+                y,
+                None,
+                None,
+                attn_mask,
+                cache,
+                position_embeddings=position_embeddings,
+                position_ids=position_ids,
+            ),
+            mlp_fn=lambda y: self.moe(y)[0],
+            n1=self.n1,
+            n2=self.n2,
+            resid_dropout=self.resid_dropout,
+            drop_path=self.drop_path,
+            residual_scale=1.0,
+            norm_policy=self.bc.norm_policy,
+        )

@@ -10,7 +10,7 @@ class PrefixCausalLM(CausalLM):
         self,
         cfg: ModelConfig,
         *,
-        block_variant: str = "prefix-lm",
+        block_variant: str = "llama",
         drop_path_max: float = 0.0,
         init_recipe: str | None = None,
         tie_weights: bool = True,
@@ -45,6 +45,4 @@ class PrefixCausalLM(CausalLM):
                     Lp = int(prefix_lengths[b].item())
                     masks.append(build_prefix_lm_mask(T, Lp, device=device))
                 attn_mask = torch.stack(masks, dim=0)
-        return super().forward(input_ids, attn_mask, cache)
-
-
+        return super().forward(input_ids=input_ids, attn_mask=attn_mask, cache=cache)

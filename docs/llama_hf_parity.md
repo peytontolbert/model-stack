@@ -75,7 +75,7 @@ Plan:
 5) Optionally verify embedding/head tying
 
 ### API Alignment (Local Model)
-- Update `model/causal.py:CausalLM.forward` to accept `attention_mask` (alias of `attn_mask`) and `cache=None`
+- `model/causal.py:CausalLM.forward` accepts `attention_mask` as an alias of `attn_mask` and supports `cache=None`
 - Return an object/dict exposing `.logits` and `.last_hidden_state` when needed by runners
 
 ### Verification Checklist
@@ -111,9 +111,8 @@ Plan:
 - Manual head projection path is implemented with `--head-device auto|cpu|same` to avoid GPU OOM deterministically
 
 ### Action Items
-- [ ] Implement safetensors weight loader (HF → Local) with key mapping and `w_in` stacking
-- [ ] Add `attention_mask` compatibility shim in `CausalLM.forward`
-- [ ] Build parity harness comparing HF vs Local on the same config/checkpoint
+- [x] Implement safetensors weight loader (HF → Local) with key mapping and `w_in` stacking
+- [x] Add `attention_mask` compatibility shim in `CausalLM.forward`
+- [x] Build parity harness comparing HF vs Local on the same config/checkpoint
 - [ ] Document any deviations and wire fixes in `blocks/*`, `attn/*`, `tensor/*`
-
 

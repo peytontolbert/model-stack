@@ -8,6 +8,7 @@
 *.safetensors
 *.so
 __pycache__/
+.pytest_cache/
 build/
 experiments/
 checkpoints/
@@ -16,5 +17,13 @@ examples/repo_grounded_adapters/artifacts/
 examples/repo_grounded_adapters/smoke_repo/
 examples/be_great/
 .gitignore
+other_repos/
 
 examples/program_conditioned_adapter/examples/hide/
+checkpoints/models--meta-llama--Llama-3.1-8B-Instruct/
+checkpoints/.locks/
+*.egg-info/
+.coverage
+CUDA_KERNEL_MAP.md
+MANIFEST.in
+docs/research/

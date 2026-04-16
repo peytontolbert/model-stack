@@ -350,6 +350,14 @@ Current local code:
 - `model/encoder.py`
 - `model/seq2seq.py`
 
+Current implementation status:
+
+- native `embedding_forward` entrypoint exists in `runtime/csrc/model_stack_native.cpp`
+- CUDA backend exists in `runtime/csrc/backend/cuda_embedding.cu`
+- `model/causal.py`, `model/encoder.py`, and `model/seq2seq.py` call the runtime embedding path on the intended hot path
+- validation is still blocked on rebuilding `_model_stack_native` in an environment with a full PyTorch extension toolchain
+- `setup.py` now accepts repo-local CUDA build controls via `MODEL_STACK_CUDA_ARCH_LIST`, `MODEL_STACK_MAX_JOBS`, and `MODEL_STACK_USE_NINJA`
+
 Recommended entrypoint:
 
 ```text
@@ -381,6 +389,13 @@ Current local code:
 
 - `tensor/sampling.py`
 - `serve/engine.py`
+
+Current implementation status:
+
+- the runtime exposes sampling entrypoints through `runtime/ops.py` and `runtime/csrc/model_stack_native.cpp`
+- CUDA kernels now cover temperature scaling, token-count accumulation, presence/frequency penalties, repetition penalties, and greedy next-token selection
+- the current implementation still relies on ATen/Torch ops for top-k, top-p, and multinomial sampling
+- sampler ownership is still incomplete, but the remaining Level-1 serving hot-path gap is now narrower than it was after embeddings
 
 Recommended entrypoint:
 

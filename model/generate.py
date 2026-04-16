@@ -1,19 +1,39 @@
 import torch
 
-from tensor.sampling import apply_temperature, apply_topk_mask, apply_topp_mask, sample_next_token
+from runtime.generation import greedy_generate as runtime_greedy_generate
+from runtime.generation import sample_generate as runtime_sample_generate
 
 
 @torch.no_grad()
-def greedy_generate(model, input_ids: torch.Tensor, *, max_new_tokens: int, eos_id: int | None = None, attn_mask=None) -> torch.Tensor:
-    seq = input_ids
-    for _ in range(max_new_tokens):
-        logits = model(seq, attn_mask)
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        seq = torch.cat([seq, next_token], dim=1)
-        if eos_id is not None:
-            if (next_token == eos_id).all():
-                break
-    return seq
+def greedy_generate(
+    model,
+    input_ids: torch.Tensor,
+    *,
+    max_new_tokens: int,
+    eos_id: int | None = None,
+    attention_mask=None,
+    attn_mask=None,
+    no_repeat_ngram: int = 0,
+    repetition_penalty: float = 1.0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    sliding_window: int | None = None,
+    cache_backend: str | None = None,
+) -> torch.Tensor:
+    resolved_attention_mask = attention_mask if attention_mask is not None else attn_mask
+    return runtime_greedy_generate(
+        model,
+        input_ids,
+        max_new_tokens=int(max_new_tokens),
+        eos_id=eos_id,
+        attention_mask=resolved_attention_mask,
+        no_repeat_ngram=int(no_repeat_ngram),
+        repetition_penalty=float(repetition_penalty),
+        presence_penalty=float(presence_penalty),
+        frequency_penalty=float(frequency_penalty),
+        sliding_window=(int(sliding_window) if sliding_window is not None else None),
+        cache_backend=cache_backend,
+    )
 
 
 @torch.no_grad()
@@ -26,28 +46,29 @@ def sample_generate(
     top_k: int | None = None,
     top_p: float | None = None,
     eos_id: int | None = None,
+    attention_mask=None,
     attn_mask=None,
+    no_repeat_ngram: int = 0,
+    repetition_penalty: float = 1.0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    sliding_window: int | None = None,
+    cache_backend: str | None = None,
 ) -> torch.Tensor:
-    seq = input_ids
-    for _ in range(max_new_tokens):
-        logits = model(seq, attn_mask)
-        logits = logits[:, -1, :]
-        if temperature is not None and temperature != 1.0:
-            logits = apply_temperature(logits, temperature)
-        mask = None
-        if top_k is not None:
-            m = apply_topk_mask(logits, top_k)
-            mask = m if mask is None else (mask | m)
-        if top_p is not None:
-            m = apply_topp_mask(logits, top_p)
-            mask = m if mask is None else (mask | m)
-        if mask is not None:
-            min_val = torch.finfo(logits.dtype).min if logits.dtype.is_floating_point else -1e9
-            logits = logits.masked_fill(mask, min_val)
-        next_token = sample_next_token(logits, True)
-        seq = torch.cat([seq, next_token], dim=1)
-        if eos_id is not None:
-            if (next_token == eos_id).all():
-                break
-    return seq
-
+    resolved_attention_mask = attention_mask if attention_mask is not None else attn_mask
+    return runtime_sample_generate(
+        model,
+        input_ids,
+        max_new_tokens=int(max_new_tokens),
+        temperature=float(temperature),
+        top_k=top_k,
+        top_p=top_p,
+        eos_id=eos_id,
+        attention_mask=resolved_attention_mask,
+        no_repeat_ngram=int(no_repeat_ngram),
+        repetition_penalty=float(repetition_penalty),
+        presence_penalty=float(presence_penalty),
+        frequency_penalty=float(frequency_penalty),
+        sliding_window=(int(sliding_window) if sliding_window is not None else None),
+        cache_backend=cache_backend,
+    )
