@@ -1,11 +1,5 @@
-from typing import Literal
+import sys
 
-NormPolicy = Literal["prenorm", "postnorm", "parallel"]
+import runtime.block_policies as _runtime_block_policies
 
-
-def validate_policy(policy: NormPolicy) -> NormPolicy:
-    if policy not in ("prenorm", "postnorm", "parallel"):
-        raise ValueError(f"Unknown norm policy: {policy}")
-    return policy
-
-
+sys.modules[__name__] = _runtime_block_policies

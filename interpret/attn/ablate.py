@@ -6,10 +6,13 @@ from typing import Dict, Iterable, List
 import torch
 import torch.nn as nn
 
-from attn.eager import EagerAttention
-from tensor.shape import split_heads, merge_heads
-from tensor.positional import build_rope_cache, apply_rotary
-from attn.backends import scaled_dot_product_attention, select_attention_backend
+from runtime.attention_modules import EagerAttention
+from runtime.attention import scaled_dot_product_attention, select_attention_backend
+from runtime.ops import apply_rotary as runtime_apply_rotary
+from runtime.ops import head_output_projection as runtime_head_output_projection
+from runtime.ops import linear as runtime_linear
+from runtime.ops import split_heads as runtime_split_heads
+from tensor.positional import build_rope_cache
 
 
 def _wrap_forward_with_head_ablation(attn: EagerAttention, zero_heads: List[int]):
@@ -22,17 +25,19 @@ def _wrap_forward_with_head_ablation(attn: EagerAttention, zero_heads: List[int]
         B, T, D = x.shape
         device, dtype = x.device, x.dtype
 
-        q_lin = attn.w_q(x)
-        k_lin = attn.w_k(x if k is None else k)
-        v_lin = attn.w_v(x if v is None else v)
+        q_lin = runtime_linear(x, attn.w_q.weight, attn.w_q.bias)
+        k_source = x if k is None else k
+        v_source = x if v is None else v
+        k_lin = runtime_linear(k_source, attn.w_k.weight, attn.w_k.bias)
+        v_lin = runtime_linear(v_source, attn.w_v.weight, attn.w_v.bias)
 
-        qh = split_heads(q_lin, attn.n_heads)
-        kh_new = split_heads(k_lin, attn.n_kv_heads)
-        vh_new = split_heads(v_lin, attn.n_kv_heads)
+        qh = runtime_split_heads(q_lin, attn.n_heads)
+        kh_new = runtime_split_heads(k_lin, attn.n_kv_heads)
+        vh_new = runtime_split_heads(v_lin, attn.n_kv_heads)
 
         if attn.use_rope:
             cos, sin = build_rope_cache(T, attn.head_dim, device=device, base_theta=float(attn.rope_theta))
-            qh, kh_new = apply_rotary(qh, kh_new, cos.to(dtype=dtype), sin.to(dtype=dtype))
+            qh, kh_new = runtime_apply_rotary(qh, kh_new, cos.to(dtype=dtype), sin.to(dtype=dtype))
 
         if cache is not None:
             k_old, v_old = cache.read(0, cache.length())
@@ -61,12 +66,10 @@ def _wrap_forward_with_head_ablation(attn: EagerAttention, zero_heads: List[int]
                 if 0 <= h < out.shape[1]:
                     out[:, h].zero_()
 
-        y = merge_heads(out)
-
         if cache is not None and T > 0:
             cache.append(kh_new, vh_new)
 
-        return attn.w_o(y)
+        return runtime_head_output_projection(out, attn.w_o.weight, attn.w_o.bias)
 
     return orig_forward, forward
 
@@ -76,7 +79,7 @@ def ablate_attention_heads(model: nn.Module, mapping: Dict[int, Iterable[int]]):
     """Temporarily zero-out specified heads in `blocks.{layer}.attn` during forward.
 
     mapping: {layer_index: [head_indices,...]}
-    Only supports `attn.eager.EagerAttention` attention modules.
+    Only supports `runtime.attention_modules.EagerAttention` attention modules.
     """
     handles = []
     origs = []
@@ -93,5 +96,3 @@ def ablate_attention_heads(model: nn.Module, mapping: Dict[int, Iterable[int]]):
     finally:
         for attn, orig_forward in origs:
             attn.forward = orig_forward  # type: ignore
-
-

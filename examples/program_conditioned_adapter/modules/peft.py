@@ -1,7 +1,7 @@
 from typing import Dict, Any, List, Optional
 import os
 import re
-from model.inspect import detect_target_names_from_model_full
+from runtime.inspect import detect_target_names_from_model_full
 
 def infer_target_names(model_id: str) -> Dict[str, str]:
     names = detect_target_names_from_model_full(model_id, target_regex=None) or {}
@@ -62,4 +62,3 @@ def save_peft_like(out_dir: str, adapters: Dict[str, Any], *, r: int, alpha: int
             pass
     except Exception:
         pass
-

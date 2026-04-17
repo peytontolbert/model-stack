@@ -1,5 +1,5 @@
-from runtime.checkpoint import ensure_snapshot
+import sys
 
-__all__ = [
-    "ensure_snapshot",
-]
+import runtime.checkpoint as _runtime_checkpoint
+
+sys.modules[__name__] = _runtime_checkpoint

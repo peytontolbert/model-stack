@@ -35,8 +35,8 @@ Implementation notes
 - runtime/generation.py now owns `GenerationConfig`, the decode session, and the generation loop.
 - serve/engine.py and serve/generate.py are compatibility wrappers that preserve the old API surface while delegating generation config construction and decode execution to runtime-owned helpers.
 - model/generate.py is also a compatibility shim over runtime-owned generation helpers rather than a separate eager decode implementation.
-- runtime/modeling.py now owns model-directory and factory-spec model loading, runtime model preparation, and device/dtype resolution for runtime-facing callers.
-- serve/runtime.py loads a model from MODEL_DIR through `runtime/modeling.py` and owns request/config coercion, health payloads, and KV cache allocation through `runtime.cache`.
+- runtime/loader.py now owns model-directory and factory-spec model loading, while runtime/prep.py owns runtime model preparation and device/dtype resolution for runtime-facing callers.
+- serve/runtime.py loads a model from MODEL_DIR through `runtime/loader.py` plus `runtime/prep.py` and owns request/config coercion, health payloads, and KV cache allocation through `runtime.cache`.
 - serve/api.py is now mostly transport glue around runtime-owned helpers, including request-side sampling-mode inference and attention-mask/cache-backend passthrough.
 - runtime/blocks.py now owns block-stack execution, generic and patterned block mask shaping, attention-bias composition, and the fused residual/norm branch helpers used by model forward paths.
 - runtime/cache.py owns cache-spec derivation, backend resolution, native paged-cache construction, the per-layer `layer(i)` view, and runtime-level eviction helpers.

@@ -1,1 +1,1 @@
-
+../../repo_grounded_adapters/docs/DESIGN_CONTEXT_AND_ADAPTERS.md

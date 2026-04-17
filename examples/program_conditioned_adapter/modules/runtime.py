@@ -10,7 +10,7 @@ import torch
 
 # Reuse existing module utilities
 # No example-specific imports in core runtime
-from model.inspect import detect_target_names_from_model_full
+from runtime.inspect import detect_target_names_from_model_full
 
 @dataclass
 class OTFFlags:
@@ -112,4 +112,3 @@ def run_program_adapter(
         return 0, text, ""
     except Exception as e:
         return 1, "", str(e)
-

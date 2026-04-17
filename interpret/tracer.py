@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from .activation_cache import ActivationCache, CaptureSpec
 try:
-    from blocks.transformer_block import TransformerBlock as _TransformerBlock
+    from runtime.block_modules import TransformerBlock as _TransformerBlock
 except Exception:
     _TransformerBlock = None  # type: ignore
 
@@ -120,5 +120,4 @@ class ActivationTracer:
             return hasattr(m, "attn") and hasattr(m, "mlp")
 
         return self.add_modules_matching(is_block)
-
 

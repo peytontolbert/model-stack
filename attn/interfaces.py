@@ -1,11 +1,5 @@
-# attn/interfaces.py
-from typing import Protocol, Optional
-import torch
+import sys
 
-class KVCache(Protocol):
-    def append(self, k: torch.Tensor, v: torch.Tensor): ...
-    def read(self, start: int, end: int) -> tuple[torch.Tensor, torch.Tensor]: ...
-    def length(self) -> int: ...
+import runtime.attention_interfaces as _runtime_attention_interfaces
 
-class Attention(Protocol):
-    def forward(self, q, k, v, mask, cache: Optional[KVCache] = None) -> torch.Tensor: ...
+sys.modules[__name__] = _runtime_attention_interfaces

@@ -1,8 +1,5 @@
-from runtime.factory import build_registered_model as build
-from runtime.factory import get_model_builder, register_model
+import sys
 
-__all__ = [
-    "build",
-    "get_model_builder",
-    "register_model",
-]
+import runtime.model_registry as _runtime_model_registry
+
+sys.modules[__name__] = _runtime_model_registry

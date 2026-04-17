@@ -1,9 +1,5 @@
-from typing import Any
-def getattr_nested(obj: Any, path: str) -> Any:
-    cur: Any = obj
-    for tok in str(path).split("."):
-        if not tok:
-            continue
-        cur = getattr(cur, tok)
-    return cur
+import sys
 
+import runtime.block_utils as _runtime_block_utils
+
+sys.modules[__name__] = _runtime_block_utils

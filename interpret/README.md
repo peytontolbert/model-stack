@@ -8,7 +8,7 @@ Highlights
 - Linear probes (classification/regression) on cached features
 - Causal tracing via activation patching (resample/restore analysis)
 - Integrated gradients token attributions
-- Attention weights/entropy extraction leveraging `attn.eager` and `tensor.*` utils
+- Attention weights/entropy extraction leveraging `runtime.attention_modules` and `tensor.*` utils
 - MLP lens: project MLP outputs through `lm_head` to get per-layer token predictions
 - Attention head ablation (EagerAttention) via context manager
 - Feature flattening utilities to prepare data for probes

@@ -10,6 +10,9 @@ import torch
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 
+from runtime.blocks import apply_native_norm
+from runtime.ops import embedding as runtime_embedding
+from runtime.ops import linear as runtime_linear
 from specs.dist import DistConfig
 from tensor.optim import (
     clip_by_policy_,
@@ -139,14 +142,14 @@ class Trainer:
         if getattr(self.dist_cfg, "grad_ckpt", False) and hasattr(self.model, "blocks"):
             # Per-block checkpointing preserves additional args
             from torch.utils.checkpoint import checkpoint
-            x = self.model.embed(batch.input_ids)
+            x = runtime_embedding(self.model.embed.weight, batch.input_ids, self.model.embed.padding_idx)
             attn_mask = getattr(batch, "attn_mask", None)
             for blk in self.model.blocks:
                 def _wrap(inp, module=blk, mask=attn_mask):
                     return module(inp, mask, None)
                 x = checkpoint(_wrap, x)
-            x = self.model.norm(x)
-            logits = self.model.lm_head(x)
+            x = apply_native_norm(x, self.model.norm)
+            logits = runtime_linear(x, self.model.lm_head.weight, self.model.lm_head.bias)
             return logits
         # Fallback to model forward
         return self.model(batch.input_ids, getattr(batch, "attn_mask", None))

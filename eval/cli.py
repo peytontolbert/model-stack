@@ -6,7 +6,7 @@ import torch
 
 from data.loader import build_dataloader
 from runtime.loader import load_runtime_model as runtime_load_runtime_model
-from runtime.modeling import resolve_model_device
+from runtime.prep import resolve_model_device
 from .loop import evaluate_lm_next_token
 from .bench import benchmark_forward, benchmark_generate
 from .calibration import evaluate_ece

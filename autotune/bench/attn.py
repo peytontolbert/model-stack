@@ -13,7 +13,7 @@ def benchmark_attention_backends(seq: int = 256, heads: int = 8, d_k: int = 64, 
     k = torch.randn(B, heads, seq, d_k, device=device, dtype=dtype)
     v = torch.randn(B, heads, seq, d_k, device=device, dtype=dtype)
 
-    from attn.backends import scaled_dot_product_attention
+    from runtime.attention import scaled_dot_product_attention
 
     backends = ["flash2", "xformers", "torch"]
     results: List[Tuple[str, float]] = []
@@ -46,5 +46,4 @@ def benchmark_attention_backends(seq: int = 256, heads: int = 8, d_k: int = 64, 
 def select_fastest_backend(seq: int = 256, heads: int = 8, d_k: int = 64, dtype: torch.dtype = torch.float16) -> str:
     res = benchmark_attention_backends(seq=seq, heads=heads, d_k=d_k, dtype=dtype)
     return res[0][0] if res else "torch"
-
 

@@ -1,7 +1,5 @@
-from runtime.checkpoint import load_config, load_pretrained, save_pretrained
+import sys
 
-__all__ = [
-    "load_config",
-    "load_pretrained",
-    "save_pretrained",
-]
+import runtime.checkpoint as _runtime_checkpoint
+
+sys.modules[__name__] = _runtime_checkpoint

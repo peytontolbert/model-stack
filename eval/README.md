@@ -47,7 +47,7 @@ python -m eval.cli ece \
 
 All commands can optionally log to viz with `--viz-log-dir .viz`.
 
-Model loading for both `--model-dir` and `--model module:function` now routes through `runtime/modeling.py`, so config load, model construction, runtime preparation, and default device resolution stay aligned with the serving runtime path.
+Model loading for both `--model-dir` and `--model module:function` now routes through `runtime/loader.py` plus `runtime/prep.py`, so config load, model construction, runtime preparation, and default device resolution stay aligned with the serving runtime path.
 
 ## Sequence metrics (BLEU, ROUGE-L, EM, token F1)
 

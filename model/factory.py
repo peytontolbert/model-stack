@@ -1,15 +1,5 @@
-from runtime.factory import (
-    build_causal_lm,
-    build_encoder,
-    build_model,
-    build_prefix_lm,
-    build_seq2seq,
-)
+import sys
 
-__all__ = [
-    "build_causal_lm",
-    "build_encoder",
-    "build_model",
-    "build_prefix_lm",
-    "build_seq2seq",
-]
+import runtime.factory as _runtime_factory
+
+sys.modules[__name__] = _runtime_factory

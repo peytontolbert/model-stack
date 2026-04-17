@@ -1,10 +1,11 @@
-from .causal import CausalLM
-from .prefix_lm import PrefixCausalLM
-from .encoder import EncoderModel
-from .seq2seq import EncoderDecoderLM
-from .registry import build, register_model, get_model_builder
-from .generate import greedy_generate, sample_generate
-from .heads import SequenceClassificationHead, TokenClassificationHead
+from runtime.causal import CausalLM
+from runtime.causal import TransformerLM
+from runtime.prefix_lm import PrefixCausalLM
+from runtime.encoder import EncoderModel
+from runtime.seq2seq import EncoderDecoderLM
+from runtime.model_generate import greedy_generate, sample_generate
+from runtime.model_registry import build, register_model, get_model_builder
+from runtime.heads import SequenceClassificationHead, TokenClassificationHead
 from runtime.checkpoint import (
     build_local_llama_from_hf_config,
     build_local_llama_from_snapshot,
@@ -25,16 +26,36 @@ from runtime.factory import (
     build_seq2seq,
 )
 from runtime.loader import load_model_dir, load_model_factory_spec, load_runtime_model
-from runtime.modeling import (
+from runtime.prep import (
     RuntimeModelArtifacts,
     prepare_model_for_runtime,
     resolve_model_config,
     resolve_model_device,
     resolve_model_dtype,
 )
+from runtime.runtime_utils import (
+    apply_weight_deltas,
+    find_module_by_relpath,
+    local_logits_last,
+    num_parameters,
+    num_trainable_parameters,
+    prepare_head_weight,
+    resolve_layer_modules,
+    to_device,
+    to_dtype,
+)
+from runtime.inspect import (
+    detect_target_names_from_model_full,
+    detect_target_shapes_from_model,
+    detect_target_shapes_from_model_full,
+    infer_target_shapes,
+    infer_target_shapes_from_config,
+)
+from runtime.compile import maybe_compile
 
 __all__ = [
     "CausalLM",
+    "TransformerLM",
     "PrefixCausalLM",
     "EncoderModel",
     "EncoderDecoderLM",
@@ -68,4 +89,19 @@ __all__ = [
     "save_pretrained",
     "load_pretrained",
     "load_config",
+    "apply_weight_deltas",
+    "find_module_by_relpath",
+    "local_logits_last",
+    "num_parameters",
+    "num_trainable_parameters",
+    "prepare_head_weight",
+    "resolve_layer_modules",
+    "to_device",
+    "to_dtype",
+    "detect_target_names_from_model_full",
+    "detect_target_shapes_from_model",
+    "detect_target_shapes_from_model_full",
+    "infer_target_shapes",
+    "infer_target_shapes_from_config",
+    "maybe_compile",
 ]

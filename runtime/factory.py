@@ -6,25 +6,25 @@ from specs.config import ModelConfig
 
 
 def build_causal_lm(cfg: ModelConfig, *, block: str = "llama", compress: dict | None = None, **kwargs):
-    from model.causal import CausalLM
+    from runtime.causal import CausalLM
 
     return CausalLM(cfg, block_variant=block, compress=compress, **kwargs)
 
 
 def build_prefix_lm(cfg: ModelConfig, *, block: str = "llama", compress: dict | None = None, **kwargs):
-    from model.prefix_lm import PrefixCausalLM
+    from runtime.prefix_lm import PrefixCausalLM
 
     return PrefixCausalLM(cfg, block_variant=block, compress=compress, **kwargs)
 
 
 def build_encoder(cfg: ModelConfig, *, compress: dict | None = None, **kwargs):
-    from model.encoder import EncoderModel
+    from runtime.encoder import EncoderModel
 
     return EncoderModel(cfg, compress=compress, **kwargs)
 
 
 def build_seq2seq(cfg: ModelConfig, *, compress: dict | None = None, **kwargs):
-    from model.seq2seq import EncoderDecoderLM
+    from runtime.seq2seq import EncoderDecoderLM
 
     return EncoderDecoderLM(cfg, compress=compress, **kwargs)
 

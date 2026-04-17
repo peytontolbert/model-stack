@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 
 from specs.config import ModelConfig
-from blocks.llama_block import LlamaBlock
-from blocks.init import init_transformer_stack
+from runtime.block_init import init_transformer_stack
+from runtime.block_modules import GPTBlock, LlamaBlock
 from runtime.blocks import apply_native_norm
 from runtime.ops import embedding as runtime_embedding
 from runtime.ops import linear as runtime_linear
@@ -19,7 +19,6 @@ class ExampleTransformerLM(nn.Module):
             if block == "llama":
                 blocks.append(LlamaBlock(cfg))
             else:
-                from blocks.gpt_block import GPTBlock
                 blocks.append(GPTBlock(cfg))
         self.blocks = nn.ModuleList(blocks)
         self.norm = nn.LayerNorm(cfg.d_model)  # final norm

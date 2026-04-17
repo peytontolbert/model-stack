@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from specs.config import ModelConfig
-from model.lm import TransformerLM
+from model import TransformerLM
 from model.generate import sample_generate
 
 
@@ -20,5 +20,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

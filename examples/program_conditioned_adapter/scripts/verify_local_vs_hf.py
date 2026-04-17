@@ -5,7 +5,7 @@ import gc
 import torch
 from typing import Tuple
 from model.hf_snapshot import ensure_snapshot
-from model.runtime_utils import local_logits_last
+from runtime.runtime_utils import local_logits_last
 
 def main() -> None:
     import argparse
@@ -476,5 +476,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

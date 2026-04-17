@@ -11,13 +11,15 @@ def _resolve_block_types() -> Set[Type[torch.nn.Module]]:
     types: Set[Type[torch.nn.Module]] = set()
     try:
         # Core transformer block and common variants
-        from blocks.transformer_block import TransformerBlock
-        from blocks.encoder_block import EncoderBlock
-        from blocks.decoder_block import DecoderBlock
-        from blocks.gpt_block import GPTBlock
-        from blocks.llama_block import LlamaBlock
-        from blocks.parallel_block import ParallelTransformerBlock
-        from blocks.moe_block import MoEBlock
+        from runtime.block_modules import (
+            DecoderBlock,
+            EncoderBlock,
+            GPTBlock,
+            LlamaBlock,
+            MoEBlock,
+            ParallelTransformerBlock,
+            TransformerBlock,
+        )
 
         types.update(
             {
@@ -68,5 +70,4 @@ def wrap_fsdp(
 
         kwargs["sharding_strategy"] = ShardingStrategy.FULL_SHARD
     return FSDP(model.cuda(), auto_wrap_policy=policy, **kwargs)
-
 

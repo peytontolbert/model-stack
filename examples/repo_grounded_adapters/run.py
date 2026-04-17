@@ -13,7 +13,7 @@ import numpy as np
 
 from examples.repo_grounded_adapters.modules.embedding import build_repo_embedding
 from examples.repo_grounded_adapters.modules.adapter import generate_lora_from_embedding, save_npz
-from blocks.inspect import infer_target_shapes_from_config as _infer_shapes_unused  # legacy; avoid transformers
+from runtime.inspect import infer_target_shapes_from_config as _infer_shapes_unused  # legacy; avoid transformers
 from model.hf_snapshot import ensure_snapshot
 
 def _root() -> Path:
@@ -364,5 +364,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

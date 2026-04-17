@@ -20,9 +20,8 @@ from examples.repo_grounded_adapters.modules.embedding import (
 )
 from model.llama_bootstrap import build_local_llama_from_snapshot
 from model.hf_snapshot import ensure_snapshot
-from blocks.targets import targets_map
-from blocks.inspect import infer_target_shapes
-from model.inspect import detect_target_names_from_model_full
+from runtime.block_targets import targets_map
+from runtime.inspect import detect_target_names_from_model_full, infer_target_shapes
 from examples.repo_grounded_adapters.modules.selection import (
     modules_from_symbols,
     question_aware_modules_and_files,
@@ -1862,6 +1861,4 @@ def generate_answer_structured(
             pass
 
     return result
-
-
 

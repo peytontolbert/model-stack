@@ -8,10 +8,7 @@ import subprocess
 import numpy as np
 import torch
 
-# Reuse existing module utilities
-from examples.repo_grounded_adapters.modules.peft import (
-)
-from model.inspect import detect_target_names_from_model_full
+from runtime.inspect import detect_target_names_from_model_full
 
 @dataclass
 class OTFFlags:
@@ -113,4 +110,3 @@ def run_repo_adapter(
         return 0, text, ""
     except Exception as e:
         return 1, "", str(e)
-

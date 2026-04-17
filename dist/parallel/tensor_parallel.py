@@ -4,6 +4,7 @@ from typing import Tuple
 
 import torch
 
+from runtime.ops import linear as runtime_linear
 from tensor.shard import allreduce_, allgather, shard_linear_weight
 from tensor.init import kaiming_uniform_linear, xavier_uniform_linear
 from dist.utils import get_rank
@@ -32,7 +33,7 @@ class TensorParallelLinear(torch.nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = torch.nn.functional.linear(x, self.weight, self.bias)
+        y = runtime_linear(x, self.weight, self.bias)
         # All-reduce partial outputs when partitioned along output dimension
         y = allreduce_(y, op="sum")
         return y
@@ -61,7 +62,7 @@ class ColumnParallelLinear(torch.nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y_local = torch.nn.functional.linear(x, self.weight, self.bias)
+        y_local = runtime_linear(x, self.weight, self.bias)
         # Gather partial outputs along last dimension using tensor.shard
         return allgather(y_local, dim=-1)
 
@@ -94,7 +95,7 @@ class RowParallelLinear(torch.nn.Module):
         start = local_index * self.in_per
         end = start + self.in_per
         x_local = x[..., start:end]
-        y_local = torch.nn.functional.linear(x_local, self.weight, None)
+        y_local = runtime_linear(x_local, self.weight, None)
         # Sum partial outputs across ranks using tensor.shard
         y = allreduce_(y_local, op="sum")
         if self.bias is not None:
@@ -149,5 +150,4 @@ def apply_tensor_parallel(model: torch.nn.Module, tp_size: int) -> torch.nn.Modu
             except Exception:
                 pass
     return model
-
 

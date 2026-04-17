@@ -7,7 +7,7 @@ import torch
 
 from specs.config import ModelConfig
 from specs.dist import DistConfig
-from model.lm import TransformerLM
+from model import TransformerLM
 from model.generate import greedy_generate
 from train.trainer import Trainer, TrainConfig
 from data.loader import build_dataloader
@@ -69,5 +69,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

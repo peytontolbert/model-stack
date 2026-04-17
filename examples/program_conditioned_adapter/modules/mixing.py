@@ -6,8 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from blocks.targets import targets_map
-from blocks.utils import getattr_nested
+from runtime.block_targets import targets_map
+from runtime.block_utils import getattr_nested
 
 def register_hook_mixed_adapters(
     model: Any,

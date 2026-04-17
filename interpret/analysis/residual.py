@@ -5,6 +5,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
+from runtime.ops import embedding as runtime_embedding
 from tensor.numerics import masked_mean
 
 
@@ -17,7 +18,7 @@ def residual_norms(model: nn.Module, input_ids: torch.Tensor, *, attn_mask: Opti
     was_training = model.training
     model.eval()
 
-    x = model.embed(input_ids)
+    x = runtime_embedding(model.embed.weight, input_ids, model.embed.padding_idx)
     L = len(model.blocks)
     B, T, D = x.shape
     pre_list = []
@@ -41,5 +42,4 @@ def residual_norms(model: nn.Module, input_ids: torch.Tensor, *, attn_mask: Opti
     if was_training:
         model.train()
     return out
-
 

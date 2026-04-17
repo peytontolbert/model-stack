@@ -8,7 +8,7 @@ import torch
 
 from specs.config import ModelConfig
 from specs.dist import DistConfig
-from model.lm import TransformerLM
+from model import TransformerLM
 from train.trainer import Trainer, TrainConfig
 from data.batch import Batch
 from data.tokenizer import get_tokenizer
@@ -72,5 +72,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

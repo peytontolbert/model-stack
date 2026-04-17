@@ -1,4 +1,5 @@
-"""Compatibility shim for sampling helpers now owned under tensor/runtime."""
+import sys
 
-from tensor.sampling import *  # noqa: F401,F403
-from tensor.sampling import __all__
+import tensor.sampling as _tensor_sampling
+
+sys.modules[__name__] = _tensor_sampling

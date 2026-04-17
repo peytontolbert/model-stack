@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from runtime.ops import activation as runtime_activation
+from runtime.ops import linear as runtime_linear
 
 @dataclass
 class SAEConfig:
@@ -26,8 +28,8 @@ class SparseAutoencoder(nn.Module):
         self.decoder = nn.Linear(code_dim, in_dim, bias=bias)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        z = self.encoder(x)
-        x_hat = self.decoder(torch.relu(z))
+        z = runtime_linear(x, self.encoder.weight, self.encoder.bias)
+        x_hat = runtime_linear(runtime_activation(z, "relu"), self.decoder.weight, self.decoder.bias)
         return x_hat, z
 
 
@@ -74,5 +76,4 @@ def fit_sae(features: torch.Tensor, *, cfg: SAEConfig) -> tuple[SparseAutoencode
             if patience_left <= 0:
                 break
     return sae, {"loss": best_loss}
-
 

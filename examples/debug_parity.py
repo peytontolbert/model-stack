@@ -12,6 +12,9 @@ _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from runtime.blocks import apply_native_norm
+from runtime.ops import embedding as runtime_embedding
+
 
 def find_checkpoint_root(root_dir: str) -> str:
     """Find the directory containing model checkpoint files."""
@@ -261,13 +264,13 @@ def main():
         print("\n=== Layer 0 Detailed Comparison ===")
         with torch.no_grad():
             hf_emb = hf_w.model.embed_tokens(input_ids_cpu)
-            local_emb = local.embed(input_ids_cpu)
+            local_emb = runtime_embedding(local.embed.weight, input_ids_cpu, local.embed.padding_idx)
             emb_diff = (hf_emb.float().cpu() - local_emb.float().cpu()).abs().max()
             print(f"After embedding, max diff: {emb_diff.item():.6f}")
             hf_norm1_in = hf_emb
             local_norm1_in = local_emb
             hf_norm1_out = hf_w.model.layers[0].input_layernorm(hf_norm1_in)
-            local_norm1_out = local.blocks[0].n1(local_norm1_in)
+            local_norm1_out = apply_native_norm(local_norm1_in, local.blocks[0].n1)
             norm1_diff = (hf_norm1_out.float().cpu() - local_norm1_out.float().cpu()).abs().max()
             print(f"After layer 0 input norm, max diff: {norm1_diff.item():.6f}")
             print(f"HF norm1 output [0,0,:5]: {hf_norm1_out[0,0,:5].float().cpu().tolist()}")
@@ -279,7 +282,7 @@ def main():
             print("\n=== Progressive Layer-by-Layer Comparison (no mask) ===")
             with torch.no_grad():
                 hf_hidden = hf_w.model.embed_tokens(input_ids_cpu)
-                local_hidden = local.embed(input_ids_cpu)
+                local_hidden = runtime_embedding(local.embed.weight, input_ids_cpu, local.embed.padding_idx)
                 position_ids = torch.arange(input_ids_cpu.shape[1], device=input_ids_cpu.device).unsqueeze(0)
                 position_embeddings = hf_w.model.rotary_emb(hf_hidden, position_ids=position_ids)
                 for li in range(min(5, cfg_hf.num_hidden_layers)):
@@ -311,4 +314,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

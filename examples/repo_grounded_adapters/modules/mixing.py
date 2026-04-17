@@ -7,8 +7,8 @@ import numpy as np
 import torch
 
 from examples.repo_grounded_adapters.code_graph import CodeGraph
-from blocks.targets import targets_map
-from blocks.utils import getattr_nested
+from runtime.block_targets import targets_map
+from runtime.block_utils import getattr_nested
 
 
 

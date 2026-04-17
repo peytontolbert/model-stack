@@ -7,7 +7,7 @@ import torch
 from specs.config import ModelConfig
 from export.exporter import export_from_dir
 from specs.export import ExportConfig
-from model.lm import TransformerLM
+from model import TransformerLM
 from model.checkpoint import save_pretrained
 
 
@@ -34,5 +34,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

@@ -44,6 +44,7 @@ import model.registry as model_registry_mod
 import model.seq2seq as seq2seq_model_mod
 import model as model_pkg
 import runtime.checkpoint as runtime_checkpoint_mod
+import runtime.prep as runtime_prep_mod
 import export.exporter as export_exporter_mod
 import runtime.modeling as runtime_modeling_mod
 import serve.api as serve_api_mod
@@ -965,8 +966,16 @@ def test_model_registry_is_runtime_shim():
     assert model_registry_mod.build is runtime_factory_mod.build_registered_model
 
 
+def test_runtime_modeling_is_prep_compatibility_shim():
+    assert runtime_modeling_mod.RuntimeModelArtifacts is runtime_prep_mod.RuntimeModelArtifacts
+    assert runtime_modeling_mod.prepare_model_for_runtime is runtime_prep_mod.prepare_model_for_runtime
+    assert runtime_modeling_mod.resolve_model_config is runtime_prep_mod.resolve_model_config
+    assert runtime_modeling_mod.resolve_model_device is runtime_prep_mod.resolve_model_device
+    assert runtime_modeling_mod.resolve_model_dtype is runtime_prep_mod.resolve_model_dtype
+
+
 def test_model_package_reexports_runtime_modeling_surface():
-    assert model_pkg.RuntimeModelArtifacts is runtime_modeling_mod.RuntimeModelArtifacts
+    assert model_pkg.RuntimeModelArtifacts is runtime_prep_mod.RuntimeModelArtifacts
     assert model_pkg.build is runtime_factory_mod.build_registered_model
     assert model_pkg.build_model is runtime_factory_mod.build_model
     assert model_pkg.build_registered_model is runtime_factory_mod.build_registered_model
@@ -983,10 +992,10 @@ def test_model_package_reexports_runtime_modeling_surface():
     assert model_pkg.load_runtime_model is runtime_loader_mod.load_runtime_model
     assert model_pkg.model_config_from_hf_llama_snapshot_config is runtime_checkpoint_mod.model_config_from_hf_llama_snapshot_config
     assert model_pkg.model_config_from_hf_llama_transformers_config is runtime_checkpoint_mod.model_config_from_hf_llama_transformers_config
-    assert model_pkg.prepare_model_for_runtime is runtime_modeling_mod.prepare_model_for_runtime
-    assert model_pkg.resolve_model_config is runtime_modeling_mod.resolve_model_config
-    assert model_pkg.resolve_model_device is runtime_modeling_mod.resolve_model_device
-    assert model_pkg.resolve_model_dtype is runtime_modeling_mod.resolve_model_dtype
+    assert model_pkg.prepare_model_for_runtime is runtime_prep_mod.prepare_model_for_runtime
+    assert model_pkg.resolve_model_config is runtime_prep_mod.resolve_model_config
+    assert model_pkg.resolve_model_device is runtime_prep_mod.resolve_model_device
+    assert model_pkg.resolve_model_dtype is runtime_prep_mod.resolve_model_dtype
     assert model_pkg.save_pretrained is runtime_checkpoint_mod.save_pretrained
     assert model_pkg.load_pretrained is runtime_checkpoint_mod.load_pretrained
     assert model_pkg.load_config is runtime_checkpoint_mod.load_config

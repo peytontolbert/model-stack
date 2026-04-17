@@ -19,7 +19,7 @@ from examples.repo_grounded_adapters.modules.adapter import (
     save_npz,
 )
 from model.hf_snapshot import ensure_snapshot
-from model.inspect import detect_target_shapes_from_model
+from runtime.inspect import detect_target_shapes_from_model
 from examples.repo_grounded_adapters.modules.capacity import entropy_score
 from examples.repo_grounded_adapters.modules.repo_state import (
     load_repo_state,
@@ -892,5 +892,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

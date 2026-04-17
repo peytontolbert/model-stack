@@ -72,6 +72,10 @@ def _layer_norm_reference(
     dim: int | tuple[int, ...] = -1,
 ) -> torch.Tensor:
     dims = _to_tuple_dims(dim, x.ndim)
+    if len(dims) == 1 and dims[0] == x.ndim - 1:
+        w = None if weight is None else weight.to(dtype=x.dtype, device=x.device)
+        b = None if bias is None else bias.to(dtype=x.dtype, device=x.device)
+        return F.layer_norm(x, (x.shape[-1],), w, b, eps)
     xf = x.float()
     mu = xf.mean(dim=dims, keepdim=True)
     var = xf.var(dim=dims, unbiased=False, keepdim=True)
@@ -1014,6 +1018,80 @@ def apply_sampling_mask(
         return logits
     min_val = torch.finfo(logits.dtype).min if logits.dtype.is_floating_point else -1e9
     return logits.masked_fill(mask, min_val)
+
+
+def beam_search_step(
+    beams: torch.Tensor,
+    logits: torch.Tensor,
+    raw_scores: torch.Tensor,
+    finished: torch.Tensor,
+    lengths: torch.Tensor,
+    *,
+    beam_size: int,
+    eos_id: int,
+    pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if has_native_op("beam_search_step"):
+        module = native_module()
+        if module is not None and hasattr(module, "beam_search_step_forward"):
+            return module.beam_search_step_forward(
+                beams,
+                logits,
+                raw_scores,
+                finished,
+                lengths,
+                int(beam_size),
+                int(eos_id),
+                int(pad_id),
+            )
+
+    if logits.dim() == 3:
+        next_logits = logits[:, -1, :]
+    elif logits.dim() == 2:
+        next_logits = logits
+    else:
+        raise ValueError("beam_search_step: logits must be rank-2 or rank-3")
+
+    batch_size = raw_scores.shape[0]
+    vocab_size = next_logits.shape[-1]
+    logp = torch.log_softmax(next_logits, dim=-1).view(batch_size, beam_size, vocab_size)
+
+    if finished.any():
+        logp = logp.masked_fill(finished.unsqueeze(-1), float("-inf"))
+        logp[:, :, pad_id] = torch.where(
+            finished,
+            torch.zeros_like(logp[:, :, pad_id]),
+            logp[:, :, pad_id],
+        )
+
+    candidate_scores = raw_scores.unsqueeze(-1) + logp
+    flat_scores = candidate_scores.view(batch_size, beam_size * vocab_size)
+    best_raw_scores, best_idx = torch.topk(flat_scores, k=beam_size, dim=-1)
+
+    parent_beams = best_idx // vocab_size
+    next_tokens = best_idx % vocab_size
+
+    prev_beams = beams.view(batch_size, beam_size, -1)
+    gathered = prev_beams.gather(
+        1,
+        parent_beams.unsqueeze(-1).expand(-1, -1, prev_beams.shape[-1]),
+    )
+
+    parent_finished = finished.gather(1, parent_beams)
+    appended_tokens = torch.where(
+        parent_finished,
+        torch.full_like(next_tokens, pad_id),
+        next_tokens,
+    )
+    next_beams = torch.cat(
+        [gathered.reshape(batch_size * beam_size, -1), appended_tokens.reshape(batch_size * beam_size, 1)],
+        dim=1,
+    )
+
+    parent_lengths = lengths.gather(1, parent_beams)
+    next_lengths = parent_lengths + (~parent_finished).long()
+    next_finished = parent_finished | (next_tokens == eos_id)
+    return next_beams, best_raw_scores, next_finished, next_lengths
 
 
 def sample_with_policies(

@@ -1,0 +1,29 @@
+from __future__ import annotations
+
+import blocks.inspect as blocks_inspect_mod
+import model as model_pkg
+import model.inspect as model_inspect_mod
+import runtime as runtime_pkg
+import runtime.inspect as runtime_inspect_mod
+
+
+def test_model_and_blocks_inspect_are_runtime_shims():
+    assert model_inspect_mod.detect_target_shapes_from_model is runtime_inspect_mod.detect_target_shapes_from_model
+    assert model_inspect_mod.detect_target_shapes_from_model_full is runtime_inspect_mod.detect_target_shapes_from_model_full
+    assert model_inspect_mod.detect_target_names_from_model_full is runtime_inspect_mod.detect_target_names_from_model_full
+    assert blocks_inspect_mod.infer_target_shapes is runtime_inspect_mod.infer_target_shapes
+    assert blocks_inspect_mod.infer_target_shapes_from_config is runtime_inspect_mod.infer_target_shapes_from_config
+
+
+def test_runtime_and_model_packages_export_inspect_surface():
+    assert runtime_pkg.detect_target_shapes_from_model is runtime_inspect_mod.detect_target_shapes_from_model
+    assert runtime_pkg.detect_target_shapes_from_model_full is runtime_inspect_mod.detect_target_shapes_from_model_full
+    assert runtime_pkg.detect_target_names_from_model_full is runtime_inspect_mod.detect_target_names_from_model_full
+    assert runtime_pkg.infer_target_shapes is runtime_inspect_mod.infer_target_shapes
+    assert runtime_pkg.infer_target_shapes_from_config is runtime_inspect_mod.infer_target_shapes_from_config
+
+    assert model_pkg.detect_target_shapes_from_model is runtime_inspect_mod.detect_target_shapes_from_model
+    assert model_pkg.detect_target_shapes_from_model_full is runtime_inspect_mod.detect_target_shapes_from_model_full
+    assert model_pkg.detect_target_names_from_model_full is runtime_inspect_mod.detect_target_names_from_model_full
+    assert model_pkg.infer_target_shapes is runtime_inspect_mod.infer_target_shapes
+    assert model_pkg.infer_target_shapes_from_config is runtime_inspect_mod.infer_target_shapes_from_config

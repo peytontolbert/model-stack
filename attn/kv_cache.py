@@ -1,19 +1,5 @@
-"""Compatibility shim for KV cache APIs that are now runtime-owned."""
+import sys
 
-from runtime.kv_cache import (
-    ContiguousKVCache,
-    PagedKVCache,
-    init_kv_cache,
-    kv_cache_append,
-    kv_cache_evict,
-    kv_cache_slice,
-)
+import runtime.kv_cache as _runtime_kv_cache
 
-__all__ = [
-    "ContiguousKVCache",
-    "PagedKVCache",
-    "init_kv_cache",
-    "kv_cache_append",
-    "kv_cache_evict",
-    "kv_cache_slice",
-]
+sys.modules[__name__] = _runtime_kv_cache

@@ -1,17 +1,5 @@
-from runtime.blocks import (
-    apply_native_norm,
-    apply_residual_update,
-    block_native_execution_info,
-    can_apply_native_norm,
-    fused_add_norm,
-    stack_native_execution_info,
-)
+import sys
 
-__all__ = [
-    "apply_native_norm",
-    "apply_residual_update",
-    "block_native_execution_info",
-    "can_apply_native_norm",
-    "fused_add_norm",
-    "stack_native_execution_info",
-]
+import runtime.blocks as _runtime_blocks
+
+sys.modules[__name__] = _runtime_blocks

@@ -15,9 +15,8 @@ from examples.program_conditioned_adapter.modules.adapter import (
 )
 from model.llama_bootstrap import build_local_llama_from_snapshot
 from model.hf_snapshot import ensure_snapshot
-from blocks.targets import targets_map
-from blocks.inspect import infer_target_shapes
-from model.inspect import detect_target_names_from_model_full
+from runtime.block_targets import targets_map
+from runtime.inspect import detect_target_names_from_model_full, infer_target_shapes
 from examples.program_conditioned_adapter.modules.mixing import (
     register_hook_mixed_adapters,
 )
@@ -1507,6 +1506,4 @@ def generate_answer_structured(
             pass
 
     return result
-
-
 

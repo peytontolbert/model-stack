@@ -6,7 +6,7 @@ from typing import Iterator
 import torch
 
 from specs.config import ModelConfig
-from model.lm import TransformerLM
+from model import TransformerLM
 from eval.loop import evaluate_lm_next_token
 from data.loader import build_dataloader
 from data.batch import Batch
@@ -42,5 +42,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

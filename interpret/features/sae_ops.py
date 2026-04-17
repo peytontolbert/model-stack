@@ -4,6 +4,8 @@ from typing import Iterable, Optional
 
 import torch
 
+from runtime.ops import activation as runtime_activation
+from runtime.ops import linear as runtime_linear
 from .sae import SparseAutoencoder
 
 
@@ -27,7 +29,7 @@ def sae_decode(sae: SparseAutoencoder, z: torch.Tensor) -> torch.Tensor:
     if z.ndim == 3:
         B, T, C = z.shape
         _z = z.reshape(B * T, C)
-    x_hat = sae.decoder(torch.relu(_z))
+    x_hat = runtime_linear(runtime_activation(_z, "relu"), sae.decoder.weight, sae.decoder.bias)
     if z.ndim == 3:
         x_hat = x_hat.view(z.shape[0], z.shape[1], -1)
     return x_hat
@@ -55,5 +57,4 @@ def sae_boost_features(sae: SparseAutoencoder, x: torch.Tensor, code_indices: It
     idx = torch.tensor(list(code_indices), device=z.device, dtype=torch.long)
     z[..., idx] = z[..., idx] * (1.0 + float(factor))
     return sae_decode(sae, z)
-
 

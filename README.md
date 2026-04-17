@@ -160,7 +160,7 @@ Artifacts: wheels w/ CUDA extras for kernel (pip install kernel[cuda12x]).
 
 Example: Building a small LM from the 10 repos
 from specs.config import ModelConfig
-from model.lm import TransformerLM
+from model import TransformerLM
 from data.loader import build_dataloader
 from train.trainer import Trainer
 from serve.generate import generate

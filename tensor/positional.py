@@ -1,39 +1,5 @@
-from runtime.positional import (
-    RotaryEmbeddingHF,
-    alibi_slopes,
-    apply_rotary,
-    apply_rotary_2d,
-    apply_rotary_scaled,
-    build_alibi_bias,
-    build_relative_position_indices,
-    build_rope_cache,
-    build_rope_cache_2d,
-    build_sinusoidal_cache,
-    fit_alibi_slopes,
-    relative_position_bias_from_table,
-    relative_position_bucket,
-    rescale_positions,
-    rope_ntk_scaling,
-    rope_yarn_factors,
-    rotary_fft,
-)
+import sys
 
-__all__ = [
-    "RotaryEmbeddingHF",
-    "alibi_slopes",
-    "apply_rotary",
-    "apply_rotary_2d",
-    "apply_rotary_scaled",
-    "build_alibi_bias",
-    "build_relative_position_indices",
-    "build_rope_cache",
-    "build_rope_cache_2d",
-    "build_sinusoidal_cache",
-    "fit_alibi_slopes",
-    "relative_position_bias_from_table",
-    "relative_position_bucket",
-    "rescale_positions",
-    "rope_ntk_scaling",
-    "rope_yarn_factors",
-    "rotary_fft",
-]
+import runtime.positional as _runtime_positional
+
+sys.modules[__name__] = _runtime_positional

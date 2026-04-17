@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from runtime.ops import linear as runtime_linear
 
 @dataclass
 class LinearProbeConfig:
@@ -25,7 +26,7 @@ class LinearProbe(nn.Module):
         self.linear = nn.Linear(in_dim, out_dim, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+        return runtime_linear(x, self.linear.weight, self.linear.bias)
 
 
 def _make_loader(x: torch.Tensor, y: torch.Tensor, batch_size: int):
@@ -114,5 +115,4 @@ def fit_linear_probe(
         best_score = score
 
     return probe, best_score
-
 

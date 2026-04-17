@@ -1,5 +1,5 @@
-from runtime.checkpoint import build_local_llama_from_snapshot
+import sys
 
-__all__ = [
-    "build_local_llama_from_snapshot",
-]
+import runtime.checkpoint as _runtime_checkpoint
+
+sys.modules[__name__] = _runtime_checkpoint

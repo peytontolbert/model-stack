@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -377,6 +378,7 @@ std::map<std::string, bool> NativeOpMap() {
       {"attention_decode", true},
       {"attention_prefill", true},
       {"sampling", true},
+      {"beam_search_step", true},
   };
 }
 
@@ -468,10 +470,10 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "activation", "gated_activation", "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "attention_decode", "attention_prefill", "sampling"};
+      "activation", "gated_activation", "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "attention_decode", "attention_prefill", "sampling", "beam_search_step"};
   info["planned_ops"] = std::vector<std::string>{
       "activation", "gated_activation", "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "attention_decode",
-      "attention_prefill", "sampling"};
+      "attention_prefill", "sampling", "beam_search_step"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
   info["linear_backends_planned"] = PlannedLinearBackends();
@@ -566,6 +568,15 @@ torch::Tensor TokenCountsForward(
     const torch::Tensor& token_ids,
     int64_t vocab_size,
     torch::ScalarType counts_dtype);
+py::tuple BeamSearchStepForward(
+    const torch::Tensor& beams,
+    const torch::Tensor& logits,
+    const torch::Tensor& raw_scores,
+    const torch::Tensor& finished,
+    const torch::Tensor& lengths,
+    int64_t beam_size,
+    int64_t eos_id,
+    int64_t pad_id);
 
 torch::Tensor RmsNormForward(
     const torch::Tensor& x,
@@ -2233,6 +2244,79 @@ torch::Tensor TokenCountsForward(
   return counts.scatter_add(1, token_ids.to(torch::kLong), ones);
 }
 
+py::tuple BeamSearchStepForward(
+    const torch::Tensor& beams,
+    const torch::Tensor& logits,
+    const torch::Tensor& raw_scores,
+    const torch::Tensor& finished,
+    const torch::Tensor& lengths,
+    int64_t beam_size,
+    int64_t eos_id,
+    int64_t pad_id) {
+  TORCH_CHECK(beams.defined(), "beam_search_step_forward: beams must be defined");
+  TORCH_CHECK(logits.defined(), "beam_search_step_forward: logits must be defined");
+  TORCH_CHECK(raw_scores.defined(), "beam_search_step_forward: raw_scores must be defined");
+  TORCH_CHECK(finished.defined(), "beam_search_step_forward: finished must be defined");
+  TORCH_CHECK(lengths.defined(), "beam_search_step_forward: lengths must be defined");
+  TORCH_CHECK(beam_size > 0, "beam_search_step_forward: beam_size must be positive");
+  TORCH_CHECK(beams.dim() == 2, "beam_search_step_forward: beams must be rank-2 (B*beam, T)");
+  TORCH_CHECK(raw_scores.dim() == 2, "beam_search_step_forward: raw_scores must be rank-2 (B, beam)");
+  TORCH_CHECK(finished.dim() == 2, "beam_search_step_forward: finished must be rank-2 (B, beam)");
+  TORCH_CHECK(lengths.dim() == 2, "beam_search_step_forward: lengths must be rank-2 (B, beam)");
+  TORCH_CHECK(raw_scores.size(1) == beam_size, "beam_search_step_forward: raw_scores beam dimension mismatch");
+  TORCH_CHECK(finished.sizes() == raw_scores.sizes(), "beam_search_step_forward: finished shape mismatch");
+  TORCH_CHECK(lengths.sizes() == raw_scores.sizes(), "beam_search_step_forward: lengths shape mismatch");
+  const auto batch_size = raw_scores.size(0);
+  TORCH_CHECK(beams.size(0) == batch_size * beam_size, "beam_search_step_forward: beams batch mismatch");
+
+  torch::Tensor next_logits;
+  if (logits.dim() == 3) {
+    TORCH_CHECK(logits.size(0) == batch_size * beam_size, "beam_search_step_forward: logits batch mismatch");
+    TORCH_CHECK(logits.size(1) > 0, "beam_search_step_forward: logits time dimension must be non-empty");
+    next_logits = logits.select(1, logits.size(1) - 1);
+  } else if (logits.dim() == 2) {
+    TORCH_CHECK(logits.size(0) == batch_size * beam_size, "beam_search_step_forward: logits batch mismatch");
+    next_logits = logits;
+  } else {
+    TORCH_CHECK(false, "beam_search_step_forward: logits must be rank-2 or rank-3");
+  }
+  TORCH_CHECK(next_logits.size(1) > 0, "beam_search_step_forward: logits vocab dimension must be non-empty");
+  TORCH_CHECK(pad_id >= 0 && pad_id < next_logits.size(1), "beam_search_step_forward: pad_id out of range");
+
+  auto logp = torch::log_softmax(next_logits, -1).view({batch_size, beam_size, next_logits.size(1)});
+  auto finished_bool = finished.to(torch::kBool);
+  if (finished_bool.any().item<bool>()) {
+    logp = logp.masked_fill(finished_bool.unsqueeze(-1), -std::numeric_limits<float>::infinity());
+    auto pad_scores = logp.select(2, pad_id);
+    pad_scores.copy_(torch::where(finished_bool, torch::zeros_like(pad_scores), pad_scores));
+  }
+
+  auto candidate_scores = raw_scores.unsqueeze(-1) + logp;
+  auto flat_scores = candidate_scores.view({batch_size, beam_size * next_logits.size(1)});
+  auto topk = torch::topk(flat_scores, beam_size, -1);
+  auto best_raw_scores = std::get<0>(topk);
+  auto best_idx = std::get<1>(topk);
+
+  auto parent_beams = torch::floor_divide(best_idx, next_logits.size(1));
+  auto next_tokens = best_idx.remainder(next_logits.size(1));
+
+  auto prev_beams = beams.view({batch_size, beam_size, beams.size(1)});
+  auto gather_index = parent_beams.unsqueeze(-1).expand({batch_size, beam_size, prev_beams.size(2)});
+  auto gathered = prev_beams.gather(1, gather_index);
+
+  auto parent_finished = finished_bool.gather(1, parent_beams);
+  auto appended_tokens = torch::where(parent_finished, torch::full_like(next_tokens, pad_id), next_tokens);
+  auto next_beams = torch::cat(
+      {gathered.reshape({batch_size * beam_size, gathered.size(2)}), appended_tokens.reshape({batch_size * beam_size, 1})},
+      1);
+
+  auto parent_lengths = lengths.gather(1, parent_beams);
+  auto next_lengths = parent_lengths + parent_finished.logical_not().to(lengths.scalar_type());
+  auto next_finished = parent_finished.logical_or(next_tokens.eq(eos_id));
+  return py::make_tuple(next_beams, best_raw_scores, next_finished, next_lengths);
+}
+
+
 py::tuple AppendTokensForward(
     const torch::Tensor& seq,
     const torch::Tensor& next_id,
@@ -2665,6 +2749,9 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("no_repeat_ngram_mask_forward", &NoRepeatNgramMaskForward, py::arg("token_ids"), py::arg("vocab_size"),
         py::arg("n"));
   m.def("sample_next_token_forward", &SampleNextTokenForward, py::arg("logits"), py::arg("do_sample"));
+  m.def("beam_search_step_forward", &BeamSearchStepForward, py::arg("beams"), py::arg("logits"),
+        py::arg("raw_scores"), py::arg("finished"), py::arg("lengths"), py::arg("beam_size"),
+        py::arg("eos_id"), py::arg("pad_id"));
   m.def("repetition_penalty_forward", &RepetitionPenaltyForward, py::arg("logits"), py::arg("token_ids"),
         py::arg("penalty"));
   m.def("token_counts_forward", &TokenCountsForward, py::arg("token_ids"), py::arg("vocab_size"),

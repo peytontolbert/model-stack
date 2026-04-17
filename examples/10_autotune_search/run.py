@@ -4,7 +4,7 @@ import time
 import torch
 
 from specs.config import ModelConfig
-from model.lm import TransformerLM
+from model import TransformerLM
 
 
 def bench_forward(attn_impl: str) -> float:
@@ -33,5 +33,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

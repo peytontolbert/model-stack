@@ -5,6 +5,8 @@ from typing import Dict, Any, List
 
 import torch
 
+from runtime.ops import embedding as runtime_embedding
+
 
 @torch.no_grad()
 def main() -> None:
@@ -125,8 +127,9 @@ def main() -> None:
     from tensor.masking import create_causal_mask
     from tensor.positional import RotaryEmbeddingHF as LocalRotary
     position_ids_local = torch.arange(T, device=args.device).unsqueeze(0)
+    local_input_embeds = runtime_embedding(local.embed.weight, input_ids, local.embed.padding_idx)
     add_mask_local = create_causal_mask(
-        input_embeds=local.embed(input_ids),
+        input_embeds=local_input_embeds,
         attention_mask=attention_mask,
         cache_position=None,
         position_ids=position_ids_local,
@@ -143,7 +146,7 @@ def main() -> None:
         low_freq_factor=getattr(mc, "rope_scaling_low_freq_factor", None),
         high_freq_factor=getattr(mc, "rope_scaling_high_freq_factor", None),
     )
-    cos_loc, sin_loc = rope.forward(local.embed(input_ids), position_ids=position_ids_local)
+    cos_loc, sin_loc = rope.forward(local_input_embeds, position_ids=position_ids_local)
 
     def _stats(a: torch.Tensor, b: torch.Tensor) -> Dict[str, float]:
         a32 = a.detach().to(torch.float32, copy=False).view(-1)
@@ -171,7 +174,7 @@ def main() -> None:
 
     # Run local forward step-by-step to collect per-layer hidden
     local_layers_out: List[torch.Tensor] = []
-    x_loc = local.embed(input_ids)
+    x_loc = local_input_embeds
     mask_loc = add_mask_local
     pos_ids = position_ids_local
     for i, blk in enumerate(local.blocks[: int(args.max_layers) ]):
@@ -207,5 +210,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

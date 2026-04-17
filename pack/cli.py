@@ -11,7 +11,7 @@ from model.factory import build_model
 from viz.session import VizSession
 from viz.render import render_index
 from specs.export import ExportConfig
-from export.exporter import export as export_model
+from export.exporter import export_model
 
 
 def _random_batch(batch_size: int, seq_len: int, vocab_size: int, device: torch.device):
@@ -98,7 +98,7 @@ def cmd_e2e(args: argparse.Namespace) -> None:
             dynamic_axes=args.export_dynamic,
             outdir=args.export_outdir,
         )
-        out = export_model(model, exp_cfg, vocab_size=cfg.vocab_size, d_model=cfg.d_model)
+        out = export_model(model, exp_cfg, model_cfg=cfg)
         print(str(out))
 
 
@@ -137,5 +137,4 @@ def main(argv: Optional[list[str]] = None) -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
 

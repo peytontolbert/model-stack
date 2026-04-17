@@ -16,7 +16,7 @@ from runtime.generation import (
     resolve_generation_sampling_mode as runtime_resolve_generation_sampling_mode,
 )
 from runtime.loader import load_model_dir as runtime_load_model_dir
-from runtime.modeling import (
+from runtime.prep import (
     prepare_model_for_runtime as runtime_prepare_model_for_runtime,
     resolve_model_config as runtime_resolve_model_config,
 )

@@ -1,12 +1,9 @@
-## runtime.py — Programmatic Runner Helpers
+## runtime.py — Thin Convenience Layer
 
-Thin wrappers to compose per‑layer deltas and invoke the orchestrator in‑process.
+Canonical notes on the thin runtime helpers live in the [repo-grounded runtime module doc](../../../repo_grounded_adapters/docs/modules/runtime.md).
 
-### Key APIs
-- `build_per_layer_deltas(adapters, target_names, g_sub=1.0, base_adapters=None)` -> `List[Dict[name->Tensor]]`
-- `run_repo_adapter(...)` -> Convenience wrapper for example backends; prefer calling `modules.runner.generate_answer(...)` in new code.
+### What is different here
+- In this variant, `run_repo_adapter(...)` should be read as a legacy convenience wrapper for example backends.
+- New code should prefer calling `modules.runner.generate_answer(...)` directly.
 
-### Usage
-Use when embedding the runner in another process or service and you need a clean (rc, stdout, stderr) contract.
-
-
+Use the canonical doc for the remaining helper semantics.

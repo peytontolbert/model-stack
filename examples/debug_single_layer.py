@@ -10,6 +10,10 @@ _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from runtime.blocks import apply_native_norm
+from runtime.ops import embedding as runtime_embedding
+from runtime.ops import linear as runtime_linear
+
 
 def main():
     from transformers import AutoModelForCausalLM, AutoConfig
@@ -51,7 +55,7 @@ def main():
     with torch.no_grad():
         # HF embedding
         hf_emb = hf.model.embed_tokens(input_ids)
-        local_emb = local.embed(input_ids)
+        local_emb = runtime_embedding(local.embed.weight, input_ids, local.embed.padding_idx)
         print(f"Embedding diff: {(hf_emb - local_emb).abs().max().item():.10f}")
         
         # Run through layer 0
@@ -79,13 +83,13 @@ def main():
         
         # Final norm
         hf_normed = hf.model.norm(hf_layer0_out)
-        local_normed = local.norm(local_layer0_out)
+        local_normed = apply_native_norm(local_layer0_out, local.norm)
         
         print(f"After final norm diff: {(hf_normed - local_normed).abs().max().item():.6f}")
         
         # LM head
         hf_logits = hf.lm_head(hf_normed)
-        local_logits = local.lm_head(local_normed)
+        local_logits = runtime_linear(local_normed, local.lm_head.weight, local.lm_head.bias)
         
         print(f"\nFinal logits diff: {(hf_logits - local_logits).abs().max().item():.6f}")
         print(f"  HF logits [0, 0, :5]: {hf_logits[0, 0, :5].tolist()}")
@@ -102,4 +106,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

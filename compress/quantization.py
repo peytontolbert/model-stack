@@ -10,7 +10,7 @@ from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from runtime.ops import linear as runtime_linear
 from tensor.numerics import percentile_scale, mse_scale
 
 
@@ -71,9 +71,15 @@ def calibrate_int8_scales(
 def _dequantize_int8_per_channel(
     qweight: torch.Tensor, inv_scale: torch.Tensor, ch_axis: int = 0
 ) -> torch.Tensor:
-    while inv_scale.ndim < qweight.ndim:
-        inv_scale = inv_scale.unsqueeze(ch_axis)
-    return (qweight.to(dtype=torch.float32) * inv_scale)
+    scale = inv_scale
+    if scale.ndim == 1:
+        view_shape = [1] * qweight.ndim
+        view_shape[ch_axis] = scale.shape[0]
+        scale = scale.view(*view_shape)
+    else:
+        while scale.ndim < qweight.ndim:
+            scale = scale.unsqueeze(-1)
+    return qweight.to(dtype=torch.float32) * scale
 
 
 def fake_quantize_fp8(
@@ -134,7 +140,7 @@ class QuantizedLinearInt8(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Dequantize weight on the fly
         w = _dequantize_int8_per_channel(self.qweight, self.inv_scale, ch_axis=0)
-        return F.linear(x, w, self.bias)
+        return runtime_linear(x, w, self.bias)
 
 
 def quantize_linear_modules(
@@ -173,5 +179,3 @@ __all__ = [
     "quantize_linear_modules",
     "calibrate_int8_scales",
 ]
-
-

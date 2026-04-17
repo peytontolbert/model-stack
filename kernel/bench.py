@@ -5,8 +5,8 @@ from typing import Iterable
 
 import torch
 
-from attn.backends import scaled_dot_product_attention as sdpa
-from attn.backends import select_attention_backend
+from runtime.attention import scaled_dot_product_attention as sdpa
+from runtime.attention import select_attention_backend
 from kernel import available as kernel_available
 
 
@@ -68,5 +68,4 @@ if __name__ == "__main__":
     res = bench_attention_backends()
     for k, v in res.items():
         print(f"{k}: {v:.2f} ms/iter")
-
 

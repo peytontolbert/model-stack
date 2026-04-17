@@ -11,6 +11,10 @@ _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from runtime.blocks import apply_native_norm
+from runtime.ops import embedding as runtime_embedding
+from runtime.ops import linear as runtime_linear
+
 
 def main():
     from transformers import AutoModelForCausalLM, AutoConfig
@@ -56,12 +60,12 @@ def main():
     with torch.no_grad():
         # Embeddings
         hf_x = hf.model.embed_tokens(input_ids)
-        local_x = local.embed(input_ids)
+        local_x = runtime_embedding(local.embed.weight, input_ids, local.embed.padding_idx)
         print(f"After embed - max diff: {(hf_x - local_x).abs().max().item():.10f}")
         
         # Pre-norm
         hf_x_norm = hf.model.layers[0].input_layernorm(hf_x)
-        local_x_norm = local.blocks[0].n1(local_x)
+        local_x_norm = apply_native_norm(local_x, local.blocks[0].n1)
         diff_norm = (hf_x_norm - local_x_norm).abs()
         print(f"After input norm - max diff: {diff_norm.max().item():.10f}")
         print(f"  HF norm output sample: {hf_x_norm[0, 0, :5].tolist()}")
@@ -72,15 +76,15 @@ def main():
         local_attn = local.blocks[0].attn
         
         hf_q = hf_attn.q_proj(hf_x_norm)
-        local_q = local_attn.w_q(local_x_norm)
+        local_q = runtime_linear(local_x_norm, local_attn.w_q.weight, local_attn.w_q.bias)
         print(f"After Q proj - max diff: {(hf_q - local_q).abs().max().item():.10f}")
         
         hf_k = hf_attn.k_proj(hf_x_norm)
-        local_k = local_attn.w_k(local_x_norm)
+        local_k = runtime_linear(local_x_norm, local_attn.w_k.weight, local_attn.w_k.bias)
         print(f"After K proj - max diff: {(hf_k - local_k).abs().max().item():.10f}")
         
         hf_v = hf_attn.v_proj(hf_x_norm)
-        local_v = local_attn.w_v(local_x_norm)
+        local_v = runtime_linear(local_x_norm, local_attn.w_v.weight, local_attn.w_v.bias)
         print(f"After V proj - max diff: {(hf_v - local_v).abs().max().item():.10f}")
         
         # Reshape to heads
@@ -155,4 +159,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

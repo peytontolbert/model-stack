@@ -8,7 +8,7 @@ Quick start
 ```python
 from specs.config import ModelConfig
 from specs.dist import DistConfig
-from model.factory import build_model
+from model import build_model
 from train.run import run_training
 
 cfg = ModelConfig(d_model=512, n_heads=8, n_layers=6, d_ff=2048, vocab_size=32000)

@@ -12,7 +12,7 @@ from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from runtime.ops import linear as runtime_linear
 from tensor.init import kaiming_uniform_linear
 
 
@@ -71,15 +71,15 @@ class LoRALinear(nn.Module):
     def _linear(self, x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]) -> torch.Tensor:
         if self.fan_in_fan_out:
             weight = weight.t()
-        return F.linear(x, weight, bias)
+        return runtime_linear(x, weight, bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         result = self._linear(x, self.weight, self.bias)
         if self.lora_rank > 0 and not self._merged:
             # LoRA path
             after_dropout = self.lora_dropout(x)
-            # [*, in_features] @ [in_features, r] @ [r, out_features] -> [*, out_features]
-            lora_update = after_dropout.matmul(self.lora_A).matmul(self.lora_B)
+            lora_hidden = runtime_linear(after_dropout, self.lora_A.t(), None)
+            lora_update = runtime_linear(lora_hidden, self.lora_B.t(), None)
             result = result + self.lora_scaling * lora_update
         return result
 
@@ -232,4 +232,3 @@ def extract_lora_delta(base_sd: Dict[str, torch.Tensor], finetuned_sd: Dict[str,
 
 
 # Local imports at end to avoid circulars
-

@@ -1,22 +1,11 @@
-## code_graph.py — Repository Index and Utilities
+## code_graph.py — Example Backend Note
 
-Parses Python files to build symbols, modules, imports, call edges, star import expansion, pytest node mapping, and optional coverage attachment.
+The canonical Python-repo `code_graph.py` walkthrough lives in the [repo-grounded code-graph doc](../../../repo_grounded_adapters/docs/modules/code_graph.md).
 
-### CLI Examples (example backend: Python repo)
-```bash
-python -m examples.program_conditioned_adapter.examples.python_repo_grounded_qa.code_graph /repo --dump
-python -m examples.program_conditioned_adapter.examples.python_repo_grounded_qa.code_graph /repo --defs-in modules.runner
-python -m examples.program_conditioned_adapter.examples.python_repo_grounded_qa.code_graph /repo --search attention_score
-```
+### What is different here
+- `Program‑Conditioned Adapter` core does not require a built-in Python `code_graph.py` owner.
+- Python repository indexing is provided by example backends, for example under:
+  - `examples.program_conditioned_adapter.examples.python_repo_grounded_qa.code_graph`
+  - `examples.program_conditioned_adapter.examples.python_repo_grounded_planning.code_graph`
 
-### Programmatic
-- `CodeGraph.load_or_build(root, ignore=None)` -> `CodeGraph`
-- Lookups: `defs_in(module)`, `find_symbol(name)`, `owners_of(symbol)`, `who_calls(fqn)`, `refs_of(fqn)`, `tests_for_module(module)`
-- Exports: `export_json()`, `export_sqlite(path)`
-- Incremental: loads/saves `.codegraph.json` with mtimes and hashes.
-
-### Notes
-- Honors `.gitignore` when available; supports additional ignore prefixes.
-- Coverage XML can be attached to compute per‑symbol coverage estimates.
-
-
+Use the canonical doc for the concrete Python repo graph behavior; treat this page as the pointer explaining that the core expects a backend, not a fixed graph implementation.

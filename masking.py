@@ -1,7 +1,5 @@
-"""Compatibility shim for masking helpers that remain tensor-owned."""
+import sys
 
-from tensor import masking as _masking
+import tensor.masking as _tensor_masking
 
-__all__ = [name for name in dir(_masking) if not name.startswith("_")]
-
-globals().update({name: getattr(_masking, name) for name in __all__})
+sys.modules[__name__] = _tensor_masking

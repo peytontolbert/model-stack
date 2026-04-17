@@ -22,7 +22,7 @@ from examples.program_conditioned_adapter.modules.adapter import (  # type: igno
     save_npz,
 )
 from model.hf_snapshot import ensure_snapshot
-from model.inspect import detect_target_shapes_from_model
+from runtime.inspect import detect_target_shapes_from_model
 from examples.program_conditioned_adapter.modules.capacity import entropy_score  # type: ignore
 #
 # NOTE: Build is program-agnostic; no backend-specific imports here.
@@ -1123,5 +1123,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

@@ -16,7 +16,7 @@ from examples.program_conditioned_adapter.modules.adapter import (
     save_npz,
     generate_lora_from_embedding,
 )
-from model.inspect import detect_target_shapes_from_model_full, detect_target_shapes_from_model
+from runtime.inspect import detect_target_shapes_from_model, detect_target_shapes_from_model_full
 
 
 def _run_repo_adapter_cli(
@@ -299,5 +299,4 @@ def export_tuned_adapters(
             )
         except Exception:
             continue
-
 

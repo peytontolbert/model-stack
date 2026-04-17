@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from attn.eager import EagerAttention
+from runtime.attention_modules import EagerAttention
 
 
 @torch.no_grad()
@@ -85,5 +85,4 @@ def head_grad_saliencies(
     if was_training:
         model.train(True)
     return sal
-
 

@@ -9,6 +9,49 @@ from typing import Any
 
 NATIVE_MODULE_NAME = "_model_stack_native"
 DISABLE_ENV = "MODEL_STACK_DISABLE_NATIVE"
+_FALLBACK_NATIVE_OPS = [
+    "activation",
+    "gated_activation",
+    "embedding",
+    "linear",
+    "pack_linear_weight",
+    "mlp",
+    "qkv_projection",
+    "pack_qkv_weights",
+    "qkv_packed_heads_projection",
+    "qkv_heads_projection",
+    "split_heads",
+    "merge_heads",
+    "head_output_projection",
+    "prepare_attention_mask",
+    "resolve_position_ids",
+    "create_causal_mask",
+    "resolve_rotary_embedding",
+    "token_counts",
+    "append_tokens",
+    "decode_positions",
+    "rms_norm",
+    "add_rms_norm",
+    "residual_add",
+    "layer_norm",
+    "add_layer_norm",
+    "rope",
+    "kv_cache_append",
+    "kv_cache_write",
+    "kv_cache_gather",
+    "paged_kv_assign_blocks",
+    "paged_kv_reserve_pages",
+    "paged_kv_read_range",
+    "paged_kv_read_last",
+    "paged_kv_append",
+    "paged_kv_compact",
+    "paged_kv_gather",
+    "paged_kv_write",
+    "attention_decode",
+    "attention_prefill",
+    "sampling",
+    "beam_search_step",
+]
 
 
 @dataclass(frozen=True)
@@ -17,6 +60,51 @@ class NativeRuntimeStatus:
     module_name: str
     info: dict[str, Any]
     error: str | None = None
+
+
+def _dedupe_str_list(values: Any) -> list[str]:
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value)
+        if text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _normalize_runtime_info(info: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(info)
+    native_ops = _dedupe_str_list(normalized.get("native_ops"))
+    if not native_ops:
+        native_ops = list(_FALLBACK_NATIVE_OPS)
+    normalized["native_ops"] = native_ops
+
+    planned_ops = _dedupe_str_list(normalized.get("planned_ops"))
+    if not planned_ops:
+        planned_ops = list(native_ops)
+    normalized["planned_ops"] = planned_ops
+
+    kernel_ops = _dedupe_str_list(normalized.get("cuda_kernel_ops") or normalized.get("cuda_backend_ops"))
+    normalized["cuda_backend_ops"] = list(kernel_ops)
+    normalized["cuda_kernel_ops"] = list(kernel_ops)
+
+    compiled_with_cuda = bool(normalized.get("compiled_with_cuda", False))
+    inference_ops = _dedupe_str_list(normalized.get("cuda_inference_ops"))
+    if not inference_ops:
+        inference_ops = list(native_ops) if compiled_with_cuda else []
+    normalized["cuda_inference_ops"] = inference_ops
+
+    composite_ops = _dedupe_str_list(normalized.get("cuda_composite_ops"))
+    if not composite_ops:
+        kernel_set = set(kernel_ops)
+        composite_ops = [name for name in inference_ops if name not in kernel_set]
+    normalized["cuda_composite_ops"] = composite_ops
+    normalized["full_cuda_inference"] = bool(compiled_with_cuda and inference_ops)
+    return normalized
 
 
 @lru_cache(maxsize=1)
@@ -63,7 +151,24 @@ def native_available() -> bool:
 
 
 def runtime_info() -> dict[str, Any]:
-    return dict(runtime_status().info)
+    return _normalize_runtime_info(runtime_status().info)
+
+
+def cuda_kernel_ops() -> list[str]:
+    return list(runtime_info().get("cuda_kernel_ops", ()))
+
+
+def cuda_inference_ops() -> list[str]:
+    return list(runtime_info().get("cuda_inference_ops", ()))
+
+
+def cuda_composite_ops() -> list[str]:
+    return list(runtime_info().get("cuda_composite_ops", ()))
+
+
+def full_cuda_inference_available() -> bool:
+    status = runtime_status()
+    return bool(status.available and runtime_info().get("full_cuda_inference", False))
 
 
 def native_module():

@@ -5,9 +5,13 @@ from typing import Optional
 import math
 import torch
 
-from attn.eager import EagerAttention
-from tensor.shape import split_heads
-from tensor.positional import build_rope_cache, apply_rotary
+from runtime.attention_modules import EagerAttention
+from runtime.blocks import apply_native_norm
+from runtime.ops import apply_rotary as runtime_apply_rotary
+from runtime.ops import embedding as runtime_embedding
+from runtime.ops import linear as runtime_linear
+from runtime.ops import split_heads as runtime_split_heads
+from tensor.positional import build_rope_cache
 from tensor.masking import broadcast_mask
 from tensor.numerics import safe_softmax, entropy_from_probs
 
@@ -24,13 +28,13 @@ def attention_weights_for_layer(
 
     This re-computes the hidden state up to the target layer and then derives
     attention weights from the layer's attention module parameters. Works with
-    `blocks.TransformerBlock` using `attn.eager.EagerAttention`.
+    `blocks.TransformerBlock` using `runtime.attention_modules.EagerAttention`.
     """
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
 
     # 1) Compute hidden state input to the target block
-    x = model.embed(input_ids.to(device))
+    x = runtime_embedding(model.embed.weight, input_ids.to(device), model.embed.padding_idx)
     for j, blk in enumerate(model.blocks):
         if j >= layer_index:
             break
@@ -43,7 +47,7 @@ def attention_weights_for_layer(
 
     # 2) Build the attention input (prenorm vs postnorm)
     if getattr(block.bc, "norm_policy", "prenorm") == "prenorm":
-        q_in = block.n1(x)
+        q_in = apply_native_norm(x, block.n1)
     else:
         q_in = x
 
@@ -53,16 +57,16 @@ def attention_weights_for_layer(
     Dh = int(attn.head_dim)
 
     # 3) Project Q,K with module weights (self-attn; K from q_in)
-    q_lin = attn.w_q(q_in)
-    k_lin = attn.w_k(q_in)
+    q_lin = runtime_linear(q_in, attn.w_q.weight, attn.w_q.bias)
+    k_lin = runtime_linear(q_in, attn.w_k.weight, attn.w_k.bias)
 
-    qh = split_heads(q_lin, H)      # (B,H,T,Dh)
-    kh_new = split_heads(k_lin, Hk) # (B,Hk,T,Dh)
+    qh = runtime_split_heads(q_lin, H)      # (B,H,T,Dh)
+    kh_new = runtime_split_heads(k_lin, Hk) # (B,Hk,T,Dh)
 
     # 4) Apply RoPE if used
     if attn.use_rope:
         cos, sin = build_rope_cache(T, Dh, device=device, base_theta=float(attn.rope_theta))
-        qh, kh_new = apply_rotary(qh, kh_new, cos.to(dtype=q_in.dtype), sin.to(dtype=q_in.dtype))
+        qh, kh_new = runtime_apply_rotary(qh, kh_new, cos.to(dtype=q_in.dtype), sin.to(dtype=q_in.dtype))
 
     # 5) Expand KV across heads for GQA
     if H != Hk:
@@ -105,5 +109,3 @@ def attention_entropy_for_layer(
     probs = attention_weights_for_layer(model, input_ids, layer_index, attn_mask=attn_mask)
     ent = entropy_from_probs(probs, dim=-1)
     return ent
-
-

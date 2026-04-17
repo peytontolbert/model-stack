@@ -5,7 +5,7 @@ from .config import RLConfig
 from .trainer import Trainer
 from specs.config import ModelConfig
 from model.causal import CausalLM
-from attn.backends import select_attention_backend
+from runtime.attention import select_attention_backend
 
 
 def make_batches(algo: str, device: torch.device, steps: int = 1000, seq_len: int = 16, vocab: int = 128):
@@ -69,5 +69,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

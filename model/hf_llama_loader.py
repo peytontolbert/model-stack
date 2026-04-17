@@ -1,5 +1,5 @@
-from runtime.checkpoint import load_hf_llama_weights_into_local
+import sys
 
-__all__ = [
-    "load_hf_llama_weights_into_local",
-]
+import runtime.checkpoint as _runtime_checkpoint
+
+sys.modules[__name__] = _runtime_checkpoint

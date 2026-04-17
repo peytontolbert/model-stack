@@ -21,7 +21,7 @@ def load_model_dir(
     **kwargs,
 ):
     from runtime.factory import build_model
-    from runtime.modeling import RuntimeModelArtifacts, prepare_model_for_runtime
+    from runtime.prep import RuntimeModelArtifacts, prepare_model_for_runtime
 
     cfg = runtime_checkpoint_mod.load_config(model_dir)
     model = build_model(cfg, task=task, block=block, compress=compress, **kwargs)
@@ -48,7 +48,7 @@ def load_model_factory_spec(
     dtype: str | torch.dtype | None = None,
     eval_mode: bool = True,
 ):
-    from runtime.modeling import RuntimeModelArtifacts, prepare_model_for_runtime, resolve_model_config
+    from runtime.prep import RuntimeModelArtifacts, prepare_model_for_runtime, resolve_model_config
 
     mod_name, fn_name = spec.split(":", 1)
     module = importlib.import_module(mod_name)

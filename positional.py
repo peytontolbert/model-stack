@@ -1,4 +1,5 @@
-"""Compatibility shim for positional helpers now owned under tensor/runtime."""
+import sys
 
-from tensor.positional import *  # noqa: F401,F403
-from tensor.positional import __all__
+import tensor.positional as _tensor_positional
+
+sys.modules[__name__] = _tensor_positional
