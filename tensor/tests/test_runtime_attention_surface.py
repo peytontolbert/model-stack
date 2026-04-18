@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import torch
+
 import attn
 import attn.backends as attn_backends_mod
 import attn.decoding as attn_decoding_mod
@@ -32,6 +34,34 @@ import runtime.kv_cache as runtime_kv_cache_mod
 import runtime.moe as runtime_moe_mod
 import runtime.optim_utils as runtime_optim_utils_mod
 import runtime.quant as runtime_quant_mod
+
+
+def test_scaled_dot_product_attention_explicit_torch_backend_bypasses_native_runtime(monkeypatch):
+    calls = {"native": 0, "torch": 0}
+
+    def fail_native(*args, **kwargs):
+        del args, kwargs
+        calls["native"] += 1
+        raise AssertionError("explicit torch backend should not route back into native attention")
+
+    def fake_torch_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=None, scale=None):
+        del k, v, attn_mask, dropout_p, is_causal, scale
+        calls["torch"] += 1
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(runtime_attention_mod, "native_attention", fail_native, raising=False)
+    monkeypatch.setattr(
+        torch.nn.functional,
+        "scaled_dot_product_attention",
+        fake_torch_sdpa,
+    )
+
+    q = torch.randn(2, 3, 4, 5)
+    out = runtime_attention_mod.scaled_dot_product_attention(q, q, q, backend="torch", is_causal=True)
+
+    assert out.shape == q.shape
+    assert calls["native"] == 0
+    assert calls["torch"] == 1
 
 
 def test_attn_shims_delegate_to_runtime_attention():

@@ -1,98 +1,45 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Dict, Iterable, List
+from contextlib import ExitStack, contextmanager
+from typing import Dict, Iterable, Optional
 
-import torch
 import torch.nn as nn
 
 from runtime.attention_modules import EagerAttention
-from runtime.attention import scaled_dot_product_attention, select_attention_backend
-from runtime.ops import apply_rotary as runtime_apply_rotary
-from runtime.ops import head_output_projection as runtime_head_output_projection
-from runtime.ops import linear as runtime_linear
-from runtime.ops import split_heads as runtime_split_heads
-from tensor.positional import build_rope_cache
 
-
-def _wrap_forward_with_head_ablation(attn: EagerAttention, zero_heads: List[int]):
-    zero_set = set(int(h) for h in zero_heads)
-    orig_forward = attn.forward
-
-    def forward(q, k, v, mask, cache=None):
-        # Re-implement EagerAttention.forward to intercept per-head outputs before w_o
-        x = q
-        B, T, D = x.shape
-        device, dtype = x.device, x.dtype
-
-        q_lin = runtime_linear(x, attn.w_q.weight, attn.w_q.bias)
-        k_source = x if k is None else k
-        v_source = x if v is None else v
-        k_lin = runtime_linear(k_source, attn.w_k.weight, attn.w_k.bias)
-        v_lin = runtime_linear(v_source, attn.w_v.weight, attn.w_v.bias)
-
-        qh = runtime_split_heads(q_lin, attn.n_heads)
-        kh_new = runtime_split_heads(k_lin, attn.n_kv_heads)
-        vh_new = runtime_split_heads(v_lin, attn.n_kv_heads)
-
-        if attn.use_rope:
-            cos, sin = build_rope_cache(T, attn.head_dim, device=device, base_theta=float(attn.rope_theta))
-            qh, kh_new = runtime_apply_rotary(qh, kh_new, cos.to(dtype=dtype), sin.to(dtype=dtype))
-
-        if cache is not None:
-            k_old, v_old = cache.read(0, cache.length())
-            if k_old is not None and k_old.shape[2] > 0:
-                kh_all = torch.cat([k_old, kh_new], dim=2)
-                vh_all = torch.cat([v_old, vh_new], dim=2)
-            else:
-                kh_all, vh_all = kh_new, vh_new
-        else:
-            kh_all, vh_all = kh_new, vh_new
-
-        if attn.n_kv_heads != attn.n_heads:
-            repeat = attn.n_heads // attn.n_kv_heads
-            kh_all = kh_all.repeat_interleave(repeat, dim=1)
-            vh_all = vh_all.repeat_interleave(repeat, dim=1)
-
-        backend = select_attention_backend(is_causal=attn.is_causal, dtype=dtype, seq=T, heads=attn.n_heads, device=device)
-        out = scaled_dot_product_attention(
-            qh, kh_all, vh_all, attn_mask=mask, dropout_p=attn.attn_dropout_p if attn.training else 0.0, backend=backend, is_causal=attn.is_causal
-        )
-
-        # Zero out selected heads in the per-head output tensor prior to merge and w_o
-        if zero_set:
-            # out shape: (B, H, T, Dh)
-            for h in zero_set:
-                if 0 <= h < out.shape[1]:
-                    out[:, h].zero_()
-
-        if cache is not None and T > 0:
-            cache.append(kh_new, vh_new)
-
-        return runtime_head_output_projection(out, attn.w_o.weight, attn.w_o.bias)
-
-    return orig_forward, forward
+from interpret.model_adapter import get_model_adapter, patched_attention
 
 
 @contextmanager
-def ablate_attention_heads(model: nn.Module, mapping: Dict[int, Iterable[int]]):
-    """Temporarily zero-out specified heads in `blocks.{layer}.attn` during forward.
+def ablate_attention_heads(
+    model: nn.Module,
+    mapping: Dict[int, Iterable[int]],
+    *,
+    stack: Optional[str] = None,
+    kind: str = "self",
+):
+    """Temporarily zero specified attention heads during forward.
 
-    mapping: {layer_index: [head_indices,...]}
-    Only supports `runtime.attention_modules.EagerAttention` attention modules.
+    The wrapper preserves the real runtime attention path and only replaces the
+    selected head outputs immediately before the output projection.
     """
-    handles = []
-    origs = []
-    try:
+    adapter = get_model_adapter(model)
+    with ExitStack() as stack_ctx:
         for layer_idx, heads in mapping.items():
-            blk = model.blocks[int(layer_idx)]
-            attn = getattr(blk, "attn", None)
+            attn = adapter.attention_target(int(layer_idx), stack=stack, kind=kind).module  # type: ignore[arg-type]
             if not isinstance(attn, EagerAttention):
                 continue
-            orig_forward, new_forward = _wrap_forward_with_head_ablation(attn, list(heads))
-            origs.append((attn, orig_forward))
-            attn.forward = new_forward  # type: ignore
+            zero_set = {int(h) for h in heads}
+
+            def _patch(head_out, *, _zero_set=zero_set):
+                out = head_out.clone()
+                for h in _zero_set:
+                    if 0 <= h < out.shape[1]:
+                        out[:, h].zero_()
+                return out
+
+            stack_ctx.enter_context(patched_attention(attn, patch_heads=_patch))
         yield
-    finally:
-        for attn, orig_forward in origs:
-            attn.forward = orig_forward  # type: ignore
+
+
+__all__ = ["ablate_attention_heads"]

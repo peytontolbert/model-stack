@@ -36,6 +36,8 @@ class GenerateRequest(BaseModel):
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     sliding_window: Optional[int] = None
+    beam_size: int = 1
+    length_penalty: float = 1.0
     cache_backend: Optional[str] = None
 
 
@@ -70,6 +72,8 @@ def generate(req: GenerateRequest) -> GenerateResponse:
             presence_penalty=req.presence_penalty,
             frequency_penalty=req.frequency_penalty,
             sliding_window=req.sliding_window,
+            beam_size=req.beam_size,
+            length_penalty=req.length_penalty,
         )
         output_ids = rt.generate_token_lists(
             req.input_ids,

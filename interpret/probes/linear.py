@@ -42,6 +42,8 @@ def evaluate(probe: LinearProbe, x: torch.Tensor, y: torch.Tensor, task: str) ->
         acc = (pred.argmax(dim=-1) == y).float().mean().item()
         return acc
     else:
+        if y.ndim == 1:
+            y = y.unsqueeze(-1)
         mse = torch.mean((pred - y) ** 2).item()
         return mse
 
@@ -70,7 +72,7 @@ def fit_linear_probe(
         y_val = y_val.to(device)
 
     in_dim = x_train.shape[-1]
-    out_dim = int(y_train.max().item()) + 1 if cfg.task == "classification" else y_train.shape[-1]
+    out_dim = int(y_train.max().item()) + 1 if cfg.task == "classification" else (1 if y_train.ndim == 1 else int(y_train.shape[-1]))
     probe = LinearProbe(in_dim, out_dim).to(device)
 
     criterion: nn.Module
@@ -87,6 +89,7 @@ def fit_linear_probe(
         best_score = 0.0
     else:
         best_score = float("inf")
+    best_state = {k: v.detach().clone() for k, v in probe.state_dict().items()}
     patience_left = cfg.patience
 
     for _epoch in range(cfg.epochs):
@@ -94,6 +97,8 @@ def fit_linear_probe(
         for xb, yb in loader:
             optimizer.zero_grad(set_to_none=True)
             logits = probe(xb)
+            if cfg.task == "regression" and yb.ndim == 1:
+                yb = yb.unsqueeze(-1)
             loss = criterion(logits, yb)
             loss.backward()
             optimizer.step()
@@ -103,6 +108,7 @@ def fit_linear_probe(
             improved = score > best_score if cfg.task == "classification" else score < best_score
             if improved:
                 best_score = score
+                best_state = {k: v.detach().clone() for k, v in probe.state_dict().items()}
                 patience_left = cfg.patience
             else:
                 patience_left -= 1
@@ -113,6 +119,8 @@ def fit_linear_probe(
     if x_val is None or y_val is None:
         score = evaluate(probe, x_train, y_train, cfg.task)
         best_score = score
+        best_state = {k: v.detach().clone() for k, v in probe.state_dict().items()}
+
+    probe.load_state_dict(best_state)
 
     return probe, best_score
-

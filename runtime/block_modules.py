@@ -14,7 +14,7 @@ from runtime.blocks import (
     prepare_encoder_attention_mask,
 )
 from runtime.moe import combine_expert_outputs, load_balance_loss, topk_router
-from runtime.ops import linear as runtime_linear
+from runtime.ops import linear_module as runtime_linear_module
 from specs.config import ModelConfig
 from tensor.mlp import MLP
 from tensor.norms import RMSNorm
@@ -102,6 +102,8 @@ class LlamaBlock(TransformerBlock):
             use_rope=overrides.pop("use_rope", True),
             rope_theta=overrides.pop("rope_theta", getattr(cfg, "rope_theta", 1e6)),
             use_alibi=overrides.pop("use_alibi", False),
+            use_rpb=overrides.pop("use_rpb", False),
+            rpb_max_distance=overrides.pop("rpb_max_distance", 128),
             checkpoint_forward=overrides.pop("checkpoint_forward", False),
         )
         attn = build_attention(
@@ -129,6 +131,8 @@ class GPTBlock(TransformerBlock):
             use_rope=overrides.pop("use_rope", False),
             rope_theta=overrides.pop("rope_theta", getattr(cfg, "rope_theta", 1e6)),
             use_alibi=overrides.pop("use_alibi", False),
+            use_rpb=overrides.pop("use_rpb", False),
+            rpb_max_distance=overrides.pop("rpb_max_distance", 128),
             checkpoint_forward=overrides.pop("checkpoint_forward", False),
         )
         attn = build_attention(
@@ -317,7 +321,7 @@ class MoEMLP(nn.Module):
         self.dropout = nn.Dropout(dropout_p) if dropout_p and dropout_p > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        logits = runtime_linear(x, self.router.weight, self.router.bias)
+        logits = runtime_linear_module(x, self.router)
         routes = topk_router(logits, k=self.k)
         expert_out = []
         for expert in self.experts:
@@ -333,6 +337,7 @@ class MoEMLP(nn.Module):
 
 class MoEBlock(TransformerBlock):
     def __init__(self, cfg: ModelConfig, num_experts: int = 4, k: int = 1, **overrides):
+        drop_path = float(overrides.pop("drop_path", 0.0))
         bc: BlockConfig = build_block_config_from_model(cfg, **overrides)
         attn = build_attention(
             cfg,
@@ -341,7 +346,6 @@ class MoEBlock(TransformerBlock):
             use_rope=bc.use_rope,
             rope_theta=bc.rope_theta,
         )
-        drop_path = float(overrides.pop("drop_path", 0.0))
         super().__init__(cfg, attn, block_cfg=bc, drop_path=drop_path)
         self.moe = MoEMLP(cfg.d_model, cfg.d_ff, num_experts=num_experts, k=k, dropout_p=bc.mlp_dropout)
 

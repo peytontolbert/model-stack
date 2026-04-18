@@ -10,6 +10,7 @@ import torch.optim as optim
 from runtime.ops import activation as runtime_activation
 from runtime.ops import linear as runtime_linear
 
+
 @dataclass
 class SAEConfig:
     code_dim: int
@@ -38,6 +39,17 @@ def _make_loader(x: torch.Tensor, batch_size: int):
     return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=False)
 
 
+@torch.no_grad()
+def sae_reconstruction_metrics(sae: SparseAutoencoder, features: torch.Tensor) -> dict[str, float]:
+    sae.eval()
+    x_hat, z = sae(features)
+    return {
+        "reconstruction_mse": float(torch.mean((x_hat - features) ** 2).item()),
+        "avg_code_l1": float(torch.mean(torch.abs(z)).item()),
+        "max_code_activation": float(z.abs().amax().item()) if z.numel() > 0 else 0.0,
+    }
+
+
 def fit_sae(features: torch.Tensor, *, cfg: SAEConfig) -> tuple[SparseAutoencoder, dict]:
     """Train a simple sparse autoencoder on features [N,D].
 
@@ -52,8 +64,10 @@ def fit_sae(features: torch.Tensor, *, cfg: SAEConfig) -> tuple[SparseAutoencode
 
     loader = _make_loader(x, cfg.batch_size)
     best_loss = float("inf")
+    best_epoch = -1
     patience_left = cfg.patience
-    for _ in range(cfg.epochs):
+    history: list[float] = []
+    for epoch in range(cfg.epochs):
         sae.train()
         running = 0.0
         count = 0
@@ -68,12 +82,30 @@ def fit_sae(features: torch.Tensor, *, cfg: SAEConfig) -> tuple[SparseAutoencode
             running += float(loss.item()) * xb.size(0)
             count += xb.size(0)
         epoch_loss = running / max(count, 1)
+        history.append(float(epoch_loss))
         if epoch_loss < best_loss:
             best_loss = epoch_loss
+            best_epoch = epoch
             patience_left = cfg.patience
         else:
             patience_left -= 1
             if patience_left <= 0:
                 break
-    return sae, {"loss": best_loss}
 
+    metrics = sae_reconstruction_metrics(sae, x)
+    return sae, {
+        "loss": float(best_loss),
+        "loss_history": history,
+        "best_epoch": int(best_epoch),
+        "epochs_run": len(history),
+        "stopped_early": len(history) < int(cfg.epochs),
+        **metrics,
+    }
+
+
+__all__ = [
+    "SAEConfig",
+    "SparseAutoencoder",
+    "fit_sae",
+    "sae_reconstruction_metrics",
+]

@@ -7,7 +7,7 @@ from runtime.block_modules import DecoderBlock, EncoderBlock
 from runtime.block_schedules import drop_path_linear
 from runtime.blocks import apply_native_norm, execute_decoder_stack, execute_encoder_stack
 from runtime.ops import embedding as runtime_embedding
-from runtime.ops import linear as runtime_linear
+from runtime.ops import linear_module as runtime_linear_module
 from specs.config import ModelConfig
 
 
@@ -83,7 +83,7 @@ class EncoderDecoderLM(nn.Module):
     ) -> torch.Tensor:
         memory = self.encode(enc_input_ids, enc_padding_mask)
         x = self.decode(dec_input_ids, memory, dec_self_mask, enc_padding_mask, cache)
-        return runtime_linear(x, self.lm_head.weight, self.lm_head.bias)
+        return runtime_linear_module(x, self.lm_head)
 
 
 __all__ = ["EncoderDecoderLM"]

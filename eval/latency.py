@@ -66,6 +66,8 @@ def latency_generate(
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
     sliding_window: int | None = None,
+    beam_size: int = 1,
+    length_penalty: float = 1.0,
     cache_backend: str | None = None,
 ) -> LatencyDist:
     dev = torch.device(device) if device is not None else next(model.parameters()).device
@@ -90,10 +92,14 @@ def latency_generate(
         presence_penalty=float(presence_penalty),
         frequency_penalty=float(frequency_penalty),
         sliding_window=(int(sliding_window) if sliding_window is not None else None),
+        beam_size=int(beam_size),
+        length_penalty=float(length_penalty),
     )
 
+    uses_cache = int(getattr(cfg, "beam_size", 1)) <= 1
+
     def _allocate_cache():
-        if kv_cache_factory is None:
+        if not uses_cache or kv_cache_factory is None:
             return None
         try:
             return kv_cache_factory(batch_size=int(batch_size), backend=cache_backend)

@@ -29,6 +29,8 @@ def _generation_kwargs_from_args(args: argparse.Namespace) -> dict[str, object]:
         "presence_penalty": float(getattr(args, "presence_penalty", 0.0)),
         "frequency_penalty": float(getattr(args, "frequency_penalty", 0.0)),
         "sliding_window": getattr(args, "sliding_window", None),
+        "beam_size": int(getattr(args, "beam_size", 1)),
+        "length_penalty": float(getattr(args, "length_penalty", 1.0)),
         "cache_backend": getattr(args, "cache_backend", None),
     }
 
@@ -211,6 +213,8 @@ def _add_generation_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--presence-penalty", type=float, default=0.0)
     parser.add_argument("--frequency-penalty", type=float, default=0.0)
     parser.add_argument("--sliding-window", type=int, default=None)
+    parser.add_argument("--beam-size", type=int, default=1)
+    parser.add_argument("--length-penalty", type=float, default=1.0)
     parser.add_argument("--cache-backend", type=str, default=None)
 
 

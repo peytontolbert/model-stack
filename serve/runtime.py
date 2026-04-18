@@ -114,6 +114,8 @@ class ModelRuntime:
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
         sliding_window: int | None = None,
+        beam_size: int = 1,
+        length_penalty: float = 1.0,
     ) -> GenerationConfig:
         resolved_do_sample = runtime_resolve_generation_sampling_mode(
             do_sample=do_sample,
@@ -133,6 +135,8 @@ class ModelRuntime:
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
             sliding_window=sliding_window,
+            beam_size=beam_size,
+            length_penalty=length_penalty,
         )
 
     def coerce_input_ids(self, input_ids) -> torch.Tensor:
@@ -207,7 +211,8 @@ class ModelRuntime:
     ) -> torch.Tensor:
         ids = self.coerce_input_ids(input_ids)
         mask = self.coerce_attention_mask(attention_mask, batch_size=int(ids.shape[0]), seq_len=int(ids.shape[1]))
-        cache = self.allocate_cache(batch_size=int(ids.shape[0]), backend=cache_backend)
+        use_cache = config is None or int(getattr(config, "beam_size", 1)) <= 1
+        cache = self.allocate_cache(batch_size=int(ids.shape[0]), backend=cache_backend) if use_cache else None
         with torch.inference_mode():
             return self.generate(
                 ids,

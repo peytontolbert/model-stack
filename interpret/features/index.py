@@ -16,13 +16,14 @@ class FeatureSlice:
 
 
 def flatten_features(cache: ActivationCache, slices: Iterable[FeatureSlice]) -> torch.Tensor:
-    """Flatten selected cached tensors to [N, D].
+    """Flatten aligned cached tensors to [N, D_total].
 
-    - Each selected tensor is expected to be [B, T, D] or [B, D].
-    - time_slice allows selecting a subset of time steps per example.
-    - batch_index can select a single example index.
+    All selected tensors must resolve to the same [B, T] index grid after applying
+    `batch_index` and `time_slice`. Features are concatenated along the channel
+    dimension, then flattened over the aligned token rows.
     """
     feats: List[torch.Tensor] = []
+    expected_bt: Optional[Tuple[int, int]] = None
     for fs in slices:
         x = cache.get(fs.key)
         if x is None:
@@ -35,22 +36,54 @@ def flatten_features(cache: ActivationCache, slices: Iterable[FeatureSlice]) -> 
         if fs.time_slice is not None:
             x = x[:, fs.time_slice]
         B, T, D = x.shape
-        feats.append(x.reshape(B * T, D))
+        if expected_bt is None:
+            expected_bt = (B, T)
+        elif expected_bt != (B, T):
+            raise ValueError(
+                f"Feature slices must align to the same [B,T] grid; expected {expected_bt}, got {(B, T)} for '{fs.key}'"
+            )
+        feats.append(x)
     if not feats:
         return torch.empty(0, 0)
-    return torch.cat(feats, dim=0)
+    combined = torch.cat(feats, dim=-1)
+    B, T, D = combined.shape
+    return combined.reshape(B * T, D)
 
 
-def targets_from_tokens(input_ids: torch.Tensor, *, position: int = -1) -> torch.Tensor:
-    """Return next-token targets for language modeling from input_ids.
+def targets_from_tokens(
+    input_ids: torch.Tensor,
+    *,
+    batch_index: Optional[int] = None,
+    time_slice: Optional[slice] = None,
+    target_shift: int = 1,
+    position: int = -1,
+) -> torch.Tensor:
+    """Return aligned token targets from input_ids.
 
-    For a single sequence [T], returns a tensor [T-1] of targets for positions 0..T-2.
-    If batched [B,T], returns [B*(T-1)].
+    The returned vector matches token rows selected from the source sequence:
+    for each kept source position `t`, the target is `input_ids[..., t + target_shift]`.
     """
     if input_ids.ndim != 2:
         raise ValueError("input_ids must be [B, T]")
-    # Left-shift targets by one for next-token prediction
-    targets = input_ids[:, 1:].contiguous()
+    x = input_ids
+    if batch_index is not None:
+        x = x[int(batch_index) : int(batch_index) + 1]
+    _, seq_len = x.shape
+    positions = torch.arange(seq_len, dtype=torch.long, device=x.device)
+    valid = (positions + int(target_shift) >= 0) & (positions + int(target_shift) < seq_len)
+    if time_slice is not None:
+        mask = torch.zeros(seq_len, dtype=torch.bool, device=x.device)
+        mask[time_slice] = True
+        valid &= mask
+    elif position != -1:
+        mask = torch.zeros(seq_len, dtype=torch.bool, device=x.device)
+        idx = int(position if position >= 0 else (seq_len + position))
+        if 0 <= idx < seq_len:
+            mask[idx] = True
+        valid &= mask
+    keep = positions[valid]
+    if keep.numel() == 0:
+        return torch.empty(0, dtype=input_ids.dtype, device=input_ids.device)
+    targets = x[:, keep + int(target_shift)].contiguous()
     return targets.reshape(-1)
-
 

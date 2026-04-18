@@ -29,21 +29,31 @@ class PrefixCausalLM(CausalLM):
         self,
         input_ids: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         prefix_lengths: int | torch.Tensor | None = None,
         cache=None,
+        **kwargs,
     ) -> torch.Tensor:
-        if attn_mask is None and prefix_lengths is not None:
+        if attention_mask is None:
+            attention_mask = attn_mask
+        if attention_mask is None and prefix_lengths is not None:
             B, T = input_ids.shape
             device = input_ids.device
             if isinstance(prefix_lengths, int):
-                attn_mask = build_prefix_lm_mask(T, prefix_lengths, device=device)
+                attention_mask = build_prefix_lm_mask(T, prefix_lengths, device=device)
             else:
                 masks = []
                 for b in range(B):
                     prefix_len = int(prefix_lengths[b].item())
                     masks.append(build_prefix_lm_mask(T, prefix_len, device=device))
-                attn_mask = torch.stack(masks, dim=0)
-        return super().forward(input_ids=input_ids, attn_mask=attn_mask, cache=cache)
+                attention_mask = torch.stack(masks, dim=0)
+        return super().forward(
+            input_ids=input_ids,
+            attn_mask=attention_mask,
+            attention_mask=attention_mask,
+            cache=cache,
+            **kwargs,
+        )
 
 
 __all__ = ["PrefixCausalLM"]

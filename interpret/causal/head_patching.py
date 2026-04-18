@@ -1,127 +1,94 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Optional
 
 import torch
 import torch.nn as nn
 
 from runtime.attention_modules import EagerAttention
-from runtime.attention import scaled_dot_product_attention, select_attention_backend
-from runtime.ops import apply_rotary as runtime_apply_rotary
-from runtime.ops import head_output_projection as runtime_head_output_projection
-from runtime.ops import linear as runtime_linear
-from runtime.ops import split_heads as runtime_split_heads
-from tensor.positional import build_rope_cache
+
+from interpret.model_adapter import AttentionSnapshot, ModelInputs, coerce_model_inputs, eager_attention_forward, get_model_adapter, resolve_model_score
 
 
-def _wrap_forward_capture_heads(attn: EagerAttention, sink: Dict[int, torch.Tensor], layer_idx: int):
+def _wrap_forward_capture_heads(
+    attn: EagerAttention,
+    sink: Dict[int, torch.Tensor],
+    layer_idx: int,
+    *,
+    detach: bool = True,
+    move_to_cpu: bool = True,
+):
     orig_forward = attn.forward
 
-    def forward(q, k, v, mask, cache=None):
-        x = q
-        B, T, D = x.shape
-        device, dtype = x.device, x.dtype
+    def _capture(snapshot: AttentionSnapshot) -> None:
+        if snapshot.head_out is None:
+            return
+        out = snapshot.head_out
+        if not detach and not move_to_cpu:
+            sink[layer_idx] = out
+            return
+        if detach:
+            out = out.detach()
+        if move_to_cpu and out.device.type != "cpu":
+            out = out.to("cpu")
+        sink[layer_idx] = out.clone()
 
-        q_lin = runtime_linear(x, attn.w_q.weight, attn.w_q.bias)
-        k_source = x if k is None else k
-        v_source = x if v is None else v
-        k_lin = runtime_linear(k_source, attn.w_k.weight, attn.w_k.bias)
-        v_lin = runtime_linear(v_source, attn.w_v.weight, attn.w_v.bias)
-
-        qh = runtime_split_heads(q_lin, attn.n_heads)
-        kh_new = runtime_split_heads(k_lin, attn.n_kv_heads)
-        vh_new = runtime_split_heads(v_lin, attn.n_kv_heads)
-
-        if attn.use_rope:
-            cos, sin = build_rope_cache(T, attn.head_dim, device=device, base_theta=float(attn.rope_theta))
-            qh, kh_new = runtime_apply_rotary(qh, kh_new, cos.to(dtype=dtype), sin.to(dtype=dtype))
-
-        if cache is not None:
-            k_old, v_old = cache.read(0, cache.length())
-            if k_old is not None and k_old.shape[2] > 0:
-                kh_all = torch.cat([k_old, kh_new], dim=2)
-                vh_all = torch.cat([v_old, vh_new], dim=2)
-            else:
-                kh_all, vh_all = kh_new, vh_new
-        else:
-            kh_all, vh_all = kh_new, vh_new
-
-        if attn.n_kv_heads != attn.n_heads:
-            repeat = attn.n_heads // attn.n_kv_heads
-            kh_all = kh_all.repeat_interleave(repeat, dim=1)
-            vh_all = vh_all.repeat_interleave(repeat, dim=1)
-
-        backend = select_attention_backend(is_causal=attn.is_causal, dtype=dtype, seq=T, heads=attn.n_heads, device=device)
-        out = scaled_dot_product_attention(
-            qh, kh_all, vh_all, attn_mask=mask, dropout_p=attn.attn_dropout_p if attn.training else 0.0, backend=backend, is_causal=attn.is_causal
+    def forward(q, k, v, mask, cache=None, *, position_embeddings=None, position_ids=None):
+        return eager_attention_forward(
+            attn,
+            q,
+            k,
+            v,
+            mask,
+            cache,
+            position_embeddings=position_embeddings,
+            position_ids=position_ids,
+            capture=_capture,
+            keep_grad=(not detach and not move_to_cpu),
         )
-
-        sink[layer_idx] = out.detach().cpu()  # (B,H,T,Dh)
-        if cache is not None and T > 0:
-            cache.append(kh_new, vh_new)
-        return runtime_head_output_projection(out, attn.w_o.weight, attn.w_o.bias)
 
     return orig_forward, forward
 
 
-def _wrap_forward_patch_heads(attn: EagerAttention, source: Dict[int, torch.Tensor], layer_idx: int, heads: Optional[Iterable[int]] = None):
-    H_sel = set(int(h) for h in heads) if heads is not None else None
+def _wrap_forward_patch_heads(
+    attn: EagerAttention,
+    source: Dict[int, torch.Tensor],
+    layer_idx: int,
+    heads: Optional[Iterable[int]] = None,
+    *,
+    time_index: Optional[int] = None,
+):
+    selected_heads = None if heads is None else {int(h) for h in heads}
     orig_forward = attn.forward
 
-    def forward(q, k, v, mask, cache=None):
-        x = q
-        B, T, D = x.shape
-        device, dtype = x.device, x.dtype
-
-        q_lin = runtime_linear(x, attn.w_q.weight, attn.w_q.bias)
-        k_source = x if k is None else k
-        v_source = x if v is None else v
-        k_lin = runtime_linear(k_source, attn.w_k.weight, attn.w_k.bias)
-        v_lin = runtime_linear(v_source, attn.w_v.weight, attn.w_v.bias)
-
-        qh = runtime_split_heads(q_lin, attn.n_heads)
-        kh_new = runtime_split_heads(k_lin, attn.n_kv_heads)
-        vh_new = runtime_split_heads(v_lin, attn.n_kv_heads)
-
-        if attn.use_rope:
-            cos, sin = build_rope_cache(T, attn.head_dim, device=device, base_theta=float(attn.rope_theta))
-            qh, kh_new = runtime_apply_rotary(qh, kh_new, cos.to(dtype=dtype), sin.to(dtype=dtype))
-
-        if cache is not None:
-            k_old, v_old = cache.read(0, cache.length())
-            if k_old is not None and k_old.shape[2] > 0:
-                kh_all = torch.cat([k_old, kh_new], dim=2)
-                vh_all = torch.cat([v_old, vh_new], dim=2)
-            else:
-                kh_all, vh_all = kh_new, vh_new
-        else:
-            kh_all, vh_all = kh_new, vh_new
-
-        if attn.n_kv_heads != attn.n_heads:
-            repeat = attn.n_heads // attn.n_kv_heads
-            kh_all = kh_all.repeat_interleave(repeat, dim=1)
-            vh_all = vh_all.repeat_interleave(repeat, dim=1)
-
-        backend = select_attention_backend(is_causal=attn.is_causal, dtype=dtype, seq=T, heads=attn.n_heads, device=device)
-        out = scaled_dot_product_attention(
-            qh, kh_all, vh_all, attn_mask=mask, dropout_p=attn.attn_dropout_p if attn.training else 0.0, backend=backend, is_causal=attn.is_causal
-        )
-
-        # Replace selected heads with clean source
+    def _patch(head_out: torch.Tensor) -> torch.Tensor:
         clean = source.get(layer_idx)
-        if clean is not None:
-            clean = clean.to(device=out.device, dtype=out.dtype)
-            if H_sel is None:
-                out.copy_(clean)
+        if clean is None:
+            return head_out
+        patched = head_out.clone()
+        clean_live = clean.to(device=patched.device, dtype=patched.dtype)
+        head_indices = range(patched.shape[1]) if selected_heads is None else selected_heads
+        for h in head_indices:
+            if not (0 <= h < patched.shape[1]):
+                continue
+            if time_index is None:
+                patched[:, h].copy_(clean_live[:, h])
             else:
-                for h in H_sel:
-                    if 0 <= h < out.shape[1]:
-                        out[:, h].copy_(clean[:, h])
+                patched[:, h, time_index].copy_(clean_live[:, h, time_index])
+        return patched
 
-        if cache is not None and T > 0:
-            cache.append(kh_new, vh_new)
-        return runtime_head_output_projection(out, attn.w_o.weight, attn.w_o.bias)
+    def forward(q, k, v, mask, cache=None, *, position_embeddings=None, position_ids=None):
+        return eager_attention_forward(
+            attn,
+            q,
+            k,
+            v,
+            mask,
+            cache,
+            position_embeddings=position_embeddings,
+            position_ids=position_ids,
+            patch_heads=_patch,
+        )
 
     return orig_forward, forward
 
@@ -130,71 +97,119 @@ def _wrap_forward_patch_heads(attn: EagerAttention, source: Dict[int, torch.Tens
 def causal_trace_heads_restore_table(
     model: nn.Module,
     *,
-    clean_input_ids: torch.Tensor,
-    corrupted_input_ids: torch.Tensor,
+    clean_inputs: Optional[ModelInputs] = None,
+    corrupted_inputs: Optional[ModelInputs] = None,
+    clean_input_ids: Optional[torch.Tensor] = None,
+    corrupted_input_ids: Optional[torch.Tensor] = None,
     position: int = -1,
     attn_mask: Optional[torch.Tensor] = None,
     target_token_id: Optional[int] = None,
+    target_feature_index: Optional[int] = None,
+    stack: Optional[str] = None,
+    kind: str = "self",
+    enc_input_ids: Optional[torch.Tensor] = None,
+    dec_input_ids: Optional[torch.Tensor] = None,
+    enc_padding_mask: Optional[torch.Tensor] = None,
+    dec_self_mask: Optional[torch.Tensor] = None,
+    score_fn=None,
 ) -> torch.Tensor:
-    """Return (L,H) table of restored target logit fraction by patching one head at a time.
-
-    If target_token_id is None, uses clean argmax at `position`.
-    """
+    """Return (L, H) restored score fractions by patching one head at a time."""
+    adapter = get_model_adapter(model)
+    if clean_inputs is None:
+        clean_inputs = coerce_model_inputs(
+            model,
+            clean_input_ids,
+            attn_mask,
+            enc_input_ids=enc_input_ids,
+            dec_input_ids=dec_input_ids,
+            enc_padding_mask=enc_padding_mask,
+            dec_self_mask=dec_self_mask,
+        )
+    if corrupted_inputs is None:
+        corrupted_inputs = coerce_model_inputs(
+            model,
+            corrupted_input_ids,
+            attn_mask,
+            enc_input_ids=enc_input_ids,
+            dec_input_ids=dec_input_ids,
+            enc_padding_mask=enc_padding_mask,
+            dec_self_mask=dec_self_mask,
+        )
+    targets = adapter.attention_targets(stack=stack, kind=kind)  # type: ignore[arg-type]
     was_training = model.training
     model.eval()
 
-    # Determine target token id from clean run if not provided
-    if target_token_id is None:
-        logits_clean = model(clean_input_ids, attn_mask)
-        target_token_id = int(logits_clean[0, position].argmax().item())
+    outputs_clean = adapter.forward(clean_inputs)
+    clean_score, target_token_id, target_feature_index = resolve_model_score(
+        model,
+        outputs_clean,
+        position=position,
+        target_token_id=target_token_id,
+        target_feature_index=target_feature_index,
+        score_fn=score_fn,
+    )
 
-    # 1) Capture clean per-head outputs
     clean_heads: Dict[int, torch.Tensor] = {}
     wrappers = []
-    for li, blk in enumerate(model.blocks):
-        attn = getattr(blk, "attn", None)
-        if isinstance(attn, EagerAttention):
-            orig, new = _wrap_forward_capture_heads(attn, clean_heads, li)
-            wrappers.append((attn, orig))
-            attn.forward = new  # type: ignore
+    for idx, target in enumerate(targets):
+        attn = target.module
+        if not isinstance(attn, EagerAttention):
+            continue
+        orig, new = _wrap_forward_capture_heads(attn, clean_heads, idx)
+        wrappers.append((attn, orig))
+        attn.forward = new  # type: ignore[assignment]
     try:
-        _ = model(clean_input_ids, attn_mask)
+        _ = adapter.forward(clean_inputs)
     finally:
         for attn, orig in wrappers:
-            attn.forward = orig  # type: ignore
+            attn.forward = orig  # type: ignore[assignment]
 
-    L = len(model.blocks)
-    H = getattr(getattr(model.blocks[0], "attn", None), "n_heads", 0) if L > 0 else 0
-    table = torch.zeros(L, H)
+    outputs_corrupted = adapter.forward(corrupted_inputs)
+    base_score, _, _ = resolve_model_score(
+        model,
+        outputs_corrupted,
+        position=position,
+        target_token_id=target_token_id,
+        target_feature_index=target_feature_index,
+        score_fn=score_fn,
+    )
 
-    # 2) Baseline corrupted logits
-    logits_cor = model(corrupted_input_ids, attn_mask)
-    base = logits_cor[0, position, target_token_id]
+    num_layers = len(targets)
+    num_heads = max((int(getattr(target.module, "n_heads", 0)) for target in targets), default=0)
+    table = torch.zeros(num_layers, num_heads)
 
-    # 3) For each layer, head: patch that head only and measure recovery
-    for li in range(L):
-        for h in range(H):
-            wrappers2 = []
-            attn = getattr(model.blocks[li], "attn", None)
-            if not isinstance(attn, EagerAttention):
-                continue
+    denom = (clean_score - base_score).abs() + 1e-8
+    for li, target in enumerate(targets):
+        attn = target.module
+        if not isinstance(attn, EagerAttention):
+            continue
+        layer_heads = clean_heads.get(li)
+        if layer_heads is None:
+            continue
+        for h in range(int(layer_heads.shape[1])):
             orig, new = _wrap_forward_patch_heads(attn, clean_heads, li, heads=[h])
-            wrappers2.append((attn, orig))
-            attn.forward = new  # type: ignore
+            attn.forward = new  # type: ignore[assignment]
             try:
-                logits_patch = model(corrupted_input_ids, attn_mask)
+                outputs_patch = adapter.forward(corrupted_inputs)
             finally:
-                for a, o in wrappers2:
-                    a.forward = o  # type: ignore
-            val = logits_patch[0, position, target_token_id]
-            clean_val = clean_heads.get(li)
-            # Use clean run logits (already computed)
-            # Need clean target logit value
-            # Reuse logits_clean computed earlier
-            clean_logit = logits_clean[0, position, target_token_id]
-            denom = (clean_logit - base).abs() + 1e-8
-            table[li, h] = ((val - base) / denom).detach().cpu()
+                attn.forward = orig  # type: ignore[assignment]
+            patched_score, _, _ = resolve_model_score(
+                model,
+                outputs_patch,
+                position=position,
+                target_token_id=target_token_id,
+                target_feature_index=target_feature_index,
+                score_fn=score_fn,
+            )
+            table[li, h] = ((patched_score - base_score) / denom).detach().cpu()
 
     if was_training:
         model.train()
     return table
+
+
+__all__ = [
+    "_wrap_forward_capture_heads",
+    "_wrap_forward_patch_heads",
+    "causal_trace_heads_restore_table",
+]

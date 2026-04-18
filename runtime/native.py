@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
+from runtime.hardware import current_cuda_hardware_info
+
 
 NATIVE_MODULE_NAME = "_model_stack_native"
 DISABLE_ENV = "MODEL_STACK_DISABLE_NATIVE"
@@ -14,11 +16,17 @@ _FALLBACK_NATIVE_OPS = [
     "gated_activation",
     "embedding",
     "linear",
+    "bitnet_linear",
+    "int4_linear",
+    "int8_linear",
+    "int8_attention",
+    "pack_bitnet_weight",
     "pack_linear_weight",
     "mlp",
     "qkv_projection",
     "pack_qkv_weights",
     "qkv_packed_heads_projection",
+    "bitnet_qkv_packed_heads_projection",
     "qkv_heads_projection",
     "split_heads",
     "merge_heads",
@@ -51,6 +59,7 @@ _FALLBACK_NATIVE_OPS = [
     "attention_prefill",
     "sampling",
     "beam_search_step",
+    "incremental_beam_search",
 ]
 
 
@@ -104,6 +113,9 @@ def _normalize_runtime_info(info: dict[str, Any]) -> dict[str, Any]:
         composite_ops = [name for name in inference_ops if name not in kernel_set]
     normalized["cuda_composite_ops"] = composite_ops
     normalized["full_cuda_inference"] = bool(compiled_with_cuda and inference_ops)
+    hardware = current_cuda_hardware_info()
+    for key, value in hardware.items():
+        normalized.setdefault(key, value)
     return normalized
 
 
@@ -258,3 +270,15 @@ def create_native_paged_kv_cache_state(
             ],
         )
     return None, None
+
+
+def native_model_session_available() -> bool:
+    module = native_module()
+    return bool(module is not None and hasattr(module, "NativeModelSession"))
+
+
+def create_native_model_session(model, seq, attention_mask=None, cache=None, trace: bool = False):
+    module = native_module()
+    if module is None or not hasattr(module, "NativeModelSession"):
+        return None
+    return module.NativeModelSession(model, seq, attention_mask, cache, bool(trace))

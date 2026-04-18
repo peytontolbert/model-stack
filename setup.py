@@ -138,6 +138,9 @@ def native_extensions():
         sources.append("runtime/csrc/backend/cuda_rope.cu")
         sources.append("runtime/csrc/backend/cuda_activation.cu")
         sources.append("runtime/csrc/backend/cuda_gated_activation.cu")
+        sources.append("runtime/csrc/backend/cuda_int4_linear.cu")
+        sources.append("runtime/csrc/backend/cuda_int8_attention.cu")
+        sources.append("runtime/csrc/backend/cuda_int8_linear.cu")
         sources.append("runtime/csrc/backend/cublaslt_linear.cu")
         define_macros.append(("MODEL_STACK_WITH_CUDA", "1"))
         if cuda_version is not None:

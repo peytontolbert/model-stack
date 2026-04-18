@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 
 from runtime.ops import gated_activation as runtime_gated_activation
-from runtime.ops import linear as runtime_linear, mlp as runtime_mlp
+from runtime.ops import linear_module as runtime_linear_module
+from runtime.ops import mlp_module as runtime_mlp_module
 from .activations import gelu, silu
 
 
@@ -46,17 +47,15 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not (self.training and not isinstance(self.dropout, nn.Identity)):
-            return runtime_mlp(
+            return runtime_mlp_module(
                 x,
-                self.w_in.weight,
-                self.w_in.bias,
-                self.w_out.weight,
-                self.w_out.bias,
+                self.w_in,
+                self.w_out,
                 activation=self.activation_name,
                 gated=self.gated,
             )
         if self.gated:
-            x_proj = runtime_linear(x, self.w_in.weight, self.w_in.bias)
+            x_proj = runtime_linear_module(x, self.w_in)
             a, b = x_proj.chunk(2, dim=-1)
             name = self.activation_name.lower()
             if name in ("swiglu", "gated-silu"):
@@ -68,6 +67,6 @@ class MLP(nn.Module):
             else:
                 x = runtime_gated_activation(a, b, "silu")
         else:
-            x = self._act(runtime_linear(x, self.w_in.weight, self.w_in.bias))
+            x = self._act(runtime_linear_module(x, self.w_in))
         x = self.dropout(x)
-        return runtime_linear(x, self.w_out.weight, self.w_out.bias)
+        return runtime_linear_module(x, self.w_out)

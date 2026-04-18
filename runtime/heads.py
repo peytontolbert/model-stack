@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from runtime.ops import linear as runtime_linear
+from runtime.ops import linear_module as runtime_linear_module
 
 
 class SequenceClassificationHead(nn.Module):
@@ -17,7 +17,7 @@ class SequenceClassificationHead(nn.Module):
             summed = (hidden_states * mask).sum(dim=1)
             denom = mask.sum(dim=1).clamp_min(1.0)
             pooled = summed / denom
-        return runtime_linear(pooled, self.proj.weight, self.proj.bias)
+        return runtime_linear_module(pooled, self.proj)
 
 
 class TokenClassificationHead(nn.Module):
@@ -26,7 +26,7 @@ class TokenClassificationHead(nn.Module):
         self.proj = nn.Linear(hidden_size, num_labels)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return runtime_linear(hidden_states, self.proj.weight, self.proj.bias)
+        return runtime_linear_module(hidden_states, self.proj)
 
 
 __all__ = ["SequenceClassificationHead", "TokenClassificationHead"]

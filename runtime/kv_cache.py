@@ -91,24 +91,7 @@ class PagedKVCache(RuntimeKVCacheMixin):
             )
             if self._native_cache is not None or self._native_layers is not None:
                 self.backend = "native-paged"
-        if self._has_native_state():
-            self.K_pages = _NativeLayerTensorList(self, "k_pages")
-            self.V_pages = _NativeLayerTensorList(self, "v_pages")
-            self.block_tables = _NativeLayerTensorList(self, "block_table")
-            self.lengths = _NativeLayerTensorList(self, "lengths")
-            self.page_counts = _NativeLayerScalarList(self, "page_count")
-        else:
-            self.K_pages = [self._allocate_page_pool(0) for _ in range(n_layers)]
-            self.V_pages = [self._allocate_page_pool(0) for _ in range(n_layers)]
-            self.page_counts = [0 for _ in range(n_layers)]
-            self.block_tables = [
-                torch.empty(batch, 0, dtype=torch.long, device=self.device)
-                for _ in range(n_layers)
-            ]
-            self.lengths = [
-                torch.zeros(batch, dtype=torch.long, device=self.device)
-                for _ in range(n_layers)
-            ]
+        self._refresh_storage_views()
 
     def _allocate_page_pool(self, capacity_pages: int) -> torch.Tensor:
         return torch.empty(
@@ -120,8 +103,48 @@ class PagedKVCache(RuntimeKVCacheMixin):
             device=self.device,
         )
 
+    def _refresh_storage_views(self) -> None:
+        if self._has_native_state():
+            self.K_pages = _NativeLayerTensorList(self, "k_pages")
+            self.V_pages = _NativeLayerTensorList(self, "v_pages")
+            self.block_tables = _NativeLayerTensorList(self, "block_table")
+            self.lengths = _NativeLayerTensorList(self, "lengths")
+            self.page_counts = _NativeLayerScalarList(self, "page_count")
+            return
+        self.K_pages = [self._allocate_page_pool(0) for _ in range(self.n_layers)]
+        self.V_pages = [self._allocate_page_pool(0) for _ in range(self.n_layers)]
+        self.page_counts = [0 for _ in range(self.n_layers)]
+        self.block_tables = [
+            torch.empty(self.batch, 0, dtype=torch.long, device=self.device)
+            for _ in range(self.n_layers)
+        ]
+        self.lengths = [
+            torch.zeros(self.batch, dtype=torch.long, device=self.device)
+            for _ in range(self.n_layers)
+        ]
+
     def _has_native_state(self) -> bool:
         return self._native_cache is not None or self._native_layers is not None
+
+    def _replace_from(self, other: "PagedKVCache") -> None:
+        self.batch = other.batch
+        self.n_layers = other.n_layers
+        self.n_kv_heads = other.n_kv_heads
+        self.head_dim = other.head_dim
+        self.pagesize = other.pagesize
+        self.dtype = other.dtype
+        self.device = other.device
+        self.backend = other.backend
+        self._native_cache = getattr(other, "_native_cache", None)
+        self._native_layers = getattr(other, "_native_layers", None)
+        if self._has_native_state():
+            self._refresh_storage_views()
+            return
+        self.K_pages = other.K_pages
+        self.V_pages = other.V_pages
+        self.page_counts = other.page_counts
+        self.block_tables = other.block_tables
+        self.lengths = other.lengths
 
     def layer_lengths(self, layer_idx: int) -> torch.Tensor:
         if self._native_cache is not None:
@@ -352,6 +375,40 @@ class PagedKVCache(RuntimeKVCacheMixin):
             self.block_tables[layer_idx] = next_table
             self.lengths[layer_idx] = next_lengths
 
+    def reorder_rows_(self, row_ids: torch.Tensor):
+        row_ids_long = row_ids.to(device=self.device, dtype=torch.long).contiguous().view(-1)
+        if self._native_cache is not None:
+            native_cache = self._native_cache
+            if hasattr(native_cache, "reorder_rows_"):
+                native_cache.reorder_rows_(row_ids_long)
+            elif hasattr(native_cache, "clone_rows"):
+                self._native_cache = native_cache.clone_rows(row_ids_long)
+            else:
+                self._replace_from(clone_kv_cache_rows(self, row_ids_long))
+                return self
+            self.batch = int(row_ids_long.numel())
+            self._native_layers = None
+            self.backend = getattr(self, "backend", "native-paged")
+            self._refresh_storage_views()
+            return self
+        if self._native_layers is not None:
+            native_layers = self._native_layers
+            if all(hasattr(layer, "reorder_rows_") for layer in native_layers):
+                for layer in native_layers:
+                    layer.reorder_rows_(row_ids_long)
+            elif all(hasattr(layer, "clone_rows") for layer in native_layers):
+                self._native_layers = [layer.clone_rows(row_ids_long) for layer in native_layers]
+            else:
+                self._replace_from(clone_kv_cache_rows(self, row_ids_long))
+                return self
+            self.batch = int(row_ids_long.numel())
+            self._native_cache = None
+            self.backend = getattr(self, "backend", "native-paged")
+            self._refresh_storage_views()
+            return self
+        self._replace_from(clone_kv_cache_rows(self, row_ids_long))
+        return self
+
 
 class ContiguousKVCache(RuntimeKVCacheMixin):
     def __init__(
@@ -517,6 +574,22 @@ class ContiguousKVCache(RuntimeKVCacheMixin):
                         self.capacities[layer_idx][batch_idx] = 0
                     self.lengths[layer_idx][batch_idx] = keep
 
+    def reorder_rows_(self, row_ids: torch.Tensor):
+        cloned = clone_kv_cache_rows(self, row_ids)
+        self.batch = cloned.batch
+        self.n_layers = cloned.n_layers
+        self.n_kv_heads = cloned.n_kv_heads
+        self.head_dim = cloned.head_dim
+        self.pagesize = cloned.pagesize
+        self.dtype = cloned.dtype
+        self.device = cloned.device
+        self.backend = cloned.backend
+        self.K = cloned.K
+        self.V = cloned.V
+        self.lengths = cloned.lengths
+        self.capacities = cloned.capacities
+        return self
+
 
 def init_kv_cache(batch: int, n_layers: int, n_kv_heads: int, head_dim: int, pagesize: int, dtype: torch.dtype, device: torch.device):
     from runtime.cache import KVCacheSpec, create_kv_cache
@@ -533,6 +606,84 @@ def init_kv_cache(batch: int, n_layers: int, n_kv_heads: int, head_dim: int, pag
             backend=(os.getenv("MODEL_STACK_KV_BACKEND", "auto") or "auto"),
         )
     )
+
+
+def clone_kv_cache_rows(cache, row_ids: torch.Tensor):
+    from runtime.cache import KVCacheSpec, create_kv_cache
+
+    row_ids_long = row_ids.to(device=cache.device, dtype=torch.long).contiguous().view(-1)
+    native_cache = getattr(cache, "_native_cache", None)
+    if native_cache is not None and hasattr(native_cache, "clone_rows"):
+        return PagedKVCache(
+            int(row_ids_long.numel()),
+            int(cache.n_layers),
+            int(cache.n_kv_heads),
+            int(cache.head_dim),
+            int(cache.pagesize),
+            cache.dtype,
+            torch.device(cache.device),
+            native_cache_state=native_cache.clone_rows(row_ids_long),
+            native_layer_states=None,
+            backend_name=getattr(cache, "backend", "native-paged"),
+        )
+    native_layers = getattr(cache, "_native_layers", None)
+    if native_layers is not None and all(hasattr(layer, "clone_rows") for layer in native_layers):
+        return PagedKVCache(
+            int(row_ids_long.numel()),
+            int(cache.n_layers),
+            int(cache.n_kv_heads),
+            int(cache.head_dim),
+            int(cache.pagesize),
+            cache.dtype,
+            torch.device(cache.device),
+            native_cache_state=None,
+            native_layer_states=[layer.clone_rows(row_ids_long) for layer in native_layers],
+            backend_name=getattr(cache, "backend", "native-paged"),
+        )
+
+    spec = KVCacheSpec(
+        batch=int(row_ids_long.numel()),
+        n_layers=int(cache.n_layers),
+        n_kv_heads=int(cache.n_kv_heads),
+        head_dim=int(cache.head_dim),
+        pagesize=int(cache.pagesize),
+        dtype=cache.dtype,
+        device=torch.device(cache.device),
+        backend=getattr(cache, "backend", "auto"),
+    )
+    next_cache = create_kv_cache(spec)
+    if row_ids_long.numel() == 0:
+        return next_cache
+
+    target_ids = torch.arange(int(row_ids_long.numel()), device=spec.device, dtype=torch.long)
+    for layer_idx in range(int(cache.n_layers)):
+        lengths = cache.layer_lengths(layer_idx).to(device=spec.device, dtype=torch.long).index_select(0, row_ids_long)
+        max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+        if max_len <= 0:
+            continue
+        if hasattr(cache, "read_batch"):
+            k, v = cache.read_batch(layer_idx, 0, max_len, block_ids=row_ids_long)
+        else:
+            raise ValueError("clone_kv_cache_rows requires a cache implementation with read_batch support")
+        for cur_len in torch.unique(lengths, sorted=True).tolist():
+            cur_len = int(cur_len)
+            if cur_len <= 0:
+                continue
+            rows = torch.nonzero(lengths == cur_len, as_tuple=False).view(-1)
+            next_cache.append_batch(
+                layer_idx,
+                k.index_select(0, rows)[:, :, :cur_len, :].contiguous(),
+                v.index_select(0, rows)[:, :, :cur_len, :].contiguous(),
+                block_ids=target_ids.index_select(0, rows),
+            )
+    return next_cache
+
+
+def reorder_kv_cache_rows_(cache, row_ids: torch.Tensor):
+    if hasattr(cache, "reorder_rows_"):
+        out = cache.reorder_rows_(row_ids)
+        return cache if out is None else out
+    return clone_kv_cache_rows(cache, row_ids)
 
 
 def kv_cache_append(cache: PagedKVCache, layer_idx: int, k_chunk: torch.Tensor, v_chunk: torch.Tensor, block_ids: Optional[torch.Tensor] = None):
@@ -571,6 +722,8 @@ def kv_cache_evict(cache: PagedKVCache, max_tokens: int, policy: str = "fifo"):
 __all__ = [
     "ContiguousKVCache",
     "PagedKVCache",
+    "clone_kv_cache_rows",
+    "reorder_kv_cache_rows_",
     "init_kv_cache",
     "kv_cache_append",
     "kv_cache_evict",

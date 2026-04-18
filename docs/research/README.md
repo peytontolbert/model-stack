@@ -37,6 +37,10 @@ Corpus-first coverage:
 
 Standalone repo notes:
 
+- `nvidia-cuda-samples-standalone-notes.md`
+  - Focused notes for `cuda-samples`.
+  - Use this when designing custom CUDA kernels or runtime policy for staging, synchronization, occupancy, and graph behavior.
+
 - `nvidia-cudalibrarysamples-standalone-notes.md`
   - Focused notes for `CUDALibrarySamples`.
   - Use this when deciding whether an op should stay library-backed instead of becoming a handwritten kernel.
@@ -108,6 +112,18 @@ Structured implementation docs:
 - `transformer10-compression-quantization-runtime-spec.md`
   - Runtime design for quantization, LoRA, pruning, distillation, and compression deltas.
 
+- `transformer10-general-native-bitnet-backend-spec.md`
+  - General native BitNet backend design for `transformer_10`.
+  - Defines the packed format, kernel families, runtime integration points, and why the core BitNet path must be custom CUDA rather than `cuBLASLt`.
+
+- `transformer10-bitnet-backend-bringup-plan.md`
+  - Concrete implementation checklist for the native BitNet backend.
+  - Maps the spec to repo files, landing phases, and exit criteria.
+
+- `transformer10-bitnet-pr1-contract.md`
+  - Exact scope for the first BitNet backend scaffolding PR.
+  - Freezes symbol names, metadata lowering, export schema, and minimum tests.
+
 - `transformer10-noncore-systems-targets.md`
   - Explicit target-state classification for governance, corpus, interpretability, visualization, export, packaging, registry, RAG, RL, safety, examples, and legacy kernel wrappers.
 
@@ -166,11 +182,14 @@ The migration docs remain here, but the intended reading order is now:
 17. `transformer10-training-backward-cuda-spec.md`
 18. `transformer10-autotune-eval-benchmark-spec.md`
 19. `transformer10-compression-quantization-runtime-spec.md`
-20. `transformer10-noncore-systems-targets.md`
-21. `transformer10-end-to-end-cpp-cuda-migration-runbook.md`
-22. `transformer10-full-repository-scope-closure.md`
-23. `transformer10-pytorch-decommission-checklist.md`
-24. then the remaining `transformer_10`-specific planning docs
+20. `transformer10-general-native-bitnet-backend-spec.md`
+21. `transformer10-bitnet-backend-bringup-plan.md`
+22. `transformer10-bitnet-pr1-contract.md`
+23. `transformer10-noncore-systems-targets.md`
+24. `transformer10-end-to-end-cpp-cuda-migration-runbook.md`
+25. `transformer10-full-repository-scope-closure.md`
+26. `transformer10-pytorch-decommission-checklist.md`
+27. then the remaining `transformer_10`-specific planning docs
 
 ## Current Repo Reality
 

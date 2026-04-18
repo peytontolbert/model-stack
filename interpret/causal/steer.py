@@ -1,23 +1,33 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Optional
 
 import torch
 import torch.nn as nn
 
+from interpret.model_adapter import get_model_adapter
+
 
 @contextmanager
-def steer_residual(model: nn.Module, mapping: Dict[int, torch.Tensor], scale: float = 1.0):
+def steer_residual(
+    model: nn.Module,
+    mapping: Dict[int, torch.Tensor],
+    scale: float = 1.0,
+    *,
+    stack: Optional[str] = None,
+    kind: Optional[str] = None,
+):
     """Add a residual direction at specified block outputs during forward.
 
     mapping: {layer_index: direction} where direction is (D,) or (1,1,D) or (B,T,D).
     Returns a context manager that adds `scale * direction` to block output.
     """
+    adapter = get_model_adapter(model)
     handles = []
     try:
         for li, vec in mapping.items():
-            blk = model.blocks[int(li)]
+            blk = adapter.block_target(int(li), stack=stack, kind=kind).module
             v = vec
             def hook(_m: nn.Module, _inp, out: torch.Tensor):
                 nonlocal v
@@ -36,5 +46,4 @@ def steer_residual(model: nn.Module, mapping: Dict[int, torch.Tensor], scale: fl
                 h.remove()
             except Exception:
                 pass
-
 

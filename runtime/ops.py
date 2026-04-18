@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -590,7 +592,7 @@ def paged_kv_compact(
     block_table: torch.Tensor,
     lengths: torch.Tensor,
     keep: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if has_native_op("paged_kv_compact"):
         module = native_module()
         if module is not None and hasattr(module, "paged_kv_compact_forward"):
@@ -1091,7 +1093,9 @@ def beam_search_step(
     parent_lengths = lengths.gather(1, parent_beams)
     next_lengths = parent_lengths + (~parent_finished).long()
     next_finished = parent_finished | (next_tokens == eos_id)
-    return next_beams, best_raw_scores, next_finished, next_lengths
+    batch_offsets = torch.arange(batch_size, device=best_idx.device, dtype=torch.long).unsqueeze(-1) * int(beam_size)
+    parent_rows = (batch_offsets + parent_beams).reshape(-1)
+    return next_beams, best_raw_scores, next_finished, next_lengths, parent_rows
 
 
 def sample_with_policies(
@@ -1213,12 +1217,18 @@ def append_tokens(
     seq: torch.Tensor,
     next_id: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
+    row_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if has_native_op("append_tokens"):
         module = native_module()
         if module is not None and hasattr(module, "append_tokens_forward"):
-            next_seq, next_mask = module.append_tokens_forward(seq, next_id, attention_mask)
+            next_seq, next_mask = module.append_tokens_forward(seq, next_id, attention_mask, row_ids)
             return next_seq, next_mask
+    if row_ids is not None:
+        row_ids_long = row_ids.to(device=seq.device, dtype=torch.long).contiguous().view(-1)
+        seq = seq.index_select(0, row_ids_long)
+        if attention_mask is not None:
+            attention_mask = attention_mask.index_select(0, row_ids_long)
     next_seq = torch.cat([seq, next_id], dim=1)
     if attention_mask is None:
         return next_seq, None
@@ -1288,6 +1298,142 @@ def linear(
     return F.linear(x, weight, bias)
 
 
+def _tensor_signature(tensor: torch.Tensor | None):
+    if tensor is None:
+        return None
+    return (
+        str(tensor.device),
+        str(tensor.dtype),
+        tuple(tensor.shape),
+        int(getattr(tensor, "_version", 0)),
+        int(tensor.data_ptr()),
+    )
+
+
+def resolve_linear_module_tensors(
+    module,
+    *,
+    reference: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None,
+    device: torch.device | str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if reference is not None:
+        dtype = reference.dtype
+        device = reference.device
+    target_device = None if device is None else torch.device(device)
+
+    runtime_weight = getattr(module, "runtime_weight", None)
+    if callable(runtime_weight):
+        weight = runtime_weight(dtype=dtype, device=target_device)
+    else:
+        weight = getattr(module, "weight")
+        if target_device is not None or dtype is not None:
+            weight = weight.to(
+                device=weight.device if target_device is None else target_device,
+                dtype=weight.dtype if dtype is None else dtype,
+            )
+
+    runtime_bias = getattr(module, "runtime_bias", None)
+    if callable(runtime_bias):
+        bias = runtime_bias(dtype=dtype, device=target_device)
+    else:
+        bias = getattr(module, "bias", None)
+        if isinstance(bias, torch.Tensor) and (target_device is not None or dtype is not None):
+            bias = bias.to(
+                device=bias.device if target_device is None else target_device,
+                dtype=bias.dtype if dtype is None else dtype,
+            )
+    return weight, bias
+
+
+def linear_module_signature(module):
+    runtime_signature = getattr(module, "runtime_signature", None)
+    if callable(runtime_signature):
+        return runtime_signature()
+    weight, bias = resolve_linear_module_tensors(module)
+    return (_tensor_signature(weight), _tensor_signature(bias))
+
+
+def packed_linear_module_signature(
+    module,
+    *,
+    backend: str | None = None,
+):
+    resolved_backend = resolve_linear_backend(backend)
+    runtime_signature = getattr(module, "runtime_packed_linear_signature", None)
+    if callable(runtime_signature):
+        signature = runtime_signature(resolved_backend)
+        if signature is not None:
+            return signature
+    return (resolved_backend, linear_module_signature(module))
+
+
+def linear_module(
+    x: torch.Tensor,
+    module,
+    *,
+    backend: str | None = None,
+) -> torch.Tensor:
+    runtime_forward = getattr(module, "runtime_linear", None)
+    if callable(runtime_forward):
+        return runtime_forward(x, backend=backend)
+    weight, bias = resolve_linear_module_tensors(module, reference=x)
+    return linear(x, weight, bias, backend=backend)
+
+
+def resolve_packed_linear_module_spec(
+    module,
+    *,
+    backend: str | None = None,
+    reference: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None,
+    device: torch.device | str | None = None,
+):
+    resolved_backend = resolve_linear_backend(backend)
+    if reference is not None:
+        dtype = reference.dtype
+        device = reference.device
+    target_device = None if device is None else torch.device(device)
+
+    runtime_linear = getattr(module, "runtime_linear", None)
+    if callable(runtime_linear):
+        supports_packed_backend = getattr(module, "runtime_supports_packed_backend", None)
+        if not callable(supports_packed_backend) or not bool(supports_packed_backend(resolved_backend)):
+            return None
+        runtime_spec = getattr(module, "runtime_packed_linear_spec", None)
+        if not callable(runtime_spec):
+            return None
+        spec = runtime_spec(backend=resolved_backend, dtype=dtype, device=target_device)
+        return None if spec is None else dict(spec)
+
+    if resolved_backend == "cublaslt":
+        weight, bias = resolve_linear_module_tensors(module, reference=reference, dtype=dtype, device=target_device)
+        packed_weight, packed_bias = pack_linear_weight(weight, bias)
+        return {
+            "format": "dense_packed",
+            "backend": resolved_backend,
+            "packed_weight": packed_weight,
+            "bias": packed_bias,
+        }
+    return None
+
+
+def packed_qkv_module_signature(
+    q_module,
+    k_module,
+    v_module,
+    *,
+    backend: str | None = None,
+):
+    resolved_backend = resolve_linear_backend(backend)
+    return (
+        resolved_backend,
+        packed_linear_module_signature(q_module, backend=resolved_backend),
+        packed_linear_module_signature(k_module, backend=resolved_backend),
+        packed_linear_module_signature(v_module, backend=resolved_backend),
+    )
+
+
 def pack_linear_weight(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
@@ -1298,6 +1444,67 @@ def pack_linear_weight(
             packed_weight, packed_bias = module.pack_linear_weight_forward(weight, bias)
             return packed_weight, packed_bias
     return weight.contiguous(), None if bias is None else bias.contiguous()
+
+
+def pack_bitnet_weight(
+    weight: torch.Tensor,
+    scale_values: torch.Tensor | None = None,
+    layout_header: torch.Tensor | None = None,
+    segment_offsets: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if scale_values is not None or layout_header is not None or segment_offsets is not None:
+        raise NotImplementedError("Explicit BitNet metadata overrides are not yet supported in the Python fallback")
+    if has_native_op("pack_bitnet_weight"):
+        module = native_module()
+        if module is not None and hasattr(module, "pack_bitnet_weight_forward"):
+            try:
+                packed_weight, packed_scale_values, packed_layout_header, packed_segment_offsets = (
+                    module.pack_bitnet_weight_forward(weight)
+                )
+                return packed_weight, packed_scale_values, packed_layout_header, packed_segment_offsets
+            except RuntimeError:
+                # Keep the reference path usable even when the local native extension has not
+                # been rebuilt after packer-side metadata changes.
+                pass
+    if weight.ndim != 2:
+        raise ValueError("pack_bitnet_weight expects a rank-2 weight tensor")
+    if not weight.dtype.is_floating_point:
+        raise TypeError("pack_bitnet_weight expects a floating-point weight tensor")
+    logical_out, logical_in = int(weight.shape[0]), int(weight.shape[1])
+    padded_out = ((logical_out + 15) // 16) * 16
+    padded_in = ((logical_in + 31) // 32) * 32
+    scale = weight.detach().abs().amax().clamp_min(1e-8).to(device=weight.device, dtype=torch.float32)
+    quantized = torch.round(weight.float() / scale).clamp_(-1, 1).to(dtype=torch.int16)
+    codes = torch.ones((padded_out, padded_in), device=weight.device, dtype=torch.uint8)
+    codes[:logical_out, :logical_in] = (quantized + 1).to(dtype=torch.uint8)
+    packed_weight = (
+        codes[:, 0::4]
+        | (codes[:, 1::4] << 2)
+        | (codes[:, 2::4] << 4)
+        | (codes[:, 3::4] << 6)
+    ).contiguous()
+    packed_scale_values = scale.reshape(1).contiguous()
+    packed_layout_header = torch.tensor(
+        [
+            1,
+            16,
+            32,
+            logical_out,
+            logical_in,
+            padded_out,
+            padded_in,
+            0,
+            logical_out,
+            1,
+            80,
+            1,
+            0,
+        ],
+        device=weight.device,
+        dtype=torch.int32,
+    )
+    packed_segment_offsets = torch.tensor([0, logical_out], device=weight.device, dtype=torch.int32)
+    return packed_weight, packed_scale_values, packed_layout_header, packed_segment_offsets
 
 
 def split_heads(
@@ -1339,6 +1546,243 @@ def merge_heads(x: torch.Tensor) -> torch.Tensor:
         raise ValueError("merge_heads expects x with shape (B, H, T, Dh)")
     bsz, heads, seq, head_dim = x.shape
     return x.permute(0, 2, 1, 3).contiguous().view(bsz, seq, heads * head_dim)
+
+
+def _quant_max(bits: int) -> int:
+    bits = int(bits)
+    if bits < 2:
+        raise ValueError("bits must be >= 2")
+    return (1 << (bits - 1)) - 1
+
+
+def _calibrate_activation_scale(
+    x: torch.Tensor,
+    *,
+    method: str,
+    bits: int,
+    percentile: float,
+) -> torch.Tensor:
+    del percentile
+    method_name = str(method).strip().lower()
+    qmax = float(_quant_max(bits))
+    values = x.detach().float()
+    if method_name in {"", "absmax"}:
+        clip = values.abs().amax()
+    else:
+        raise ValueError(f"Unsupported packed activation calibration method: {method}")
+    return (clip.clamp_min(1e-8) / qmax).to(dtype=torch.float32)
+
+
+def _fake_quantize_activation(
+    x: torch.Tensor,
+    scale: torch.Tensor | float,
+    *,
+    bits: int,
+) -> torch.Tensor:
+    qmax = float(_quant_max(bits))
+    scale_t = scale if isinstance(scale, torch.Tensor) else torch.tensor(scale, device=x.device, dtype=torch.float32)
+    scale_t = scale_t.to(device=x.device, dtype=torch.float32).clamp_min(1e-8)
+    while scale_t.ndim < x.ndim:
+        scale_t = scale_t.unsqueeze(0)
+    q = torch.round(x.float() / scale_t).clamp_(-qmax, qmax)
+    return (q * scale_t).to(dtype=x.dtype)
+
+
+def _power_of_two_segments(size: int) -> tuple[int, ...]:
+    if size <= 0:
+        return ()
+    out: list[int] = []
+    remaining = int(size)
+    while remaining > 0:
+        seg = 1 << (remaining.bit_length() - 1)
+        out.append(seg)
+        remaining -= seg
+    return tuple(out)
+
+
+def _hadamard_lastdim_power2(x: torch.Tensor) -> torch.Tensor:
+    width = int(x.shape[-1])
+    if width <= 1:
+        return x
+    if width & (width - 1):
+        raise ValueError("Hadamard width must be a power of two")
+    y = x.reshape(-1, width)
+    block = 1
+    while block < width:
+        y = y.view(-1, width // (block * 2), 2, block)
+        a = y[:, :, 0, :]
+        b = y[:, :, 1, :]
+        y = torch.cat((a + b, a - b), dim=-1)
+        block *= 2
+    return (y.view_as(x) / math.sqrt(float(width))).contiguous()
+
+
+def _apply_spin_transform(x: torch.Tensor, spin_signs: torch.Tensor) -> torch.Tensor:
+    if x.shape[-1] != spin_signs.numel():
+        raise ValueError("spin_signs must match the last dimension of x")
+    work_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
+    signs = spin_signs.to(device=x.device, dtype=work_dtype)
+    x_local = x.to(dtype=work_dtype) * signs
+    segments = _power_of_two_segments(int(signs.numel()))
+    if not segments:
+        return x_local
+    if len(segments) == 1:
+        return _hadamard_lastdim_power2(x_local)
+    parts = []
+    start = 0
+    for seg in segments:
+        stop = start + seg
+        part = x_local[..., start:stop]
+        parts.append(_hadamard_lastdim_power2(part) if seg > 1 else part)
+        start = stop
+    return torch.cat(parts, dim=-1).contiguous()
+
+
+def _packed_pre_scale_active(pre_scale: torch.Tensor | None) -> bool:
+    if pre_scale is None:
+        return False
+    return bool((pre_scale.detach().float() - 1.0).abs().max().item() > 1e-6)
+
+
+def _apply_pre_scale_to_input(x: torch.Tensor, pre_scale: torch.Tensor) -> torch.Tensor:
+    view_shape = [1] * x.ndim
+    view_shape[-1] = pre_scale.numel()
+    return x / pre_scale.to(device=x.device, dtype=x.dtype).view(*view_shape)
+
+
+def _apply_packed_activation_quantization(
+    x: torch.Tensor,
+    *,
+    mode: str,
+    act_scale: torch.Tensor | None,
+    bits: int,
+    method: str,
+    percentile: float,
+) -> torch.Tensor:
+    mode_name = str(mode).strip().lower()
+    if mode_name in {"", "none", "off"}:
+        return x
+    if mode_name == "dynamic_int8":
+        scale = _calibrate_activation_scale(x, method=method, bits=bits, percentile=percentile)
+        return _fake_quantize_activation(x, scale, bits=bits)
+    if mode_name == "static_int8":
+        if act_scale is None:
+            raise ValueError("Packed static_int8 activation quantization requires act_scale")
+        return _fake_quantize_activation(x, act_scale, bits=bits)
+    raise ValueError(f"Unknown packed activation quantization mode: {mode}")
+
+
+def _apply_packed_linear_input_spec(x: torch.Tensor, spec: dict) -> torch.Tensor:
+    x_local = x
+    if bool(spec.get("spin_enabled", False)):
+        spin_signs = spec.get("spin_signs")
+        if not isinstance(spin_signs, torch.Tensor):
+            raise ValueError("Packed linear spec with spin_enabled requires spin_signs")
+        x_local = _apply_spin_transform(x_local, spin_signs)
+    pre_scale = spec.get("pre_scale")
+    if isinstance(pre_scale, torch.Tensor) and _packed_pre_scale_active(pre_scale):
+        x_local = _apply_pre_scale_to_input(x_local, pre_scale)
+    x_local = _apply_packed_activation_quantization(
+        x_local,
+        mode=str(spec.get("act_quant_mode", "none")),
+        act_scale=spec.get("act_scale") if isinstance(spec.get("act_scale"), torch.Tensor) else None,
+        bits=int(spec.get("act_quant_bits", 8)),
+        method=str(spec.get("act_quant_method", "absmax")),
+        percentile=float(spec.get("act_quant_percentile", 0.999)),
+    )
+    return x_local
+
+
+def linear_from_packed_spec(
+    x: torch.Tensor,
+    spec: dict,
+    *,
+    backend: str | None = None,
+) -> torch.Tensor:
+    format_name = str(spec.get("format"))
+    if format_name == "dense_packed":
+        return linear(x, spec["packed_weight"], spec.get("bias"), backend=backend)
+    if format_name == "bitnet_w2a8":
+        x_local = _apply_packed_linear_input_spec(x, spec)
+        return _bitnet_linear_from_transformed_input(x_local, spec)
+    raise NotImplementedError(f"Packed linear format {format_name} is not implemented")
+
+
+def _bitnet_linear_from_transformed_input(
+    x: torch.Tensor,
+    spec: dict,
+) -> torch.Tensor:
+    from runtime.quant import bitnet_linear as runtime_bitnet_linear
+
+    return runtime_bitnet_linear(
+        x,
+        spec["packed_weight"],
+        spec["scale_values"],
+        spec["layout_header"],
+        spec["segment_offsets"],
+        bias=spec.get("bias"),
+    )
+
+
+def bitnet_qkv_packed_heads_projection(
+    x: torch.Tensor,
+    q_spec: dict,
+    k_spec: dict,
+    v_spec: dict,
+    *,
+    q_heads: int,
+    kv_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    qx = _apply_packed_linear_input_spec(x, q_spec)
+    kx = _apply_packed_linear_input_spec(x, k_spec)
+    vx = _apply_packed_linear_input_spec(x, v_spec)
+    q_bias = q_spec.get("bias")
+    k_bias = k_spec.get("bias")
+    v_bias = v_spec.get("bias")
+
+    if not _should_use_eager_autograd_fallback(
+        qx,
+        kx,
+        vx,
+        q_spec["packed_weight"],
+        q_bias,
+        k_spec["packed_weight"],
+        k_bias,
+        v_spec["packed_weight"],
+        v_bias,
+    ):
+        if has_native_op("bitnet_qkv_packed_heads_projection"):
+            module = native_module()
+            if module is not None and hasattr(module, "bitnet_qkv_packed_heads_projection_forward"):
+                q, k, v = module.bitnet_qkv_packed_heads_projection_forward(
+                    qx,
+                    q_spec["packed_weight"],
+                    q_spec["scale_values"],
+                    q_spec["layout_header"],
+                    q_spec["segment_offsets"],
+                    q_bias,
+                    kx,
+                    k_spec["packed_weight"],
+                    k_spec["scale_values"],
+                    k_spec["layout_header"],
+                    k_spec["segment_offsets"],
+                    k_bias,
+                    vx,
+                    v_spec["packed_weight"],
+                    v_spec["scale_values"],
+                    v_spec["layout_header"],
+                    v_spec["segment_offsets"],
+                    v_bias,
+                    int(q_heads),
+                    int(kv_heads),
+                )
+                return q, k, v
+
+    return (
+        split_heads(_bitnet_linear_from_transformed_input(qx, q_spec), q_heads),
+        split_heads(_bitnet_linear_from_transformed_input(kx, k_spec), kv_heads),
+        split_heads(_bitnet_linear_from_transformed_input(vx, v_spec), kv_heads),
+    )
 
 
 def qkv_projection(
@@ -1420,6 +1864,123 @@ def pack_qkv_weights(
                 bias_parts.append(bias.to(device=target_device, dtype=target_dtype).contiguous())
         packed_bias = torch.cat(bias_parts, dim=0).contiguous()
     return packed_weight, packed_bias, int(q_weight.shape[0]), int(k_weight.shape[0]), int(v_weight.shape[0])
+
+
+def resolve_packed_qkv_module_spec(
+    q_module,
+    k_module,
+    v_module,
+    *,
+    backend: str | None = None,
+    reference: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None,
+    device: torch.device | str | None = None,
+):
+    resolved_backend = resolve_linear_backend(backend)
+    if reference is not None:
+        dtype = reference.dtype
+        device = reference.device
+    target_device = None if device is None else torch.device(device)
+
+    q_spec = resolve_packed_linear_module_spec(q_module, backend=resolved_backend, reference=reference, dtype=dtype, device=target_device)
+    k_spec = resolve_packed_linear_module_spec(k_module, backend=resolved_backend, reference=reference, dtype=dtype, device=target_device)
+    v_spec = resolve_packed_linear_module_spec(v_module, backend=resolved_backend, reference=reference, dtype=dtype, device=target_device)
+
+    if q_spec is None and k_spec is None and v_spec is None:
+        if resolved_backend != "cublaslt":
+            return None
+        q_weight, q_bias = resolve_linear_module_tensors(q_module, reference=reference, dtype=dtype, device=target_device)
+        k_weight, k_bias = resolve_linear_module_tensors(k_module, reference=reference, dtype=dtype, device=target_device)
+        v_weight, v_bias = resolve_linear_module_tensors(v_module, reference=reference, dtype=dtype, device=target_device)
+        packed_weight, packed_bias, q_size, k_size, v_size = pack_qkv_weights(
+            q_weight,
+            q_bias,
+            k_weight,
+            k_bias,
+            v_weight,
+            v_bias,
+        )
+        return {
+            "format": "dense_qkv_packed",
+            "backend": resolved_backend,
+            "packed_weight": packed_weight,
+            "packed_bias": packed_bias,
+            "q_size": int(q_size),
+            "k_size": int(k_size),
+            "v_size": int(v_size),
+        }
+
+    if q_spec is None or k_spec is None or v_spec is None:
+        return None
+
+    formats = {str(q_spec.get("format")), str(k_spec.get("format")), str(v_spec.get("format"))}
+    if formats == {"dense_packed"}:
+        packed_bias_parts = []
+        packed_bias_any = False
+        for spec in (q_spec, k_spec, v_spec):
+            bias = spec.get("bias")
+            if bias is None:
+                packed_bias_parts.append(torch.zeros(spec["packed_weight"].shape[0], device=spec["packed_weight"].device, dtype=spec["packed_weight"].dtype))
+            else:
+                packed_bias_any = True
+                packed_bias_parts.append(bias.to(device=spec["packed_weight"].device, dtype=spec["packed_weight"].dtype).contiguous())
+        return {
+            "format": "dense_qkv_packed",
+            "backend": resolved_backend,
+            "packed_weight": torch.cat([q_spec["packed_weight"], k_spec["packed_weight"], v_spec["packed_weight"]], dim=0).contiguous(),
+            "packed_bias": torch.cat(packed_bias_parts, dim=0).contiguous() if packed_bias_any else None,
+            "q_size": int(q_spec["packed_weight"].shape[0]),
+            "k_size": int(k_spec["packed_weight"].shape[0]),
+            "v_size": int(v_spec["packed_weight"].shape[0]),
+        }
+
+    if formats == {"bitnet_w2a8"} and resolved_backend == "bitnet":
+        return {
+            "format": "bitnet_qkv",
+            "backend": resolved_backend,
+            "q_spec": q_spec,
+            "k_spec": k_spec,
+            "v_spec": v_spec,
+            "q_size": int(q_spec["layout_header"][3].item()),
+            "k_size": int(k_spec["layout_header"][3].item()),
+            "v_size": int(v_spec["layout_header"][3].item()),
+        }
+    return None
+
+
+def qkv_packed_spec_heads_projection(
+    x: torch.Tensor,
+    spec: dict,
+    *,
+    q_heads: int,
+    kv_heads: int,
+    backend: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    format_name = str(spec.get("format"))
+    if format_name == "dense_qkv_packed":
+        return qkv_packed_heads_projection(
+            x,
+            spec["packed_weight"],
+            spec.get("packed_bias"),
+            q_size=int(spec["q_size"]),
+            k_size=int(spec["k_size"]),
+            v_size=int(spec["v_size"]),
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+            backend=backend,
+        )
+    if format_name == "bitnet_qkv":
+        if not all(key in spec for key in ("q_spec", "k_spec", "v_spec")):
+            raise NotImplementedError("Packed QKV format bitnet_qkv requires q_spec, k_spec, and v_spec payloads")
+        return bitnet_qkv_packed_heads_projection(
+            x,
+            spec["q_spec"],
+            spec["k_spec"],
+            spec["v_spec"],
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+        )
+    raise NotImplementedError(f"Packed QKV format {format_name} is not implemented")
 
 
 def qkv_packed_heads_projection(
@@ -1550,6 +2111,20 @@ def head_output_projection(
     return linear(merge_heads(x), weight, bias, backend=backend)
 
 
+def head_output_packed_projection(
+    x: torch.Tensor,
+    spec: dict,
+    *,
+    backend: str | None = None,
+) -> torch.Tensor:
+    format_name = str(spec.get("format"))
+    if format_name == "dense_packed":
+        return head_output_projection(x, spec["packed_weight"], spec.get("bias"), backend=backend)
+    if format_name == "bitnet_w2a8":
+        return linear_from_packed_spec(merge_heads(x), spec, backend=backend)
+    raise NotImplementedError(f"Packed output projection format {format_name} is not implemented")
+
+
 def activation(
     x: torch.Tensor,
     activation: str,
@@ -1619,11 +2194,11 @@ def mlp(
                 hidden = gated_activation(a, b, "silu")
         else:
             if act in ("gelu",):
-                hidden = activation(hidden, "gelu")
+                hidden = globals()["activation"](hidden, "gelu")
             elif act in ("silu", "swish"):
-                hidden = activation(hidden, "silu")
+                hidden = globals()["activation"](hidden, "silu")
             else:
-                hidden = activation(hidden, "gelu")
+                hidden = globals()["activation"](hidden, "gelu")
         return linear(hidden, w_out_weight, w_out_bias, backend=backend)
     if has_native_op("mlp"):
         module = native_module()
@@ -1644,8 +2219,42 @@ def mlp(
         a, b = hidden.chunk(2, dim=-1)
         hidden = gated_activation(a, b, act)
     else:
-        hidden = activation(hidden, act)
+        hidden = globals()["activation"](hidden, act)
     return linear(hidden, w_out_weight, w_out_bias, backend=backend)
+
+
+def mlp_module(
+    x: torch.Tensor,
+    w_in_module,
+    w_out_module,
+    *,
+    activation: str,
+    gated: bool,
+    backend: str | None = None,
+) -> torch.Tensor:
+    runtime_linear_in = getattr(w_in_module, "runtime_linear", None)
+    runtime_linear_out = getattr(w_out_module, "runtime_linear", None)
+    if callable(runtime_linear_in) or callable(runtime_linear_out):
+        hidden = linear_module(x, w_in_module, backend=backend)
+        act = str(activation).lower()
+        if gated:
+            a, b = hidden.chunk(2, dim=-1)
+            hidden = gated_activation(a, b, act)
+        else:
+            hidden = globals()["activation"](hidden, act)
+        return linear_module(hidden, w_out_module, backend=backend)
+    w_in_weight, w_in_bias = resolve_linear_module_tensors(w_in_module, reference=x)
+    w_out_weight, w_out_bias = resolve_linear_module_tensors(w_out_module, reference=x)
+    return mlp(
+        x,
+        w_in_weight,
+        w_in_bias,
+        w_out_weight,
+        w_out_bias,
+        activation=activation,
+        gated=gated,
+        backend=backend,
+    )
 
 
 def embedding(

@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from interpret.features.sae import SparseAutoencoder
 from interpret.features.sae_ops import sae_mask_features, sae_boost_features
+from interpret.model_adapter import get_model_adapter
 
 
 @contextmanager
@@ -16,6 +17,8 @@ def sae_feature_mask(
     layer_index: int,
     sae: SparseAutoencoder,
     *,
+    stack: Optional[str] = None,
+    kind: Optional[str] = None,
     drop_codes: Optional[Iterable[int]] = None,
     keep_codes: Optional[Iterable[int]] = None,
     boost_codes: Optional[Iterable[int]] = None,
@@ -27,7 +30,8 @@ def sae_feature_mask(
     Exactly one of drop_codes/keep_codes/boost_codes should be provided.
     time_slice can restrict to certain positions (e.g., slice(-1, None)).
     """
-    blk = model.blocks[int(layer_index)]
+    adapter = get_model_adapter(model)
+    blk = adapter.block_target(int(layer_index), stack=stack, kind=kind).module
 
     def hook(_m: nn.Module, _inp, out: torch.Tensor):
         x = out
@@ -57,5 +61,4 @@ def sae_feature_mask(
             h.remove()
         except Exception:
             pass
-
 

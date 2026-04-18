@@ -236,3 +236,26 @@ def test_runtime_mlp_uses_eager_reference_when_grad_enabled(monkeypatch):
     assert x.grad is not None
     assert w_in.grad is not None
     assert w_out.grad is not None
+
+
+def test_runtime_mlp_runs_dense_reference_path_without_activation_name_collision(monkeypatch):
+    x = torch.randn(2, 3, 4)
+    w_in = torch.randn(10, 4)
+    b_in = torch.randn(10)
+    w_out = torch.randn(4, 10)
+    b_out = torch.randn(4)
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: False)
+
+    out = runtime_ops_mod.mlp(
+        x,
+        w_in,
+        b_in,
+        w_out,
+        b_out,
+        activation="silu",
+        gated=False,
+    )
+
+    ref = F.linear(F.silu(F.linear(x, w_in, b_in)), w_out, b_out)
+    assert torch.allclose(out, ref)

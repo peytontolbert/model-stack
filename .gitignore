@@ -26,4 +26,9 @@ checkpoints/.locks/
 .coverage
 CUDA_KERNEL_MAP.md
 MANIFEST.in
-docs/research/
+docs/research/*
+!docs/research/README.md
+!docs/research/nvidia-cuda-samples-standalone-notes.md
+!docs/research/transformer10-bitnet-backend-bringup-plan.md
+!docs/research/transformer10-general-native-bitnet-backend-spec.md
+!docs/research/transformer10-bitnet-pr1-contract.md

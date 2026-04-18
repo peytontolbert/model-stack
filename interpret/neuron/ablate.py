@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from interpret.model_adapter import get_model_adapter
 from tensor.mlp import MLP
 from tensor.activations import silu as act_silu, gelu as act_gelu
 
@@ -40,18 +41,22 @@ def _wrap_mlp_forward_zero_channels(mlp: MLP, channels: List[int]):
 
 
 @contextmanager
-def ablate_mlp_channels(model: nn.Module, mapping: Dict[int, Iterable[int]]):
+def ablate_mlp_channels(
+    model: nn.Module,
+    mapping: Dict[int, Iterable[int]],
+    *,
+    stack: Optional[str] = None,
+    kind: Optional[str] = None,
+):
     """Temporarily zero selected MLP channels in `blocks.{layer}.mlp` forward.
 
     mapping: {layer_index: [channels...]}
     """
+    adapter = get_model_adapter(model)
     origs = []
     try:
         for li, chans in mapping.items():
-            blk = model.blocks[int(li)]
-            mlp = getattr(blk, "mlp", None)
-            if not isinstance(mlp, MLP):
-                continue
+            mlp = adapter.mlp_module(int(li), stack=stack, kind=kind)
             orig, new = _wrap_mlp_forward_zero_channels(mlp, list(chans))
             origs.append((mlp, orig))
             mlp.forward = new  # type: ignore
@@ -59,5 +64,4 @@ def ablate_mlp_channels(model: nn.Module, mapping: Dict[int, Iterable[int]]):
     finally:
         for mlp, orig in origs:
             mlp.forward = orig  # type: ignore
-
 

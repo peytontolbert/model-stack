@@ -43,6 +43,8 @@ def run_basic_suite(
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
     sliding_window: int | None = None,
+    beam_size: int = 1,
+    length_penalty: float = 1.0,
     cache_backend: str | None = None,
 ) -> SuiteResult:
     del outdir
@@ -64,6 +66,8 @@ def run_basic_suite(
         presence_penalty=float(presence_penalty),
         frequency_penalty=float(frequency_penalty),
         sliding_window=sliding_window,
+        beam_size=int(beam_size),
+        length_penalty=float(length_penalty),
         cache_backend=cache_backend,
     )
     r_ece = evaluate_ece(model, loader, device=dev)

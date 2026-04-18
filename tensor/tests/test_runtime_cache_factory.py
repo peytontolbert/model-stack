@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import sys
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -158,6 +159,103 @@ def test_model_runtime_allocate_cache_uses_runtime_factory(monkeypatch):
     assert seen["spec_args"]["backend"] == "contiguous"
 
 
+def test_clone_kv_cache_rows_uses_native_cache_clone_rows_fast_path():
+    class FakeNativeClone:
+        def __init__(self):
+            self.ids = None
+
+        def clone_rows(self, row_ids):
+            self.ids = row_ids.clone()
+            return "native-clone"
+
+    native = FakeNativeClone()
+    cache = runtime_kv_cache_mod.PagedKVCache(
+        batch=2,
+        n_layers=1,
+        n_kv_heads=1,
+        head_dim=2,
+        pagesize=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        native_cache_state=native,
+        native_layer_states=None,
+        backend_name="native-paged",
+    )
+
+    cloned = runtime_kv_cache_mod.clone_kv_cache_rows(cache, torch.tensor([1, 0, 1], dtype=torch.long))
+
+    assert native.ids.tolist() == [1, 0, 1]
+    assert isinstance(cloned, runtime_kv_cache_mod.PagedKVCache)
+    assert cloned._native_cache == "native-clone"
+    assert cloned.batch == 3
+
+
+def test_clone_kv_cache_rows_clones_selected_contiguous_rows():
+    cache = runtime_kv_cache_mod.ContiguousKVCache(
+        batch=2,
+        n_layers=1,
+        n_kv_heads=1,
+        head_dim=2,
+        pagesize=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        backend_name="contiguous",
+    )
+    cache.append_batch(
+        0,
+        torch.tensor([[[[1.0, 10.0], [2.0, 20.0]]]], dtype=torch.float32),
+        torch.tensor([[[[11.0, 110.0], [12.0, 120.0]]]], dtype=torch.float32),
+        block_ids=torch.tensor([0], dtype=torch.long),
+    )
+    cache.append_batch(
+        0,
+        torch.tensor([[[[3.0, 30.0]]]], dtype=torch.float32),
+        torch.tensor([[[[13.0, 130.0]]]], dtype=torch.float32),
+        block_ids=torch.tensor([1], dtype=torch.long),
+    )
+
+    cloned = runtime_kv_cache_mod.clone_kv_cache_rows(cache, torch.tensor([1, 0, 1], dtype=torch.long))
+
+    assert cloned.batch == 3
+    assert cloned.backend == "contiguous"
+    assert cloned.layer_lengths(0).tolist() == [1, 2, 1]
+    k, v = cloned.read_batch(0, 0, 2)
+    assert torch.equal(k[0, :, 0, :], torch.tensor([[3.0, 30.0]], dtype=torch.float32))
+    assert torch.equal(k[1], torch.tensor([[[1.0, 10.0], [2.0, 20.0]]], dtype=torch.float32))
+    assert torch.equal(v[2, :, 0, :], torch.tensor([[13.0, 130.0]], dtype=torch.float32))
+    assert torch.equal(k[0, :, 1, :], torch.zeros((1, 2), dtype=torch.float32))
+
+
+def test_reorder_kv_cache_rows_uses_native_cache_reorder_rows_fast_path():
+    class FakeNativeCache:
+        def __init__(self):
+            self.ids = None
+
+        def reorder_rows_(self, row_ids):
+            self.ids = row_ids.clone()
+
+    native = FakeNativeCache()
+    cache = runtime_kv_cache_mod.PagedKVCache(
+        batch=2,
+        n_layers=1,
+        n_kv_heads=1,
+        head_dim=2,
+        pagesize=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        native_cache_state=native,
+        native_layer_states=None,
+        backend_name="native-paged",
+    )
+
+    out = runtime_kv_cache_mod.reorder_kv_cache_rows_(cache, torch.tensor([1, 0, 1], dtype=torch.long))
+
+    assert out is cache
+    assert native.ids.tolist() == [1, 0, 1]
+    assert cache.batch == 3
+    assert cache._native_cache is native
+
+
 def test_model_runtime_health_info_reports_runtime_owned_payload():
     cfg = _cfg()
     model = torch.nn.Linear(16, 16, bias=False)
@@ -186,13 +284,15 @@ def test_model_runtime_build_generation_config_delegates_to_runtime_builder(monk
 
     monkeypatch.setattr(serve_runtime_mod, "runtime_build_generation_config", fake_builder)
 
-    built = rt.build_generation_config(max_new_tokens=12, top_k=5, presence_penalty=0.3)
+    built = rt.build_generation_config(max_new_tokens=12, top_k=5, presence_penalty=0.3, beam_size=4, length_penalty=0.8)
 
     assert built == "cfg"
     assert seen["kwargs"]["max_new_tokens"] == 12
     assert seen["kwargs"]["do_sample"] is True
     assert seen["kwargs"]["top_k"] == 5
     assert seen["kwargs"]["presence_penalty"] == 0.3
+    assert seen["kwargs"]["beam_size"] == 4
+    assert seen["kwargs"]["length_penalty"] == 0.8
 
 
 def test_model_runtime_build_generation_config_honors_explicit_greedy_override(monkeypatch):
@@ -1777,11 +1877,20 @@ def test_serve_generate_builds_config_via_runtime_builder(monkeypatch):
     monkeypatch.setattr(serve_generate_mod, "runtime_build_generation_config", fake_builder)
     monkeypatch.setattr(serve_generate_mod, "_engine_generate", fake_engine_generate)
 
-    out = serve_generate_mod.generate(object(), torch.tensor([[1, 2]], dtype=torch.long), max_new_tokens=9, top_k=7)
+    out = serve_generate_mod.generate(
+        object(),
+        torch.tensor([[1, 2]], dtype=torch.long),
+        max_new_tokens=9,
+        top_k=7,
+        beam_size=3,
+        length_penalty=0.6,
+    )
 
     assert torch.equal(out, torch.full((1, 3), 4, dtype=torch.long))
     assert seen["builder_kwargs"]["max_new_tokens"] == 9
     assert seen["builder_kwargs"]["top_k"] == 7
+    assert seen["builder_kwargs"]["beam_size"] == 3
+    assert seen["builder_kwargs"]["length_penalty"] == 0.6
     assert seen["engine_kwargs"]["config"] == "cfg"
 
 
@@ -1893,6 +2002,8 @@ def test_model_causal_generate_builds_config_via_runtime_builder(monkeypatch):
         frequency_penalty=0.4,
         attn_mask=torch.tensor([[1, 1]], dtype=torch.long),
         sliding_window=32,
+        beam_size=4,
+        length_penalty=0.7,
         cache_backend="native-paged",
         return_dict=False,
     )
@@ -1909,6 +2020,8 @@ def test_model_causal_generate_builds_config_via_runtime_builder(monkeypatch):
     assert seen["builder_kwargs"]["presence_penalty"] == 0.3
     assert seen["builder_kwargs"]["frequency_penalty"] == 0.4
     assert seen["builder_kwargs"]["sliding_window"] == 32
+    assert seen["builder_kwargs"]["beam_size"] == 4
+    assert seen["builder_kwargs"]["length_penalty"] == 0.7
     assert seen["engine_kwargs"]["config"] == "cfg"
     assert torch.equal(seen["engine_kwargs"]["attention_mask"], torch.tensor([[1, 1]], dtype=torch.long))
     assert seen["engine_kwargs"]["cache_backend"] == "native-paged"
@@ -2139,6 +2252,8 @@ def test_serve_api_generate_delegates_to_runtime_transport_helpers(monkeypatch):
             presence_penalty=0.4,
             frequency_penalty=0.2,
             sliding_window=32,
+            beam_size=5,
+            length_penalty=0.75,
             cache_backend="native-paged",
         )
     )
@@ -2159,6 +2274,8 @@ def test_serve_api_generate_delegates_to_runtime_transport_helpers(monkeypatch):
     assert seen["config_kwargs"]["presence_penalty"] == 0.4
     assert seen["config_kwargs"]["frequency_penalty"] == 0.2
     assert seen["config_kwargs"]["sliding_window"] == 32
+    assert seen["config_kwargs"]["beam_size"] == 5
+    assert seen["config_kwargs"]["length_penalty"] == 0.75
 
 
 def test_serve_api_generate_honors_explicit_greedy_override(monkeypatch):
@@ -2223,6 +2340,8 @@ def test_eval_benchmark_generate_builds_config_via_runtime_builder(monkeypatch):
         top_p=0.9,
         repetition_penalty=1.2,
         sliding_window=16,
+        beam_size=3,
+        length_penalty=0.9,
         cache_backend="native-paged",
         kv_cache_factory=fake_cache_factory,
     )
@@ -2233,8 +2352,44 @@ def test_eval_benchmark_generate_builds_config_via_runtime_builder(monkeypatch):
     assert seen["builder_kwargs"]["top_p"] == 0.9
     assert seen["builder_kwargs"]["repetition_penalty"] == 1.2
     assert seen["builder_kwargs"]["sliding_window"] == 16
+    assert seen["builder_kwargs"]["beam_size"] == 3
+    assert seen["builder_kwargs"]["length_penalty"] == 0.9
     assert [cache["id"] for cache in cache_ids] == [1, 2, 3]
     assert all(cache["backend"] == "native-paged" for cache in cache_ids)
+
+
+def test_eval_benchmark_generate_skips_cache_for_beam_search(monkeypatch):
+    cache_ids = []
+
+    monkeypatch.setattr(
+        eval_bench_mod,
+        "runtime_build_generation_config",
+        lambda **kwargs: serve_runtime_mod.GenerationConfig(max_new_tokens=3, beam_size=2),
+    )
+    monkeypatch.setattr(
+        eval_bench_mod,
+        "decode_tokens",
+        lambda model, x, **kwargs: cache_ids.append(kwargs.get("cache")) or x,
+    )
+
+    model = torch.nn.Linear(16, 16, bias=False)
+
+    def fake_cache_factory(*, batch_size, backend=None):
+        raise AssertionError("beam search benchmark should not allocate cache")
+
+    eval_bench_mod.benchmark_generate(
+        model,
+        batch_size=1,
+        seq_len=2,
+        max_new_tokens=3,
+        warmup_steps=1,
+        repeats=2,
+        vocab_size=8,
+        beam_size=2,
+        kv_cache_factory=fake_cache_factory,
+    )
+
+    assert cache_ids == [None, None, None]
 
 
 def test_eval_latency_generate_builds_config_via_runtime_builder(monkeypatch):
@@ -2270,6 +2425,8 @@ def test_eval_latency_generate_builds_config_via_runtime_builder(monkeypatch):
         do_sample=True,
         top_k=4,
         presence_penalty=0.5,
+        beam_size=2,
+        length_penalty=0.65,
         cache_backend="paged",
         kv_cache_factory=fake_cache_factory,
     )
@@ -2278,8 +2435,43 @@ def test_eval_latency_generate_builds_config_via_runtime_builder(monkeypatch):
     assert seen["builder_kwargs"]["do_sample"] is True
     assert seen["builder_kwargs"]["top_k"] == 4
     assert seen["builder_kwargs"]["presence_penalty"] == 0.5
+    assert seen["builder_kwargs"]["beam_size"] == 2
+    assert seen["builder_kwargs"]["length_penalty"] == 0.65
     assert [cache["id"] for cache in cache_ids] == [1, 2]
     assert all(cache["backend"] == "paged" for cache in cache_ids)
+
+
+def test_eval_latency_generate_skips_cache_for_beam_search(monkeypatch):
+    cache_ids = []
+
+    monkeypatch.setattr(
+        eval_latency_mod,
+        "runtime_build_generation_config",
+        lambda **kwargs: serve_runtime_mod.GenerationConfig(max_new_tokens=4, beam_size=2),
+    )
+    monkeypatch.setattr(
+        eval_latency_mod,
+        "decode_tokens",
+        lambda model, x, **kwargs: cache_ids.append(kwargs.get("cache")) or x,
+    )
+
+    model = torch.nn.Linear(16, 16, bias=False)
+
+    def fake_cache_factory(*, batch_size, backend=None):
+        raise AssertionError("beam search latency path should not allocate cache")
+
+    eval_latency_mod.latency_generate(
+        model,
+        repeats=2,
+        batch_size=1,
+        seq_len=2,
+        max_new_tokens=4,
+        vocab_size=8,
+        beam_size=2,
+        kv_cache_factory=fake_cache_factory,
+    )
+
+    assert cache_ids == [None, None]
 
 
 def test_eval_suite_run_basic_suite_passes_runtime_decode_kwargs(monkeypatch):
@@ -2320,6 +2512,8 @@ def test_eval_suite_run_basic_suite_passes_runtime_decode_kwargs(monkeypatch):
         top_p=0.9,
         repetition_penalty=1.2,
         sliding_window=32,
+        beam_size=6,
+        length_penalty=0.55,
         cache_backend="native-paged",
     )
 
@@ -2330,6 +2524,8 @@ def test_eval_suite_run_basic_suite_passes_runtime_decode_kwargs(monkeypatch):
     assert seen["gen_kwargs"]["top_p"] == 0.9
     assert seen["gen_kwargs"]["repetition_penalty"] == 1.2
     assert seen["gen_kwargs"]["sliding_window"] == 32
+    assert seen["gen_kwargs"]["beam_size"] == 6
+    assert seen["gen_kwargs"]["length_penalty"] == 0.55
     assert seen["gen_kwargs"]["cache_backend"] == "native-paged"
 
 
@@ -2387,6 +2583,8 @@ def test_eval_cli_suite_uses_runtime_from_model_and_generation_kwargs(monkeypatc
             "presence_penalty": 0.2,
             "frequency_penalty": 0.4,
             "sliding_window": 40,
+            "beam_size": 3,
+            "length_penalty": 0.6,
             "cache_backend": "paged",
             "outdir": None,
             "model_dir": None,
@@ -2405,6 +2603,8 @@ def test_eval_cli_suite_uses_runtime_from_model_and_generation_kwargs(monkeypatc
     assert seen["suite"]["kwargs"]["top_k"] == 7
     assert seen["suite"]["kwargs"]["top_p"] == 0.85
     assert seen["suite"]["kwargs"]["repetition_penalty"] == 1.1
+    assert seen["suite"]["kwargs"]["beam_size"] == 3
+    assert seen["suite"]["kwargs"]["length_penalty"] == 0.6
     assert seen["suite"]["kwargs"]["cache_backend"] == "paged"
 
 
@@ -2415,6 +2615,589 @@ def test_serve_api_healthz_delegates_to_runtime_health_info(monkeypatch):
         lambda: type("FakeRuntime", (), {"health_info": lambda self: {"status": "ok", "device": "cpu"}})(),
     )
     assert serve_api_mod.healthz() == {"status": "ok", "device": "cpu"}
+
+
+def test_clone_kv_cache_rows_uses_native_layer_clone_rows_fast_path():
+    class FakeNativeLayer:
+        def __init__(self):
+            self.ids = None
+
+        def clone_rows(self, row_ids):
+            self.ids = row_ids.clone()
+            return f"layer-clone:{id(self)}"
+
+    layers = [FakeNativeLayer(), FakeNativeLayer()]
+    cache = runtime_kv_cache_mod.PagedKVCache(
+        batch=2,
+        n_layers=2,
+        n_kv_heads=1,
+        head_dim=2,
+        pagesize=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        native_cache_state=None,
+        native_layer_states=layers,
+        backend_name="native-paged",
+    )
+
+    cloned = runtime_kv_cache_mod.clone_kv_cache_rows(cache, torch.tensor([0, 1, 1], dtype=torch.long))
+
+    assert [layer.ids.tolist() for layer in layers] == [[0, 1, 1], [0, 1, 1]]
+    assert isinstance(cloned, runtime_kv_cache_mod.PagedKVCache)
+    assert cloned._native_layers == [f"layer-clone:{id(layer)}" for layer in layers]
+    assert cloned.batch == 3
+
+
+def test_reorder_kv_cache_rows_reorders_contiguous_cache_in_place():
+    cache = runtime_kv_cache_mod.ContiguousKVCache(
+        batch=2,
+        n_layers=1,
+        n_kv_heads=1,
+        head_dim=2,
+        pagesize=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        backend_name="contiguous",
+    )
+    cache.append_batch(
+        0,
+        torch.tensor([[[[1.0, 10.0], [2.0, 20.0]]]], dtype=torch.float32),
+        torch.tensor([[[[11.0, 110.0], [12.0, 120.0]]]], dtype=torch.float32),
+        block_ids=torch.tensor([0], dtype=torch.long),
+    )
+    cache.append_batch(
+        0,
+        torch.tensor([[[[3.0, 30.0]]]], dtype=torch.float32),
+        torch.tensor([[[[13.0, 130.0]]]], dtype=torch.float32),
+        block_ids=torch.tensor([1], dtype=torch.long),
+    )
+
+    out = runtime_kv_cache_mod.reorder_kv_cache_rows_(cache, torch.tensor([1, 0, 1], dtype=torch.long))
+
+    assert out is cache
+    assert cache.batch == 3
+    assert cache.layer_lengths(0).tolist() == [1, 2, 1]
+    k, v = cache.read_batch(0, 0, 2)
+    assert torch.equal(k[0, :, 0, :], torch.tensor([[3.0, 30.0]], dtype=torch.float32))
+    assert torch.equal(k[1], torch.tensor([[[1.0, 10.0], [2.0, 20.0]]], dtype=torch.float32))
+    assert torch.equal(v[2, :, 0, :], torch.tensor([[13.0, 130.0]], dtype=torch.float32))
+
+
+def test_runtime_generate_uses_cached_beam_decode_when_available(monkeypatch):
+    seen = {"reorder_rows": []}
+    fake_cache = object()
+
+    class FakeModel:
+        cfg = type("Cfg", (), {"pad_token_id": 0})()
+
+        def __call__(self, input_ids, **kwargs):
+            seen.setdefault("calls", []).append(
+                {
+                    "shape": tuple(input_ids.shape),
+                    "attention_mask": kwargs.get("attention_mask"),
+                    "cache": kwargs.get("cache"),
+                    "position_ids": kwargs.get("position_ids"),
+                }
+            )
+            logits = torch.full((input_ids.shape[0], input_ids.shape[1], 6), -100.0, dtype=torch.float32)
+            if input_ids.shape[1] > 1:
+                logits[:, -1, 2] = 0.0
+                logits[:, -1, 3] = -0.1
+            else:
+                last = input_ids[:, -1]
+                logits[last == 2, -1, 4] = 0.0
+                logits[last == 3, -1, 5] = -0.5
+                logits[last == 2, -1, 0] = -1.0
+                logits[last == 3, -1, 0] = -1.5
+            return logits
+
+    def fake_from_model(cls, model_in, input_ids, **kwargs):
+        del cls
+        return runtime_generation_mod.RuntimeGenerationSession(
+            model=model_in,
+            seq=input_ids,
+            attention_mask=kwargs.get("attention_mask"),
+            cache=fake_cache,
+            trace=False,
+        )
+
+    def fake_reorder(cache, row_ids):
+        assert cache is fake_cache
+        seen["reorder_rows"].append(row_ids.detach().cpu().tolist())
+        return fake_cache
+
+    monkeypatch.setattr(runtime_generation_mod, "create_native_model_session", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime_generation_mod.RuntimeGenerationSession, "from_model", classmethod(fake_from_model))
+    monkeypatch.setattr(runtime_generation_mod, "runtime_reorder_kv_cache_rows_", fake_reorder)
+    monkeypatch.setattr(
+        runtime_generation_mod,
+        "_generate_with_full_forward_beam_search",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected fallback")),
+    )
+
+    cfg = runtime_generation_mod.GenerationConfig(max_new_tokens=2, beam_size=2, eos_id=0)
+    out = runtime_generation_mod.generate(
+        FakeModel(),
+        torch.tensor([[1, 1]], dtype=torch.long),
+        attention_mask=torch.tensor([[1, 1]], dtype=torch.long),
+        config=cfg,
+    )
+
+    assert out.tolist() == [[1, 1, 2, 4]]
+    assert seen["reorder_rows"][0] == [0, 0]
+    assert len(seen["reorder_rows"]) == 1
+    assert seen["calls"][0]["shape"] == (1, 2)
+    assert seen["calls"][1]["shape"] == (2, 1)
+    assert seen["calls"][1]["cache"] is fake_cache
+    assert torch.equal(
+        seen["calls"][1]["attention_mask"],
+        torch.tensor([[1, 1, 1], [1, 1, 1]], dtype=torch.long),
+    )
+
+
+def test_runtime_generation_session_python_append_preserves_explicit_2d_attention_mask_mode(monkeypatch):
+    monkeypatch.setattr(runtime_generation_mod, "create_native_model_session", lambda *args, **kwargs: None)
+    session = runtime_generation_mod.RuntimeGenerationSession(
+        torch.nn.Identity(),
+        torch.tensor([[1, 2]], dtype=torch.long),
+        attention_mask=runtime_blocks_mod.build_prefix_lm_mask(2, 1),
+    )
+
+    session.append(torch.tensor([[3]], dtype=torch.long))
+    session.append(torch.tensor([[4]], dtype=torch.long))
+
+    assert session.attention_mask_mode == "explicit"
+    assert session.attention_mask.shape == (1, 4)
+    assert session.attention_mask.dtype == torch.bool
+    assert torch.equal(session.attention_mask, torch.zeros((1, 4), dtype=torch.bool))
+
+
+def test_prefix_causal_lm_accepts_attention_mask_alias():
+    model = runtime_modeling_mod.build_model(_cfg(), task="prefix-lm")
+    out = model(
+        torch.tensor([[1, 2, 3]], dtype=torch.long),
+        attention_mask=runtime_blocks_mod.build_prefix_lm_mask(3, 1),
+    )
+    assert out.shape == (1, 3, model.cfg.vocab_size)
+
+
+def test_runtime_generation_session_native_prefix_executor_skips_python_forward():
+    model = runtime_modeling_mod.build_model(_cfg(), task="prefix-lm")
+    model.eval()
+    session = runtime_generation_mod.RuntimeGenerationSession.from_model(
+        model,
+        torch.tensor([[1, 2]], dtype=torch.long),
+        attention_mask=runtime_blocks_mod.build_prefix_lm_mask(2, 1),
+        cache_pagesize=32,
+        cache_backend="native-paged",
+    )
+
+    if not session.uses_native_session:
+        pytest.skip("native model session unavailable")
+    if session.native_executor_kind != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("python model forward should not be called")
+
+    model.forward = boom
+
+    prefill = session.prefill_next_logits()
+    assert prefill is not None
+    assert prefill.shape == (1, model.cfg.vocab_size)
+
+    next_id = torch.argmax(prefill, dim=-1, keepdim=True)
+    session.append(next_id)
+
+    assert session.attention_mask is not None
+    assert tuple(session.attention_mask.shape) == (1, 3)
+
+    decode = session.decode_next_logits()
+    assert decode is not None
+    assert decode.shape == (1, model.cfg.vocab_size)
+
+
+def test_runtime_generation_session_native_causal_executor_supports_3d_attention_mask():
+    model = causal_model_mod.CausalLM(_cfg(), block_variant="llama")
+    model.eval()
+    attention_mask = runtime_blocks_mod.build_prefix_lm_mask(2, 1).unsqueeze(0)
+    session = runtime_generation_mod.RuntimeGenerationSession.from_model(
+        model,
+        torch.tensor([[1, 2]], dtype=torch.long),
+        attention_mask=attention_mask,
+        cache_pagesize=32,
+        cache_backend="native-paged",
+    )
+
+    if not session.uses_native_session:
+        pytest.skip("native model session unavailable")
+    if session.native_executor_kind != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("python model forward should not be called")
+
+    model.forward = boom
+
+    prefill = session.prefill_next_logits()
+    assert prefill is not None
+    next_id = torch.argmax(prefill, dim=-1, keepdim=True)
+    session.append(next_id)
+
+    assert session.attention_mask is not None
+    assert tuple(session.attention_mask.shape) == (1, 1, 3)
+
+    decode = session.decode_next_logits()
+    assert decode is not None
+    assert decode.shape == (1, model.cfg.vocab_size)
+
+
+def test_runtime_generation_session_native_causal_executor_supports_4d_attention_mask():
+    model = causal_model_mod.CausalLM(_cfg(), block_variant="llama")
+    model.eval()
+    bool_mask = runtime_blocks_mod.build_prefix_lm_mask(2, 1)
+    attention_mask = torch.where(
+        bool_mask,
+        torch.full(bool_mask.shape, float("-inf"), dtype=torch.float32),
+        torch.zeros(bool_mask.shape, dtype=torch.float32),
+    ).view(1, 1, 2, 2)
+    session = runtime_generation_mod.RuntimeGenerationSession.from_model(
+        model,
+        torch.tensor([[1, 2]], dtype=torch.long),
+        attention_mask=attention_mask,
+        cache_pagesize=32,
+        cache_backend="native-paged",
+    )
+
+    if not session.uses_native_session:
+        pytest.skip("native model session unavailable")
+    if session.native_executor_kind != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("python model forward should not be called")
+
+    model.forward = boom
+
+    prefill = session.prefill_next_logits()
+    assert prefill is not None
+    next_id = torch.argmax(prefill, dim=-1, keepdim=True)
+    session.append(next_id)
+
+    assert session.attention_mask is not None
+    assert tuple(session.attention_mask.shape) == (1, 1, 1, 3)
+
+    decode = session.decode_next_logits()
+    assert decode is not None
+    assert decode.shape == (1, model.cfg.vocab_size)
+
+
+def test_runtime_generation_session_native_moe_executor_skips_python_forward():
+    model = causal_model_mod.CausalLM(_cfg(), block_variant="moe", num_experts=3, k=2)
+    model.eval()
+    session = runtime_generation_mod.RuntimeGenerationSession.from_model(
+        model,
+        torch.tensor([[1, 2]], dtype=torch.long),
+        cache_pagesize=32,
+        cache_backend="native-paged",
+    )
+
+    if not session.uses_native_session:
+        pytest.skip("native model session unavailable")
+    if session.native_executor_kind != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("python model forward should not be called")
+
+    model.forward = boom
+
+    prefill = session.prefill_next_logits()
+    assert prefill is not None
+    assert prefill.shape == (1, model.cfg.vocab_size)
+
+    next_id = torch.argmax(prefill, dim=-1, keepdim=True)
+    session.append(next_id)
+
+    decode = session.decode_next_logits()
+    assert decode is not None
+    assert decode.shape == (1, model.cfg.vocab_size)
+
+
+def test_runtime_generation_session_native_causal_executor_supports_alibi_bias():
+    model = causal_model_mod.CausalLM(_cfg(), block_variant="gpt", use_alibi=True)
+    model.eval()
+    session = runtime_generation_mod.RuntimeGenerationSession.from_model(
+        model,
+        torch.tensor([[1, 2]], dtype=torch.long),
+        cache_pagesize=32,
+        cache_backend="native-paged",
+    )
+
+    if not session.uses_native_session:
+        pytest.skip("native model session unavailable")
+    if session.native_executor_kind != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("python model forward should not be called")
+
+    model.forward = boom
+
+    prefill = session.prefill_next_logits()
+    assert prefill is not None
+    next_id = torch.argmax(prefill, dim=-1, keepdim=True)
+    session.append(next_id)
+    decode = session.decode_next_logits()
+    assert decode is not None
+    assert decode.shape == (1, model.cfg.vocab_size)
+
+
+def test_runtime_generation_session_native_causal_executor_supports_rpb_table():
+    model = causal_model_mod.CausalLM(_cfg(), block_variant="gpt", use_rpb=True, rpb_max_distance=4)
+    model.eval()
+    assert model.blocks[0].rpb_table is not None
+    session = runtime_generation_mod.RuntimeGenerationSession.from_model(
+        model,
+        torch.tensor([[1, 2]], dtype=torch.long),
+        cache_pagesize=32,
+        cache_backend="native-paged",
+    )
+
+    if not session.uses_native_session:
+        pytest.skip("native model session unavailable")
+    if session.native_executor_kind != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("python model forward should not be called")
+
+    model.forward = boom
+
+    prefill = session.prefill_next_logits()
+    assert prefill is not None
+    next_id = torch.argmax(prefill, dim=-1, keepdim=True)
+    session.append(next_id)
+    decode = session.decode_next_logits()
+    assert decode is not None
+    assert decode.shape == (1, model.cfg.vocab_size)
+
+
+def test_runtime_generation_session_native_parallel_executor_skips_python_forward():
+    model = causal_model_mod.CausalLM(_cfg(), block_variant="parallel")
+    model.eval()
+    session = runtime_generation_mod.RuntimeGenerationSession.from_model(
+        model,
+        torch.tensor([[1, 2]], dtype=torch.long),
+        cache_pagesize=32,
+        cache_backend="native-paged",
+    )
+
+    if not session.uses_native_session:
+        pytest.skip("native model session unavailable")
+    if session.native_executor_kind != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("python model forward should not be called")
+
+    model.forward = boom
+
+    prefill = session.prefill_next_logits()
+    assert prefill is not None
+    assert prefill.shape == (1, model.cfg.vocab_size)
+
+    next_id = torch.argmax(prefill, dim=-1, keepdim=True)
+    session.append(next_id)
+
+    decode = session.decode_next_logits()
+    assert decode is not None
+    assert decode.shape == (1, model.cfg.vocab_size)
+
+
+def test_runtime_generation_session_native_causal_executor_skips_python_forward():
+    model = causal_model_mod.CausalLM(_cfg(), block_variant="llama")
+    model.eval()
+    session = runtime_generation_mod.RuntimeGenerationSession.from_model(
+        model,
+        torch.tensor([[1, 2]], dtype=torch.long),
+        cache_pagesize=32,
+        cache_backend="native-paged",
+    )
+
+    if not session.uses_native_session:
+        pytest.skip("native model session unavailable")
+    if getattr(session.native_session, "native_executor_kind", "python") != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("python model forward should not be called")
+
+    model.forward = boom
+
+    prefill = session.prefill_next_logits()
+    assert prefill is not None
+    assert prefill.shape == (1, model.cfg.vocab_size)
+
+    next_id = torch.argmax(prefill, dim=-1, keepdim=True)
+    session.append(next_id)
+
+    decode = session.decode_next_logits()
+    assert decode is not None
+    assert decode.shape == (1, model.cfg.vocab_size)
+
+    full = session.full_next_logits()
+    assert full.shape == (1, model.cfg.vocab_size)
+
+
+def test_runtime_generation_session_advances_beam_via_native_session(monkeypatch):
+    seen = {}
+
+    class FakeNativeSession:
+        def __init__(self, model, seq, attention_mask, cache, trace):
+            self.model = model
+            self.seq = seq
+            self.attention_mask = attention_mask
+            self.cache = cache
+            self.trace = trace
+
+        @property
+        def batch_size(self):
+            return int(self.seq.shape[0])
+
+        @property
+        def seq_len(self):
+            return int(self.seq.shape[1])
+
+        def advance_beam_decode(
+            self,
+            next_beams,
+            cache_row_ids,
+            mask_row_ids,
+            source_attention_mask,
+            source_cache,
+            max_tokens,
+            policy,
+        ):
+            seen["next_beams"] = next_beams.clone()
+            seen["cache_row_ids"] = cache_row_ids.clone()
+            seen["mask_row_ids"] = None if mask_row_ids is None else mask_row_ids.clone()
+            seen["source_attention_mask"] = source_attention_mask.clone()
+            seen["source_cache"] = source_cache
+            seen["max_tokens"] = max_tokens
+            seen["policy"] = policy
+            self.seq = next_beams
+            self.attention_mask = source_attention_mask
+            self.cache = source_cache
+            return torch.zeros(next_beams.shape[0], 7, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        runtime_generation_mod,
+        "create_native_model_session",
+        lambda model, seq, attention_mask=None, cache=None, trace=False: FakeNativeSession(
+            model,
+            seq,
+            attention_mask,
+            cache,
+            trace,
+        ),
+    )
+
+    source_mask = torch.tensor([[1, 1], [1, 1]], dtype=torch.long)
+    source_cache = object()
+    session = runtime_generation_mod.RuntimeGenerationSession(
+        model=object(),
+        seq=torch.tensor([[1, 2], [1, 3]], dtype=torch.long),
+        attention_mask=None,
+        cache=None,
+        trace=False,
+    )
+
+    out = session.advance_beam_decode(
+        torch.tensor([[1, 2, 4], [1, 3, 5]], dtype=torch.long),
+        torch.tensor([0, 1], dtype=torch.long),
+        mask_row_ids=torch.tensor([0, 1], dtype=torch.long),
+        source_attention_mask=source_mask,
+        source_cache=source_cache,
+        max_tokens=9,
+        policy="sliding-window",
+    )
+
+    assert session.uses_native_session is True
+    assert out.shape == (2, 7)
+    assert seen["next_beams"].tolist() == [[1, 2, 4], [1, 3, 5]]
+    assert seen["cache_row_ids"].tolist() == [0, 1]
+    assert seen["mask_row_ids"].tolist() == [0, 1]
+    assert torch.equal(seen["source_attention_mask"], source_mask)
+    assert seen["source_cache"] is source_cache
+    assert seen["max_tokens"] == 9
+    assert seen["policy"] == "sliding-window"
+
+
+def test_runtime_generate_beam_search_falls_back_to_full_forward_without_cache(monkeypatch):
+    seen = {}
+
+    def fake_from_model(cls, model_in, input_ids, **kwargs):
+        del cls, model_in, kwargs
+        return runtime_generation_mod.RuntimeGenerationSession(
+            model=object(),
+            seq=input_ids,
+            attention_mask=None,
+            cache=None,
+            trace=False,
+        )
+
+    def fake_full_forward(model, input_ids, **kwargs):
+        seen["kwargs"] = kwargs
+        return torch.full((input_ids.shape[0], input_ids.shape[1] + 1), 8, dtype=torch.long)
+
+    monkeypatch.setattr(runtime_generation_mod.RuntimeGenerationSession, "from_model", classmethod(fake_from_model))
+    monkeypatch.setattr(runtime_generation_mod, "_generate_with_full_forward_beam_search", fake_full_forward)
+
+    out = runtime_generation_mod.generate(
+        object(),
+        torch.tensor([[1, 2]], dtype=torch.long),
+        config=runtime_generation_mod.GenerationConfig(max_new_tokens=3, beam_size=2, eos_id=4),
+    )
+
+    assert torch.equal(out, torch.full((1, 3), 8, dtype=torch.long))
+    assert seen["kwargs"]["config"].beam_size == 2
+
+
+def test_runtime_generate_rejects_sampling_with_beam_search():
+    cfg = runtime_generation_mod.GenerationConfig(max_new_tokens=2, beam_size=2, do_sample=True)
+
+    with pytest.raises(ValueError, match="beam search does not support sampling"):
+        runtime_generation_mod.generate(object(), torch.tensor([[1, 2]], dtype=torch.long), config=cfg)
+
+
+def test_model_runtime_generate_token_ids_skips_cache_for_beam_search(monkeypatch):
+    cfg = _cfg()
+    model = torch.nn.Linear(16, 16, bias=False)
+    rt = ModelRuntime(cfg, model, torch.device("cpu"), torch.float32, kv_pagesize=160)
+    seen = {}
+
+    def fail_allocate(*args, **kwargs):
+        raise AssertionError("beam search should not allocate cache")
+
+    def fake_generate(input_ids, **kwargs):
+        seen["input_ids"] = input_ids
+        seen["kwargs"] = kwargs
+        return torch.tensor([[7, 8, 9]], dtype=torch.long)
+
+    monkeypatch.setattr(rt, "allocate_cache", fail_allocate)
+    monkeypatch.setattr(rt, "generate", fake_generate)
+
+    out = rt.generate_token_ids(
+        [[1, 2, 3]],
+        config=serve_runtime_mod.GenerationConfig(max_new_tokens=2, beam_size=3),
+        cache_backend="paged",
+    )
+
+    assert torch.equal(out, torch.tensor([[7, 8, 9]], dtype=torch.long))
+    assert torch.equal(seen["input_ids"], torch.tensor([[1, 2, 3]], dtype=torch.long))
+    assert seen["kwargs"]["cache"] is None
+    assert seen["kwargs"]["cache_backend"] == "paged"
 
 
 def test_runtime_generate_defaults_config(monkeypatch):

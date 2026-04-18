@@ -6,6 +6,8 @@ from typing import Dict, Iterable, Optional
 import torch
 import torch.nn as nn
 
+from interpret.model_adapter import ModelInputs, coerce_model_inputs, get_model_adapter, resolve_model_score
+
 
 @contextmanager
 def output_patching(model: nn.Module, replacements: Dict[str, torch.Tensor]):
@@ -41,11 +43,20 @@ def output_patching(model: nn.Module, replacements: Dict[str, torch.Tensor]):
 def causal_trace_restore_fraction(
     model: nn.Module,
     *,
-    clean_input_ids: torch.Tensor,
-    corrupted_input_ids: torch.Tensor,
+    clean_inputs: Optional[ModelInputs] = None,
+    corrupted_inputs: Optional[ModelInputs] = None,
+    clean_input_ids: Optional[torch.Tensor] = None,
+    corrupted_input_ids: Optional[torch.Tensor] = None,
     patch_points: Iterable[str],
     position: int = -1,
     attn_mask: Optional[torch.Tensor] = None,
+    target_token_id: Optional[int] = None,
+    target_feature_index: Optional[int] = None,
+    enc_input_ids: Optional[torch.Tensor] = None,
+    dec_input_ids: Optional[torch.Tensor] = None,
+    enc_padding_mask: Optional[torch.Tensor] = None,
+    dec_self_mask: Optional[torch.Tensor] = None,
+    score_fn=None,
 ) -> torch.Tensor:
     """Measure how much of the clean logit at position is restored by patching.
 
@@ -57,6 +68,27 @@ def causal_trace_restore_fraction(
     Returns a 1D tensor of shape [V] with the fraction of clean-correct-logit recovered (for the last token).
     """
     from interpret.tracer import ActivationTracer
+    adapter = get_model_adapter(model)
+    if clean_inputs is None:
+        clean_inputs = coerce_model_inputs(
+            model,
+            clean_input_ids,
+            attn_mask,
+            enc_input_ids=enc_input_ids,
+            dec_input_ids=dec_input_ids,
+            enc_padding_mask=enc_padding_mask,
+            dec_self_mask=dec_self_mask,
+        )
+    if corrupted_inputs is None:
+        corrupted_inputs = coerce_model_inputs(
+            model,
+            corrupted_input_ids,
+            attn_mask,
+            enc_input_ids=enc_input_ids,
+            dec_input_ids=dec_input_ids,
+            enc_padding_mask=enc_padding_mask,
+            dec_self_mask=dec_self_mask,
+        )
 
     model_was_training = model.training
     model.eval()
@@ -65,29 +97,51 @@ def causal_trace_restore_fraction(
     tracer = ActivationTracer(model)
     tracer.add_modules(patch_points)
     with tracer.trace() as cache:
-        clean_logits = model(clean_input_ids, attn_mask)
+        clean_logits = adapter.forward(clean_inputs)
         clean_h = {k: cache.get(k) for k in patch_points}
 
     # Corrupted baseline
-    corrupted_logits = model(corrupted_input_ids, attn_mask)
+    corrupted_logits = adapter.forward(corrupted_inputs)
 
     # Patched run
     with output_patching(model, clean_h):
-        patched_logits = model(corrupted_input_ids, attn_mask)
+        patched_logits = adapter.forward(corrupted_inputs)
 
-    # Compare on target position
-    clean_pos = clean_logits[:, position, :]
-    corrupted_pos = corrupted_logits[:, position, :]
-    patched_pos = patched_logits[:, position, :]
-
-    # Recovery fraction per vocab entry: (patched - corrupted) / (clean - corrupted)
-    denom = (clean_pos - corrupted_pos)
-    eps = 1e-8
-    frac = (patched_pos - corrupted_pos) / (denom.abs() + eps)
-    frac = frac[0].detach().cpu()
+    if adapter.output_module() is not None and score_fn is None:
+        clean_pos = clean_logits[:, position, :]
+        corrupted_pos = corrupted_logits[:, position, :]
+        patched_pos = patched_logits[:, position, :]
+        denom = (clean_pos - corrupted_pos)
+        frac = (patched_pos - corrupted_pos) / (denom.abs() + 1e-8)
+        frac = frac[0].detach().cpu()
+    else:
+        clean_score, target_token_id, target_feature_index = resolve_model_score(
+            model,
+            clean_logits,
+            position=position,
+            target_token_id=target_token_id,
+            target_feature_index=target_feature_index,
+            score_fn=score_fn,
+        )
+        corrupted_score, _, _ = resolve_model_score(
+            model,
+            corrupted_logits,
+            position=position,
+            target_token_id=target_token_id,
+            target_feature_index=target_feature_index,
+            score_fn=score_fn,
+        )
+        patched_score, _, _ = resolve_model_score(
+            model,
+            patched_logits,
+            position=position,
+            target_token_id=target_token_id,
+            target_feature_index=target_feature_index,
+            score_fn=score_fn,
+        )
+        frac = (((patched_score - corrupted_score) / ((clean_score - corrupted_score).abs() + 1e-8))).view(1).detach().cpu()
 
     if model_was_training:
         model.train()
     return frac
-
 

@@ -13,6 +13,32 @@ constexpr int kSmallRowThreads = 64;
 constexpr int kMediumRowThreads = 128;
 constexpr int kLargeRowThreads = 256;
 
+template <int Threads>
+__device__ inline float BlockReduceMax(float value, float* shared) {
+  shared[threadIdx.x] = value;
+  __syncthreads();
+  for (int stride = Threads / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  return shared[0];
+}
+
+template <int Threads>
+__device__ inline float BlockReduceSum(float value, float* shared) {
+  shared[threadIdx.x] = value;
+  __syncthreads();
+  for (int stride = Threads / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  return shared[0];
+}
+
 template <typename scalar_t, int Threads, bool HasMask>
 __global__ void generic_attention_forward_kernel(
     const scalar_t* __restrict__ q,

@@ -4,61 +4,59 @@ This module provides lightweight, composable tools for model interpretability ac
 
 Highlights
 - Logit lens over residual streams per layer
-- Activation tracing and caching via robust forward hooks
+- Runtime-aware model adapter for `CausalLM`, `EncoderModel`, and `EncoderDecoderLM`
+- Activation tracing and caching via robust forward hooks plus canonical interpret surfaces
 - Linear probes (classification/regression) on cached features
-- Causal tracing via activation patching (resample/restore analysis)
-- Integrated gradients token attributions
-- Attention weights/entropy extraction leveraging `runtime.attention_modules` and `tensor.*` utils
+- Output/head/neuron/path patching sweeps and restoration analysis
+- Integrated gradients, grad×input, occlusion, and direct component/head/neuron/SAE attribution
+- Attention weights/entropy extraction captured from the real runtime attention path
 - MLP lens: project MLP outputs through `lm_head` to get per-layer token predictions
 - Attention head ablation (EagerAttention) via context manager
-- Feature flattening utilities to prepare data for probes
+- Probe dataset builders, train/validation splits, and dataset-scale activation mining
+- Reporting helpers for patch sweeps, path grids, probe datasets, and SAE training
 
 Quick Start (Python API)
 ```python
 import torch
-from interpret import ActivationTracer, logit_lens, integrated_gradients_tokens
+from interpret import ActivationTracer, ModelInputs, ProbeFeatureSlice, attention_snapshot_for_layer, build_probe_dataset, component_logit_attribution, logit_lens
 
-# model: instance of model.CausalLM (or any nn.Module with .embed/.lm_head)
-input_ids = torch.tensor([[1,2,3,4]])
+# causal model
+input_ids = torch.tensor([[1, 2, 3, 4]])
 
 # Logit lens
 out = logit_lens(model, input_ids, topk=5)
 for layer, (idx, val) in sorted(out.items()):
     print(layer, idx.tolist(), val.tolist())
 
-# Activation tracing (capture block outputs)
+# Activation tracing with canonical interpret surfaces
 tracer = ActivationTracer(model)
-tracer.add_block_outputs()
+tracer.add_interpret_surfaces()
 with tracer.trace() as cache:
     _ = model(input_ids)
-    h0 = cache.get("blocks.0")  # [B, T, D]
+    h0 = cache.get("blocks.0.resid_post")      # [B, T, D]
+    a0 = cache.get("blocks.0.attn.attn_probs") # [B, H, T, S]
+    m0 = cache.get("blocks.0.mlp.mlp_mid")     # [B, T, D_ff]
 
-# Integrated gradients (token-level attributions)
-scores = integrated_gradients_tokens(model, input_ids, steps=32)
-print(scores.tolist())
+# Direct residual component attribution
+scores = component_logit_attribution(model, input_ids)
+print(scores)
 
-# Attention weights and entropy for a specific layer
-from interpret import attention_weights_for_layer, attention_entropy_for_layer
-probs = attention_weights_for_layer(model, input_ids, layer_index=0)
-ent = attention_entropy_for_layer(model, input_ids, layer_index=0)
+# Runtime-faithful attention capture
+snap = attention_snapshot_for_layer(model, input_ids, layer_index=0)
+print(snap.probs.shape, snap.head_out.shape)
 
-# MLP lens (feedforward contributions)
-from interpret import mlp_lens
-mlp_out = mlp_lens(model, input_ids, topk=5)
-print(mlp_out)
+# Probe dataset construction from aligned cached activations
+ds = build_probe_dataset(cache, [ProbeFeatureSlice("blocks.0.resid_post")], input_ids=input_ids)
+train_ds, val_ds = split_probe_dataset(ds, val_fraction=0.2, stratify=True)
+print(summarize_probe_dataset(train_ds))
 
-# Head ablation (temporarily zero specific heads)
-from interpret import ablate_attention_heads
-with ablate_attention_heads(model, {0: [0,1], 3: [2]}):
-  _ = model(input_ids)
-
-# Features for probes
-from interpret import ActivationTracer, flatten_features, FeatureSlice
-tr = ActivationTracer(model)
-tr.add_block_outputs()
-with tr.trace() as cache:
-  _ = model(input_ids)
-X = flatten_features(cache, [FeatureSlice("blocks.0"), FeatureSlice("blocks.1.mlp", time_slice=slice(-1,None))])
+# Seq2seq example: decoder cross-attention weights
+seq_inputs = ModelInputs.encoder_decoder(
+    enc_input_ids=torch.tensor([[1, 2, 3, 4]]),
+    dec_input_ids=torch.tensor([[5, 6, 7]]),
+)
+cross = attention_snapshot_for_layer(seq2seq_model, layer_index=0, stack="decoder", kind="cross", **seq_inputs.__dict__)
+print(cross.probs.shape)
 ```
 
 CLI Usage
@@ -75,16 +73,29 @@ python -m interpret.cli causal-trace \
   --corrupted 1,999,3,4 \
   --points blocks.0,blocks.3 \
   --topk 10
+
+python -m interpret.cli path-sweep \
+  --model mypkg.models:load_small_lm \
+  --clean 1,2,3,4 \
+  --corrupted 1,999,3,4 \
+  --sources blocks.0,blocks.1 \
+  --receivers blocks.2.attn,blocks.3.mlp \
+  --topk 5
 ```
 
 API Overview
 - `ActivationTracer`: register forward hooks by module name or predicate, capture outputs to an `ActivationCache`.
+- `ModelInputs` / `ModelAdapter`: normalize causal, encoder, and encoder-decoder interpret calls.
 - `logit_lens(model, input_ids, ...)`: compute top-k tokens when projecting intermediate hidden states through `lm_head`.
 - `fit_linear_probe(x_train, y_train, ...)`: train a simple linear probe on cached features.
-- `causal_trace_restore_fraction(...)`: replace specified module outputs from clean run into corrupted run and measure recovery per token id.
-- `integrated_gradients_tokens(...)`: token-level attributions using zero baseline and path integration.
+- `causal_trace_restore_fraction(...)`: replace specified module outputs from clean run into corrupted run and measure recovery.
+- `head_patch_sweep(...)`, `block_output_patch_sweep(...)`, `mlp_neuron_patch_sweep(...)`, `path_patch_effect(...)`, `path_patch_sweep(...)`: patch sweeps and path analysis.
+- `component_logit_attribution(...)`, `head_logit_attribution(...)`, `mlp_neuron_logit_attribution(...)`, `sae_feature_logit_attribution(...)`: direct attribution surfaces.
+- `build_probe_dataset(...)`, `split_probe_dataset(...)`, `summarize_probe_dataset(...)`: aligned feature construction plus train/validation split and dataset summaries for probes.
+- `sae_feature_dashboard(...)`, `search_feature_activations(...)`, `summarize_sae_training(...)`: dataset-scale mining and reporting helpers.
 
 Notes
-- Works out-of-the-box with `model.CausalLM` and `blocks.*` transformer blocks.
-- For non-standard models, ensure there is an `embed` layer and `lm_head.weight` (or tied `embed.weight`) for logit lens.
+- Works with causal, encoder-only, and encoder-decoder runtime stacks through `ModelAdapter`.
+- Attention capture and head patching preserve the native runtime attention path; masks and resolved tensors come from the real forward call.
+- The lightweight helpers `flatten_features(...)` and `targets_from_tokens(...)` now enforce alignment instead of silently stacking mismatched rows.
 - Features stored in `ActivationCache` can be serialized via `save_pt(path)` and reloaded.

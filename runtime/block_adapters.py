@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from runtime.ops import linear as runtime_linear
+from runtime.ops import linear_module as runtime_linear_module
 
 
 class BottleneckAdapter(nn.Module):
@@ -15,8 +15,8 @@ class BottleneckAdapter(nn.Module):
         self.scale = float(scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = runtime_linear(x, self.down.weight, self.down.bias)
-        y = runtime_linear(y, self.up.weight, self.up.bias)
+        y = runtime_linear_module(x, self.down)
+        y = runtime_linear_module(y, self.up)
         y = self.dropout(y)
         return self.scale * y
 

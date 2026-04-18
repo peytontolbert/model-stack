@@ -2,110 +2,133 @@ from __future__ import annotations
 
 from typing import Optional
 
-import math
 import torch
 
-from runtime.attention_modules import EagerAttention
-from runtime.blocks import apply_native_norm
-from runtime.ops import apply_rotary as runtime_apply_rotary
-from runtime.ops import embedding as runtime_embedding
-from runtime.ops import linear as runtime_linear
-from runtime.ops import split_heads as runtime_split_heads
-from tensor.positional import build_rope_cache
-from tensor.masking import broadcast_mask
-from tensor.numerics import safe_softmax, entropy_from_probs
+from tensor.numerics import entropy_from_probs
+
+from interpret.model_adapter import AttentionSnapshot, coerce_model_inputs, get_model_adapter, patched_attention
+
+
+@torch.inference_mode()
+def attention_snapshot_for_layer(
+    model,
+    input_ids: Optional[torch.Tensor] = None,
+    layer_index: int = 0,
+    *,
+    attn_mask: Optional[torch.Tensor] = None,
+    enc_input_ids: Optional[torch.Tensor] = None,
+    dec_input_ids: Optional[torch.Tensor] = None,
+    enc_padding_mask: Optional[torch.Tensor] = None,
+    dec_self_mask: Optional[torch.Tensor] = None,
+    stack: Optional[str] = None,
+    kind: str = "self",
+) -> AttentionSnapshot:
+    """Capture a runtime-faithful attention snapshot for one layer.
+
+    The snapshot is collected by wrapping the real attention module used during the
+    model forward pass, so the prepared masks and resolved module tensors match the
+    actual runtime path.
+    """
+    adapter = get_model_adapter(model)
+    inputs = coerce_model_inputs(
+        model,
+        input_ids,
+        attn_mask,
+        enc_input_ids=enc_input_ids,
+        dec_input_ids=dec_input_ids,
+        enc_padding_mask=enc_padding_mask,
+        dec_self_mask=dec_self_mask,
+    )
+    target = adapter.attention_target(int(layer_index), stack=stack, kind=kind)  # type: ignore[arg-type]
+    if not hasattr(target.module, "forward"):
+        raise TypeError(f"Target attention module at layer {layer_index} has no forward method")
+
+    captured: dict[str, AttentionSnapshot] = {}
+
+    def _capture(snapshot: AttentionSnapshot) -> None:
+        captured["snapshot"] = AttentionSnapshot(
+            q=(None if snapshot.q is None else snapshot.q.detach().cpu()),
+            k=(None if snapshot.k is None else snapshot.k.detach().cpu()),
+            v=(None if snapshot.v is None else snapshot.v.detach().cpu()),
+            attn_mask=(None if snapshot.attn_mask is None else snapshot.attn_mask.detach().cpu()),
+            logits=(None if snapshot.logits is None else snapshot.logits.detach().cpu()),
+            probs=(None if snapshot.probs is None else snapshot.probs.detach().cpu()),
+            head_out=(None if snapshot.head_out is None else snapshot.head_out.detach().cpu()),
+            output=(None if snapshot.output is None else snapshot.output.detach().cpu()),
+        )
+
+    with patched_attention(target.module, capture=_capture, capture_logits=True, capture_probs=True):
+        _ = adapter.forward(inputs)
+
+    if "snapshot" not in captured:
+        raise RuntimeError(f"Failed to capture attention snapshot for layer {layer_index}")
+    return captured["snapshot"]
 
 
 @torch.inference_mode()
 def attention_weights_for_layer(
     model,
-    input_ids: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
     layer_index: int,
     *,
     attn_mask: Optional[torch.Tensor] = None,
+    enc_input_ids: Optional[torch.Tensor] = None,
+    dec_input_ids: Optional[torch.Tensor] = None,
+    enc_padding_mask: Optional[torch.Tensor] = None,
+    dec_self_mask: Optional[torch.Tensor] = None,
+    stack: Optional[str] = None,
+    kind: str = "self",
 ) -> torch.Tensor:
-    """Return attention probabilities (B, H, T, S) for a given transformer layer.
-
-    This re-computes the hidden state up to the target layer and then derives
-    attention weights from the layer's attention module parameters. Works with
-    `blocks.TransformerBlock` using `runtime.attention_modules.EagerAttention`.
-    """
-    device = next(model.parameters()).device
-    dtype = next(model.parameters()).dtype
-
-    # 1) Compute hidden state input to the target block
-    x = runtime_embedding(model.embed.weight, input_ids.to(device), model.embed.padding_idx)
-    for j, blk in enumerate(model.blocks):
-        if j >= layer_index:
-            break
-        x = blk(x, attn_mask, None)
-
-    block = model.blocks[layer_index]
-    attn = block.attn
-    if not isinstance(attn, EagerAttention):
-        raise TypeError("attention_weights_for_layer currently supports EagerAttention blocks only")
-
-    # 2) Build the attention input (prenorm vs postnorm)
-    if getattr(block.bc, "norm_policy", "prenorm") == "prenorm":
-        q_in = apply_native_norm(x, block.n1)
-    else:
-        q_in = x
-
-    B, T, D = q_in.shape
-    H = int(attn.n_heads)
-    Hk = int(attn.n_kv_heads)
-    Dh = int(attn.head_dim)
-
-    # 3) Project Q,K with module weights (self-attn; K from q_in)
-    q_lin = runtime_linear(q_in, attn.w_q.weight, attn.w_q.bias)
-    k_lin = runtime_linear(q_in, attn.w_k.weight, attn.w_k.bias)
-
-    qh = runtime_split_heads(q_lin, H)      # (B,H,T,Dh)
-    kh_new = runtime_split_heads(k_lin, Hk) # (B,Hk,T,Dh)
-
-    # 4) Apply RoPE if used
-    if attn.use_rope:
-        cos, sin = build_rope_cache(T, Dh, device=device, base_theta=float(attn.rope_theta))
-        qh, kh_new = runtime_apply_rotary(qh, kh_new, cos.to(dtype=q_in.dtype), sin.to(dtype=q_in.dtype))
-
-    # 5) Expand KV across heads for GQA
-    if H != Hk:
-        repeat = H // Hk
-        kh_all = kh_new.repeat_interleave(repeat, dim=1)
-    else:
-        kh_all = kh_new
-
-    # 6) Compute attention logits (scaled dot-product)
-    #    logits[b,h,t,s] = <q_{b,h,t,:}, k_{b,h,s,:}> / sqrt(Dh)
-    scale = 1.0 / math.sqrt(float(Dh))
-    logits = torch.einsum("bhtd,bhsd->bhts", qh.float(), kh_all.float()) * float(scale)
-
-    # 7) Apply mask if provided -> boolean mask (B,H,T,S) where True means masked
-    if attn_mask is not None:
-        m = broadcast_mask(batch_size=B, num_heads=H, tgt_len=T, src_len=T, causal_mask=None, padding_mask=attn_mask)
-        logits = logits.masked_fill(m, torch.finfo(logits.dtype).min)
-    elif attn.is_causal:
-        # Causal mask if none provided
-        i = torch.arange(T, device=device).view(T, 1)
-        j = torch.arange(T, device=device).view(1, T)
-        future = j > i
-        m = future.view(1, 1, T, T).expand(B, H, T, T)
-        logits = logits.masked_fill(m, torch.finfo(logits.dtype).min)
-
-    # 8) Softmax for probabilities
-    probs = safe_softmax(logits.to(dtype=q_in.dtype), dim=-1)
-    return probs
+    """Return attention probabilities (B, H, T, S) for a given layer."""
+    snapshot = attention_snapshot_for_layer(
+        model,
+        input_ids,
+        layer_index,
+        attn_mask=attn_mask,
+        enc_input_ids=enc_input_ids,
+        dec_input_ids=dec_input_ids,
+        enc_padding_mask=enc_padding_mask,
+        dec_self_mask=dec_self_mask,
+        stack=stack,
+        kind=kind,
+    )
+    if snapshot.probs is None:
+        raise RuntimeError(f"Attention probabilities were not captured for layer {layer_index}")
+    return snapshot.probs
 
 
 @torch.inference_mode()
 def attention_entropy_for_layer(
     model,
-    input_ids: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
     layer_index: int,
     *,
     attn_mask: Optional[torch.Tensor] = None,
+    enc_input_ids: Optional[torch.Tensor] = None,
+    dec_input_ids: Optional[torch.Tensor] = None,
+    enc_padding_mask: Optional[torch.Tensor] = None,
+    dec_self_mask: Optional[torch.Tensor] = None,
+    stack: Optional[str] = None,
+    kind: str = "self",
 ) -> torch.Tensor:
     """Return per-head attention entropy (B, H, T) at the target layer."""
-    probs = attention_weights_for_layer(model, input_ids, layer_index, attn_mask=attn_mask)
-    ent = entropy_from_probs(probs, dim=-1)
-    return ent
+    probs = attention_weights_for_layer(
+        model,
+        input_ids,
+        layer_index,
+        attn_mask=attn_mask,
+        enc_input_ids=enc_input_ids,
+        dec_input_ids=dec_input_ids,
+        enc_padding_mask=enc_padding_mask,
+        dec_self_mask=dec_self_mask,
+        stack=stack,
+        kind=kind,
+    )
+    return entropy_from_probs(probs, dim=-1)
+
+
+__all__ = [
+    "attention_snapshot_for_layer",
+    "attention_weights_for_layer",
+    "attention_entropy_for_layer",
+]

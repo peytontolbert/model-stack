@@ -13,7 +13,7 @@ from runtime.generation import build_generation_config as runtime_build_generati
 from runtime.generation import resolve_generation_sampling_mode as runtime_resolve_generation_sampling_mode
 from runtime.ops import create_causal_mask as runtime_create_causal_mask
 from runtime.ops import embedding as runtime_embedding
-from runtime.ops import linear as runtime_linear
+from runtime.ops import linear_module as runtime_linear_module
 from runtime.ops import resolve_position_ids as runtime_resolve_position_ids
 from runtime.ops import resolve_rotary_embedding as runtime_resolve_rotary_embedding
 from serve.engine import generate as engine_generate
@@ -145,7 +145,7 @@ class CausalLM(nn.Module):
             position_ids=position_ids,
         )
         x = apply_native_norm(x, self.norm)
-        logits = runtime_linear(x, self.lm_head.weight, self.lm_head.bias)
+        logits = runtime_linear_module(x, self.lm_head)
         if return_dict:
             return {"logits": logits, "last_hidden_state": x}
         return logits
@@ -180,6 +180,8 @@ class CausalLM(nn.Module):
         attention_mask: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         sliding_window: int | None = None,
+        beam_size: int = 1,
+        length_penalty: float = 1.0,
         cache_backend: str | None = None,
         return_dict: bool = True,
     ):
@@ -207,6 +209,8 @@ class CausalLM(nn.Module):
             presence_penalty=float(presence_penalty),
             frequency_penalty=float(frequency_penalty),
             sliding_window=(int(sliding_window) if sliding_window is not None else None),
+            beam_size=int(beam_size),
+            length_penalty=float(length_penalty),
         )
         seq = engine_generate(
             self,

@@ -5,52 +5,80 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from interpret.model_adapter import coerce_model_inputs, get_model_adapter, patched_embedding_output, resolve_model_score
+
 
 def grad_x_input_tokens(
     model: nn.Module,
-    input_ids: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
     *,
     target_token_id: Optional[int] = None,
+    target_feature_index: Optional[int] = None,
     position: int = -1,
     attn_mask: Optional[torch.Tensor] = None,
+    enc_input_ids: Optional[torch.Tensor] = None,
+    dec_input_ids: Optional[torch.Tensor] = None,
+    enc_padding_mask: Optional[torch.Tensor] = None,
+    dec_self_mask: Optional[torch.Tensor] = None,
+    stack: Optional[str] = None,
+    score_fn=None,
 ) -> torch.Tensor:
     """Gradient x input attribution on token embeddings; returns scores [T].
 
     Uses embedding output as "input". If target_token_id is None, uses argmax at position.
     """
-    assert hasattr(model, "embed"), "Model must have an embedding layer 'embed'"
+    adapter = get_model_adapter(model)
+    inputs = coerce_model_inputs(
+        model,
+        input_ids,
+        attn_mask,
+        enc_input_ids=enc_input_ids,
+        dec_input_ids=dec_input_ids,
+        enc_padding_mask=enc_padding_mask,
+        dec_self_mask=dec_self_mask,
+    )
+    resolved_stack = stack or ("causal" if adapter.kind == "causal" else "encoder" if adapter.kind == "encoder" else "decoder")
     was_training = model.training
     model.eval()
 
-    name_to_module = dict(model.named_modules())
-    embed = name_to_module.get("embed", getattr(model, "embed"))
+    outputs = adapter.forward(inputs)
+    _, target_token_id, target_feature_index = resolve_model_score(
+        model,
+        outputs,
+        position=position,
+        target_token_id=target_token_id,
+        target_feature_index=target_feature_index,
+        score_fn=score_fn,
+    )
 
-    logits = model(input_ids, attn_mask)
-    if target_token_id is None:
-        target_token_id = int(logits[0, position].argmax().item())
+    feats: dict[str, torch.Tensor] = {}
 
-    grads = {}
-    feats = {}
+    def _capture(output: torch.Tensor) -> None:
+        feats["emb"] = output
 
-    def hook(_m, _inp, out):
-        out.retain_grad()
-        feats["emb"] = out
-        return out
-
-    h = embed.register_forward_hook(hook)
-    try:
-        logits = model(input_ids, attn_mask)
-        score = logits[0, position, target_token_id]
+    with patched_embedding_output(
+        adapter,
+        inputs=inputs,
+        stack=resolved_stack,
+        capture=_capture,
+        keep_grad=True,
+    ):
+        outputs = adapter.forward(inputs)
+        score, _, _ = resolve_model_score(
+            model,
+            outputs,
+            position=position,
+            target_token_id=target_token_id,
+            target_feature_index=target_feature_index,
+            score_fn=score_fn,
+        )
         model.zero_grad(set_to_none=True)
         score.backward()
         grad = feats["emb"].grad.detach()  # [B,T,D]
         emb = feats["emb"].detach()
-    finally:
-        h.remove()
 
     scores = (emb * grad).sum(dim=-1)[0].cpu()
     if was_training:
         model.train()
     return scores
-
 

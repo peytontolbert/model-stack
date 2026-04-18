@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cuda_attention_common.cuh"
+#include "../cuda_device_arch.cuh"
 
 #include "../../descriptors/attention_desc.h"
 #include "../../policy/attention_policy.h"
@@ -270,6 +271,158 @@ __global__ void prefill_attention_hdim_forward_kernel(
   }
 }
 
+template <typename scalar_t, int Threads, int HeadDim>
+__global__ __launch_bounds__(Threads, 2) void prefill_attention_hdim_sm90_forward_kernel(
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ v,
+    const void* __restrict__ mask,
+    int mask_kind,
+    scalar_t* __restrict__ out,
+    int64_t batch,
+    int64_t q_heads,
+    int64_t kv_heads,
+    int64_t tq,
+    int64_t sk,
+    float scale,
+    bool is_causal) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  const int64_t total_rows = batch * q_heads * tq;
+  if (row >= total_rows) {
+    return;
+  }
+
+  __shared__ float reduce_shared[Threads];
+  __shared__ float q_shared[HeadDim];
+  __shared__ float broadcast_shared;
+
+  constexpr int kOutputsPerThread = (HeadDim + Threads - 1) / Threads;
+  float accum[kOutputsPerThread];
+  #pragma unroll
+  for (int idx = 0; idx < kOutputsPerThread; ++idx) {
+    accum[idx] = 0.0f;
+  }
+
+  const int64_t query_idx = row % tq;
+  const int64_t tmp = row / tq;
+  const int64_t head_idx = tmp % q_heads;
+  const int64_t batch_idx = tmp / q_heads;
+  const int64_t head_group = q_heads / kv_heads;
+  const int64_t kv_head_idx = head_idx / head_group;
+
+  const int64_t q_base = (((batch_idx * q_heads) + head_idx) * tq + query_idx) * HeadDim;
+  const int64_t kv_base = ((batch_idx * kv_heads) + kv_head_idx) * sk * HeadDim;
+  const int64_t mask_base = (((batch_idx * q_heads) + head_idx) * tq + query_idx) * sk;
+
+  for (int d = threadIdx.x; d < HeadDim; d += Threads) {
+    q_shared[d] = static_cast<float>(q[q_base + d]);
+  }
+  __syncthreads();
+
+  float row_max = -INFINITY;
+  for (int64_t s = 0; s < sk; ++s) {
+    const int64_t k_base = kv_base + s * HeadDim;
+    float partial = 0.0f;
+    for (int d = threadIdx.x; d < HeadDim; d += Threads) {
+      partial += q_shared[d] * static_cast<float>(k[k_base + d]);
+    }
+    const float dot = BlockReduceSum<Threads>(partial, reduce_shared);
+    if (threadIdx.x == 0) {
+      float score = dot * scale;
+      if (mask_kind == 1) {
+        if (static_cast<const bool*>(mask)[mask_base + s]) {
+          score = -INFINITY;
+        }
+      } else if (mask_kind == 2) {
+        score += static_cast<float>(static_cast<const scalar_t*>(mask)[mask_base + s]);
+      } else if (mask_kind == 3) {
+        score += static_cast<const float*>(mask)[mask_base + s];
+      }
+      if (is_causal && s > query_idx) {
+        score = -INFINITY;
+      }
+      row_max = fmaxf(row_max, score);
+      broadcast_shared = row_max;
+    }
+    __syncthreads();
+    row_max = broadcast_shared;
+  }
+
+  float denom = 0.0f;
+  for (int64_t s = 0; s < sk; ++s) {
+    const int64_t k_base = kv_base + s * HeadDim;
+    float partial = 0.0f;
+    for (int d = threadIdx.x; d < HeadDim; d += Threads) {
+      partial += q_shared[d] * static_cast<float>(k[k_base + d]);
+    }
+    const float dot = BlockReduceSum<Threads>(partial, reduce_shared);
+    if (threadIdx.x == 0) {
+      float score = dot * scale;
+      if (mask_kind == 1) {
+        if (static_cast<const bool*>(mask)[mask_base + s]) {
+          score = -INFINITY;
+        }
+      } else if (mask_kind == 2) {
+        score += static_cast<float>(static_cast<const scalar_t*>(mask)[mask_base + s]);
+      } else if (mask_kind == 3) {
+        score += static_cast<const float*>(mask)[mask_base + s];
+      }
+      if (is_causal && s > query_idx) {
+        score = -INFINITY;
+      }
+      denom += expf(score - row_max);
+      broadcast_shared = denom;
+    }
+    __syncthreads();
+    denom = broadcast_shared;
+  }
+  denom = fmaxf(denom, 1e-20f);
+
+  for (int64_t s = 0; s < sk; ++s) {
+    const int64_t k_base = kv_base + s * HeadDim;
+    float partial = 0.0f;
+    for (int d = threadIdx.x; d < HeadDim; d += Threads) {
+      partial += q_shared[d] * static_cast<float>(k[k_base + d]);
+    }
+    const float dot = BlockReduceSum<Threads>(partial, reduce_shared);
+    if (threadIdx.x == 0) {
+      float score = dot * scale;
+      if (mask_kind == 1) {
+        if (static_cast<const bool*>(mask)[mask_base + s]) {
+          score = -INFINITY;
+        }
+      } else if (mask_kind == 2) {
+        score += static_cast<float>(static_cast<const scalar_t*>(mask)[mask_base + s]);
+      } else if (mask_kind == 3) {
+        score += static_cast<const float*>(mask)[mask_base + s];
+      }
+      if (is_causal && s > query_idx) {
+        score = -INFINITY;
+      }
+      broadcast_shared = expf(score - row_max) / denom;
+    }
+    __syncthreads();
+    const float weight = broadcast_shared;
+    const int64_t v_base = kv_base + s * HeadDim;
+    #pragma unroll
+    for (int idx = 0; idx < kOutputsPerThread; ++idx) {
+      const int d = threadIdx.x + idx * Threads;
+      if (d < HeadDim) {
+        accum[idx] += weight * static_cast<float>(v[v_base + d]);
+      }
+    }
+    __syncthreads();
+  }
+
+  #pragma unroll
+  for (int idx = 0; idx < kOutputsPerThread; ++idx) {
+    const int d = threadIdx.x + idx * Threads;
+    if (d < HeadDim) {
+      out[q_base + d] = static_cast<scalar_t>(accum[idx]);
+    }
+  }
+}
+
 template <typename scalar_t>
 inline void LaunchGenericAttentionPrefill(
     const torch::Tensor& q_contig,
@@ -341,57 +494,112 @@ inline void LaunchPrefillAttentionSpecialized(
     cudaStream_t stream,
     int row_reduce_threads) {
   const dim3 blocks(static_cast<unsigned int>(desc.batch * desc.q_heads * desc.q_len));
+  const bool use_sm90 = t10::cuda::DeviceIsSm90OrLater(q_contig);
   switch (row_reduce_threads) {
     case kSmallRowThreads:
-      prefill_attention_hdim_forward_kernel<scalar_t, kSmallRowThreads, HeadDim>
-          <<<blocks, kSmallRowThreads, 0, stream>>>(
-              q_contig.data_ptr<scalar_t>(),
-              k_contig.data_ptr<scalar_t>(),
-              v_contig.data_ptr<scalar_t>(),
-              mask_ptr,
-              mask_kind,
-              out.data_ptr<scalar_t>(),
-              desc.batch,
-              desc.q_heads,
-              desc.kv_heads,
-              desc.q_len,
-              desc.kv_len,
-              scale_value,
-              desc.causal);
+      if (use_sm90) {
+        prefill_attention_hdim_sm90_forward_kernel<scalar_t, kSmallRowThreads, HeadDim>
+            <<<blocks, kSmallRowThreads, 0, stream>>>(
+                q_contig.data_ptr<scalar_t>(),
+                k_contig.data_ptr<scalar_t>(),
+                v_contig.data_ptr<scalar_t>(),
+                mask_ptr,
+                mask_kind,
+                out.data_ptr<scalar_t>(),
+                desc.batch,
+                desc.q_heads,
+                desc.kv_heads,
+                desc.q_len,
+                desc.kv_len,
+                scale_value,
+                desc.causal);
+      } else {
+        prefill_attention_hdim_forward_kernel<scalar_t, kSmallRowThreads, HeadDim>
+            <<<blocks, kSmallRowThreads, 0, stream>>>(
+                q_contig.data_ptr<scalar_t>(),
+                k_contig.data_ptr<scalar_t>(),
+                v_contig.data_ptr<scalar_t>(),
+                mask_ptr,
+                mask_kind,
+                out.data_ptr<scalar_t>(),
+                desc.batch,
+                desc.q_heads,
+                desc.kv_heads,
+                desc.q_len,
+                desc.kv_len,
+                scale_value,
+                desc.causal);
+      }
       return;
     case kMediumRowThreads:
-      prefill_attention_hdim_forward_kernel<scalar_t, kMediumRowThreads, HeadDim>
-          <<<blocks, kMediumRowThreads, 0, stream>>>(
-              q_contig.data_ptr<scalar_t>(),
-              k_contig.data_ptr<scalar_t>(),
-              v_contig.data_ptr<scalar_t>(),
-              mask_ptr,
-              mask_kind,
-              out.data_ptr<scalar_t>(),
-              desc.batch,
-              desc.q_heads,
-              desc.kv_heads,
-              desc.q_len,
-              desc.kv_len,
-              scale_value,
-              desc.causal);
+      if (use_sm90) {
+        prefill_attention_hdim_sm90_forward_kernel<scalar_t, kMediumRowThreads, HeadDim>
+            <<<blocks, kMediumRowThreads, 0, stream>>>(
+                q_contig.data_ptr<scalar_t>(),
+                k_contig.data_ptr<scalar_t>(),
+                v_contig.data_ptr<scalar_t>(),
+                mask_ptr,
+                mask_kind,
+                out.data_ptr<scalar_t>(),
+                desc.batch,
+                desc.q_heads,
+                desc.kv_heads,
+                desc.q_len,
+                desc.kv_len,
+                scale_value,
+                desc.causal);
+      } else {
+        prefill_attention_hdim_forward_kernel<scalar_t, kMediumRowThreads, HeadDim>
+            <<<blocks, kMediumRowThreads, 0, stream>>>(
+                q_contig.data_ptr<scalar_t>(),
+                k_contig.data_ptr<scalar_t>(),
+                v_contig.data_ptr<scalar_t>(),
+                mask_ptr,
+                mask_kind,
+                out.data_ptr<scalar_t>(),
+                desc.batch,
+                desc.q_heads,
+                desc.kv_heads,
+                desc.q_len,
+                desc.kv_len,
+                scale_value,
+                desc.causal);
+      }
       return;
     default:
-      prefill_attention_hdim_forward_kernel<scalar_t, kLargeRowThreads, HeadDim>
-          <<<blocks, kLargeRowThreads, 0, stream>>>(
-              q_contig.data_ptr<scalar_t>(),
-              k_contig.data_ptr<scalar_t>(),
-              v_contig.data_ptr<scalar_t>(),
-              mask_ptr,
-              mask_kind,
-              out.data_ptr<scalar_t>(),
-              desc.batch,
-              desc.q_heads,
-              desc.kv_heads,
-              desc.q_len,
-              desc.kv_len,
-              scale_value,
-              desc.causal);
+      if (use_sm90) {
+        prefill_attention_hdim_sm90_forward_kernel<scalar_t, kLargeRowThreads, HeadDim>
+            <<<blocks, kLargeRowThreads, 0, stream>>>(
+                q_contig.data_ptr<scalar_t>(),
+                k_contig.data_ptr<scalar_t>(),
+                v_contig.data_ptr<scalar_t>(),
+                mask_ptr,
+                mask_kind,
+                out.data_ptr<scalar_t>(),
+                desc.batch,
+                desc.q_heads,
+                desc.kv_heads,
+                desc.q_len,
+                desc.kv_len,
+                scale_value,
+                desc.causal);
+      } else {
+        prefill_attention_hdim_forward_kernel<scalar_t, kLargeRowThreads, HeadDim>
+            <<<blocks, kLargeRowThreads, 0, stream>>>(
+                q_contig.data_ptr<scalar_t>(),
+                k_contig.data_ptr<scalar_t>(),
+                v_contig.data_ptr<scalar_t>(),
+                mask_ptr,
+                mask_kind,
+                out.data_ptr<scalar_t>(),
+                desc.batch,
+                desc.q_heads,
+                desc.kv_heads,
+                desc.q_len,
+                desc.kv_len,
+                scale_value,
+                desc.causal);
+      }
       return;
   }
 }

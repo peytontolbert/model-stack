@@ -7,18 +7,26 @@ import torch
 import torch.nn as nn
 
 from runtime.attention import _read_backend_from_env_or_file, scaled_dot_product_attention, select_attention_backend
+from runtime.hardware import prefer_hopper_library_attention
 from runtime.attention_interfaces import Attention, KVCache
 from runtime.native import resolve_linear_backend
+from runtime.quant import int8_matmul_qkv as runtime_int8_matmul_qkv
+from runtime.quant import quantize_activation_int8_rowwise as runtime_quantize_activation_int8_rowwise
 from runtime.ops import (
     attention as runtime_attention,
     apply_rotary as runtime_apply_rotary,
+    head_output_packed_projection as runtime_head_output_packed_projection,
     head_output_projection as runtime_head_output_projection,
-    linear as runtime_linear,
-    pack_linear_weight as runtime_pack_linear_weight,
-    pack_qkv_weights as runtime_pack_qkv_weights,
+    linear_module as runtime_linear_module,
+    packed_qkv_module_signature as runtime_packed_qkv_module_signature,
+    packed_linear_module_signature as runtime_packed_linear_module_signature,
+    merge_heads as runtime_merge_heads,
     prepare_attention_mask as runtime_prepare_attention_mask,
     qkv_heads_projection as runtime_qkv_heads_projection,
-    qkv_packed_heads_projection as runtime_qkv_packed_heads_projection,
+    qkv_packed_spec_heads_projection as runtime_qkv_packed_spec_heads_projection,
+    resolve_packed_qkv_module_spec as runtime_resolve_packed_qkv_module_spec,
+    resolve_packed_linear_module_spec as runtime_resolve_packed_linear_module_spec,
+    resolve_linear_module_tensors as runtime_resolve_linear_module_tensors,
     resolve_rotary_embedding as runtime_resolve_rotary_embedding,
     split_heads as runtime_split_heads,
 )
@@ -79,68 +87,145 @@ class EagerAttention(nn.Module):
         self.register_buffer("_rope_cos", torch.tensor([]), persistent=False)
         self.register_buffer("_rope_sin", torch.tensor([]), persistent=False)
         self._packed_qkv_signature = None
-        self._packed_qkv_weight = None
-        self._packed_qkv_bias = None
+        self._packed_qkv_spec = None
         self._packed_q_sizes = None
         self._packed_o_signature = None
-        self._packed_o_weight = None
-        self._packed_o_bias = None
+        self._packed_o_spec = None
 
-    @staticmethod
-    def _tensor_signature(t: torch.Tensor | None):
-        if t is None:
-            return None
+    def _uses_module_runtime_linear(self) -> bool:
+        for projection in (self.w_q, self.w_k, self.w_v, self.w_o):
+            runtime_linear = getattr(projection, "runtime_linear", None)
+            if callable(runtime_linear):
+                return True
+        return False
+
+    def _shared_int8_qkv_input_signature(self):
+        shared_signature = None
+        for projection in (self.w_q, self.w_k, self.w_v):
+            runtime_signature = getattr(projection, "runtime_shared_int8_input_signature", None)
+            runtime_linear = getattr(projection, "runtime_linear_from_quantized_input", None)
+            runtime_quantize = getattr(projection, "runtime_quantize_int8_input", None)
+            if not callable(runtime_signature) or not callable(runtime_linear) or not callable(runtime_quantize):
+                return None
+            current = runtime_signature()
+            if current is None:
+                return None
+            if shared_signature is None:
+                shared_signature = current
+            elif current != shared_signature:
+                return None
+        return shared_signature
+
+    def _shared_int8_qkv_projection(self, x: torch.Tensor):
+        qx, row_scale, out_dtype = self.w_q.runtime_quantize_int8_input(x)
+        q_lin = self.w_q.runtime_linear_from_quantized_input(qx, row_scale, out_dtype=out_dtype)
+        k_lin = self.w_k.runtime_linear_from_quantized_input(qx, row_scale, out_dtype=out_dtype)
+        v_lin = self.w_v.runtime_linear_from_quantized_input(qx, row_scale, out_dtype=out_dtype)
         return (
-            str(t.device),
-            str(t.dtype),
-            tuple(t.shape),
-            int(getattr(t, "_version", 0)),
-            int(t.data_ptr()),
+            runtime_split_heads(q_lin, self.n_heads),
+            runtime_split_heads(k_lin, self.n_kv_heads),
+            runtime_split_heads(v_lin, self.n_kv_heads),
+        )
+
+    def _supports_int8_attention_core(self) -> bool:
+        for projection in (self.w_q, self.w_k, self.w_v):
+            runtime_signature = getattr(projection, "runtime_shared_int8_input_signature", None)
+            if not callable(runtime_signature):
+                return False
+            if runtime_signature() is None:
+                return False
+        return True
+
+    def _int8_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        attn_mask: torch.Tensor | None,
+        is_causal: bool,
+        scale: float,
+    ) -> torch.Tensor:
+        qq, q_scale = runtime_quantize_activation_int8_rowwise(q)
+        kq, k_scale = runtime_quantize_activation_int8_rowwise(k)
+        vq, v_scale = runtime_quantize_activation_int8_rowwise(v)
+        return runtime_int8_matmul_qkv(
+            qq,
+            kq,
+            vq,
+            q_scale,
+            k_scale,
+            v_scale,
+            attn_mask,
+            is_causal=is_causal,
+            scale=scale,
+            out_dtype=q.dtype,
         )
 
     def _packed_backend(self, x: torch.Tensor) -> str | None:
-        if self.training or (not x.is_cuda):
+        if self.training or (not getattr(x, "is_cuda", False)):
             return None
-        backend = resolve_linear_backend("auto")
-        return backend if backend == "cublaslt" else None
+        preferred_backend = resolve_linear_backend("auto")
 
-    def _ensure_packed_qkv(self, backend: str):
+        def _supports_backend(candidate: str) -> bool:
+            for projection in (self.w_q, self.w_k, self.w_v, self.w_o):
+                runtime_linear = getattr(projection, "runtime_linear", None)
+                supports_packed_backend = getattr(projection, "runtime_supports_packed_backend", None)
+                if callable(runtime_linear):
+                    if not callable(supports_packed_backend):
+                        return False
+                    if not bool(supports_packed_backend(candidate)):
+                        return False
+                elif candidate == "cublaslt":
+                    if callable(supports_packed_backend) and not bool(supports_packed_backend(candidate)):
+                        return False
+                else:
+                    return False
+            return True
+
+        candidates: list[str] = []
+        if preferred_backend == "cublaslt":
+            candidates.append("cublaslt")
+        if preferred_backend == "bitnet":
+            candidates.append("bitnet")
+        if "bitnet" not in candidates:
+            candidates.append("bitnet")
+
+        for candidate in candidates:
+            if _supports_backend(candidate):
+                return candidate
+        return None
+
+    def _ensure_packed_qkv(self, backend: str, reference: torch.Tensor):
         signature = (
             backend,
-            self._tensor_signature(self.w_q.weight),
-            self._tensor_signature(self.w_q.bias),
-            self._tensor_signature(self.w_k.weight),
-            self._tensor_signature(self.w_k.bias),
-            self._tensor_signature(self.w_v.weight),
-            self._tensor_signature(self.w_v.bias),
+            str(reference.device),
+            str(reference.dtype),
+            runtime_packed_qkv_module_signature(self.w_q, self.w_k, self.w_v, backend=backend),
         )
         if signature != self._packed_qkv_signature:
-            packed_weight, packed_bias, q_size, k_size, v_size = runtime_pack_qkv_weights(
-                self.w_q.weight,
-                self.w_q.bias,
-                self.w_k.weight,
-                self.w_k.bias,
-                self.w_v.weight,
-                self.w_v.bias,
-            )
+            spec = runtime_resolve_packed_qkv_module_spec(self.w_q, self.w_k, self.w_v, backend=backend, reference=reference)
+            if spec is None:
+                raise RuntimeError(f"Unable to resolve packed QKV spec for backend {backend}")
             self._packed_qkv_signature = signature
-            self._packed_qkv_weight = packed_weight
-            self._packed_qkv_bias = packed_bias
-            self._packed_q_sizes = (q_size, k_size, v_size)
-        return self._packed_qkv_weight, self._packed_qkv_bias, self._packed_q_sizes
+            self._packed_qkv_spec = spec
+            self._packed_q_sizes = (int(spec["q_size"]), int(spec["k_size"]), int(spec["v_size"]))
+        return self._packed_qkv_spec, self._packed_q_sizes
 
-    def _ensure_packed_output(self, backend: str):
+    def _ensure_packed_output(self, backend: str, reference: torch.Tensor):
         signature = (
             backend,
-            self._tensor_signature(self.w_o.weight),
-            self._tensor_signature(self.w_o.bias),
+            str(reference.device),
+            str(reference.dtype),
+            runtime_packed_linear_module_signature(self.w_o, backend=backend),
         )
         if signature != self._packed_o_signature:
-            packed_weight, packed_bias = runtime_pack_linear_weight(self.w_o.weight, self.w_o.bias)
+            spec = runtime_resolve_packed_linear_module_spec(self.w_o, backend=backend, reference=reference)
+            if spec is None:
+                raise RuntimeError(f"Unable to resolve packed output projection spec for backend {backend}")
             self._packed_o_signature = signature
-            self._packed_o_weight = packed_weight
-            self._packed_o_bias = packed_bias
-        return self._packed_o_weight, self._packed_o_bias
+            self._packed_o_spec = spec
+        return self._packed_o_spec
 
     def _ensure_rope_cache(self, seq_len: int, reference: torch.Tensor):
         if not self.use_rope:
@@ -188,35 +273,42 @@ class EagerAttention(nn.Module):
 
         if k is None and v is None:
             if packed_backend is not None:
-                packed_weight, packed_bias, packed_sizes = self._ensure_packed_qkv(packed_backend)
-                q_size, k_size, v_size = packed_sizes
-                qh, kh_new, vh_new = runtime_qkv_packed_heads_projection(
+                packed_qkv_spec, _ = self._ensure_packed_qkv(packed_backend, x)
+                qh, kh_new, vh_new = runtime_qkv_packed_spec_heads_projection(
                     x,
-                    packed_weight,
-                    packed_bias,
-                    q_size=q_size,
-                    k_size=k_size,
-                    v_size=v_size,
+                    packed_qkv_spec,
                     q_heads=self.n_heads,
                     kv_heads=self.n_kv_heads,
                     backend=packed_backend,
                 )
+            elif self._shared_int8_qkv_input_signature() is not None:
+                qh, kh_new, vh_new = self._shared_int8_qkv_projection(x)
+            elif self._uses_module_runtime_linear():
+                q_lin = runtime_linear_module(x, self.w_q)
+                k_lin = runtime_linear_module(x, self.w_k)
+                v_lin = runtime_linear_module(x, self.w_v)
+                qh = runtime_split_heads(q_lin, self.n_heads)
+                kh_new = runtime_split_heads(k_lin, self.n_kv_heads)
+                vh_new = runtime_split_heads(v_lin, self.n_kv_heads)
             else:
+                q_weight, q_bias = runtime_resolve_linear_module_tensors(self.w_q, reference=x)
+                k_weight, k_bias = runtime_resolve_linear_module_tensors(self.w_k, reference=x)
+                v_weight, v_bias = runtime_resolve_linear_module_tensors(self.w_v, reference=x)
                 qh, kh_new, vh_new = runtime_qkv_heads_projection(
                     x,
-                    self.w_q.weight,
-                    self.w_q.bias,
-                    self.w_k.weight,
-                    self.w_k.bias,
-                    self.w_v.weight,
-                    self.w_v.bias,
+                    q_weight,
+                    q_bias,
+                    k_weight,
+                    k_bias,
+                    v_weight,
+                    v_bias,
                     q_heads=self.n_heads,
                     kv_heads=self.n_kv_heads,
                 )
         else:
-            q_lin = runtime_linear(x, self.w_q.weight, self.w_q.bias)
-            k_lin = runtime_linear(x if k is None else k, self.w_k.weight, self.w_k.bias)
-            v_lin = runtime_linear(x if v is None else v, self.w_v.weight, self.w_v.bias)
+            q_lin = runtime_linear_module(x, self.w_q)
+            k_lin = runtime_linear_module(x if k is None else k, self.w_k)
+            v_lin = runtime_linear_module(x if v is None else v, self.w_v)
             qh = runtime_split_heads(q_lin, self.n_heads)
             kh_new = runtime_split_heads(k_lin, self.n_kv_heads)
             vh_new = runtime_split_heads(v_lin, self.n_kv_heads)
@@ -286,17 +378,38 @@ class EagerAttention(nn.Module):
         else:
             is_causal_flag = add is None
             forced_backend = self.backend_override or _read_backend_from_env_or_file()
-            use_runtime_attention = forced_backend is None and (self.attn_dropout_p if self.training else 0.0) == 0.0
+            prefer_library_backend = prefer_hopper_library_attention(
+                device=device,
+                dtype=dtype,
+                q_seq=T,
+                kv_seq=S,
+                forced_backend=forced_backend,
+            )
+            use_runtime_attention = (
+                forced_backend is None
+                and (self.attn_dropout_p if self.training else 0.0) == 0.0
+                and not prefer_library_backend
+            )
             if use_runtime_attention:
                 kh_backend, vh_backend = kh_all, vh_all
-                out = runtime_attention(
-                    qh,
-                    kh_backend,
-                    vh_backend,
-                    attn_mask=add,
-                    is_causal=is_causal_flag,
-                    scale=float(self.scaling),
-                )
+                if self._supports_int8_attention_core():
+                    out = self._int8_attention(
+                        qh,
+                        kh_backend,
+                        vh_backend,
+                        attn_mask=add,
+                        is_causal=is_causal_flag,
+                        scale=float(self.scaling),
+                    )
+                else:
+                    out = runtime_attention(
+                        qh,
+                        kh_backend,
+                        vh_backend,
+                        attn_mask=add,
+                        is_causal=is_causal_flag,
+                        scale=float(self.scaling),
+                    )
             else:
                 backend = forced_backend or select_attention_backend(
                     is_causal=is_causal_flag,
@@ -304,6 +417,7 @@ class EagerAttention(nn.Module):
                     seq=T,
                     heads=self.n_heads,
                     device=device,
+                    kv_seq=S,
                 )
                 use_native_gqa = backend == "torch" and (self.attn_dropout_p if self.training else 0.0) == 0.0
                 if use_native_gqa:
@@ -334,9 +448,13 @@ class EagerAttention(nn.Module):
             cache.append(kh_new, vh_new)
 
         if packed_backend is not None:
-            packed_o_weight, packed_o_bias = self._ensure_packed_output(packed_backend)
-            return runtime_head_output_projection(out, packed_o_weight, packed_o_bias, backend=packed_backend)
-        return runtime_head_output_projection(out, self.w_o.weight, self.w_o.bias)
+            packed_o_spec = self._ensure_packed_output(packed_backend, out)
+            return runtime_head_output_packed_projection(out, packed_o_spec, backend=packed_backend)
+        runtime_linear = getattr(self.w_o, "runtime_linear", None)
+        if callable(runtime_linear):
+            return runtime_linear_module(runtime_merge_heads(out), self.w_o)
+        o_weight, o_bias = runtime_resolve_linear_module_tensors(self.w_o, reference=out)
+        return runtime_head_output_projection(out, o_weight, o_bias)
 
 
 class FlashAttention(EagerAttention):

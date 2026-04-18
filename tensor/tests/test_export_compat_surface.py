@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+import export.exporter as runtime_exporter_mod
 import model.export as model_export_mod
 
 
@@ -76,3 +77,60 @@ def test_pack_cli_uses_current_export_model_signature() -> None:
     source = (Path(__file__).resolve().parents[2] / "pack/cli.py").read_text(encoding="utf-8")
     assert "from export.exporter import export_model" in source
     assert "export_model(model, exp_cfg, model_cfg=cfg)" in source
+
+
+def test_runtime_exporter_loads_calibration_input_map(tmp_path):
+    calibration_path = tmp_path / "calibration.pt"
+    expected = {"layer.w_q": torch.randn(4, 16)}
+    torch.save({"calibration_inputs": expected}, calibration_path)
+
+    loaded = runtime_exporter_mod._load_quant_calibration_inputs(
+        type("ExportCfg", (), {"quant_calibration_inputs_path": str(calibration_path)})()
+    )
+
+    assert loaded is not None
+    assert set(loaded) == {"layer.w_q"}
+    assert torch.equal(loaded["layer.w_q"], expected["layer.w_q"])
+
+
+def test_runtime_exporter_threads_awq_and_activation_quantization(monkeypatch, tmp_path):
+    calibration_path = tmp_path / "calibration.pt"
+    calibration_inputs = {"layer.w_q": torch.randn(8, 16)}
+    torch.save(calibration_inputs, calibration_path)
+    seen = {}
+
+    def fake_apply_compression(model, *, quant=None, lora=None):
+        del model, lora
+        seen["quant"] = quant
+        return {}
+
+    monkeypatch.setattr(runtime_exporter_mod, "apply_compression", fake_apply_compression)
+
+    runtime_exporter_mod._maybe_apply_quantization(
+        torch.nn.Linear(16, 8, bias=False),
+        type(
+            "ExportCfg",
+            (),
+            {
+                "quantize": "int4",
+                "quant_spin": True,
+                "quant_spin_seed": 7,
+                "quant_weight_opt": "awq",
+                "quant_activation_quant": "static_int8",
+                "quant_activation_quant_bits": 8,
+                "quant_activation_quant_method": "percentile",
+                "quant_activation_quant_percentile": 0.995,
+                "quant_calibration_inputs_path": str(calibration_path),
+            },
+        )(),
+    )
+
+    assert seen["quant"] is not None
+    assert seen["quant"]["scheme"] == "int4"
+    assert seen["quant"]["spin"] is True
+    assert seen["quant"]["spin_seed"] == 7
+    assert seen["quant"]["weight_opt"] == "awq"
+    assert seen["quant"]["activation_quant"] == "static_int8"
+    assert seen["quant"]["activation_quant_method"] == "percentile"
+    assert seen["quant"]["activation_quant_percentile"] == 0.995
+    assert set(seen["quant"]["calibration_inputs"]) == {"layer.w_q"}

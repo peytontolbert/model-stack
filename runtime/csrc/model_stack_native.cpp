@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cmath>
 #include <cstdlib>
 #include <map>
@@ -24,6 +25,7 @@
 
 namespace py = pybind11;
 namespace torch_ext = torch;
+using namespace pybind11::literals;
 
 #if MODEL_STACK_WITH_CUDA
 torch::Tensor CudaRmsNormForward(
@@ -116,12 +118,47 @@ std::vector<torch::Tensor> CudaDecodePositionsForward(
     int64_t batch_size,
     int64_t seq_len,
     const torch::Tensor& reference);
+std::vector<torch::Tensor> CudaBeamSearchStepForward(
+    const torch::Tensor& beams,
+    const torch::Tensor& logits,
+    const torch::Tensor& raw_scores,
+    const torch::Tensor& finished,
+    const torch::Tensor& lengths,
+    int64_t beam_size,
+    int64_t eos_id,
+    int64_t pad_id);
 bool HasCudaDecodePositionsKernel();
 torch::Tensor CublasLtLinearForward(
     const torch::Tensor& x,
     const torch::Tensor& weight,
     const c10::optional<torch::Tensor>& bias);
 bool HasCublasLtLinearBackend();
+torch::Tensor CudaInt4LinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias);
+bool HasCudaInt4LinearKernel();
+torch::Tensor CudaInt8LinearForward(
+    const torch::Tensor& qx,
+    const torch::Tensor& x_scale,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::ScalarType>& out_dtype);
+bool HasCudaInt8LinearKernel();
+torch::Tensor CudaInt8AttentionForward(
+    const torch::Tensor& q,
+    const torch::Tensor& q_scale,
+    const torch::Tensor& k,
+    const torch::Tensor& k_scale,
+    const torch::Tensor& v,
+    const torch::Tensor& v_scale,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    const c10::optional<double>& scale,
+    const c10::optional<torch::ScalarType>& out_dtype);
+bool HasCudaInt8AttentionKernel();
 torch::Tensor CudaActivationForward(
     const torch::Tensor& x,
     const std::string& activation);
@@ -201,6 +238,15 @@ bool HasCudaDecodePositionsKernel() {
   return false;
 }
 bool HasCublasLtLinearBackend() {
+  return false;
+}
+bool HasCudaInt4LinearKernel() {
+  return false;
+}
+bool HasCudaInt8LinearKernel() {
+  return false;
+}
+bool HasCudaInt8AttentionKernel() {
   return false;
 }
 bool HasCudaActivationKernel() {
@@ -336,17 +382,65 @@ bool CanUseCudaAttentionPath(
 #endif
 }
 
+bool CanUseCudaInt8AttentionPath(
+    const torch::Tensor& q,
+    const torch::Tensor& q_scale,
+    const torch::Tensor& k,
+    const torch::Tensor& k_scale,
+    const torch::Tensor& v,
+    const torch::Tensor& v_scale,
+    const c10::optional<torch::Tensor>& attn_mask) {
+#if MODEL_STACK_WITH_CUDA
+  if (!(q.is_cuda() && q_scale.is_cuda() && k.is_cuda() && k_scale.is_cuda() && v.is_cuda() && v_scale.is_cuda() &&
+        HasCudaInt8AttentionKernel())) {
+    return false;
+  }
+  if (attn_mask.has_value() && attn_mask.value().defined()) {
+    const auto& mask = attn_mask.value();
+    if (!mask.is_cuda() || mask.dim() != 4) {
+      return false;
+    }
+    if (!(mask.scalar_type() == torch::kBool || mask.scalar_type() == torch::kFloat32 ||
+          mask.scalar_type() == torch::kFloat16 || mask.scalar_type() == torch::kBFloat16)) {
+      return false;
+    }
+    if (mask.size(0) != q.size(0) || mask.size(2) != q.size(2) || mask.size(3) != k.size(2)) {
+      return false;
+    }
+    if (!(mask.size(1) == 1 || mask.size(1) == q.size(1))) {
+      return false;
+    }
+  }
+  return true;
+#else
+  (void)q;
+  (void)q_scale;
+  (void)k;
+  (void)k_scale;
+  (void)v;
+  (void)v_scale;
+  (void)attn_mask;
+  return false;
+#endif
+}
+
 std::map<std::string, bool> NativeOpMap() {
   return {
       {"activation", true},
       {"gated_activation", true},
       {"embedding", true},
       {"linear", true},
+      {"bitnet_linear", true},
+      {"int4_linear", true},
+      {"int8_linear", true},
+      {"int8_attention", true},
+      {"pack_bitnet_weight", true},
       {"pack_linear_weight", true},
       {"mlp", true},
       {"qkv_projection", true},
       {"pack_qkv_weights", true},
       {"qkv_packed_heads_projection", true},
+      {"bitnet_qkv_packed_heads_projection", true},
       {"qkv_heads_projection", true},
       {"split_heads", true},
       {"merge_heads", true},
@@ -379,16 +473,17 @@ std::map<std::string, bool> NativeOpMap() {
       {"attention_prefill", true},
       {"sampling", true},
       {"beam_search_step", true},
+      {"incremental_beam_search", true},
   };
 }
 
 std::vector<std::string> SupportedLinearBackends() {
 #if MODEL_STACK_WITH_CUDA
   if (HasCublasLtLinearBackend()) {
-    return {"aten", "cublaslt"};
+    return {"aten", "bitnet", "cublaslt"};
   }
 #endif
-  return {"aten"};
+  return {"aten", "bitnet"};
 }
 
 std::vector<std::string> PlannedLinearBackends() {
@@ -413,11 +508,297 @@ std::string ResolveLinearBackend(const std::string& requested) {
     }
   }
   TORCH_CHECK(
-      candidate == "aten" || (candidate == "cublaslt" && HasCublasLtLinearBackend()),
+      candidate == "aten" || candidate == "bitnet" || (candidate == "cublaslt" && HasCublasLtLinearBackend()),
       "Unsupported linear backend request: ",
       candidate,
-      " (supported backends: aten; planned backends: cublaslt)");
+      " (supported backends: aten, bitnet; planned backends: cublaslt)");
   return candidate;
+}
+
+torch::Tensor ReferenceInt4LinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias) {
+  const auto in_features = x.size(-1);
+  auto packed_cpu = packed_weight.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8)).contiguous();
+  auto scale_cpu = inv_scale.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32)).contiguous();
+  auto weight_cpu = torch::empty(
+      {packed_cpu.size(0), in_features},
+      torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+
+  auto packed_acc = packed_cpu.accessor<uint8_t, 2>();
+  auto scale_acc = scale_cpu.accessor<float, 1>();
+  auto weight_acc = weight_cpu.accessor<float, 2>();
+  for (int64_t out_idx = 0; out_idx < packed_cpu.size(0); ++out_idx) {
+    for (int64_t in_idx = 0; in_idx < in_features; ++in_idx) {
+      const auto packed_value = packed_acc[out_idx][in_idx / 2];
+      const auto nibble = (in_idx % 2) == 0 ? (packed_value & 0x0F) : ((packed_value >> 4) & 0x0F);
+      const auto q = static_cast<int>(nibble) - 8;
+      weight_acc[out_idx][in_idx] = static_cast<float>(q) * scale_acc[out_idx];
+    }
+  }
+
+  auto weight = weight_cpu.to(x.device(), x.scalar_type());
+  c10::optional<torch::Tensor> bias_cast = c10::nullopt;
+  if (bias.has_value() && bias.value().defined()) {
+    bias_cast = bias.value().to(x.device(), x.scalar_type());
+  }
+  return ReferenceLinearForward(x, weight, bias_cast);
+}
+
+torch::Tensor ReferenceInt8LinearForward(
+    const torch::Tensor& qx,
+    const torch::Tensor& x_scale,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  TORCH_CHECK(qx.scalar_type() == torch::kInt8, "int8_linear_forward: qx must use int8 storage");
+  TORCH_CHECK(qweight.scalar_type() == torch::kInt8, "int8_linear_forward: qweight must use int8 storage");
+  TORCH_CHECK(x_scale.scalar_type() == torch::kFloat32, "int8_linear_forward: x_scale must use float32 storage");
+  TORCH_CHECK(inv_scale.scalar_type() == torch::kFloat32, "int8_linear_forward: inv_scale must use float32 storage");
+  const auto in_features = qx.size(-1);
+  const auto rows = qx.numel() / in_features;
+  auto qx_2d = qx.reshape({rows, in_features}).to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt8)).contiguous();
+  auto x_scale_cpu = x_scale.reshape({rows}).to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32)).contiguous();
+  auto qweight_cpu = qweight.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt8)).contiguous();
+  auto inv_scale_cpu = inv_scale.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32)).contiguous();
+
+  auto x_float_cpu = qx_2d.to(torch::kFloat32) * x_scale_cpu.unsqueeze(1);
+  auto weight_float_cpu = qweight_cpu.to(torch::kFloat32) * inv_scale_cpu.unsqueeze(1);
+  std::vector<int64_t> out_sizes(qx.sizes().begin(), qx.sizes().end());
+  auto x_float = x_float_cpu.to(qx.device(), torch::kFloat32).view(out_sizes);
+  auto weight_float = weight_float_cpu.to(qweight.device(), torch::kFloat32);
+
+  c10::optional<torch::Tensor> bias_cast = c10::nullopt;
+  if (bias.has_value() && bias.value().defined()) {
+    bias_cast = bias.value().to(qx.device(), torch::kFloat32);
+  }
+  auto out = ReferenceLinearForward(x_float, weight_float, bias_cast);
+  if (out_dtype.has_value()) {
+    out = out.to(out_dtype.value());
+  }
+  return out;
+}
+
+torch::Tensor ReferenceInt8AttentionForward(
+    const torch::Tensor& q,
+    const torch::Tensor& q_scale,
+    const torch::Tensor& k,
+    const torch::Tensor& k_scale,
+    const torch::Tensor& v,
+    const torch::Tensor& v_scale,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    const c10::optional<double>& scale,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  TORCH_CHECK(q.scalar_type() == torch::kInt8, "int8_attention_forward: q must use int8 storage");
+  TORCH_CHECK(k.scalar_type() == torch::kInt8, "int8_attention_forward: k must use int8 storage");
+  TORCH_CHECK(v.scalar_type() == torch::kInt8, "int8_attention_forward: v must use int8 storage");
+  TORCH_CHECK(q_scale.scalar_type() == torch::kFloat32, "int8_attention_forward: q_scale must use float32 storage");
+  TORCH_CHECK(k_scale.scalar_type() == torch::kFloat32, "int8_attention_forward: k_scale must use float32 storage");
+  TORCH_CHECK(v_scale.scalar_type() == torch::kFloat32, "int8_attention_forward: v_scale must use float32 storage");
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "int8_attention_forward: q, k, and v must be rank-4");
+  TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0), "int8_attention_forward: batch size mismatch");
+  TORCH_CHECK(k.size(1) == v.size(1), "int8_attention_forward: kv head mismatch");
+  TORCH_CHECK(q.size(1) % k.size(1) == 0, "int8_attention_forward: q heads must be a multiple of kv heads");
+  TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3), "int8_attention_forward: head_dim mismatch");
+  const auto q_rows = q.size(0) * q.size(1) * q.size(2);
+  const auto kv_rows = k.size(0) * k.size(1) * k.size(2);
+  TORCH_CHECK(q_scale.numel() == q_rows, "int8_attention_forward: q_scale size mismatch");
+  TORCH_CHECK(k_scale.numel() == kv_rows, "int8_attention_forward: k_scale size mismatch");
+  TORCH_CHECK(v_scale.numel() == kv_rows, "int8_attention_forward: v_scale size mismatch");
+
+  auto q_2d = q.reshape({q_rows, q.size(3)}).to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt8)).contiguous();
+  auto k_2d = k.reshape({kv_rows, k.size(3)}).to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt8)).contiguous();
+  auto v_2d = v.reshape({kv_rows, v.size(3)}).to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt8)).contiguous();
+  auto q_scale_cpu = q_scale.reshape({q_rows, 1}).to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32)).contiguous();
+  auto k_scale_cpu = k_scale.reshape({kv_rows, 1}).to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32)).contiguous();
+  auto v_scale_cpu = v_scale.reshape({kv_rows, 1}).to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32)).contiguous();
+
+  auto q_float = (q_2d.to(torch::kFloat32) * q_scale_cpu).view({q.size(0), q.size(1), q.size(2), q.size(3)}).to(q.device(), torch::kFloat32);
+  auto k_float = (k_2d.to(torch::kFloat32) * k_scale_cpu).view({k.size(0), k.size(1), k.size(2), k.size(3)}).to(k.device(), torch::kFloat32);
+  auto v_float = (v_2d.to(torch::kFloat32) * v_scale_cpu).view({v.size(0), v.size(1), v.size(2), v.size(3)}).to(v.device(), torch::kFloat32);
+
+  c10::optional<torch::Tensor> mask_cast = c10::nullopt;
+  if (attn_mask.has_value() && attn_mask.value().defined()) {
+    mask_cast = attn_mask.value().to(q.device());
+  }
+  auto out = ReferenceAttentionForward(q_float, k_float, v_float, mask_cast, is_causal, scale);
+  if (out_dtype.has_value()) {
+    out = out.to(out_dtype.value());
+  }
+  return out;
+}
+
+constexpr int64_t kBitNetLayoutHeaderLen = 13;
+constexpr int64_t kBitNetIdxFormatVersion = 0;
+constexpr int64_t kBitNetIdxTileN = 1;
+constexpr int64_t kBitNetIdxTileK = 2;
+constexpr int64_t kBitNetIdxLogicalOut = 3;
+constexpr int64_t kBitNetIdxLogicalIn = 4;
+constexpr int64_t kBitNetIdxPaddedOut = 5;
+constexpr int64_t kBitNetIdxPaddedIn = 6;
+constexpr int64_t kBitNetIdxScaleGranularity = 7;
+constexpr int64_t kBitNetIdxScaleGroupSize = 8;
+constexpr int64_t kBitNetIdxInterleaveMode = 9;
+constexpr int64_t kBitNetIdxArchMin = 10;
+constexpr int64_t kBitNetIdxSegmentCount = 11;
+constexpr int64_t kBitNetIdxFlags = 12;
+
+struct BitNetLayoutInfo {
+  int64_t format_version = 0;
+  int64_t tile_n = 0;
+  int64_t tile_k = 0;
+  int64_t logical_out_features = 0;
+  int64_t logical_in_features = 0;
+  int64_t padded_out_features = 0;
+  int64_t padded_in_features = 0;
+  int64_t scale_granularity = 0;
+  int64_t scale_group_size = 0;
+  int64_t interleave_mode = 0;
+  int64_t arch_min = 0;
+  int64_t segment_count = 0;
+  int64_t flags = 0;
+};
+
+BitNetLayoutInfo ParseBitNetLayoutHeader(const torch::Tensor& layout_header) {
+  TORCH_CHECK(layout_header.defined(), "bitnet layout_header must be defined");
+  TORCH_CHECK(layout_header.dim() == 1, "bitnet layout_header must be rank-1");
+  TORCH_CHECK(layout_header.numel() >= kBitNetLayoutHeaderLen,
+              "bitnet layout_header must have at least ",
+              kBitNetLayoutHeaderLen,
+              " entries");
+  auto header_cpu = layout_header.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kLong)).contiguous();
+  auto acc = header_cpu.accessor<int64_t, 1>();
+  BitNetLayoutInfo info;
+  info.format_version = acc[kBitNetIdxFormatVersion];
+  info.tile_n = acc[kBitNetIdxTileN];
+  info.tile_k = acc[kBitNetIdxTileK];
+  info.logical_out_features = acc[kBitNetIdxLogicalOut];
+  info.logical_in_features = acc[kBitNetIdxLogicalIn];
+  info.padded_out_features = acc[kBitNetIdxPaddedOut];
+  info.padded_in_features = acc[kBitNetIdxPaddedIn];
+  info.scale_granularity = acc[kBitNetIdxScaleGranularity];
+  info.scale_group_size = acc[kBitNetIdxScaleGroupSize];
+  info.interleave_mode = acc[kBitNetIdxInterleaveMode];
+  info.arch_min = acc[kBitNetIdxArchMin];
+  info.segment_count = acc[kBitNetIdxSegmentCount];
+  info.flags = acc[kBitNetIdxFlags];
+  TORCH_CHECK(info.format_version == 1,
+              "bitnet layout_header format_version must be 1 (got ",
+              info.format_version,
+              ")");
+  TORCH_CHECK(info.logical_out_features > 0 && info.logical_in_features > 0,
+              "bitnet logical dimensions must be positive");
+  TORCH_CHECK(info.padded_out_features >= info.logical_out_features &&
+                  info.padded_in_features >= info.logical_in_features,
+              "bitnet padded dimensions must be at least the logical dimensions");
+  TORCH_CHECK(info.segment_count > 0, "bitnet segment_count must be positive");
+  return info;
+}
+
+void ValidateBitNetSegmentOffsets(
+    const torch::Tensor& segment_offsets,
+    const BitNetLayoutInfo& layout) {
+  TORCH_CHECK(segment_offsets.defined(), "bitnet segment_offsets must be defined");
+  TORCH_CHECK(segment_offsets.dim() == 1, "bitnet segment_offsets must be rank-1");
+  TORCH_CHECK(segment_offsets.numel() == layout.segment_count + 1,
+              "bitnet segment_offsets length mismatch");
+  auto offsets_cpu = segment_offsets.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kLong)).contiguous();
+  auto acc = offsets_cpu.accessor<int64_t, 1>();
+  TORCH_CHECK(acc[0] == 0, "bitnet segment_offsets must start at 0");
+  TORCH_CHECK(acc[layout.segment_count] == layout.logical_out_features,
+              "bitnet segment_offsets must end at logical_out_features");
+  for (int64_t idx = 1; idx < offsets_cpu.size(0); ++idx) {
+    TORCH_CHECK(acc[idx] >= acc[idx - 1], "bitnet segment_offsets must be non-decreasing");
+  }
+}
+
+float ResolveBitNetRowScale(
+    int64_t out_idx,
+    const BitNetLayoutInfo& layout,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& segment_offsets) {
+  auto scale_cpu = scale_values.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32)).contiguous();
+  auto scale_acc = scale_cpu.accessor<float, 1>();
+  if (layout.scale_granularity == 0) {
+    TORCH_CHECK(scale_cpu.numel() >= 1, "bitnet per-matrix scaling requires at least one value");
+    return scale_acc[0];
+  }
+  if (layout.scale_granularity == 1) {
+    TORCH_CHECK(scale_cpu.numel() == layout.segment_count, "bitnet per-segment scaling size mismatch");
+    auto offsets_cpu = segment_offsets.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kLong)).contiguous();
+    auto offsets_acc = offsets_cpu.accessor<int64_t, 1>();
+    for (int64_t seg_idx = 0; seg_idx < layout.segment_count; ++seg_idx) {
+      if (out_idx >= offsets_acc[seg_idx] && out_idx < offsets_acc[seg_idx + 1]) {
+        return scale_acc[seg_idx];
+      }
+    }
+    return 0.0f;
+  }
+  if (layout.scale_granularity == 2) {
+    TORCH_CHECK(layout.scale_group_size > 0,
+                "bitnet per-output-group scaling requires a positive scale_group_size");
+    const int64_t group_idx = out_idx / layout.scale_group_size;
+    const int64_t expected_groups =
+        (layout.logical_out_features + layout.scale_group_size - 1) / layout.scale_group_size;
+    TORCH_CHECK(scale_cpu.numel() == expected_groups, "bitnet per-output-group scaling size mismatch");
+    return scale_acc[group_idx];
+  }
+  TORCH_CHECK(false, "Unsupported bitnet scale granularity: ", layout.scale_granularity);
+  return 0.0f;
+}
+
+torch::Tensor ReferenceBitNetLinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& layout_header,
+    const torch::Tensor& segment_offsets,
+    const c10::optional<torch::Tensor>& bias) {
+  const auto layout = ParseBitNetLayoutHeader(layout_header);
+  ValidateBitNetSegmentOffsets(segment_offsets, layout);
+  TORCH_CHECK(packed_weight.dim() == 2, "bitnet_linear_forward: packed_weight must be rank-2");
+  TORCH_CHECK(packed_weight.scalar_type() == torch::kUInt8,
+              "bitnet_linear_forward: packed_weight must use uint8 storage");
+  TORCH_CHECK(scale_values.dim() == 1, "bitnet_linear_forward: scale_values must be rank-1");
+  TORCH_CHECK(x.size(-1) == layout.logical_in_features,
+              "bitnet_linear_forward: input feature size mismatch");
+  TORCH_CHECK(packed_weight.size(0) == layout.padded_out_features,
+              "bitnet_linear_forward: packed_weight row count mismatch");
+  TORCH_CHECK(packed_weight.size(1) == (layout.padded_in_features + 3) / 4,
+              "bitnet_linear_forward: packed_weight column count mismatch");
+  if (bias.has_value() && bias.value().defined()) {
+    const auto& b = bias.value();
+    TORCH_CHECK(b.dim() == 1, "bitnet_linear_forward: bias must be rank-1");
+    TORCH_CHECK(b.size(0) == layout.logical_out_features,
+                "bitnet_linear_forward: bias size mismatch");
+  }
+
+  auto packed_cpu = packed_weight.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8)).contiguous();
+  auto weight_cpu = torch::empty(
+      {layout.logical_out_features, layout.logical_in_features},
+      torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+  auto packed_acc = packed_cpu.accessor<uint8_t, 2>();
+  auto weight_acc = weight_cpu.accessor<float, 2>();
+  for (int64_t out_idx = 0; out_idx < layout.logical_out_features; ++out_idx) {
+    const float row_scale = ResolveBitNetRowScale(out_idx, layout, scale_values, segment_offsets);
+    for (int64_t in_idx = 0; in_idx < layout.logical_in_features; ++in_idx) {
+      const auto packed_value = packed_acc[out_idx][in_idx / 4];
+      const auto code = static_cast<int>((packed_value >> ((in_idx % 4) * 2)) & 0x03);
+      const auto q = code == 0 ? -1 : (code == 2 ? 1 : 0);
+      weight_acc[out_idx][in_idx] = static_cast<float>(q) * row_scale;
+    }
+  }
+
+  auto weight = weight_cpu.to(x.device(), x.scalar_type());
+  c10::optional<torch::Tensor> bias_cast = c10::nullopt;
+  if (bias.has_value() && bias.value().defined()) {
+    bias_cast = bias.value().to(x.device(), x.scalar_type());
+  }
+  return ReferenceLinearForward(x, weight, bias_cast);
 }
 
 bool ForceReferenceGatedMlpFp16() {
@@ -461,6 +842,317 @@ torch::Tensor ApplyGatedActivation(const torch::Tensor& x, const std::string& ac
   return ApplyActivation(a, activation) * b;
 }
 
+c10::optional<torch::Tensor> OptionalTensorFromPyObject(const py::object& obj) {
+  if (obj.is_none()) {
+    return c10::nullopt;
+  }
+  return py::cast<torch::Tensor>(obj);
+}
+
+py::tuple AppendTokensForward(
+    const torch::Tensor& seq,
+    const torch::Tensor& next_id,
+    const c10::optional<torch::Tensor>& attention_mask,
+    const c10::optional<torch::Tensor>& row_ids);
+
+py::tuple DecodePositionsForward(
+    int64_t batch_size,
+    int64_t seq_len,
+    const torch::Tensor& reference);
+
+torch::Tensor EmbeddingForward(
+    const torch::Tensor& weight,
+    const torch::Tensor& indices,
+    int64_t padding_idx);
+
+torch::Tensor RmsNormForward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& weight,
+    double eps);
+
+torch::Tensor LayerNormForward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& weight,
+    const c10::optional<torch::Tensor>& bias,
+    double eps);
+
+std::vector<torch::Tensor> AddRmsNormForward(
+    const torch::Tensor& x,
+    const torch::Tensor& update,
+    const c10::optional<torch::Tensor>& weight,
+    double residual_scale,
+    double eps);
+
+std::vector<torch::Tensor> AddLayerNormForward(
+    const torch::Tensor& x,
+    const torch::Tensor& update,
+    const c10::optional<torch::Tensor>& weight,
+    const c10::optional<torch::Tensor>& bias,
+    double residual_scale,
+    double eps);
+
+torch::Tensor ResidualAddForward(
+    const torch::Tensor& x,
+    const torch::Tensor& update,
+    double residual_scale);
+
+std::vector<torch::Tensor> ApplyRotaryForward(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin);
+
+torch::Tensor ResolvePositionIdsForward(
+    int64_t batch_size,
+    int64_t seq_len,
+    const torch::Tensor& reference,
+    const c10::optional<torch::Tensor>& attention_mask,
+    const c10::optional<torch::Tensor>& cache_position,
+    int64_t past_length);
+
+torch::Tensor CreateCausalMaskForward(
+    const torch::Tensor& reference,
+    const c10::optional<torch::Tensor>& attention_mask,
+    const c10::optional<torch::Tensor>& cache_position,
+    const c10::optional<torch::Tensor>& position_ids);
+
+std::vector<torch::Tensor> ResolveRotaryEmbeddingForward(
+    const torch::Tensor& reference,
+    int64_t head_dim,
+    double base_theta,
+    double attention_scaling,
+    const c10::optional<torch::Tensor>& position_ids);
+
+torch::Tensor NativeAttentionForward(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    const c10::optional<double>& scale);
+
+torch::Tensor MlpForward(
+    const torch::Tensor& x,
+    const torch::Tensor& w_in_weight,
+    const c10::optional<torch::Tensor>& w_in_bias,
+    const torch::Tensor& w_out_weight,
+    const c10::optional<torch::Tensor>& w_out_bias,
+    const std::string& activation,
+    bool gated,
+    const std::string& backend);
+
+std::vector<torch::Tensor> QkvHeadsProjectionForward(
+    const torch::Tensor& x,
+    const torch::Tensor& q_weight,
+    const c10::optional<torch::Tensor>& q_bias,
+    const torch::Tensor& k_weight,
+    const c10::optional<torch::Tensor>& k_bias,
+    const torch::Tensor& v_weight,
+    const c10::optional<torch::Tensor>& v_bias,
+    int64_t q_heads,
+    int64_t kv_heads,
+    const std::string& backend);
+
+torch::Tensor HeadOutputProjectionForward(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias,
+    const std::string& backend);
+
+std::string DetectNativeExecutorKind(const py::object& model);
+c10::optional<torch::Tensor> TryNativeCausalModelForward(
+    const py::object& model,
+    const torch::Tensor& input_ids,
+    const py::object& attention_mask,
+    const py::object& cache,
+    const py::object& position_ids,
+    const py::object& cache_position);
+std::string ResolveAttentionMaskMode(
+    const py::object& attention_mask,
+    int64_t batch_size,
+    int64_t seq_len);
+torch::Tensor AppendExplicitDecodeAttentionMaskForward(
+    const torch::Tensor& attention_mask,
+    const c10::optional<torch::Tensor>& row_ids);
+
+class NativeModelSession {
+ public:
+  NativeModelSession(
+      py::object model,
+      const torch::Tensor& seq,
+      py::object attention_mask = py::none(),
+      py::object cache = py::none(),
+      bool trace = false)
+      : model_(std::move(model)),
+        seq_(seq),
+        attention_mask_(std::move(attention_mask)),
+        cache_(std::move(cache)),
+        trace_(trace),
+        native_executor_kind_(DetectNativeExecutorKind(model_)),
+        attention_mask_mode_(ResolveAttentionMaskMode(attention_mask_, BatchSize(), SeqLen())) {}
+
+  int64_t BatchSize() const { return seq_.defined() ? seq_.size(0) : 0; }
+  int64_t SeqLen() const { return seq_.defined() ? seq_.size(1) : 0; }
+
+  torch::Tensor GetSeq() const { return seq_; }
+  void SetSeq(const torch::Tensor& seq) { seq_ = seq; }
+
+  py::object GetAttentionMask() const { return attention_mask_; }
+  void SetAttentionMask(py::object attention_mask) {
+    attention_mask_ = std::move(attention_mask);
+    attention_mask_mode_ = ResolveAttentionMaskMode(attention_mask_, BatchSize(), SeqLen());
+  }
+
+  py::object GetCache() const { return cache_; }
+  void SetCache(py::object cache) { cache_ = std::move(cache); }
+
+  std::string NativeExecutorKind() const { return native_executor_kind_; }
+
+  void DisableCache() { cache_ = py::none(); }
+
+  py::object PrefillNextLogits() const {
+    if (cache_.is_none()) {
+      return py::none();
+    }
+    auto logits = CallModel(seq_.contiguous(), attention_mask_, cache_, py::none(), py::none());
+    return py::cast(logits.index({at::indexing::Slice(), -1, at::indexing::Slice()}));
+  }
+
+  torch::Tensor FullNextLogits() const {
+    auto logits = CallModel(seq_.contiguous(), attention_mask_, py::none(), py::none(), py::none());
+    return logits.index({at::indexing::Slice(), -1, at::indexing::Slice()});
+  }
+
+  void Append(const torch::Tensor& next_id) {
+    if (attention_mask_mode_ == "explicit" && !attention_mask_.is_none()) {
+      auto next = AppendTokensForward(seq_, next_id, c10::nullopt, c10::nullopt);
+      seq_ = py::cast<torch::Tensor>(next[0]);
+      attention_mask_ = py::cast(AppendExplicitDecodeAttentionMaskForward(py::cast<torch::Tensor>(attention_mask_), c10::nullopt));
+      attention_mask_mode_ = "explicit";
+      return;
+    }
+    auto next = AppendTokensForward(seq_, next_id, OptionalTensorFromPyObject(attention_mask_), c10::nullopt);
+    seq_ = py::cast<torch::Tensor>(next[0]);
+    attention_mask_ = next[1].is_none() ? py::none() : next[1];
+    attention_mask_mode_ = attention_mask_.is_none() ? std::string("none") : std::string("token");
+  }
+
+  py::tuple DecodePositions() const {
+    if (cache_.is_none()) {
+      return py::make_tuple(py::none(), py::none());
+    }
+    return DecodePositionsForward(BatchSize(), SeqLen(), seq_);
+  }
+
+  py::object DecodeNextLogits() const {
+    if (cache_.is_none()) {
+      return py::none();
+    }
+    auto pos = DecodePositions();
+    auto logits = CallModel(
+        seq_.slice(1, std::max<int64_t>(SeqLen() - 1, 0), SeqLen()).contiguous(),
+        attention_mask_,
+        cache_,
+        pos[0],
+        pos[1]);
+    return py::cast(logits.index({at::indexing::Slice(), -1, at::indexing::Slice()}));
+  }
+
+  void ReorderCache(const torch::Tensor& row_ids, py::object source_cache = py::none()) {
+    py::object cache_in = source_cache.is_none() ? cache_ : source_cache;
+    if (cache_in.is_none()) {
+      cache_ = py::none();
+      return;
+    }
+    cache_ = py::module_::import("runtime.kv_cache").attr("reorder_kv_cache_rows_")(cache_in, row_ids);
+  }
+
+  void AppendAttentionMask(py::object row_ids = py::none(), py::object source_attention_mask = py::none()) {
+    py::object mask_in = source_attention_mask.is_none() ? attention_mask_ : source_attention_mask;
+    if (mask_in.is_none()) {
+      attention_mask_ = py::none();
+      attention_mask_mode_ = "none";
+      return;
+    }
+    auto mask = py::cast<torch::Tensor>(mask_in);
+    auto row_ids_tensor = OptionalTensorFromPyObject(row_ids);
+    const bool token_mask = attention_mask_mode_ == "token" || (attention_mask_mode_ != "explicit" && mask.dim() == 2 && mask.size(0) != mask.size(1));
+    if (!token_mask) {
+      attention_mask_ = py::cast(AppendExplicitDecodeAttentionMaskForward(mask, row_ids_tensor));
+      attention_mask_mode_ = "explicit";
+      return;
+    }
+    const auto rows = row_ids_tensor.has_value() ? row_ids_tensor->numel() : mask.size(0);
+    auto ones = torch::ones(
+        {rows, 1},
+        torch::TensorOptions().dtype(mask.scalar_type()).device(mask.device()));
+    auto next = AppendTokensForward(mask, ones, c10::nullopt, row_ids_tensor);
+    attention_mask_ = next[0];
+    attention_mask_mode_ = attention_mask_.is_none() ? std::string("none") : std::string("token");
+  }
+
+  void EvictIfNeeded(int64_t max_tokens, const std::string& policy = "sliding-window") {
+    if (cache_.is_none() || max_tokens < 0) {
+      return;
+    }
+    py::module_::import("runtime.cache").attr("evict_kv_cache")(cache_, max_tokens, policy);
+  }
+
+  py::object AdvanceBeamDecode(
+      const torch::Tensor& next_beams,
+      const torch::Tensor& cache_row_ids,
+      py::object mask_row_ids = py::none(),
+      py::object source_attention_mask = py::none(),
+      py::object source_cache = py::none(),
+      int64_t max_tokens = -1,
+      const std::string& policy = "sliding-window") {
+    seq_ = next_beams;
+    AppendAttentionMask(std::move(mask_row_ids), std::move(source_attention_mask));
+    ReorderCache(cache_row_ids, std::move(source_cache));
+    EvictIfNeeded(max_tokens, policy);
+    return DecodeNextLogits();
+  }
+
+ private:
+  torch::Tensor CallModel(
+      const torch::Tensor& tokens,
+      const py::object& attention_mask,
+      const py::object& cache,
+      const py::object& position_ids,
+      const py::object& cache_position) const {
+    if (native_executor_kind_ == "causal_lm") {
+      auto native_logits = TryNativeCausalModelForward(
+          model_,
+          tokens,
+          attention_mask,
+          cache,
+          position_ids,
+          cache_position);
+      if (native_logits.has_value()) {
+        return native_logits.value();
+      }
+    }
+    py::object out = model_(
+        tokens,
+        "attn_mask"_a = py::none(),
+        "attention_mask"_a = attention_mask,
+        "cache"_a = cache,
+        "position_ids"_a = position_ids,
+        "cache_position"_a = cache_position,
+        "return_dict"_a = false);
+    return py::cast<torch::Tensor>(out);
+  }
+
+  py::object model_;
+  torch::Tensor seq_;
+  py::object attention_mask_;
+  py::object cache_;
+  bool trace_;
+  std::string native_executor_kind_;
+  std::string attention_mask_mode_;
+};
+
+
 py::dict RuntimeInfo() {
   py::dict info;
   info["abi_version"] = kAbiVersion;
@@ -470,16 +1162,63 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "activation", "gated_activation", "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "attention_decode", "attention_prefill", "sampling", "beam_search_step"};
+      "activation", "gated_activation", "embedding", "linear", "bitnet_linear", "int4_linear", "int8_linear", "int8_attention", "pack_bitnet_weight", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "bitnet_qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "attention_decode", "attention_prefill", "sampling", "beam_search_step", "incremental_beam_search"};
   info["planned_ops"] = std::vector<std::string>{
-      "activation", "gated_activation", "embedding", "linear", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "attention_decode",
-      "attention_prefill", "sampling", "beam_search_step"};
+      "activation", "gated_activation", "embedding", "linear", "bitnet_linear", "int4_linear", "int8_linear", "int8_attention", "pack_bitnet_weight", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "bitnet_qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "attention_decode",
+      "attention_prefill", "sampling", "beam_search_step", "incremental_beam_search"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
   info["linear_backends_planned"] = PlannedLinearBackends();
   info["cublaslt_linear_dtypes"] = HasCublasLtLinearBackend()
       ? std::vector<std::string>{"float32", "float16", "bfloat16"}
       : std::vector<std::string>{};
+  info["bitnet_available"] = true;
+  info["bitnet_arches"] = std::vector<std::string>{"sm80+"};
+  info["bitnet_linear_dtypes"] = std::vector<std::string>{"float32", "float16", "bfloat16"};
+  info["bitnet_weight_storage"] = std::string("uint8_packed_2bit_ternary");
+  info["bitnet_layout_version"] = 1;
+  info["attention_arches"] = std::vector<std::string>{"sm50+", "sm90_specialized"};
+  info["int4_linear_dtypes"] = HasCudaInt4LinearKernel()
+      ? std::vector<std::string>{"float32", "float16", "bfloat16"}
+      : std::vector<std::string>{};
+  info["int4_linear_arches"] = std::vector<std::string>{"sm50+", "sm90_specialized"};
+  info["int4_linear_kernel_family"] = std::string("packed_byte_decode_sm90_with_optional_imma_act_quant");
+  info["int4_linear_sm90_tile"] = std::vector<int>{8, 128, 128};
+  info["int4_linear_imma_tile"] = std::vector<int>{8, 8, 32};
+  info["int4_linear_imma_requires"] = std::vector<std::string>{"sm90", "dynamic_int4_activation_quantization"};
+  info["int4_linear_weight_storage"] = std::string("uint8_packed_symmetric_per_channel");
+  info["int8_linear_dtypes"] = HasCudaInt8LinearKernel()
+      ? std::vector<std::string>{"float32", "float16", "bfloat16"}
+      : std::vector<std::string>{};
+  info["int8_linear_arches"] = std::vector<std::string>{"sm61+", "sm90_specialized"};
+  info["int8_linear_kernel_family"] = std::string("wmma_sm90_with_dp4a_tiled_fallback");
+  info["int8_linear_tensorcore_tile"] = std::vector<int>{16, 16, 16};
+  info["int8_linear_tensorcore_arches"] = std::vector<std::string>{"sm90_specialized"};
+  info["int8_linear_large_gemm_backend"] = std::string("cublaslt_int8");
+  info["int8_linear_weight_storage"] = std::string("int8_symmetric_per_channel");
+  info["int8_linear_activation_storage"] = std::string("int8_symmetric_per_row");
+  info["int8_attention_dtypes"] = HasCudaInt8AttentionKernel()
+      ? std::vector<std::string>{"float32", "float16", "bfloat16"}
+      : std::vector<std::string>{};
+  info["int8_attention_qkv_storage"] = std::string("int8_symmetric_per_row");
+  info["int8_attention_kernel_family"] = std::string("sm90_pipeline_wmma_online_softmax_with_generic_fallback");
+  info["int8_attention_tensorcore_tile"] = std::vector<int>{16, 16, 16};
+  info["int8_attention_tensorcore_head_dims"] = std::vector<int>{32, 64, 96, 128, 192, 256};
+  info["int8_attention_sm90_pipeline_stages"] = 2;
+  info["int8_attention_specializations"] = std::vector<std::string>{
+      "nomask",
+      "bool_mask",
+      "additive_mask",
+      "causal",
+      "decode_q1_nomask",
+  };
+  info["sm90_specialized_ops"] = std::vector<std::string>{
+      "attention_decode",
+      "attention_prefill",
+      "int8_attention",
+      "int4_linear",
+      "int8_linear",
+  };
   std::vector<std::string> cuda_backend_ops;
   if (HasCudaRmsNormKernel()) {
     cuda_backend_ops.push_back("rms_norm");
@@ -501,6 +1240,7 @@ py::dict RuntimeInfo() {
   }
   if (HasCudaSamplingKernel()) {
     cuda_backend_ops.push_back("sampling");
+    cuda_backend_ops.push_back("beam_search_step");
   }
   if (HasCudaAppendTokensKernel()) {
     cuda_backend_ops.push_back("append_tokens");
@@ -520,6 +1260,15 @@ py::dict RuntimeInfo() {
   if (HasCublasLtLinearBackend()) {
     cuda_backend_ops.push_back("linear");
     cuda_backend_ops.push_back("qkv_projection");
+  }
+  if (HasCudaInt4LinearKernel()) {
+    cuda_backend_ops.push_back("int4_linear");
+  }
+  if (HasCudaInt8LinearKernel()) {
+    cuda_backend_ops.push_back("int8_linear");
+  }
+  if (HasCudaInt8AttentionKernel()) {
+    cuda_backend_ops.push_back("int8_attention");
   }
   if (HasCudaActivationKernel()) {
     cuda_backend_ops.push_back("activation");
@@ -1226,6 +1975,57 @@ class PagedKvLayerState {
     return {keep_k[0], keep_v[0], ids, keep_k[1]};
   }
 
+  std::shared_ptr<PagedKvLayerState> CloneRows(const torch::Tensor& row_ids) const {
+    auto ids = NormalizeSelectionRowIds(row_ids);
+    auto out = std::make_shared<PagedKvLayerState>(ids.numel(), heads_, head_dim_, page_size_, k_pages_);
+    if (ids.numel() == 0) {
+      return out;
+    }
+    auto gathered_lengths = lengths_.index_select(0, ids);
+    const auto max_len = gathered_lengths.numel() > 0 ? gathered_lengths.max().item<int64_t>() : 0;
+    if (max_len <= 0) {
+      return out;
+    }
+    auto gathered_table = block_table_.index_select(0, ids).contiguous().clone();
+    gathered_table.clamp_min_(0);
+    auto gathered_k = PagedKvReadRangeForward(k_pages_.slice(0, 0, page_count_), gathered_table, gathered_lengths, 0, max_len);
+    auto gathered_v = PagedKvReadRangeForward(v_pages_.slice(0, 0, page_count_), gathered_table, gathered_lengths, 0, max_len);
+
+    auto kept_cpu = gathered_lengths.to(torch::kCPU);
+    std::vector<int64_t> unique_lengths;
+    unique_lengths.reserve(static_cast<size_t>(kept_cpu.numel()));
+    for (int64_t i = 0; i < kept_cpu.numel(); ++i) {
+      const auto length = kept_cpu[i].item<int64_t>();
+      if (length > 0) {
+        unique_lengths.push_back(length);
+      }
+    }
+    std::sort(unique_lengths.begin(), unique_lengths.end());
+    unique_lengths.erase(std::unique(unique_lengths.begin(), unique_lengths.end()), unique_lengths.end());
+
+    for (const auto length : unique_lengths) {
+      auto rows = torch::nonzero(gathered_lengths == length).view(-1);
+      if (rows.numel() == 0) {
+        continue;
+      }
+      out->Append(
+          gathered_k.index_select(0, rows).slice(2, 0, length).contiguous(),
+          gathered_v.index_select(0, rows).slice(2, 0, length).contiguous(),
+          rows);
+    }
+    return out;
+  }
+
+  void ReorderRowsInPlace(const torch::Tensor& row_ids) {
+    auto reordered = CloneRows(row_ids);
+    batch_ = reordered->batch_;
+    k_pages_ = reordered->k_pages_;
+    v_pages_ = reordered->v_pages_;
+    block_table_ = reordered->block_table_;
+    lengths_ = reordered->lengths_;
+    page_count_ = reordered->page_count_;
+  }
+
   void Compact(int64_t keep) {
     auto result = PagedKvCompactForward(
         k_pages_.slice(0, 0, page_count_),
@@ -1273,6 +2073,19 @@ class PagedKvLayerState {
     TORCH_CHECK(max_id < batch_, "PagedKvLayerState: block_ids exceed cache batch size");
     const auto unique_result = at::_unique2(ids, true, false, false);
     TORCH_CHECK(std::get<0>(unique_result).numel() == ids.numel(), "PagedKvLayerState: block_ids must be unique");
+    return ids;
+  }
+
+  torch::Tensor NormalizeSelectionRowIds(const torch::Tensor& row_ids) const {
+    TORCH_CHECK(row_ids.defined(), "PagedKvLayerState: row_ids must be defined");
+    auto ids = row_ids.to(torch::kLong).contiguous().view(-1);
+    if (ids.numel() == 0) {
+      return ids;
+    }
+    const auto min_id = ids.min().item<int64_t>();
+    const auto max_id = ids.max().item<int64_t>();
+    TORCH_CHECK(min_id >= 0, "PagedKvLayerState: row_ids must be non-negative");
+    TORCH_CHECK(max_id < batch_, "PagedKvLayerState: row_ids exceed cache batch size");
     return ids;
   }
 
@@ -1339,6 +2152,27 @@ class PagedKvCacheState {
     return Layer(layer_idx)->ReadLast(keep, block_ids);
   }
 
+  std::shared_ptr<PagedKvCacheState> CloneRows(const torch::Tensor& row_ids) const {
+    auto ids = NormalizeSelectionRowIds(row_ids);
+    auto out = std::make_shared<PagedKvCacheState>(
+        ids.numel(),
+        layers_count_,
+        heads_,
+        head_dim_,
+        page_size_,
+        layers_count_ > 0 ? layers_[0]->KPages() : torch::empty({0, heads_, page_size_, head_dim_}, torch::TensorOptions().dtype(torch::kFloat32)));
+    for (int64_t layer_idx = 0; layer_idx < layers_count_; ++layer_idx) {
+      out->layers_[static_cast<size_t>(layer_idx)] = layers_[static_cast<size_t>(layer_idx)]->CloneRows(ids);
+    }
+    return out;
+  }
+
+  void ReorderRowsInPlace(const torch::Tensor& row_ids) {
+    auto reordered = CloneRows(row_ids);
+    batch_ = reordered->batch_;
+    layers_ = reordered->layers_;
+  }
+
   void Compact(int64_t keep) {
     for (const auto& layer : layers_) {
       layer->Compact(keep);
@@ -1361,6 +2195,19 @@ class PagedKvCacheState {
   int64_t NumLayers() const { return layers_count_; }
 
  private:
+  torch::Tensor NormalizeSelectionRowIds(const torch::Tensor& row_ids) const {
+    TORCH_CHECK(row_ids.defined(), "PagedKvCacheState: row_ids must be defined");
+    auto ids = row_ids.to(torch::kLong).contiguous().view(-1);
+    if (ids.numel() == 0) {
+      return ids;
+    }
+    const auto min_id = ids.min().item<int64_t>();
+    const auto max_id = ids.max().item<int64_t>();
+    TORCH_CHECK(min_id >= 0, "PagedKvCacheState: row_ids must be non-negative");
+    TORCH_CHECK(max_id < batch_, "PagedKvCacheState: row_ids exceed cache batch size");
+    return ids;
+  }
+
   std::shared_ptr<PagedKvLayerState> Layer(int64_t layer_idx) const {
     TORCH_CHECK(layer_idx >= 0 && layer_idx < layers_count_, "PagedKvCacheState: layer_idx out of range");
     return layers_[static_cast<size_t>(layer_idx)];
@@ -2269,6 +3116,23 @@ py::tuple BeamSearchStepForward(
   const auto batch_size = raw_scores.size(0);
   TORCH_CHECK(beams.size(0) == batch_size * beam_size, "beam_search_step_forward: beams batch mismatch");
 
+#if MODEL_STACK_WITH_CUDA
+  if (beams.is_cuda() && logits.is_cuda() && raw_scores.is_cuda() && finished.is_cuda() && lengths.is_cuda() &&
+      HasCudaSamplingKernel() && beam_size <= 32) {
+    auto next_logits = logits.dim() == 3 ? logits.select(1, logits.size(1) - 1) : logits;
+    auto next = CudaBeamSearchStepForward(
+        beams,
+        next_logits,
+        raw_scores,
+        finished,
+        lengths,
+        beam_size,
+        eos_id,
+        pad_id);
+    return py::make_tuple(next[0], next[1], next[2], next[3], next[4]);
+  }
+#endif
+
   torch::Tensor next_logits;
   if (logits.dim() == 3) {
     TORCH_CHECK(logits.size(0) == batch_size * beam_size, "beam_search_step_forward: logits batch mismatch");
@@ -2313,20 +3177,99 @@ py::tuple BeamSearchStepForward(
   auto parent_lengths = lengths.gather(1, parent_beams);
   auto next_lengths = parent_lengths + parent_finished.logical_not().to(lengths.scalar_type());
   auto next_finished = parent_finished.logical_or(next_tokens.eq(eos_id));
-  return py::make_tuple(next_beams, best_raw_scores, next_finished, next_lengths);
+  auto batch_offsets = torch::arange(batch_size, parent_beams.options()).unsqueeze(1) * beam_size;
+  auto parent_rows = (batch_offsets + parent_beams).reshape({batch_size * beam_size});
+  return py::make_tuple(next_beams, best_raw_scores, next_finished, next_lengths, parent_rows);
+}
+
+py::object IncrementalBeamSearchForward(
+    const torch::Tensor& initial_beams,
+    const torch::Tensor& initial_logits,
+    int64_t beam_size,
+    int64_t max_new_tokens,
+    int64_t prompt_length,
+    int64_t eos_id,
+    int64_t pad_id,
+    const py::function& advance_fn) {
+  TORCH_CHECK(initial_beams.defined(), "incremental_beam_search_forward: initial_beams must be defined");
+  TORCH_CHECK(initial_logits.defined(), "incremental_beam_search_forward: initial_logits must be defined");
+  TORCH_CHECK(initial_beams.dim() == 2, "incremental_beam_search_forward: initial_beams must be rank-2 (B*beam, T)");
+  TORCH_CHECK(beam_size > 0, "incremental_beam_search_forward: beam_size must be positive");
+  TORCH_CHECK(max_new_tokens > 0, "incremental_beam_search_forward: max_new_tokens must be positive");
+  TORCH_CHECK(prompt_length >= 0, "incremental_beam_search_forward: prompt_length must be non-negative");
+  const auto total_rows = initial_beams.size(0);
+  TORCH_CHECK(total_rows % beam_size == 0, "incremental_beam_search_forward: initial_beams batch mismatch");
+  const auto batch_size = total_rows / beam_size;
+
+  auto raw_scores = torch::full(
+      {batch_size, beam_size},
+      -std::numeric_limits<float>::infinity(),
+      torch::TensorOptions().dtype(torch::kFloat32).device(initial_beams.device()));
+  raw_scores.select(1, 0).zero_();
+  auto finished = torch::zeros(
+      {batch_size, beam_size},
+      torch::TensorOptions().dtype(torch::kBool).device(initial_beams.device()));
+  auto lengths = torch::full(
+      {batch_size, beam_size},
+      prompt_length,
+      torch::TensorOptions().dtype(torch::kLong).device(initial_beams.device()));
+
+  auto current = BeamSearchStepForward(initial_beams, initial_logits, raw_scores, finished, lengths, beam_size, eos_id, pad_id);
+  auto beams = py::cast<torch::Tensor>(current[0]);
+  raw_scores = py::cast<torch::Tensor>(current[1]);
+  finished = py::cast<torch::Tensor>(current[2]);
+  lengths = py::cast<torch::Tensor>(current[3]);
+  auto parent_rows = py::cast<torch::Tensor>(current[4]);
+
+  for (int64_t step = 1; step < max_new_tokens; ++step) {
+    if (finished.all().item<bool>()) {
+      break;
+    }
+    py::object next_logits_obj = advance_fn(parent_rows, beams);
+    if (next_logits_obj.is_none()) {
+      return py::none();
+    }
+    auto next_logits = py::cast<torch::Tensor>(next_logits_obj);
+    current = BeamSearchStepForward(beams, next_logits, raw_scores, finished, lengths, beam_size, eos_id, pad_id);
+    beams = py::cast<torch::Tensor>(current[0]);
+    raw_scores = py::cast<torch::Tensor>(current[1]);
+    finished = py::cast<torch::Tensor>(current[2]);
+    lengths = py::cast<torch::Tensor>(current[3]);
+    parent_rows = py::cast<torch::Tensor>(current[4]);
+  }
+
+  return py::make_tuple(beams, raw_scores, finished, lengths, parent_rows);
 }
 
 
 py::tuple AppendTokensForward(
     const torch::Tensor& seq,
     const torch::Tensor& next_id,
-    const c10::optional<torch::Tensor>& attention_mask) {
+    const c10::optional<torch::Tensor>& attention_mask,
+    const c10::optional<torch::Tensor>& row_ids) {
   TORCH_CHECK(seq.defined() && next_id.defined(), "append_tokens_forward: seq and next_id must be defined");
   TORCH_CHECK(seq.dim() == 2 && next_id.dim() == 2, "append_tokens_forward: seq and next_id must be rank-2");
-  TORCH_CHECK(seq.size(0) == next_id.size(0), "append_tokens_forward: batch mismatch");
+
+  auto selected_seq = seq;
+  c10::optional<torch::Tensor> selected_mask = attention_mask;
+  if (row_ids.has_value() && row_ids.value().defined()) {
+    auto ids = row_ids.value().to(torch::kLong).contiguous().view({-1});
+    if (ids.numel() > 0) {
+      const auto min_id = ids.min().item<int64_t>();
+      const auto max_id = ids.max().item<int64_t>();
+      TORCH_CHECK(min_id >= 0, "append_tokens_forward: row_ids must be non-negative");
+      TORCH_CHECK(max_id < seq.size(0), "append_tokens_forward: row_ids exceed source batch size");
+    }
+    selected_seq = seq.index_select(0, ids);
+    if (attention_mask.has_value() && attention_mask.value().defined()) {
+      selected_mask = attention_mask.value().index_select(0, ids);
+    }
+  }
+
+  TORCH_CHECK(selected_seq.size(0) == next_id.size(0), "append_tokens_forward: batch mismatch");
 #if MODEL_STACK_WITH_CUDA
-  if (seq.is_cuda() && next_id.is_cuda() && HasCudaAppendTokensKernel()) {
-    auto next = CudaAppendTokensForward(seq, next_id, attention_mask);
+  if (selected_seq.is_cuda() && next_id.is_cuda() && HasCudaAppendTokensKernel()) {
+    auto next = CudaAppendTokensForward(selected_seq, next_id, selected_mask);
     py::object next_mask = py::none();
     if (next.size() > 1 && next[1].defined()) {
       next_mask = py::cast(next[1]);
@@ -2334,13 +3277,13 @@ py::tuple AppendTokensForward(
     return py::make_tuple(next[0], next_mask);
   }
 #endif
-  auto next_seq = torch::cat({seq, next_id}, 1);
+  auto next_seq = torch::cat({selected_seq, next_id}, 1);
   py::object next_mask = py::none();
-  if (attention_mask.has_value() && attention_mask.value().defined()) {
+  if (selected_mask.has_value() && selected_mask.value().defined()) {
     auto ones = torch::ones(
         {next_id.size(0), next_id.size(1)},
-        torch::TensorOptions().dtype(attention_mask.value().scalar_type()).device(attention_mask.value().device()));
-    next_mask = py::cast(torch::cat({attention_mask.value(), ones}, 1));
+        torch::TensorOptions().dtype(selected_mask.value().scalar_type()).device(selected_mask.value().device()));
+    next_mask = py::cast(torch::cat({selected_mask.value(), ones}, 1));
   }
   return py::make_tuple(next_seq, next_mask);
 }
@@ -2385,6 +3328,133 @@ torch::Tensor LinearForward(
   }
 #endif
   return ReferenceLinearForward(x, weight, bias);
+}
+
+torch::Tensor Int4LinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias) {
+  TORCH_CHECK(x.defined() && packed_weight.defined() && inv_scale.defined(),
+              "int4_linear_forward: x, packed_weight, and inv_scale must be defined");
+  TORCH_CHECK(x.dim() >= 2, "int4_linear_forward: x must have rank >= 2");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
+                  x.scalar_type() == torch::kBFloat16,
+              "int4_linear_forward: x must use float32, float16, or bfloat16");
+  TORCH_CHECK(packed_weight.dim() == 2, "int4_linear_forward: packed_weight must be rank-2");
+  TORCH_CHECK(packed_weight.scalar_type() == torch::kUInt8,
+              "int4_linear_forward: packed_weight must use uint8 storage");
+  TORCH_CHECK(inv_scale.dim() == 1, "int4_linear_forward: inv_scale must be rank-1");
+  TORCH_CHECK(inv_scale.size(0) == packed_weight.size(0),
+              "int4_linear_forward: inv_scale size mismatch");
+  TORCH_CHECK(packed_weight.size(1) == (x.size(-1) + 1) / 2,
+              "int4_linear_forward: packed_weight column count mismatch");
+  if (bias.has_value() && bias.value().defined()) {
+    const auto& b = bias.value();
+    TORCH_CHECK(b.dim() == 1, "int4_linear_forward: bias must be rank-1");
+    TORCH_CHECK(b.size(0) == packed_weight.size(0), "int4_linear_forward: bias size mismatch");
+  }
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && packed_weight.is_cuda() && inv_scale.is_cuda() && HasCudaInt4LinearKernel()) {
+    return CudaInt4LinearForward(x, packed_weight, inv_scale, bias);
+  }
+#endif
+  return ReferenceInt4LinearForward(x, packed_weight, inv_scale, bias);
+}
+
+torch::Tensor Int8LinearForward(
+    const torch::Tensor& qx,
+    const torch::Tensor& x_scale,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  TORCH_CHECK(qx.defined() && x_scale.defined() && qweight.defined() && inv_scale.defined(),
+              "int8_linear_forward: qx, x_scale, qweight, and inv_scale must be defined");
+  TORCH_CHECK(qx.dim() >= 2, "int8_linear_forward: qx must have rank >= 2");
+  TORCH_CHECK(qx.scalar_type() == torch::kInt8, "int8_linear_forward: qx must use int8 storage");
+  TORCH_CHECK(x_scale.dim() == 1, "int8_linear_forward: x_scale must be rank-1");
+  TORCH_CHECK(x_scale.scalar_type() == torch::kFloat32, "int8_linear_forward: x_scale must use float32 storage");
+  TORCH_CHECK(qweight.dim() == 2, "int8_linear_forward: qweight must be rank-2");
+  TORCH_CHECK(qweight.scalar_type() == torch::kInt8, "int8_linear_forward: qweight must use int8 storage");
+  TORCH_CHECK(inv_scale.dim() == 1, "int8_linear_forward: inv_scale must be rank-1");
+  TORCH_CHECK(inv_scale.scalar_type() == torch::kFloat32, "int8_linear_forward: inv_scale must use float32 storage");
+  const auto in_features = qx.size(-1);
+  const auto rows = qx.numel() / in_features;
+  TORCH_CHECK(x_scale.size(0) == rows, "int8_linear_forward: x_scale size mismatch");
+  TORCH_CHECK(qweight.size(1) == in_features, "int8_linear_forward: qweight column count mismatch");
+  TORCH_CHECK(inv_scale.size(0) == qweight.size(0), "int8_linear_forward: inv_scale size mismatch");
+  if (bias.has_value() && bias.value().defined()) {
+    const auto& b = bias.value();
+    TORCH_CHECK(b.dim() == 1, "int8_linear_forward: bias must be rank-1");
+    TORCH_CHECK(b.size(0) == qweight.size(0), "int8_linear_forward: bias size mismatch");
+  }
+#if MODEL_STACK_WITH_CUDA
+  if (qx.is_cuda() && x_scale.is_cuda() && qweight.is_cuda() && inv_scale.is_cuda() && HasCudaInt8LinearKernel()) {
+    return CudaInt8LinearForward(qx, x_scale, qweight, inv_scale, bias, out_dtype);
+  }
+#endif
+  return ReferenceInt8LinearForward(qx, x_scale, qweight, inv_scale, bias, out_dtype);
+}
+
+torch::Tensor Int8AttentionForward(
+    const torch::Tensor& q,
+    const torch::Tensor& q_scale,
+    const torch::Tensor& k,
+    const torch::Tensor& k_scale,
+    const torch::Tensor& v,
+    const torch::Tensor& v_scale,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    const c10::optional<double>& scale,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  TORCH_CHECK(q.defined() && q_scale.defined() && k.defined() && k_scale.defined() && v.defined() && v_scale.defined(),
+              "int8_attention_forward: q, q_scale, k, k_scale, v, and v_scale must be defined");
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "int8_attention_forward: q, k, and v must be rank-4");
+  TORCH_CHECK(q.scalar_type() == torch::kInt8 && k.scalar_type() == torch::kInt8 && v.scalar_type() == torch::kInt8,
+              "int8_attention_forward: q, k, and v must use int8 storage");
+  TORCH_CHECK(q_scale.dim() == 1 && k_scale.dim() == 1 && v_scale.dim() == 1,
+              "int8_attention_forward: q_scale, k_scale, and v_scale must be rank-1");
+  TORCH_CHECK(q_scale.scalar_type() == torch::kFloat32 && k_scale.scalar_type() == torch::kFloat32 &&
+                  v_scale.scalar_type() == torch::kFloat32,
+              "int8_attention_forward: q_scale, k_scale, and v_scale must use float32 storage");
+  TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0), "int8_attention_forward: batch size mismatch");
+  TORCH_CHECK(k.size(1) == v.size(1), "int8_attention_forward: kv head mismatch");
+  TORCH_CHECK(q.size(1) % k.size(1) == 0, "int8_attention_forward: q heads must be a multiple of kv heads");
+  TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3), "int8_attention_forward: head_dim mismatch");
+  TORCH_CHECK(q_scale.numel() == q.size(0) * q.size(1) * q.size(2), "int8_attention_forward: q_scale size mismatch");
+  TORCH_CHECK(k_scale.numel() == k.size(0) * k.size(1) * k.size(2), "int8_attention_forward: k_scale size mismatch");
+  TORCH_CHECK(v_scale.numel() == v.size(0) * v.size(1) * v.size(2), "int8_attention_forward: v_scale size mismatch");
+#if MODEL_STACK_WITH_CUDA
+  if (CanUseCudaInt8AttentionPath(q, q_scale, k, k_scale, v, v_scale, attn_mask)) {
+    return CudaInt8AttentionForward(q, q_scale, k, k_scale, v, v_scale, attn_mask, is_causal, scale, out_dtype);
+  }
+#endif
+  return ReferenceInt8AttentionForward(q, q_scale, k, k_scale, v, v_scale, attn_mask, is_causal, scale, out_dtype);
+}
+
+torch::Tensor BitNetLinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& layout_header,
+    const torch::Tensor& segment_offsets,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::ScalarType>& out_dtype,
+    bool debug_dense_fallback) {
+  TORCH_CHECK(x.defined() && packed_weight.defined() && scale_values.defined() && layout_header.defined() &&
+                  segment_offsets.defined(),
+              "bitnet_linear_forward: x, packed_weight, scale_values, layout_header, and segment_offsets must be defined");
+  TORCH_CHECK(x.dim() >= 2, "bitnet_linear_forward: x must have rank >= 2");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
+                  x.scalar_type() == torch::kBFloat16,
+              "bitnet_linear_forward: x must use float32, float16, or bfloat16");
+  auto out = ReferenceBitNetLinearForward(x, packed_weight, scale_values, layout_header, segment_offsets, bias);
+  if (out_dtype.has_value()) {
+    out = out.to(out_dtype.value());
+  }
+  (void)debug_dense_fallback;
+  return out;
 }
 
 torch::Tensor MlpForward(
@@ -2478,6 +3548,78 @@ py::tuple PackLinearWeightForward(
   return py::make_tuple(weight.contiguous(), packed_bias);
 }
 
+py::tuple PackBitNetWeightForward(
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& scale_values,
+    const c10::optional<torch::Tensor>& layout_header,
+    const c10::optional<torch::Tensor>& segment_offsets) {
+  TORCH_CHECK(weight.defined(), "pack_bitnet_weight_forward: weight must be defined");
+  TORCH_CHECK(weight.dim() == 2, "pack_bitnet_weight_forward: weight must be rank-2");
+  TORCH_CHECK(weight.scalar_type() == torch::kFloat32 || weight.scalar_type() == torch::kFloat16 ||
+                  weight.scalar_type() == torch::kBFloat16,
+              "pack_bitnet_weight_forward: weight must use float32, float16, or bfloat16");
+  TORCH_CHECK(!scale_values.has_value() && !layout_header.has_value() && !segment_offsets.has_value(),
+              "pack_bitnet_weight_forward: explicit metadata overrides are not supported yet");
+
+  const auto logical_out = weight.size(0);
+  const auto logical_in = weight.size(1);
+  const auto padded_out = ((logical_out + 15) / 16) * 16;
+  const auto padded_in = ((logical_in + 31) / 32) * 32;
+
+  auto weight_cpu = weight.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32)).contiguous();
+  const auto max_abs = weight_cpu.abs().amax().item<float>();
+  const float scale = std::max(max_abs, 1.0e-8f);
+
+  auto packed_cpu = torch::full(
+      {padded_out, (padded_in + 3) / 4},
+      static_cast<uint8_t>(0x55),
+      torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8));
+  auto weight_acc = weight_cpu.accessor<float, 2>();
+  auto packed_acc = packed_cpu.accessor<uint8_t, 2>();
+  for (int64_t out_idx = 0; out_idx < logical_out; ++out_idx) {
+    for (int64_t in_idx = 0; in_idx < logical_in; ++in_idx) {
+      const auto normalized = weight_acc[out_idx][in_idx] / scale;
+      const auto rounded = static_cast<int>(std::llround(normalized));
+      const auto clamped = std::max(-1, std::min(1, rounded));
+      const auto code = static_cast<uint8_t>(clamped + 1);
+      auto& packed_value = packed_acc[out_idx][in_idx / 4];
+      const auto shift = static_cast<int>((in_idx % 4) * 2);
+      packed_value = static_cast<uint8_t>((packed_value & ~(0x03 << shift)) | (code << shift));
+    }
+  }
+
+  auto packed_scale_values = torch::tensor({scale}, torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+  auto packed_layout_header = torch::zeros(
+      {kBitNetLayoutHeaderLen},
+      torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt32));
+  auto header_acc = packed_layout_header.accessor<int32_t, 1>();
+  header_acc[kBitNetIdxFormatVersion] = 1;
+  header_acc[kBitNetIdxTileN] = 16;
+  header_acc[kBitNetIdxTileK] = 32;
+  header_acc[kBitNetIdxLogicalOut] = static_cast<int32_t>(logical_out);
+  header_acc[kBitNetIdxLogicalIn] = static_cast<int32_t>(logical_in);
+  header_acc[kBitNetIdxPaddedOut] = static_cast<int32_t>(padded_out);
+  header_acc[kBitNetIdxPaddedIn] = static_cast<int32_t>(padded_in);
+  header_acc[kBitNetIdxScaleGranularity] = 0;
+  header_acc[kBitNetIdxScaleGroupSize] = static_cast<int32_t>(logical_out);
+  header_acc[kBitNetIdxInterleaveMode] = 1;
+  header_acc[kBitNetIdxArchMin] = 80;
+  header_acc[kBitNetIdxSegmentCount] = 1;
+  header_acc[kBitNetIdxFlags] = 0;
+  auto packed_segment_offsets = torch::zeros(
+      {2},
+      torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt32));
+  auto offsets_acc = packed_segment_offsets.accessor<int32_t, 1>();
+  offsets_acc[0] = 0;
+  offsets_acc[1] = static_cast<int32_t>(logical_out);
+
+  return py::make_tuple(
+      packed_cpu.to(weight.device()),
+      packed_scale_values.to(weight.device()),
+      packed_layout_header.to(weight.device()),
+      packed_segment_offsets.to(weight.device()));
+}
+
 py::tuple PackQkvWeightsForward(
     const torch::Tensor& q_weight,
     const c10::optional<torch::Tensor>& q_bias,
@@ -2548,6 +3690,62 @@ std::vector<torch::Tensor> QkvPackedHeadsProjectionForward(
   };
 }
 
+std::vector<torch::Tensor> BitNetQkvPackedHeadsProjectionForward(
+    const torch::Tensor& q_x,
+    const torch::Tensor& q_packed_weight,
+    const torch::Tensor& q_scale_values,
+    const torch::Tensor& q_layout_header,
+    const torch::Tensor& q_segment_offsets,
+    const c10::optional<torch::Tensor>& q_bias,
+    const torch::Tensor& k_x,
+    const torch::Tensor& k_packed_weight,
+    const torch::Tensor& k_scale_values,
+    const torch::Tensor& k_layout_header,
+    const torch::Tensor& k_segment_offsets,
+    const c10::optional<torch::Tensor>& k_bias,
+    const torch::Tensor& v_x,
+    const torch::Tensor& v_packed_weight,
+    const torch::Tensor& v_scale_values,
+    const torch::Tensor& v_layout_header,
+    const torch::Tensor& v_segment_offsets,
+    const c10::optional<torch::Tensor>& v_bias,
+    int64_t q_heads,
+    int64_t kv_heads,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  auto q = BitNetLinearForward(
+      q_x,
+      q_packed_weight,
+      q_scale_values,
+      q_layout_header,
+      q_segment_offsets,
+      q_bias,
+      out_dtype,
+      false);
+  auto k = BitNetLinearForward(
+      k_x,
+      k_packed_weight,
+      k_scale_values,
+      k_layout_header,
+      k_segment_offsets,
+      k_bias,
+      out_dtype,
+      false);
+  auto v = BitNetLinearForward(
+      v_x,
+      v_packed_weight,
+      v_scale_values,
+      v_layout_header,
+      v_segment_offsets,
+      v_bias,
+      out_dtype,
+      false);
+  return {
+      SplitHeadsForward(q, q_heads),
+      SplitHeadsForward(k, kv_heads),
+      SplitHeadsForward(v, kv_heads),
+  };
+}
+
 torch::Tensor EmbeddingForward(
     const torch::Tensor& weight,
     const torch::Tensor& indices,
@@ -2608,6 +3806,1100 @@ torch::Tensor HeadOutputProjectionForward(
   return LinearForward(MergeHeadsForward(x), weight, bias, backend);
 }
 
+std::string PyTypeName(const py::handle& obj) {
+  return std::string(py::str(obj.get_type().attr("__name__")));
+}
+
+bool PyCallableAttr(const py::object& obj, const char* name) {
+  if (!py::hasattr(obj, name)) {
+    return false;
+  }
+  try {
+    return PyCallable_Check(obj.attr(name).ptr()) != 0;
+  } catch (...) {
+    return false;
+  }
+}
+
+py::object PyAttrOrNone(const py::object& obj, const char* name) {
+  if (!py::hasattr(obj, name)) {
+    return py::none();
+  }
+  return obj.attr(name);
+}
+
+bool PyBoolAttr(const py::object& obj, const char* name, bool default_value = false) {
+  if (!py::hasattr(obj, name)) {
+    return default_value;
+  }
+  try {
+    return py::cast<bool>(obj.attr(name));
+  } catch (...) {
+    return default_value;
+  }
+}
+
+double PyFloatAttr(const py::object& obj, const char* name, double default_value = 0.0) {
+  if (!py::hasattr(obj, name)) {
+    return default_value;
+  }
+  try {
+    return py::cast<double>(obj.attr(name));
+  } catch (...) {
+    return default_value;
+  }
+}
+
+int64_t PyIntAttr(const py::object& obj, const char* name, int64_t default_value = 0) {
+  if (!py::hasattr(obj, name)) {
+    return default_value;
+  }
+  try {
+    return py::cast<int64_t>(obj.attr(name));
+  } catch (...) {
+    return default_value;
+  }
+}
+
+std::string PyStringAttr(const py::object& obj, const char* name, const std::string& default_value = "") {
+  if (!py::hasattr(obj, name)) {
+    return default_value;
+  }
+  try {
+    return py::cast<std::string>(obj.attr(name));
+  } catch (...) {
+    return default_value;
+  }
+}
+
+torch::Tensor TensorAttr(const py::object& obj, const char* name) {
+  return py::cast<torch::Tensor>(obj.attr(name));
+}
+
+c10::optional<torch::Tensor> TensorAttrOptional(const py::object& obj, const char* name) {
+  return OptionalTensorFromPyObject(PyAttrOrNone(obj, name));
+}
+
+py::module_ RuntimeOpsModule() {
+  return py::module_::import("runtime.ops");
+}
+
+struct BitNetModuleState {
+  torch::Tensor packed_weight;
+  torch::Tensor scale_values;
+  torch::Tensor layout_header;
+  torch::Tensor segment_offsets;
+  c10::optional<torch::Tensor> bias = c10::nullopt;
+  bool spin_enabled = false;
+  torch::Tensor spin_signs;
+  torch::Tensor pre_scale;
+  std::string act_quant_mode = "none";
+  std::string act_quant_method = "absmax";
+  double act_quant_percentile = 0.999;
+  int64_t act_quant_bits = 8;
+  torch::Tensor act_scale;
+};
+
+bool IsSupportedLinearLikeModule(const py::object& module) {
+  return py::hasattr(module, "weight") || PyCallableAttr(module, "runtime_linear");
+}
+
+bool ModuleSupportsPackedBackend(const py::object& module, const std::string& backend) {
+  if (!PyCallableAttr(module, "runtime_supports_packed_backend")) {
+    return false;
+  }
+  try {
+    return py::cast<bool>(module.attr("runtime_supports_packed_backend")(backend));
+  } catch (...) {
+    return false;
+  }
+}
+
+bool ModuleHasRuntimeLinear(const py::object& module) {
+  return PyCallableAttr(module, "runtime_linear");
+}
+
+bool TryLoadBitNetModuleState(const py::object& module, BitNetModuleState* state) {
+  if (state == nullptr) {
+    return false;
+  }
+  if (!py::hasattr(module, "packed_weight") || !py::hasattr(module, "scale_values") ||
+      !py::hasattr(module, "layout_header") || !py::hasattr(module, "segment_offsets")) {
+    return false;
+  }
+  try {
+    BitNetModuleState out;
+    out.packed_weight = TensorAttr(module, "packed_weight");
+    out.scale_values = TensorAttr(module, "scale_values");
+    out.layout_header = TensorAttr(module, "layout_header");
+    out.segment_offsets = TensorAttr(module, "segment_offsets");
+    out.bias = TensorAttrOptional(module, "bias");
+    auto spin_enabled_flag = TensorAttrOptional(module, "spin_enabled_flag");
+    if (spin_enabled_flag.has_value() && spin_enabled_flag.value().defined() && spin_enabled_flag.value().numel() > 0) {
+      out.spin_enabled = spin_enabled_flag.value().item<int64_t>() != 0;
+    }
+    if (py::hasattr(module, "spin_signs")) {
+      out.spin_signs = TensorAttr(module, "spin_signs");
+    }
+    if (py::hasattr(module, "pre_scale")) {
+      out.pre_scale = TensorAttr(module, "pre_scale");
+    }
+    out.act_quant_mode = PyStringAttr(module, "act_quant_mode", "none");
+    out.act_quant_method = PyStringAttr(module, "act_quant_method", "absmax");
+    out.act_quant_percentile = PyFloatAttr(module, "act_quant_percentile", 0.999);
+    out.act_quant_bits = PyIntAttr(module, "act_quant_bits", 8);
+    if (py::hasattr(module, "act_scale")) {
+      out.act_scale = TensorAttr(module, "act_scale");
+    }
+    *state = std::move(out);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+int64_t BitNetQuantMax(int64_t bits) {
+  TORCH_CHECK(bits >= 2, "BitNet activation quantization bits must be >= 2");
+  return (static_cast<int64_t>(1) << (bits - 1)) - 1;
+}
+
+std::vector<int64_t> BitNetPowerOfTwoSegments(int64_t size) {
+  std::vector<int64_t> out;
+  if (size <= 0) {
+    return out;
+  }
+  int64_t remaining = size;
+  while (remaining > 0) {
+    int64_t seg = static_cast<int64_t>(1) << (63 - __builtin_clzll(static_cast<unsigned long long>(remaining)));
+    out.push_back(seg);
+    remaining -= seg;
+  }
+  return out;
+}
+
+torch::Tensor HadamardLastDimPower2(const torch::Tensor& x) {
+  const auto width = x.size(-1);
+  if (width <= 1) {
+    return x;
+  }
+  TORCH_CHECK((width & (width - 1)) == 0, "Hadamard width must be a power of two");
+  auto y = x.reshape({-1, width});
+  int64_t block = 1;
+  while (block < width) {
+    auto view = y.view({-1, width / (block * 2), 2, block});
+    auto a = view.select(2, 0);
+    auto b = view.select(2, 1);
+    y = torch::cat({a + b, a - b}, -1);
+    block *= 2;
+  }
+  return (y.view(x.sizes()) / std::sqrt(static_cast<double>(width))).contiguous();
+}
+
+torch::Tensor ApplyBitNetSpinTransform(const torch::Tensor& x, const torch::Tensor& spin_signs) {
+  TORCH_CHECK(x.size(-1) == spin_signs.numel(), "spin_signs must match the last dimension of x");
+  auto work_dtype = x.scalar_type();
+  if (!(work_dtype == torch::kFloat32 || work_dtype == torch::kFloat16 || work_dtype == torch::kBFloat16)) {
+    work_dtype = torch::kFloat32;
+  }
+  auto signs = spin_signs.to(torch::TensorOptions().device(x.device()).dtype(work_dtype));
+  auto x_local = x.to(torch::TensorOptions().device(x.device()).dtype(work_dtype)) * signs;
+  auto segments = BitNetPowerOfTwoSegments(signs.numel());
+  if (segments.empty()) {
+    return x_local;
+  }
+  if (segments.size() == 1) {
+    return HadamardLastDimPower2(x_local);
+  }
+  std::vector<torch::Tensor> parts;
+  parts.reserve(segments.size());
+  int64_t start = 0;
+  for (auto seg : segments) {
+    const auto stop = start + seg;
+    auto part = x_local.slice(-1, start, stop);
+    parts.push_back(seg > 1 ? HadamardLastDimPower2(part) : part);
+    start = stop;
+  }
+  return torch::cat(parts, -1).contiguous();
+}
+
+bool BitNetPreScaleActive(const torch::Tensor& pre_scale) {
+  if (!pre_scale.defined() || pre_scale.numel() == 0) {
+    return false;
+  }
+  return (pre_scale.detach().to(torch::kFloat32) - 1.0).abs().amax().item<float>() > 1.0e-6f;
+}
+
+torch::Tensor ApplyBitNetPreScaleToInput(const torch::Tensor& x, const torch::Tensor& pre_scale) {
+  std::vector<int64_t> view_shape(static_cast<size_t>(x.dim()), 1);
+  view_shape.back() = pre_scale.numel();
+  return x / pre_scale.to(torch::TensorOptions().device(x.device()).dtype(x.scalar_type())).view(view_shape);
+}
+
+bool BitNetActivationCalibrationMethodSupported(const std::string& method) {
+  const auto method_name = NormalizeBackendName(method);
+  return method_name.empty() || method_name == "absmax" || method_name == "percentile" || method_name == "mse";
+}
+
+torch::Tensor CalibrateBitNetActivationScale(
+    const torch::Tensor& x,
+    const std::string& method,
+    int64_t bits,
+    double percentile) {
+  const auto method_name = NormalizeBackendName(method);
+  TORCH_CHECK(BitNetActivationCalibrationMethodSupported(method_name),
+              "Unsupported native BitNet activation calibration method: ",
+              method);
+  const auto qmax = static_cast<double>(BitNetQuantMax(bits));
+  auto abs_x = x.detach().to(torch::kFloat32).abs();
+  torch::Tensor clip;
+  if (method_name == "percentile") {
+    const auto q = std::max(0.0, std::min(1.0, percentile));
+    auto flat = abs_x.reshape({-1});
+    const auto k = std::max<int64_t>(static_cast<int64_t>(q * static_cast<double>(std::max<int64_t>(flat.numel() - 1, 0))), 0);
+    clip = std::get<0>(torch::kthvalue(flat, k + 1));
+  } else {
+    // Python mse_scale() is currently an absmax fallback, so keep native behavior aligned.
+    clip = abs_x.amax();
+  }
+  clip = clip.clamp_min(1.0e-8);
+  return (clip / qmax).to(torch::kFloat32);
+}
+
+torch::Tensor FakeQuantizeBitNetActivation(
+    const torch::Tensor& x,
+    const torch::Tensor& scale,
+    int64_t bits) {
+  const auto qmax = static_cast<double>(BitNetQuantMax(bits));
+  auto scale_t = scale.to(torch::TensorOptions().device(x.device()).dtype(torch::kFloat32)).clamp_min(1.0e-8);
+  while (scale_t.dim() < x.dim()) {
+    scale_t = scale_t.unsqueeze(0);
+  }
+  auto q = torch::round(x.to(torch::kFloat32) / scale_t).clamp_(-qmax, qmax);
+  return (q * scale_t).to(x.scalar_type());
+}
+
+bool BitNetModuleDirectSupported(const BitNetModuleState& state) {
+  const auto mode = NormalizeBackendName(state.act_quant_mode);
+  if (mode.empty() || mode == "none" || mode == "off") {
+    return true;
+  }
+  if ((mode == "dynamic_int8" || mode == "static_int8") && state.act_quant_bits >= 2) {
+    return BitNetActivationCalibrationMethodSupported(state.act_quant_method);
+  }
+  return false;
+}
+
+bool BitNetModuleDirectSupported(const py::object& module, BitNetModuleState* state = nullptr) {
+  BitNetModuleState local;
+  if (!TryLoadBitNetModuleState(module, &local)) {
+    return false;
+  }
+  if (!BitNetModuleDirectSupported(local)) {
+    return false;
+  }
+  if (state != nullptr) {
+    *state = std::move(local);
+  }
+  return true;
+}
+
+torch::Tensor ApplyBitNetModuleInputTransforms(const torch::Tensor& x, const BitNetModuleState& state) {
+  auto target_dtype = x.scalar_type();
+  if (!(target_dtype == torch::kFloat32 || target_dtype == torch::kFloat16 || target_dtype == torch::kBFloat16)) {
+    target_dtype = torch::kFloat32;
+  }
+  auto x_local = x.to(torch::TensorOptions().device(x.device()).dtype(target_dtype));
+  if (state.spin_enabled && state.spin_signs.defined() && state.spin_signs.numel() > 0) {
+    x_local = ApplyBitNetSpinTransform(x_local, state.spin_signs);
+  }
+  if (state.pre_scale.defined() && BitNetPreScaleActive(state.pre_scale)) {
+    x_local = ApplyBitNetPreScaleToInput(x_local, state.pre_scale);
+  }
+  const auto mode = NormalizeBackendName(state.act_quant_mode);
+  if (mode.empty() || mode == "none" || mode == "off") {
+    return x_local;
+  }
+  if (mode == "dynamic_int8") {
+    auto scale =
+        CalibrateBitNetActivationScale(x_local, state.act_quant_method, state.act_quant_bits, state.act_quant_percentile);
+    return FakeQuantizeBitNetActivation(x_local, scale, state.act_quant_bits);
+  }
+  if (mode == "static_int8") {
+    TORCH_CHECK(state.act_scale.defined(), "BitNet static_int8 activation quantization requires act_scale");
+    return FakeQuantizeBitNetActivation(x_local, state.act_scale, state.act_quant_bits);
+  }
+  TORCH_CHECK(false, "Unsupported native BitNet activation quantization mode: ", state.act_quant_mode);
+}
+
+torch::Tensor BitNetLinearModuleForward(const torch::Tensor& x, const py::object& module) {
+  BitNetModuleState state;
+  TORCH_CHECK(BitNetModuleDirectSupported(module, &state), "BitNet module is not directly supported in native executor");
+  auto x_local = ApplyBitNetModuleInputTransforms(x, state);
+  return BitNetLinearForward(
+      x_local,
+      state.packed_weight,
+      state.scale_values,
+      state.layout_header,
+      state.segment_offsets,
+      state.bias,
+      c10::nullopt,
+      false);
+}
+
+torch::Tensor PythonLinearModuleForward(
+    const torch::Tensor& x,
+    const py::object& module,
+    const std::string& backend) {
+  return py::cast<torch::Tensor>(
+      RuntimeOpsModule().attr("linear_module")(x, module, "backend"_a = backend));
+}
+
+torch::Tensor LinearLikeModuleForward(
+    const torch::Tensor& x,
+    const py::object& module,
+    const std::string& backend) {
+  if (BitNetModuleDirectSupported(module)) {
+    return BitNetLinearModuleForward(x, module);
+  }
+  if (ModuleHasRuntimeLinear(module)) {
+    return PythonLinearModuleForward(x, module, backend);
+  }
+  return LinearForward(x, TensorAttr(module, "weight"), TensorAttrOptional(module, "bias"), backend);
+}
+
+bool AttentionQkvSupportsPackedBitNet(const py::object& attn) {
+  for (const char* name : {"w_q", "w_k", "w_v"}) {
+    if (!ModuleSupportsPackedBackend(attn.attr(name), "bitnet")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::vector<torch::Tensor> AttentionPackedBitNetQkvForward(
+    const torch::Tensor& x,
+    const py::object& attn,
+    int64_t q_heads,
+    int64_t kv_heads) {
+  BitNetModuleState q_state;
+  BitNetModuleState k_state;
+  BitNetModuleState v_state;
+  if (BitNetModuleDirectSupported(attn.attr("w_q"), &q_state) &&
+      BitNetModuleDirectSupported(attn.attr("w_k"), &k_state) &&
+      BitNetModuleDirectSupported(attn.attr("w_v"), &v_state)) {
+    auto q_x = ApplyBitNetModuleInputTransforms(x, q_state);
+    auto k_x = ApplyBitNetModuleInputTransforms(x, k_state);
+    auto v_x = ApplyBitNetModuleInputTransforms(x, v_state);
+    return BitNetQkvPackedHeadsProjectionForward(
+        q_x,
+        q_state.packed_weight,
+        q_state.scale_values,
+        q_state.layout_header,
+        q_state.segment_offsets,
+        q_state.bias,
+        k_x,
+        k_state.packed_weight,
+        k_state.scale_values,
+        k_state.layout_header,
+        k_state.segment_offsets,
+        k_state.bias,
+        v_x,
+        v_state.packed_weight,
+        v_state.scale_values,
+        v_state.layout_header,
+        v_state.segment_offsets,
+        v_state.bias,
+        q_heads,
+        kv_heads,
+        c10::nullopt);
+  }
+  auto runtime_ops = RuntimeOpsModule();
+  auto spec = runtime_ops.attr("resolve_packed_qkv_module_spec")(
+      attn.attr("w_q"),
+      attn.attr("w_k"),
+      attn.attr("w_v"),
+      "backend"_a = "bitnet",
+      "reference"_a = x);
+  auto out = py::cast<py::tuple>(runtime_ops.attr("qkv_packed_spec_heads_projection")(
+      x,
+      spec,
+      "q_heads"_a = q_heads,
+      "kv_heads"_a = kv_heads,
+      "backend"_a = "bitnet"));
+  return {
+      py::cast<torch::Tensor>(out[0]),
+      py::cast<torch::Tensor>(out[1]),
+      py::cast<torch::Tensor>(out[2]),
+  };
+}
+
+torch::Tensor AttentionPackedBitNetOutputForward(
+    const torch::Tensor& x,
+    const py::object& module) {
+  if (BitNetModuleDirectSupported(module)) {
+    return BitNetLinearModuleForward(MergeHeadsForward(x), module);
+  }
+  auto runtime_ops = RuntimeOpsModule();
+  auto spec = runtime_ops.attr("resolve_packed_linear_module_spec")(
+      module,
+      "backend"_a = "bitnet",
+      "reference"_a = MergeHeadsForward(x));
+  return py::cast<torch::Tensor>(
+      runtime_ops.attr("head_output_packed_projection")(x, spec, "backend"_a = "bitnet"));
+}
+
+bool IsSupportedNormModule(const py::object& norm) {
+  const auto name = PyTypeName(norm);
+  return name == "RMSNorm" || name == "LayerNorm";
+}
+
+torch::Tensor ApplyNormModuleForward(const torch::Tensor& x, const py::object& norm) {
+  const auto name = PyTypeName(norm);
+  if (name == "RMSNorm") {
+    return RmsNormForward(x, TensorAttrOptional(norm, "weight"), PyFloatAttr(norm, "eps", 1e-6));
+  }
+  if (name == "LayerNorm") {
+    return LayerNormForward(x, TensorAttrOptional(norm, "weight"), TensorAttrOptional(norm, "bias"), PyFloatAttr(norm, "eps", 1e-5));
+  }
+  throw std::runtime_error("unsupported norm module for native causal executor");
+}
+
+std::vector<torch::Tensor> AddNormModuleForward(const torch::Tensor& x, const torch::Tensor& update, const py::object& norm, double residual_scale) {
+  const auto name = PyTypeName(norm);
+  if (name == "RMSNorm") {
+    return AddRmsNormForward(x, update, TensorAttrOptional(norm, "weight"), residual_scale, PyFloatAttr(norm, "eps", 1e-6));
+  }
+  if (name == "LayerNorm") {
+    return AddLayerNormForward(
+        x,
+        update,
+        TensorAttrOptional(norm, "weight"),
+        TensorAttrOptional(norm, "bias"),
+        residual_scale,
+        PyFloatAttr(norm, "eps", 1e-5));
+  }
+  throw std::runtime_error("unsupported add+norm module for native causal executor");
+}
+
+bool HasNativeCacheSupport(const py::object& cache) {
+  if (cache.is_none()) {
+    return true;
+  }
+  auto native_cache = PyAttrOrNone(cache, "_native_cache");
+  if (!native_cache.is_none()) {
+    return true;
+  }
+  auto native_layers = PyAttrOrNone(cache, "_native_layers");
+  return !native_layers.is_none();
+}
+
+bool IsSupportedAttentionMask(const py::object& attention_mask) {
+  if (attention_mask.is_none()) {
+    return true;
+  }
+  try {
+    auto mask = py::cast<torch::Tensor>(attention_mask);
+    return mask.defined() && mask.dim() >= 2 && mask.dim() <= 4;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool IsTokenAttentionMaskTensor(const torch::Tensor& attention_mask, int64_t batch_size, int64_t seq_len) {
+  return attention_mask.defined() && attention_mask.dim() == 2 && attention_mask.size(0) == batch_size && attention_mask.size(1) == seq_len;
+}
+
+std::string ResolveAttentionMaskMode(
+    const py::object& attention_mask,
+    int64_t batch_size,
+    int64_t seq_len) {
+  if (attention_mask.is_none()) {
+    return "none";
+  }
+  try {
+    auto mask = py::cast<torch::Tensor>(attention_mask);
+    return IsTokenAttentionMaskTensor(mask, batch_size, seq_len) ? std::string("token") : std::string("explicit");
+  } catch (...) {
+    return "python";
+  }
+}
+
+torch::Tensor PrepareExplicitAttentionMaskForHeads(
+    const torch::Tensor& mask,
+    int64_t batch_size,
+    int64_t num_heads,
+    int64_t tgt_len,
+    int64_t src_len) {
+  TORCH_CHECK(mask.defined(), "prepare_explicit_attention_mask_for_heads: mask must be defined");
+  TORCH_CHECK(mask.dim() >= 2 && mask.dim() <= 4,
+              "prepare_explicit_attention_mask_for_heads: mask rank must be between 2 and 4");
+  if (mask.dim() == 2) {
+    if (mask.size(0) == batch_size && mask.size(1) == src_len) {
+      auto padding_mask = mask.scalar_type() == torch::kBool ? mask : mask.eq(0);
+      return padding_mask.view({batch_size, 1, 1, src_len}).expand({batch_size, num_heads, tgt_len, src_len});
+    }
+    TORCH_CHECK(mask.size(0) == tgt_len && mask.size(1) == src_len,
+                "prepare_explicit_attention_mask_for_heads: 2D mask must have shape (B,S) or (T,S)");
+    return mask.view({1, 1, tgt_len, src_len}).expand({batch_size, num_heads, tgt_len, src_len});
+  }
+  if (mask.dim() == 3) {
+    TORCH_CHECK(mask.size(0) == batch_size && mask.size(1) == tgt_len && mask.size(2) == src_len,
+                "prepare_explicit_attention_mask_for_heads: 3D mask must have shape (B,T,S)");
+    return mask.unsqueeze(1).expand({batch_size, num_heads, tgt_len, src_len});
+  }
+  TORCH_CHECK(mask.size(-2) == tgt_len && mask.size(-1) == src_len,
+              "prepare_explicit_attention_mask_for_heads: 4D mask must end in (T,S)");
+  TORCH_CHECK(mask.size(0) == 1 || mask.size(0) == batch_size,
+              "prepare_explicit_attention_mask_for_heads: 4D batch dim must be 1 or batch_size");
+  TORCH_CHECK(mask.size(1) == 1 || mask.size(1) == num_heads,
+              "prepare_explicit_attention_mask_for_heads: 4D head dim must be 1 or num_heads");
+  return mask.expand({batch_size, num_heads, tgt_len, src_len});
+}
+
+torch::Tensor AppendExplicitDecodeAttentionMaskForward(
+    const torch::Tensor& attention_mask,
+    const c10::optional<torch::Tensor>& row_ids) {
+  TORCH_CHECK(attention_mask.defined(), "append_explicit_decode_attention_mask_forward: attention_mask must be defined");
+  TORCH_CHECK(attention_mask.dim() >= 2 && attention_mask.dim() <= 4,
+              "append_explicit_decode_attention_mask_forward: attention_mask rank must be between 2 and 4");
+  auto mask = attention_mask;
+  if (row_ids.has_value() && row_ids.value().defined()) {
+    auto ids = row_ids.value().to(torch::kLong).contiguous().view({-1});
+    if (mask.dim() == 3 || mask.dim() == 4) {
+      if (mask.size(0) == 1 && ids.numel() > 1) {
+        std::vector<int64_t> expanded(mask.sizes().begin(), mask.sizes().end());
+        expanded[0] = ids.numel();
+        mask = mask.expand(expanded);
+      } else if (mask.size(0) > 1) {
+        mask = mask.index_select(0, ids);
+      }
+    }
+  }
+  const auto src_len = mask.size(-1) + 1;
+  if (mask.dim() == 2) {
+    return torch::zeros({1, src_len}, mask.options());
+  }
+  if (mask.dim() == 3) {
+    return torch::zeros({mask.size(0), 1, src_len}, mask.options());
+  }
+  return torch::zeros({mask.size(0), mask.size(1), 1, src_len}, mask.options());
+}
+
+bool IsSupportedAttentionModule(const py::object& attn) {
+  for (const char* name : {"w_q", "w_k", "w_v", "w_o"}) {
+    if (!py::hasattr(attn, name)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsSupportedMlpModule(const py::object& mlp) {
+  return py::hasattr(mlp, "w_in") && py::hasattr(mlp, "w_out") && py::hasattr(mlp, "activation_name") && py::hasattr(mlp, "gated");
+}
+
+bool IsSupportedMoEMlpModule(const py::object& moe) {
+  if (!py::hasattr(moe, "router") || !py::hasattr(moe, "experts") || !py::hasattr(moe, "num_experts") || !py::hasattr(moe, "k")) {
+    return false;
+  }
+  auto router = moe.attr("router");
+  if (!IsSupportedLinearLikeModule(router)) {
+    return false;
+  }
+  const auto num_experts = PyIntAttr(moe, "num_experts", -1);
+  const auto k = PyIntAttr(moe, "k", -1);
+  if (num_experts <= 0 || k <= 0 || k > num_experts) {
+    return false;
+  }
+  auto experts = moe.attr("experts");
+  if (py::len(experts) != num_experts) {
+    return false;
+  }
+  for (auto expert_handle : experts) {
+    py::object expert = py::reinterpret_borrow<py::object>(expert_handle);
+    if (!IsSupportedMlpModule(expert)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsSupportedNativeCausalModel(const py::object& model, const py::object& attention_mask, const py::object& cache) {
+  if (PyBoolAttr(model, "training", false)) {
+    return false;
+  }
+  if (!IsSupportedAttentionMask(attention_mask) || !HasNativeCacheSupport(cache)) {
+    return false;
+  }
+  for (const char* name : {"embed", "blocks", "norm", "lm_head"}) {
+    if (!py::hasattr(model, name)) {
+      return false;
+    }
+  }
+  if (!IsSupportedNormModule(model.attr("norm"))) {
+    return false;
+  }
+  for (auto block_handle : model.attr("blocks")) {
+    py::object block = py::reinterpret_borrow<py::object>(block_handle);
+    const auto block_type = PyTypeName(block);
+    const bool standard_block = block_type == "TransformerBlock" || block_type == "LlamaBlock" || block_type == "GPTBlock";
+    const bool parallel_block = block_type == "ParallelTransformerBlock";
+    const bool moe_block = block_type == "MoEBlock";
+    if (!standard_block && !parallel_block && !moe_block) {
+      return false;
+    }
+    if (!py::hasattr(block, "attn") || !py::hasattr(block, "bc")) {
+      return false;
+    }
+    if (moe_block) {
+      if (!py::hasattr(block, "moe")) {
+        return false;
+      }
+    } else if (!py::hasattr(block, "mlp")) {
+      return false;
+    }
+    if (standard_block || moe_block) {
+      if (!py::hasattr(block, "n1") || !py::hasattr(block, "n2")) {
+        return false;
+      }
+      if (!IsSupportedNormModule(block.attr("n1")) || !IsSupportedNormModule(block.attr("n2"))) {
+        return false;
+      }
+    } else {
+      if (!py::hasattr(block, "n") || !IsSupportedNormModule(block.attr("n"))) {
+        return false;
+      }
+    }
+    if (!IsSupportedAttentionModule(block.attr("attn"))) {
+      return false;
+    }
+    if (moe_block) {
+      if (!IsSupportedMoEMlpModule(block.attr("moe"))) {
+        return false;
+      }
+    } else if (!IsSupportedMlpModule(block.attr("mlp"))) {
+      return false;
+    }
+    auto bc = block.attr("bc");
+    const auto norm_policy = PyStringAttr(bc, "norm_policy", "prenorm");
+    if (standard_block || moe_block) {
+      if (norm_policy != "prenorm" && norm_policy != "postnorm") {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+std::string DetectNativeExecutorKind(const py::object& model) {
+  return IsSupportedNativeCausalModel(model, py::none(), py::none()) ? std::string("causal_lm") : std::string("python");
+}
+
+int64_t NativeCacheLayerLength(const py::object& cache, int64_t layer_idx) {
+  auto native_cache = PyAttrOrNone(cache, "_native_cache");
+  if (!native_cache.is_none()) {
+    return py::cast<int64_t>(native_cache.attr("max_length")(layer_idx));
+  }
+  auto native_layers = PyAttrOrNone(cache, "_native_layers");
+  if (!native_layers.is_none()) {
+    py::object layer = native_layers[py::int_(layer_idx)];
+    auto lengths = py::cast<torch::Tensor>(layer.attr("lengths")());
+    return lengths.numel() > 0 ? lengths.max().item<int64_t>() : 0;
+  }
+  return 0;
+}
+
+void NativeCacheAppendLayer(const py::object& cache, int64_t layer_idx, const torch::Tensor& k, const torch::Tensor& v) {
+  auto native_cache = PyAttrOrNone(cache, "_native_cache");
+  if (!native_cache.is_none()) {
+    native_cache.attr("append")(layer_idx, k, v);
+    return;
+  }
+  auto native_layers = PyAttrOrNone(cache, "_native_layers");
+  if (!native_layers.is_none()) {
+    py::object layer = native_layers[py::int_(layer_idx)];
+    layer.attr("append")(k, v);
+  }
+}
+
+std::pair<torch::Tensor, torch::Tensor> NativeCacheReadLayerAll(const py::object& cache, int64_t layer_idx) {
+  const auto length = NativeCacheLayerLength(cache, layer_idx);
+  auto native_cache = PyAttrOrNone(cache, "_native_cache");
+  if (!native_cache.is_none()) {
+    auto out = py::cast<py::tuple>(native_cache.attr("read_range")(layer_idx, 0, length));
+    return {py::cast<torch::Tensor>(out[0]), py::cast<torch::Tensor>(out[1])};
+  }
+  auto native_layers = PyAttrOrNone(cache, "_native_layers");
+  if (!native_layers.is_none()) {
+    py::object layer = native_layers[py::int_(layer_idx)];
+    auto out = py::cast<py::tuple>(layer.attr("read_range")(0, length));
+    return {py::cast<torch::Tensor>(out[0]), py::cast<torch::Tensor>(out[1])};
+  }
+  throw std::runtime_error("native cache state unavailable for supported causal executor");
+}
+
+torch::Tensor ToAdditiveMask(const torch::Tensor& mask) {
+  if (mask.scalar_type() == torch::kBool) {
+    auto masked = torch::full(
+        mask.sizes(),
+        -std::numeric_limits<float>::infinity(),
+        torch::TensorOptions().dtype(torch::kFloat32).device(mask.device()));
+    auto zeros = torch::zeros(
+        mask.sizes(),
+        torch::TensorOptions().dtype(torch::kFloat32).device(mask.device()));
+    return torch::where(mask, masked, zeros);
+  }
+  return mask.to(torch::kFloat32);
+}
+
+torch::Tensor MergeAttentionBias(
+    const c10::optional<torch::Tensor>& base_mask,
+    const torch::Tensor& bias) {
+  if (!base_mask.has_value() || !base_mask.value().defined()) {
+    return bias;
+  }
+  return ToAdditiveMask(base_mask.value()) + bias.to(torch::kFloat32);
+}
+
+torch::Tensor BuildAlibiBiasForPositions(
+    int64_t batch_size,
+    int64_t num_heads,
+    int64_t tgt_len,
+    int64_t src_len,
+    const torch::Device& device,
+    const c10::optional<torch::Tensor>& position_ids) {
+  auto float_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+  int64_t m = 1;
+  while ((m << 1) <= num_heads) {
+    m <<= 1;
+  }
+  auto slopes = torch::pow(
+      torch::full({m}, 2.0f, float_opts),
+      -torch::arange(0, m, float_opts) / static_cast<double>(m));
+  if (m < num_heads) {
+    auto extra = torch::pow(
+        torch::full({num_heads - m}, 2.0f, float_opts),
+        -torch::arange(1, 2 * (num_heads - m) + 1, 2, float_opts) / static_cast<double>(m));
+    slopes = torch::cat({slopes, extra}, 0);
+  }
+  slopes = slopes.slice(0, 0, num_heads).view({1, num_heads, 1, 1});
+
+  torch::Tensor qpos;
+  if (position_ids.has_value() && position_ids.value().defined()) {
+    qpos = position_ids.value().to(float_opts);
+    if (qpos.dim() == 1) {
+      qpos = qpos.view({1, -1});
+    }
+    if (qpos.size(0) == 1 && batch_size > 1) {
+      qpos = qpos.expand({batch_size, qpos.size(1)});
+    }
+  } else {
+    auto start = std::max<int64_t>(src_len - tgt_len, 0);
+    qpos = torch::arange(start, start + tgt_len, float_opts).view({1, tgt_len}).expand({batch_size, tgt_len});
+  }
+  auto kpos = torch::arange(src_len, float_opts).view({1, 1, 1, src_len});
+  return -slopes * (qpos.view({batch_size, 1, tgt_len, 1}) - kpos);
+}
+
+torch::Tensor BuildRelativePositionBiasForPositions(
+    const torch::Tensor& table,
+    int64_t batch_size,
+    int64_t tgt_len,
+    int64_t src_len,
+    int64_t max_distance,
+    const torch::Device& device,
+    const c10::optional<torch::Tensor>& position_ids) {
+  auto table_f = table.to(torch::TensorOptions().dtype(torch::kFloat32).device(device)).contiguous();
+  auto long_opts = torch::TensorOptions().dtype(torch::kLong).device(device);
+  torch::Tensor qpos;
+  if (position_ids.has_value() && position_ids.value().defined()) {
+    qpos = position_ids.value().to(long_opts);
+    if (qpos.dim() == 1) {
+      qpos = qpos.view({1, -1});
+    }
+    if (qpos.size(0) == 1 && batch_size > 1) {
+      qpos = qpos.expand({batch_size, qpos.size(1)});
+    }
+  } else {
+    auto start = std::max<int64_t>(src_len - tgt_len, 0);
+    qpos = torch::arange(start, start + tgt_len, long_opts).view({1, tgt_len}).expand({batch_size, tgt_len});
+  }
+  auto kpos = torch::arange(src_len, long_opts).view({1, 1, src_len});
+  auto rel = (kpos - qpos.view({batch_size, tgt_len, 1}))
+      .clamp(-(max_distance - 1), max_distance - 1)
+      + (max_distance - 1);
+  auto flat = rel.contiguous().view({-1});
+  auto gathered = table_f.index_select(1, flat);
+  return gathered.view({table_f.size(0), batch_size, tgt_len, src_len}).permute({1, 0, 2, 3}).contiguous();
+}
+
+c10::optional<torch::Tensor> ApplySupportedAttentionBiases(
+    const py::object& block,
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& base_mask,
+    const c10::optional<torch::Tensor>& position_ids) {
+  c10::optional<torch::Tensor> mask = base_mask;
+  auto bc = block.attr("bc");
+  const auto num_heads = PyIntAttr(block.attr("attn"), "n_heads", 0);
+  const auto tgt_len = x.size(1);
+  const auto src_len = mask.has_value() && mask.value().defined() ? mask.value().size(-1) : tgt_len;
+  if (PyBoolAttr(bc, "use_alibi", false)) {
+    mask = MergeAttentionBias(
+        mask,
+        BuildAlibiBiasForPositions(x.size(0), num_heads, tgt_len, src_len, x.device(), position_ids));
+  }
+  auto rpb_table = PyAttrOrNone(block, "rpb_table");
+  if (!rpb_table.is_none()) {
+    const auto max_distance = PyIntAttr(bc, "rpb_max_distance", 0);
+    TORCH_CHECK(max_distance > 0, "supported causal executor requires positive rpb_max_distance when rpb_table is present");
+    mask = MergeAttentionBias(
+        mask,
+        BuildRelativePositionBiasForPositions(
+            py::cast<torch::Tensor>(rpb_table),
+            x.size(0),
+            tgt_len,
+            src_len,
+            max_distance,
+            x.device(),
+            position_ids));
+  }
+  return mask;
+}
+
+torch::Tensor ExecuteSupportedAttention(
+    const py::object& attn,
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& mask,
+    const py::object& cache,
+    int64_t layer_idx,
+    const c10::optional<torch::Tensor>& position_ids) {
+  const auto q_heads = PyIntAttr(attn, "n_heads", 0);
+  const auto kv_heads = PyIntAttr(attn, "n_kv_heads", q_heads);
+  const auto head_dim = PyIntAttr(attn, "head_dim", x.size(-1) / std::max<int64_t>(q_heads, 1));
+  std::vector<torch::Tensor> qkv;
+  if (AttentionQkvSupportsPackedBitNet(attn)) {
+    qkv = AttentionPackedBitNetQkvForward(x, attn, q_heads, kv_heads);
+  } else if (ModuleHasRuntimeLinear(attn.attr("w_q")) || ModuleHasRuntimeLinear(attn.attr("w_k")) ||
+             ModuleHasRuntimeLinear(attn.attr("w_v"))) {
+    auto q = PythonLinearModuleForward(x, attn.attr("w_q"), "auto");
+    auto k = PythonLinearModuleForward(x, attn.attr("w_k"), "auto");
+    auto v = PythonLinearModuleForward(x, attn.attr("w_v"), "auto");
+    qkv = {
+        SplitHeadsForward(q, q_heads),
+        SplitHeadsForward(k, kv_heads),
+        SplitHeadsForward(v, kv_heads),
+    };
+  } else {
+    qkv = QkvHeadsProjectionForward(
+        x,
+        TensorAttr(attn.attr("w_q"), "weight"),
+        TensorAttrOptional(attn.attr("w_q"), "bias"),
+        TensorAttr(attn.attr("w_k"), "weight"),
+        TensorAttrOptional(attn.attr("w_k"), "bias"),
+        TensorAttr(attn.attr("w_v"), "weight"),
+        TensorAttrOptional(attn.attr("w_v"), "bias"),
+        q_heads,
+        kv_heads,
+        "auto");
+  }
+  auto qh = qkv[0];
+  auto kh_new = qkv[1];
+  auto vh_new = qkv[2];
+
+  if (PyBoolAttr(attn, "use_rope", false)) {
+    double base_theta = PyFloatAttr(attn, "rope_theta", 1e6);
+    const auto scaling_type = PyStringAttr(attn, "rope_scaling_type", "");
+    auto scaling_factor_obj = PyAttrOrNone(attn, "rope_scaling_factor");
+    if (scaling_type == "linear" && !scaling_factor_obj.is_none()) {
+      base_theta *= py::cast<double>(scaling_factor_obj);
+    }
+    auto cos_sin = ResolveRotaryEmbeddingForward(
+        x,
+        head_dim,
+        base_theta,
+        PyFloatAttr(attn, "rope_attention_scaling", 1.0),
+        position_ids);
+    auto rotated = ApplyRotaryForward(qh, kh_new, cos_sin[0], cos_sin[1]);
+    qh = rotated[0];
+    kh_new = rotated[1];
+  }
+
+  torch::Tensor kh_all = kh_new;
+  torch::Tensor vh_all = vh_new;
+  if (!cache.is_none()) {
+    NativeCacheAppendLayer(cache, layer_idx, kh_new, vh_new);
+    auto kv = NativeCacheReadLayerAll(cache, layer_idx);
+    kh_all = kv.first;
+    vh_all = kv.second;
+  }
+
+  auto out = NativeAttentionForward(
+      qh,
+      kh_all,
+      vh_all,
+      mask,
+      !mask.has_value(),
+      c10::optional<double>(PyFloatAttr(attn, "scaling", std::pow(static_cast<double>(head_dim), -0.5))));
+  if (ModuleSupportsPackedBackend(attn.attr("w_o"), "bitnet")) {
+    return AttentionPackedBitNetOutputForward(out, attn.attr("w_o"));
+  }
+  if (ModuleHasRuntimeLinear(attn.attr("w_o"))) {
+    return PythonLinearModuleForward(MergeHeadsForward(out), attn.attr("w_o"), "auto");
+  }
+  return HeadOutputProjectionForward(
+      out,
+      TensorAttr(attn.attr("w_o"), "weight"),
+      TensorAttrOptional(attn.attr("w_o"), "bias"),
+      "auto");
+}
+
+torch::Tensor ExecuteSupportedMlp(const py::object& mlp, const torch::Tensor& x) {
+  const auto activation = PyStringAttr(mlp, "activation_name", "gelu");
+  const bool gated = PyBoolAttr(mlp, "gated", false);
+  const bool module_aware =
+      ModuleHasRuntimeLinear(mlp.attr("w_in")) || ModuleHasRuntimeLinear(mlp.attr("w_out"));
+  if (!module_aware) {
+    return MlpForward(
+        x,
+        TensorAttr(mlp.attr("w_in"), "weight"),
+        TensorAttrOptional(mlp.attr("w_in"), "bias"),
+        TensorAttr(mlp.attr("w_out"), "weight"),
+        TensorAttrOptional(mlp.attr("w_out"), "bias"),
+        activation,
+        gated,
+        "auto");
+  }
+
+  auto hidden = LinearLikeModuleForward(x, mlp.attr("w_in"), "auto");
+  if (gated) {
+    hidden = ApplyGatedActivation(hidden, activation);
+  } else {
+    hidden = ApplyActivation(hidden, activation);
+  }
+  return LinearLikeModuleForward(hidden, mlp.attr("w_out"), "auto");
+}
+
+torch::Tensor ExecuteSupportedMoE(const py::object& moe, const torch::Tensor& x) {
+  const auto num_experts = PyIntAttr(moe, "num_experts", 0);
+  const auto k = PyIntAttr(moe, "k", 1);
+  TORCH_CHECK(num_experts > 0, "supported native MoE requires positive num_experts");
+  TORCH_CHECK(k > 0 && k <= num_experts, "supported native MoE requires 0 < k <= num_experts");
+
+  auto logits = LinearLikeModuleForward(x, moe.attr("router"), "auto");
+  auto probs = torch::softmax(logits.to(torch::kFloat32), -1);
+  auto topk = torch::topk(probs, k, -1, true, true);
+  auto assignments = std::get<1>(topk).to(torch::kLong);
+  auto combine_weights = std::get<0>(topk);
+
+  std::vector<torch::Tensor> expert_outputs;
+  expert_outputs.reserve(static_cast<size_t>(num_experts));
+  for (auto expert_handle : moe.attr("experts")) {
+    py::object expert = py::reinterpret_borrow<py::object>(expert_handle);
+    expert_outputs.push_back(ExecuteSupportedMlp(expert, x));
+  }
+  auto stacked = torch::stack(expert_outputs, 2);
+  auto gather_index = assignments.unsqueeze(-1).expand({stacked.size(0), stacked.size(1), assignments.size(-1), stacked.size(-1)});
+  auto gathered = stacked.gather(2, gather_index);
+  return (gathered * combine_weights.unsqueeze(-1).to(gathered.scalar_type())).sum(2);
+}
+
+c10::optional<torch::Tensor> TryNativeCausalModelForward(
+    const py::object& model,
+    const torch::Tensor& input_ids,
+    const py::object& attention_mask,
+    const py::object& cache,
+    const py::object& position_ids_obj,
+    const py::object& cache_position_obj) {
+  if (!IsSupportedNativeCausalModel(model, attention_mask, cache)) {
+    return c10::nullopt;
+  }
+  auto embed = model.attr("embed");
+  int64_t padding_idx = -1;
+  auto padding_idx_obj = PyAttrOrNone(embed, "padding_idx");
+  if (!padding_idx_obj.is_none()) {
+    padding_idx = py::cast<int64_t>(padding_idx_obj);
+  }
+  auto x = EmbeddingForward(TensorAttr(embed, "weight"), input_ids, padding_idx);
+
+  auto provided_attention_mask = OptionalTensorFromPyObject(attention_mask);
+  c10::optional<torch::Tensor> token_attention_mask = c10::nullopt;
+  c10::optional<torch::Tensor> explicit_attention_mask = c10::nullopt;
+  if (provided_attention_mask.has_value() && provided_attention_mask.value().defined()) {
+    if (IsTokenAttentionMaskTensor(provided_attention_mask.value(), x.size(0), x.size(1))) {
+      token_attention_mask = provided_attention_mask;
+    } else {
+      explicit_attention_mask = provided_attention_mask;
+    }
+  }
+  auto cache_position = OptionalTensorFromPyObject(cache_position_obj);
+  auto position_ids = OptionalTensorFromPyObject(position_ids_obj);
+  if (!position_ids.has_value()) {
+    int64_t past_length = 0;
+    if (!cache.is_none() && !cache_position.has_value()) {
+      past_length = NativeCacheLayerLength(cache, 0);
+    }
+    position_ids = ResolvePositionIdsForward(
+        x.size(0),
+        x.size(1),
+        x,
+        token_attention_mask,
+        cache_position,
+        past_length);
+  }
+  auto blocks = model.attr("blocks");
+  c10::optional<torch::Tensor> mask = c10::nullopt;
+  if (explicit_attention_mask.has_value()) {
+    TORCH_CHECK(py::len(blocks) > 0, "supported causal executor requires at least one block");
+    auto first_block = py::reinterpret_borrow<py::object>(blocks[py::int_(0)]);
+    const auto num_heads = PyIntAttr(first_block.attr("attn"), "n_heads", 0);
+    TORCH_CHECK(num_heads > 0, "supported causal executor requires attention heads");
+    mask = PrepareExplicitAttentionMaskForHeads(
+        explicit_attention_mask.value(),
+        x.size(0),
+        num_heads,
+        x.size(1),
+        explicit_attention_mask.value().size(-1));
+  } else {
+    mask = CreateCausalMaskForward(x, token_attention_mask, cache_position, position_ids);
+  }
+  int64_t layer_idx = 0;
+  for (auto block_handle : blocks) {
+    py::object block = py::reinterpret_borrow<py::object>(block_handle);
+    const auto block_type = PyTypeName(block);
+    auto bc = block.attr("bc");
+    const auto residual_scale = PyFloatAttr(bc, "residual_scale", 1.0);
+    if (block_type == "ParallelTransformerBlock") {
+      auto y = ApplyNormModuleForward(x, block.attr("n"));
+      auto attn_out = ExecuteSupportedAttention(block.attr("attn"), y, mask, cache, layer_idx, position_ids);
+      auto mlp_out = ExecuteSupportedMlp(block.attr("mlp"), y);
+      x = ResidualAddForward(x, attn_out, residual_scale);
+      x = ResidualAddForward(x, mlp_out, residual_scale);
+      ++layer_idx;
+      continue;
+    }
+    const auto block_mask = ApplySupportedAttentionBiases(block, x, mask, position_ids);
+    const auto norm_policy = PyStringAttr(bc, "norm_policy", "prenorm");
+    const bool moe_block = block_type == "MoEBlock";
+    if (norm_policy == "prenorm") {
+      auto attn_in = ApplyNormModuleForward(x, block.attr("n1"));
+      auto attn_out = ExecuteSupportedAttention(block.attr("attn"), attn_in, block_mask, cache, layer_idx, position_ids);
+      auto add_norm = AddNormModuleForward(x, attn_out, block.attr("n2"), residual_scale);
+      x = add_norm[0];
+      auto mlp_out = moe_block ? ExecuteSupportedMoE(block.attr("moe"), add_norm[1]) : ExecuteSupportedMlp(block.attr("mlp"), add_norm[1]);
+      x = ResidualAddForward(x, mlp_out, residual_scale);
+    } else {
+      auto attn_out = ExecuteSupportedAttention(block.attr("attn"), x, block_mask, cache, layer_idx, position_ids);
+      x = AddNormModuleForward(x, attn_out, block.attr("n1"), residual_scale)[1];
+      auto mlp_out = moe_block ? ExecuteSupportedMoE(block.attr("moe"), x) : ExecuteSupportedMlp(block.attr("mlp"), x);
+      x = AddNormModuleForward(x, mlp_out, block.attr("n2"), residual_scale)[1];
+    }
+    ++layer_idx;
+  }
+
+  x = ApplyNormModuleForward(x, model.attr("norm"));
+  return LinearLikeModuleForward(x, model.attr("lm_head"), "auto");
+}
+
 std::string ResolveLinearBackendPy(const std::string& requested) {
   return ResolveLinearBackend(requested);
 }
@@ -2616,6 +4908,36 @@ std::string ResolveLinearBackendPy(const std::string& requested) {
 
 PYBIND11_MODULE(_model_stack_native, m) {
   m.doc() = "Model-stack native C++/CUDA extension boundary.";
+  py::class_<NativeModelSession>(m, "NativeModelSession")
+      .def(py::init<py::object, const torch::Tensor&, py::object, py::object, bool>(),
+           py::arg("model"),
+           py::arg("seq"),
+           py::arg("attention_mask") = py::none(),
+           py::arg("cache") = py::none(),
+           py::arg("trace") = false)
+      .def_property("seq", &NativeModelSession::GetSeq, &NativeModelSession::SetSeq)
+      .def_property("attention_mask", &NativeModelSession::GetAttentionMask, &NativeModelSession::SetAttentionMask)
+      .def_property("cache", &NativeModelSession::GetCache, &NativeModelSession::SetCache)
+      .def_property_readonly("batch_size", &NativeModelSession::BatchSize)
+      .def_property_readonly("seq_len", &NativeModelSession::SeqLen)
+      .def_property_readonly("native_executor_kind", &NativeModelSession::NativeExecutorKind)
+      .def("disable_cache", &NativeModelSession::DisableCache)
+      .def("prefill_next_logits", &NativeModelSession::PrefillNextLogits)
+      .def("full_next_logits", &NativeModelSession::FullNextLogits)
+      .def("append", &NativeModelSession::Append, py::arg("next_id"))
+      .def("decode_positions", &NativeModelSession::DecodePositions)
+      .def("decode_next_logits", &NativeModelSession::DecodeNextLogits)
+      .def("reorder_cache_", &NativeModelSession::ReorderCache, py::arg("row_ids"), py::arg("source_cache") = py::none())
+      .def("append_attention_mask_", &NativeModelSession::AppendAttentionMask, py::arg("row_ids") = py::none(), py::arg("source_attention_mask") = py::none())
+      .def("evict_if_needed", &NativeModelSession::EvictIfNeeded, py::arg("max_tokens"), py::arg("policy") = "sliding-window")
+      .def("advance_beam_decode", &NativeModelSession::AdvanceBeamDecode,
+           py::arg("next_beams"),
+           py::arg("cache_row_ids"),
+           py::arg("mask_row_ids") = py::none(),
+           py::arg("source_attention_mask") = py::none(),
+           py::arg("source_cache") = py::none(),
+           py::arg("max_tokens") = -1,
+           py::arg("policy") = "sliding-window");
   py::class_<PagedKvLayerState, std::shared_ptr<PagedKvLayerState>>(m, "PagedKvLayerState")
       .def(py::init<int64_t, int64_t, int64_t, int64_t, const torch::Tensor&>(),
            py::arg("batch"),
@@ -2639,6 +4961,8 @@ PYBIND11_MODULE(_model_stack_native, m) {
            py::arg("keep"),
            py::arg("block_ids") = py::none())
       .def("compact", &PagedKvLayerState::Compact, py::arg("keep"))
+      .def("clone_rows", &PagedKvLayerState::CloneRows, py::arg("row_ids"))
+      .def("reorder_rows_", &PagedKvLayerState::ReorderRowsInPlace, py::arg("row_ids"))
       .def("k_pages", &PagedKvLayerState::KPages)
       .def("v_pages", &PagedKvLayerState::VPages)
       .def("block_table", &PagedKvLayerState::BlockTable)
@@ -2672,6 +4996,8 @@ PYBIND11_MODULE(_model_stack_native, m) {
            py::arg("keep"),
            py::arg("block_ids") = py::none())
       .def("compact", &PagedKvCacheState::Compact, py::arg("keep"))
+      .def("clone_rows", &PagedKvCacheState::CloneRows, py::arg("row_ids"))
+      .def("reorder_rows_", &PagedKvCacheState::ReorderRowsInPlace, py::arg("row_ids"))
       .def("compact_layer", &PagedKvCacheState::CompactLayer, py::arg("layer_idx"), py::arg("keep"))
       .def("k_pages", &PagedKvCacheState::KPages, py::arg("layer_idx"))
       .def("v_pages", &PagedKvCacheState::VPages, py::arg("layer_idx"))
@@ -2752,18 +5078,35 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("beam_search_step_forward", &BeamSearchStepForward, py::arg("beams"), py::arg("logits"),
         py::arg("raw_scores"), py::arg("finished"), py::arg("lengths"), py::arg("beam_size"),
         py::arg("eos_id"), py::arg("pad_id"));
+  m.def("incremental_beam_search_forward", &IncrementalBeamSearchForward, py::arg("initial_beams"),
+        py::arg("initial_logits"), py::arg("beam_size"), py::arg("max_new_tokens"), py::arg("prompt_length"),
+        py::arg("eos_id"), py::arg("pad_id"), py::arg("advance_fn"));
   m.def("repetition_penalty_forward", &RepetitionPenaltyForward, py::arg("logits"), py::arg("token_ids"),
         py::arg("penalty"));
   m.def("token_counts_forward", &TokenCountsForward, py::arg("token_ids"), py::arg("vocab_size"),
         py::arg("counts_dtype"));
   m.def("append_tokens_forward", &AppendTokensForward, py::arg("seq"), py::arg("next_id"),
-        py::arg("attention_mask") = py::none());
+        py::arg("attention_mask") = py::none(), py::arg("row_ids") = py::none());
   m.def("decode_positions_forward", &DecodePositionsForward, py::arg("batch_size"), py::arg("seq_len"),
         py::arg("reference"));
   m.def("activation_forward", &ApplyActivation, py::arg("x"), py::arg("activation") = "gelu");
   m.def("gated_activation_forward", &ApplyGatedActivation, py::arg("x"), py::arg("activation") = "swiglu");
   m.def("linear_forward", &LinearForward, py::arg("x"), py::arg("weight"), py::arg("bias") = py::none(),
         py::arg("backend") = "auto");
+  m.def("int8_linear_forward", &Int8LinearForward, py::arg("qx"), py::arg("x_scale"), py::arg("qweight"),
+        py::arg("inv_scale"), py::arg("bias") = py::none(), py::arg("out_dtype") = py::none());
+  m.def("int8_attention_forward", &Int8AttentionForward, py::arg("q"), py::arg("q_scale"), py::arg("k"),
+        py::arg("k_scale"), py::arg("v"), py::arg("v_scale"), py::arg("attn_mask") = py::none(),
+        py::arg("is_causal") = false, py::arg("scale") = py::none(), py::arg("out_dtype") = py::none());
+  m.def("bitnet_linear_forward", &BitNetLinearForward, py::arg("x"), py::arg("packed_weight"),
+        py::arg("scale_values"), py::arg("layout_header"), py::arg("segment_offsets"),
+        py::arg("bias") = py::none(), py::arg("out_dtype") = py::none(),
+        py::arg("debug_dense_fallback") = false);
+  m.def("int4_linear_forward", &Int4LinearForward, py::arg("x"), py::arg("packed_weight"),
+        py::arg("inv_scale"), py::arg("bias") = py::none());
+  m.def("pack_bitnet_weight_forward", &PackBitNetWeightForward, py::arg("weight"),
+        py::arg("scale_values") = py::none(), py::arg("layout_header") = py::none(),
+        py::arg("segment_offsets") = py::none());
   m.def("pack_linear_weight_forward", &PackLinearWeightForward, py::arg("weight"), py::arg("bias") = py::none());
   m.def("mlp_forward", &MlpForward, py::arg("x"), py::arg("w_in_weight"), py::arg("w_in_bias") = py::none(),
         py::arg("w_out_weight"), py::arg("w_out_bias") = py::none(), py::arg("activation") = "gelu",
@@ -2777,6 +5120,14 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("qkv_packed_heads_projection_forward", &QkvPackedHeadsProjectionForward, py::arg("x"),
         py::arg("packed_weight"), py::arg("packed_bias") = py::none(), py::arg("q_size"), py::arg("k_size"),
         py::arg("v_size"), py::arg("q_heads"), py::arg("kv_heads"), py::arg("backend") = "auto");
+  m.def("bitnet_qkv_packed_heads_projection_forward", &BitNetQkvPackedHeadsProjectionForward,
+        py::arg("q_x"), py::arg("q_packed_weight"), py::arg("q_scale_values"), py::arg("q_layout_header"),
+        py::arg("q_segment_offsets"), py::arg("q_bias") = py::none(), py::arg("k_x"),
+        py::arg("k_packed_weight"), py::arg("k_scale_values"), py::arg("k_layout_header"),
+        py::arg("k_segment_offsets"), py::arg("k_bias") = py::none(), py::arg("v_x"),
+        py::arg("v_packed_weight"), py::arg("v_scale_values"), py::arg("v_layout_header"),
+        py::arg("v_segment_offsets"), py::arg("v_bias") = py::none(), py::arg("q_heads"),
+        py::arg("kv_heads"), py::arg("out_dtype") = py::none());
   m.def("qkv_heads_projection_forward", &QkvHeadsProjectionForward, py::arg("x"), py::arg("q_weight"),
         py::arg("q_bias") = py::none(), py::arg("k_weight"), py::arg("k_bias") = py::none(),
         py::arg("v_weight"), py::arg("v_bias") = py::none(), py::arg("q_heads"), py::arg("kv_heads"),

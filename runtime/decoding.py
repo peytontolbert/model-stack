@@ -4,6 +4,7 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
+from runtime.native import has_native_op, native_module
 from runtime.ops import beam_search_step
 
 
@@ -39,7 +40,7 @@ def beam_search(
     for _ in range(max_new_tokens):
         step_out = step_fn(beams)
         logits = logits_fn(step_out)
-        beams, raw_scores, finished, lengths = beam_search_step(
+        beams, raw_scores, finished, lengths, _ = beam_search_step(
             beams,
             logits,
             raw_scores,
@@ -57,6 +58,78 @@ def beam_search(
     best = final_scores.argmax(dim=-1)
     final_beams = beams.view(batch_size, beam_size, -1)
     return final_beams[torch.arange(batch_size, device=device), best]
+
+
+def incremental_beam_search(
+    initial_beams: torch.Tensor,
+    initial_logits: torch.Tensor,
+    *,
+    beam_size: int,
+    max_new_tokens: int,
+    prompt_length: int,
+    eos_id: int,
+    pad_id: int,
+    advance_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor | None],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    if beam_size <= 0:
+        raise ValueError("beam_size must be positive")
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
+    if initial_beams.dim() != 2:
+        raise ValueError("initial_beams must be rank-2 (B*beam, T)")
+
+    if has_native_op("incremental_beam_search"):
+        module = native_module()
+        if module is not None and hasattr(module, "incremental_beam_search_forward"):
+            return module.incremental_beam_search_forward(
+                initial_beams,
+                initial_logits,
+                int(beam_size),
+                int(max_new_tokens),
+                int(prompt_length),
+                int(eos_id),
+                int(pad_id),
+                advance_fn,
+            )
+
+    batch_size = int(initial_beams.shape[0] // beam_size)
+    if batch_size * beam_size != int(initial_beams.shape[0]):
+        raise ValueError("initial_beams batch does not match beam_size")
+
+    raw_scores = torch.full((batch_size, beam_size), float("-inf"), device=initial_beams.device)
+    raw_scores[:, 0] = 0.0
+    finished = torch.zeros((batch_size, beam_size), dtype=torch.bool, device=initial_beams.device)
+    lengths = torch.full((batch_size, beam_size), int(prompt_length), dtype=torch.long, device=initial_beams.device)
+
+    beams, raw_scores, finished, lengths, parent_rows = beam_search_step(
+        initial_beams,
+        initial_logits,
+        raw_scores,
+        finished,
+        lengths,
+        beam_size=beam_size,
+        eos_id=eos_id,
+        pad_id=pad_id,
+    )
+
+    for _ in range(1, max_new_tokens):
+        if finished.all():
+            break
+        next_logits = advance_fn(parent_rows, beams)
+        if next_logits is None:
+            return None
+        beams, raw_scores, finished, lengths, parent_rows = beam_search_step(
+            beams,
+            next_logits,
+            raw_scores,
+            finished,
+            lengths,
+            beam_size=beam_size,
+            eos_id=eos_id,
+            pad_id=pad_id,
+        )
+
+    return beams, raw_scores, finished, lengths, parent_rows
 
 
 def mirostat_step(mu: float, tau: float, k: int, logits: torch.Tensor) -> Tuple[int, float]:

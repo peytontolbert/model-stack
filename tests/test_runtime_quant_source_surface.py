@@ -1,0 +1,303 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _read(relpath: str) -> str:
+    return (REPO_ROOT / relpath).read_text(encoding="utf-8")
+
+
+def test_quantization_source_uses_channelwise_reduction_and_cache_invalidation() -> None:
+    source = _read("compress/quantization.py")
+    assert "def _channel_reduce_dims" in source
+    assert "amax(dim=reduce_dims, keepdim=False)" in source
+    assert "_reshape_channel_values(inv_s, weight, 0)" in source
+    assert "def _load_from_state_dict" in source
+    assert "self._invalidate_weight_cache()" in source
+    assert "def _pack_int4_signed" in source
+    assert "def _unpack_int4_signed" in source
+    assert "def apply_spin_transform(" in source
+    assert "def undo_spin_transform(" in source
+    assert "def collect_linear_calibration_inputs(" in source
+    assert "def awq_optimize_pre_scale(" in source
+    assert "class QuantizedLinearInt4" in source
+    assert "class QuantizedLinearBitNet" in source
+    assert "runtime_int4_linear(" in source
+    assert "runtime_int8_linear_from_quantized_activation(" in source
+    assert "runtime_bitnet_linear(" in source
+    assert "def runtime_supports_packed_backend(self, backend: str) -> bool:" in source
+
+
+def test_quantized_delta_source_persists_qweight_and_invalidates_cache() -> None:
+    source = _read("compress/export.py")
+    assert "\"qweight\": m.qweight.detach().cpu()" in source
+    assert "if \"qweight\" in info:" in source
+    assert "m.qweight.copy_(info[\"qweight\"].to(m.qweight.device))" in source
+    assert "m._invalidate_weight_cache()" in source
+    assert "\"qweight_packed\": m.qweight_packed.detach().cpu()" in source
+    assert "if \"qweight_packed\" in info:" in source
+    assert "m.qweight_packed.copy_(info[\"qweight_packed\"].to(m.qweight_packed.device))" in source
+    assert "\"spin_signs\": m.spin_signs.detach().cpu()" in source
+    assert "\"spin_enabled\": bool(int(m.spin_enabled_flag.item()))" in source
+    assert "\"pre_scale\": m.pre_scale.detach().cpu()" in source
+    assert "\"act_scale\": m.act_scale.detach().cpu()" in source
+    assert "\"weight_opt\": m.weight_opt" in source
+    assert "\"act_quant_mode\": m.act_quant_mode" in source
+    assert "\"packed_weight\": m.packed_weight.detach().cpu()" in source
+    assert "if \"packed_weight\" in info:" in source
+    assert "m.packed_weight = info[\"packed_weight\"].to(m.packed_weight.device, dtype=m.packed_weight.dtype)" in source
+
+
+def test_fp8_quantization_source_threads_through_compression_and_export() -> None:
+    quant_source = _read("compress/quantization.py")
+    apply_source = _read("compress/apply.py")
+    export_source = _read("export/exporter.py")
+    delta_source = _read("compress/export.py")
+    cli_source = _read("export/cli.py")
+    spec_source = _read("specs/export.py")
+    runtime_quant_source = _read("runtime/quant.py")
+    runtime_init_source = _read("runtime/__init__.py")
+    assert "class QuantizedLinearFP8" in quant_source
+    assert "runtime_fp8_linear(" in quant_source
+    assert "elif quant_scheme == \"bitnet\":" in quant_source
+    assert "elif quant_scheme == \"int4\":" in quant_source
+    assert "elif quant_scheme == \"fp8\":" in quant_source
+    assert "\"scheme\": str = \"int8\"" in apply_source
+    assert "scheme=str(quant.get(\"scheme\", \"int8\"))" in apply_source
+    assert "calibration_inputs=quant.get(\"calibration_inputs\")" in apply_source
+    assert "weight_opt=str(quant.get(\"weight_opt\", \"none\"))" in apply_source
+    assert "activation_quant=str(quant.get(\"activation_quant\", \"none\"))" in apply_source
+    assert "spin=bool(quant.get(\"spin\", False))" in apply_source
+    assert "apply_compression(model, quant={**quant_cfg, \"scheme\": \"int4\"})" in export_source
+    assert "apply_compression(model, quant={**quant_cfg, \"scheme\": \"fp8\"})" in export_source
+    assert "apply_compression(model, quant={**quant_cfg, \"scheme\": \"bitnet\"})" in export_source
+    assert "meta[\"quantize\"] = str(cfg.quantize)" in export_source
+    assert "meta[\"quant_spin\"] = bool(cfg.quant_spin)" in export_source
+    assert "meta[\"quant_weight_opt\"] = str(cfg.quant_weight_opt)" in export_source
+    assert "meta[\"quant_activation_quant\"] = str(cfg.quant_activation_quant)" in export_source
+    assert "meta[\"quant_calibration_inputs_path\"] = str(cfg.quant_calibration_inputs_path)" in export_source
+    assert "def _load_quant_calibration_inputs(" in export_source
+    assert "torch.load(Path(path), map_location=\"cpu\")" in export_source
+    assert "\"calibration_inputs\": calibration_inputs" in export_source
+    assert "\"weight_opt\": str(getattr(cfg, \"quant_weight_opt\", \"none\"))" in export_source
+    assert "\"activation_quant\": \"none\"" in export_source
+    assert "\"int8\", \"int4\", \"fp8\", \"bitnet\"" in cli_source
+    assert "quant_spin=args.quant_spin" in cli_source
+    assert "\"--quant-weight-opt\"" in cli_source
+    assert "\"--quant-activation-quant\"" in cli_source
+    assert "\"--quant-calibration-inputs\"" in cli_source
+    assert "quant_weight_opt=args.quant_weight_opt" in cli_source
+    assert "quant_activation_quant=args.quant_activation_quant" in cli_source
+    assert "quant_calibration_inputs_path=args.quant_calibration_inputs" in cli_source
+    assert "Literal[\"int8\",\"int4\",\"fp8\",\"bitnet\"]" in spec_source
+    assert "quant_weight_opt: Literal[\"none\", \"awq\", \"gptq\"] = \"none\"" in spec_source
+    assert "quant_activation_quant: Optional[Literal[\"static_int8\", \"dynamic_int8\"]] = None" in spec_source
+    assert "quant_calibration_inputs_path: Optional[str] = None" in spec_source
+    assert "def int4_linear(" in runtime_quant_source
+    assert "def int8_linear(" in runtime_quant_source
+    assert "def int8_matmul_qkv(" in runtime_quant_source
+    assert "def bitnet_linear(" in runtime_quant_source
+    assert "prefer_hopper_library_attention" in runtime_quant_source
+    assert "prefer_hopper_library_linear" not in runtime_quant_source
+    assert "module.int8_linear_forward(" in runtime_quant_source
+    assert "module.int8_attention_forward(" in runtime_quant_source
+    assert "native_mask_ok" in runtime_quant_source
+    assert "module.int4_linear_forward(x_cast, packed_cast, scale_cast, bias_cast)" in runtime_quant_source
+    assert "\"bitnet_linear\": \"runtime.quant\"" in runtime_init_source
+    assert "\"int4_linear\": \"runtime.quant\"" in runtime_init_source
+    assert "\"int8_linear\": \"runtime.quant\"" in runtime_init_source
+    assert "\"type\": \"bitnet_w2a8\"" in delta_source
+    assert "\"type\": \"int4_pc_packed\"" in delta_source
+    assert "\"type\": \"fp8_fake\"" in delta_source
+    assert "m.weight_fp8.copy_(info[\"weight_fp8\"].to(m.weight_fp8.device))" in delta_source
+
+
+def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
+    ops_source = _read("runtime/ops.py")
+    attn_source = _read("runtime/attention_modules.py")
+    mlp_source = _read("tensor/mlp.py")
+    causal_source = _read("runtime/causal.py")
+    seq2seq_source = _read("runtime/seq2seq.py")
+    heads_source = _read("runtime/heads.py")
+    adapters_source = _read("runtime/block_adapters.py")
+    block_source = _read("runtime/block_modules.py")
+    quant_source = _read("compress/quantization.py")
+    assert "def resolve_linear_module_tensors(" in ops_source
+    assert "def linear_module(" in ops_source
+    assert "def mlp_module(" in ops_source
+    assert "def linear_module_signature(" in ops_source
+    assert "def packed_linear_module_signature(" in ops_source
+    assert "def resolve_packed_linear_module_spec(" in ops_source
+    assert "def packed_qkv_module_signature(" in ops_source
+    assert "def resolve_packed_qkv_module_spec(" in ops_source
+    assert "def linear_from_packed_spec(" in ops_source
+    assert "def bitnet_qkv_packed_heads_projection(" in ops_source
+    assert "has_native_op(\"bitnet_qkv_packed_heads_projection\")" in ops_source
+    assert "module.bitnet_qkv_packed_heads_projection_forward(" in ops_source
+    assert "def qkv_packed_spec_heads_projection(" in ops_source
+    assert "def head_output_packed_projection(" in ops_source
+    assert "def runtime_weight(" in quant_source
+    assert "def runtime_linear(self, x: torch.Tensor" in quant_source
+    assert "def runtime_shared_int8_input_signature(" in quant_source
+    assert "def runtime_quantize_int8_input(" in quant_source
+    assert "def runtime_linear_from_quantized_input(" in quant_source
+    assert "def runtime_packed_linear_signature(self, backend: str):" in quant_source
+    assert "def runtime_packed_linear_spec(" in quant_source
+    assert "\"act_quant_percentile\": float(self.act_quant_percentile)" in quant_source
+    assert "runtime_mlp_module(" in mlp_source
+    assert "runtime_linear_module(x, self.w_in)" in mlp_source
+    assert "return runtime_linear_module(x, self.w_out)" in mlp_source
+    assert "runtime_linear_module(x, self.w_q)" in attn_source
+    assert "runtime_packed_qkv_module_signature(self.w_q, self.w_k, self.w_v, backend=backend)" in attn_source
+    assert "runtime_resolve_packed_qkv_module_spec(self.w_q, self.w_k, self.w_v, backend=backend, reference=reference)" in attn_source
+    assert "runtime_qkv_packed_spec_heads_projection(" in attn_source
+    assert "def _shared_int8_qkv_input_signature(" in attn_source
+    assert "def _shared_int8_qkv_projection(" in attn_source
+    assert "def _supports_int8_attention_core(" in attn_source
+    assert "def _int8_attention(" in attn_source
+    assert "elif self._shared_int8_qkv_input_signature() is not None:" in attn_source
+    assert "out = self._int8_attention(" in attn_source
+    assert "attn_mask=add" in attn_source
+    assert "runtime_head_output_packed_projection(" in attn_source
+    assert "runtime_resolve_linear_module_tensors(self.w_q, reference=x)" in attn_source
+    assert "runtime_resolve_packed_linear_module_spec(self.w_o, backend=backend, reference=reference)" in attn_source
+    assert "if callable(runtime_linear):" in attn_source
+    assert "if not callable(supports_packed_backend):" in attn_source
+    assert "runtime_linear_module(x, self.lm_head)" in causal_source
+    assert "runtime_linear_module(x, self.lm_head)" in seq2seq_source
+    assert "runtime_linear_module(pooled, self.proj)" in heads_source
+    assert "runtime_linear_module(x, self.down)" in adapters_source
+    assert "runtime_linear_module(x, self.router)" in block_source
+    assert "runtime_supports_packed_backend" in attn_source
+    native_source = _read("runtime/csrc/model_stack_native.cpp")
+    assert "bool PyCallableAttr(" in native_source
+    assert "struct BitNetModuleState" in native_source
+    assert "bool TryLoadBitNetModuleState(" in native_source
+    assert "torch::Tensor ApplyBitNetModuleInputTransforms(" in native_source
+    assert "torch::Tensor BitNetLinearModuleForward(" in native_source
+    assert "bool ModuleHasRuntimeLinear(" in native_source
+    assert "torch::Tensor PythonLinearModuleForward(" in native_source
+    assert "if (BitNetModuleDirectSupported(module)) {" in native_source
+    assert "bool BitNetActivationCalibrationMethodSupported(" in native_source
+    assert "state.act_quant_percentile" in native_source
+    assert "state.act_quant_bits >= 2" in native_source
+    assert "bool AttentionQkvSupportsPackedBitNet(" in native_source
+    assert "runtime_ops.attr(\"resolve_packed_qkv_module_spec\")" in native_source
+    assert "runtime_ops.attr(\"qkv_packed_spec_heads_projection\")" in native_source
+    assert "runtime_ops.attr(\"head_output_packed_projection\")" in native_source
+    assert "auto hidden = LinearLikeModuleForward(x, mlp.attr(\"w_in\"), \"auto\");" in native_source
+    assert "return LinearLikeModuleForward(hidden, mlp.attr(\"w_out\"), \"auto\");" in native_source
+    assert "return BitNetQkvPackedHeadsProjectionForward(" in native_source
+    assert "auto logits = LinearLikeModuleForward(x, moe.attr(\"router\"), \"auto\");" in native_source
+    assert "return LinearLikeModuleForward(x, model.attr(\"lm_head\"), \"auto\");" in native_source
+
+
+def test_quantized_wrappers_accept_float_checkpoint_keys_on_load() -> None:
+    quant_source = _read("compress/quantization.py")
+    assert "weight_key = prefix + \"weight\"" in quant_source
+    assert "if weight_key in state_dict:" in quant_source
+    assert "self._assign_float_state(weight, bias)" in quant_source
+    assert "qweight_key = prefix + \"qweight\"" in quant_source
+    assert "qweight_packed_key = prefix + \"qweight_packed\"" in quant_source
+    assert "fp8_weight_key = prefix + \"weight_fp8\"" in quant_source
+
+
+def test_native_int4_kernel_is_registered_in_source() -> None:
+    native_source = _read("runtime/csrc/model_stack_native.cpp")
+    cuda_source = _read("runtime/csrc/backend/cuda_int4_linear.cu")
+    cuda_int8_source = _read("runtime/csrc/backend/cuda_int8_linear.cu")
+    cuda_int8_attention_source = _read("runtime/csrc/backend/cuda_int8_attention.cu")
+    cublaslt_source = _read("runtime/csrc/backend/cublaslt_linear.cu")
+    cuda_arch_source = _read("runtime/csrc/backend/cuda_device_arch.cuh")
+    decode_source = _read("runtime/csrc/backend/attention/cuda_attention_decode.cuh")
+    prefill_source = _read("runtime/csrc/backend/attention/cuda_attention_prefill.cuh")
+    setup_source = _read("setup.py")
+    native_py_source = _read("runtime/native.py")
+    assert "{\"bitnet_linear\", true}" in native_source
+    assert "{\"pack_bitnet_weight\", true}" in native_source
+    assert "{\"bitnet_qkv_packed_heads_projection\", true}" in native_source
+    assert "info[\"bitnet_linear_dtypes\"]" in native_source
+    assert "m.def(\"bitnet_linear_forward\"" in native_source
+    assert "m.def(\"pack_bitnet_weight_forward\"" in native_source
+    assert "m.def(\"bitnet_qkv_packed_heads_projection_forward\"" in native_source
+    assert "{\"int4_linear\", true}" in native_source
+    assert "info[\"int4_linear_dtypes\"]" in native_source
+    assert "m.def(\"int4_linear_forward\"" in native_source
+    assert "CudaInt4LinearForward(" in native_source
+    assert "HasCudaInt4LinearKernel()" in native_source
+    assert "{\"int8_linear\", true}" in native_source
+    assert "info[\"int8_linear_dtypes\"]" in native_source
+    assert "m.def(\"int8_linear_forward\"" in native_source
+    assert "CudaInt8LinearForward(" in native_source
+    assert "HasCudaInt8LinearKernel()" in native_source
+    assert "{\"int8_attention\", true}" in native_source
+    assert "info[\"int8_attention_dtypes\"]" in native_source
+    assert "info[\"int8_attention_kernel_family\"]" in native_source
+    assert "info[\"int8_attention_tensorcore_tile\"]" in native_source
+    assert "info[\"int8_attention_specializations\"]" in native_source
+    assert "row_rescale" in cuda_int8_attention_source
+    assert "m.def(\"int8_attention_forward\"" in native_source
+    assert "CudaInt8AttentionForward(" in native_source
+    assert "HasCudaInt8AttentionKernel()" in native_source
+    assert "int4_linear_forward_kernel" in cuda_source
+    assert "int4_linear_forward_tiled_kernel" in cuda_source
+    assert "int4_linear_forward_sm90_vectorized_kernel" in cuda_source
+    assert "int4_linear_forward_sm90_imma_kernel" in cuda_source
+    assert "MODEL_STACK_ENABLE_INT4_IMMA_ACT_QUANT" in cuda_source
+    assert "wmma::experimental::precision::s4" in cuda_source
+    assert "int8_linear_forward_kernel" in cuda_int8_source
+    assert "int8_linear_forward_tiled_kernel" in cuda_int8_source
+    assert "int8_linear_forward_sm90_tensorcore_kernel" in cuda_int8_source
+    assert "CublasLtInt8LinearForward" in cuda_int8_source
+    assert "MODEL_STACK_INT8_LINEAR_CUBLASLT_MIN_OPS" in cuda_int8_source
+    assert "MODEL_STACK_DISABLE_INT8_LINEAR_WMMA" in cuda_int8_source
+    assert "#include <mma.h>" in cuda_int8_source
+    assert "wmma::mma_sync" in cuda_int8_source
+    assert "RunCublasLtInt8LinearAccum" in cublaslt_source
+    assert "CublasLtInt8LinearForward" in cublaslt_source
+    assert "MODEL_STACK_DISABLE_INT8_LINEAR_CUBLASLT" in cublaslt_source
+    assert "int8_attention_forward_generic_kernel" in cuda_int8_attention_source
+    assert "int8_attention_forward_tensorcore_kernel" in cuda_int8_attention_source
+    assert "int8_attention_forward_sm90_pipeline_kernel" in cuda_int8_attention_source
+    assert "launch_int8_attention_sm90_pipeline_if_supported" in cuda_int8_attention_source
+    assert "#include <mma.h>" in cuda_int8_attention_source
+    assert "#include <sm_61_intrinsics.h>" in cuda_int8_attention_source
+    assert "wmma::mma_sync" in cuda_int8_attention_source
+    assert "MODEL_STACK_DISABLE_INT8_ATTENTION_WMMA" in cuda_int8_attention_source
+    assert "MODEL_STACK_DISABLE_INT8_ATTENTION_SM90_PIPELINE" in cuda_int8_attention_source
+    assert "MODEL_STACK_DISABLE_INT8_ATTENTION_OPTIMIZED" in cuda_int8_attention_source
+    assert "__pipeline_memcpy_async" in cuda_int8_attention_source
+    assert "launch_int8_attention_tensorcore_specialized" in cuda_int8_attention_source
+    assert "launch_int8_attention_decode_if_supported" in cuda_int8_attention_source
+    assert "int8_attention_decode_nomask_kernel" in cuda_int8_attention_source
+    assert "if constexpr (HasBoolMask)" in cuda_int8_attention_source
+    assert "if constexpr (HasAdditiveMask)" in cuda_int8_attention_source
+    assert "if constexpr (IsCausal)" in cuda_int8_attention_source
+    assert "DeviceIsSm90OrLater" in cuda_arch_source
+    assert "decode_attention_q1_hdim_sm90_forward_kernel" in decode_source
+    assert "prefill_attention_hdim_sm90_forward_kernel" in prefill_source
+    assert "sm90_specialized_ops" in native_source
+    assert "attention_arches" in native_source
+    assert "int4_linear_arches" in native_source
+    assert "int4_linear_kernel_family" in native_source
+    assert "int4_linear_sm90_tile" in native_source
+    assert "int4_linear_imma_tile" in native_source
+    assert "int4_linear_imma_requires" in native_source
+    assert "int8_linear_arches" in native_source
+    assert "int8_linear_kernel_family" in native_source
+    assert "int8_linear_tensorcore_tile" in native_source
+    assert "int8_linear_tensorcore_arches" in native_source
+    assert "int8_linear_large_gemm_backend" in native_source
+    assert "int8_attention_sm90_pipeline_stages" in native_source
+    assert "runtime/csrc/backend/cuda_int4_linear.cu" in setup_source
+    assert "runtime/csrc/backend/cuda_int8_attention.cu" in setup_source
+    assert "runtime/csrc/backend/cuda_int8_linear.cu" in setup_source
+    assert "\"bitnet_linear\"" in native_py_source
+    assert "\"pack_bitnet_weight\"" in native_py_source
+    assert "\"bitnet_qkv_packed_heads_projection\"" in native_py_source
+    assert "\"int4_linear\"" in native_py_source
+    assert "\"int8_linear\"" in native_py_source
+    assert "\"int8_attention\"" in native_py_source

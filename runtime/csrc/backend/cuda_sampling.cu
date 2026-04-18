@@ -20,6 +20,8 @@ namespace {
 constexpr int kThreads = 256;
 constexpr int kSmallRowThreads = 64;
 constexpr int kMediumRowThreads = 128;
+constexpr int kBeamSearchThreads = 128;
+constexpr int kMaxBeamSearchBeamSize = 32;
 
 struct SamplingLaunchPolicy {
   int elementwise_threads;
@@ -833,6 +835,208 @@ __global__ void filtered_multinomial_next_token_forward_kernel(
       }
     }
     next_token[row] = selected;
+  }
+}
+
+
+
+template <int MaxBeam>
+__device__ inline void init_beam_topk(
+    float* scores,
+    int64_t* tokens,
+    int64_t* parents,
+    int beam_size,
+    int64_t default_token,
+    int64_t default_parent) {
+  for (int i = 0; i < beam_size; ++i) {
+    scores[i] = -std::numeric_limits<float>::infinity();
+    tokens[i] = default_token;
+    parents[i] = default_parent;
+  }
+}
+
+template <int MaxBeam>
+__device__ inline void insert_beam_topk(
+    float score,
+    int64_t token,
+    int64_t parent,
+    float* scores,
+    int64_t* tokens,
+    int64_t* parents,
+    int beam_size) {
+  if (beam_size <= 0) {
+    return;
+  }
+  if (score <= scores[beam_size - 1]) {
+    return;
+  }
+  int pos = beam_size - 1;
+  while (pos > 0 && score > scores[pos - 1]) {
+    scores[pos] = scores[pos - 1];
+    tokens[pos] = tokens[pos - 1];
+    parents[pos] = parents[pos - 1];
+    --pos;
+  }
+  scores[pos] = score;
+  tokens[pos] = token;
+  parents[pos] = parent;
+}
+
+template <typename scalar_t, int MaxBeam>
+__global__ void beam_search_candidates_kernel(
+    const scalar_t* __restrict__ logits,
+    const float* __restrict__ raw_scores,
+    const bool* __restrict__ finished,
+    float* __restrict__ cand_scores,
+    int64_t* __restrict__ cand_tokens,
+    int64_t rows,
+    int64_t vocab_size,
+    int beam_size,
+    int64_t pad_id) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  if (row >= rows) {
+    return;
+  }
+
+  const int64_t cand_base = row * beam_size;
+  if (finished[row]) {
+    if (threadIdx.x == 0) {
+      cand_scores[cand_base] = raw_scores[row];
+      cand_tokens[cand_base] = pad_id;
+      for (int i = 1; i < beam_size; ++i) {
+        cand_scores[cand_base + i] = -std::numeric_limits<float>::infinity();
+        cand_tokens[cand_base + i] = pad_id;
+      }
+    }
+    return;
+  }
+
+  __shared__ float reduce_buffer[kBeamSearchThreads];
+  const int64_t row_base = row * vocab_size;
+
+  float local_max = -std::numeric_limits<float>::infinity();
+  for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
+    local_max = fmaxf(local_max, static_cast<float>(logits[row_base + col]));
+  }
+  reduce_buffer[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reduce_buffer[threadIdx.x] = fmaxf(reduce_buffer[threadIdx.x], reduce_buffer[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  const float row_max = reduce_buffer[0];
+
+  float local_sum = 0.0f;
+  for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
+    local_sum += expf(static_cast<float>(logits[row_base + col]) - row_max);
+  }
+  reduce_buffer[threadIdx.x] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reduce_buffer[threadIdx.x] += reduce_buffer[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float log_denom = row_max + logf(fmaxf(reduce_buffer[0], 1.0e-20f));
+
+  if (threadIdx.x == 0) {
+    float top_scores[MaxBeam];
+    int64_t top_tokens[MaxBeam];
+    int64_t top_parents[MaxBeam];
+    init_beam_topk<MaxBeam>(top_scores, top_tokens, top_parents, beam_size, pad_id, 0);
+    const float base_score = raw_scores[row];
+    for (int64_t col = 0; col < vocab_size; ++col) {
+      const float score = base_score + static_cast<float>(logits[row_base + col]) - log_denom;
+      insert_beam_topk<MaxBeam>(score, col, 0, top_scores, top_tokens, top_parents, beam_size);
+    }
+    for (int i = 0; i < beam_size; ++i) {
+      cand_scores[cand_base + i] = top_scores[i];
+      cand_tokens[cand_base + i] = top_tokens[i];
+    }
+  }
+}
+
+template <int MaxBeam>
+__global__ void beam_search_merge_kernel(
+    const float* __restrict__ cand_scores,
+    const int64_t* __restrict__ cand_tokens,
+    const bool* __restrict__ finished,
+    const int64_t* __restrict__ lengths,
+    float* __restrict__ best_scores,
+    int64_t* __restrict__ parent_indices,
+    int64_t* __restrict__ next_tokens,
+    bool* __restrict__ next_finished,
+    int64_t* __restrict__ next_lengths,
+    int64_t batch_size,
+    int beam_size,
+    int64_t eos_id,
+    int64_t pad_id) {
+  const int64_t batch = static_cast<int64_t>(blockIdx.x);
+  if (batch >= batch_size || threadIdx.x != 0) {
+    return;
+  }
+
+  float top_scores[MaxBeam];
+  int64_t top_tokens[MaxBeam];
+  int64_t top_parents[MaxBeam];
+  init_beam_topk<MaxBeam>(top_scores, top_tokens, top_parents, beam_size, pad_id, 0);
+
+  const int64_t batch_base = batch * beam_size;
+  for (int parent = 0; parent < beam_size; ++parent) {
+    const int64_t cand_base = (batch_base + parent) * beam_size;
+    for (int slot = 0; slot < beam_size; ++slot) {
+      insert_beam_topk<MaxBeam>(
+          cand_scores[cand_base + slot],
+          cand_tokens[cand_base + slot],
+          parent,
+          top_scores,
+          top_tokens,
+          top_parents,
+          beam_size);
+    }
+  }
+
+  for (int i = 0; i < beam_size; ++i) {
+    const int64_t out_idx = batch_base + i;
+    const int64_t parent = top_parents[i];
+    const bool parent_done = finished[batch_base + parent];
+    const int64_t token = top_tokens[i];
+    best_scores[out_idx] = top_scores[i];
+    parent_indices[out_idx] = parent;
+    next_tokens[out_idx] = token;
+    next_finished[out_idx] = parent_done || (token == eos_id);
+    next_lengths[out_idx] = lengths[batch_base + parent] + (parent_done ? 0 : 1);
+  }
+}
+
+__global__ void beam_search_gather_append_kernel(
+    const int64_t* __restrict__ beams,
+    const int64_t* __restrict__ parent_indices,
+    const int64_t* __restrict__ next_tokens,
+    int64_t* __restrict__ next_beams,
+    int64_t batch_size,
+    int beam_size,
+    int64_t seq_len) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  const int64_t total_rows = batch_size * beam_size;
+  if (row >= total_rows) {
+    return;
+  }
+
+  const int64_t batch = row / beam_size;
+  const int64_t parent = parent_indices[row];
+  const int64_t src_row = batch * beam_size + parent;
+  const int64_t src_base = src_row * seq_len;
+  const int64_t dst_base = row * (seq_len + 1);
+
+  for (int64_t col = threadIdx.x; col < seq_len; col += blockDim.x) {
+    next_beams[dst_base + col] = beams[src_base + col];
+  }
+  if (threadIdx.x == 0) {
+    next_beams[dst_base + seq_len] = next_tokens[row];
   }
 }
 
@@ -1762,6 +1966,131 @@ torch::Tensor CudaMultinomialSampleForward(const torch::Tensor& logits) {
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return next_token;
+}
+
+
+std::vector<torch::Tensor> CudaBeamSearchStepForward(
+    const torch::Tensor& beams,
+    const torch::Tensor& logits,
+    const torch::Tensor& raw_scores,
+    const torch::Tensor& finished,
+    const torch::Tensor& lengths,
+    int64_t beam_size,
+    int64_t eos_id,
+    int64_t pad_id) {
+  TORCH_CHECK(beams.is_cuda() && logits.is_cuda() && raw_scores.is_cuda() && finished.is_cuda() && lengths.is_cuda(),
+              "CudaBeamSearchStepForward: all tensors must be CUDA tensors");
+  TORCH_CHECK(beams.dim() == 2, "CudaBeamSearchStepForward: beams must be rank-2 (B*beam, T)");
+  TORCH_CHECK(logits.dim() == 2, "CudaBeamSearchStepForward: logits must be rank-2 (B*beam, V)");
+  TORCH_CHECK(raw_scores.dim() == 2, "CudaBeamSearchStepForward: raw_scores must be rank-2 (B, beam)");
+  TORCH_CHECK(finished.dim() == 2, "CudaBeamSearchStepForward: finished must be rank-2 (B, beam)");
+  TORCH_CHECK(lengths.dim() == 2, "CudaBeamSearchStepForward: lengths must be rank-2 (B, beam)");
+  TORCH_CHECK(beam_size > 0, "CudaBeamSearchStepForward: beam_size must be positive");
+  TORCH_CHECK(beam_size <= kMaxBeamSearchBeamSize,
+              "CudaBeamSearchStepForward: beam_size exceeds CUDA kernel limit of ",
+              kMaxBeamSearchBeamSize);
+  TORCH_CHECK(raw_scores.size(1) == beam_size, "CudaBeamSearchStepForward: raw_scores beam dimension mismatch");
+  TORCH_CHECK(finished.sizes() == raw_scores.sizes(), "CudaBeamSearchStepForward: finished shape mismatch");
+  TORCH_CHECK(lengths.sizes() == raw_scores.sizes(), "CudaBeamSearchStepForward: lengths shape mismatch");
+  TORCH_CHECK(logits.size(0) == raw_scores.size(0) * beam_size, "CudaBeamSearchStepForward: logits batch mismatch");
+  TORCH_CHECK(beams.size(0) == logits.size(0), "CudaBeamSearchStepForward: beams/logits batch mismatch");
+  TORCH_CHECK(logits.size(1) > 0, "CudaBeamSearchStepForward: vocab dimension must be non-empty");
+  TORCH_CHECK(pad_id >= 0 && pad_id < logits.size(1), "CudaBeamSearchStepForward: pad_id out of range");
+
+  c10::cuda::CUDAGuard device_guard{logits.device()};
+
+  auto beams_contig = NormalizeTokenIdsLongContiguous(beams);
+  auto logits_contig = logits.contiguous();
+  auto raw_scores_contig = raw_scores.to(torch::kFloat32).contiguous();
+  auto finished_contig = finished.to(torch::kBool).contiguous();
+  auto lengths_contig = lengths.to(torch::kLong).contiguous();
+
+  const auto batch_size = raw_scores_contig.size(0);
+  const auto rows = batch_size * beam_size;
+  const auto seq_len = beams_contig.size(1);
+  const auto vocab_size = logits_contig.size(1);
+  auto stream = c10::cuda::getCurrentCUDAStream(logits.get_device());
+
+  auto cand_scores = torch::full(
+      {rows, beam_size},
+      -std::numeric_limits<float>::infinity(),
+      torch::TensorOptions().dtype(torch::kFloat32).device(logits.device()));
+  auto cand_tokens = torch::full(
+      {rows, beam_size},
+      pad_id,
+      torch::TensorOptions().dtype(torch::kLong).device(logits.device()));
+
+  const dim3 candidate_blocks(static_cast<unsigned int>(rows));
+  const dim3 candidate_threads(kBeamSearchThreads);
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      logits_contig.scalar_type(),
+      "model_stack_cuda_beam_search_candidates",
+      [&] {
+        beam_search_candidates_kernel<scalar_t, kMaxBeamSearchBeamSize><<<candidate_blocks, candidate_threads, 0, stream.stream()>>>(
+            logits_contig.data_ptr<scalar_t>(),
+            raw_scores_contig.data_ptr<float>(),
+            finished_contig.data_ptr<bool>(),
+            cand_scores.data_ptr<float>(),
+            cand_tokens.data_ptr<int64_t>(),
+            rows,
+            vocab_size,
+            static_cast<int>(beam_size),
+            pad_id);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto best_scores = torch::empty(
+      {batch_size, beam_size},
+      torch::TensorOptions().dtype(torch::kFloat32).device(logits.device()));
+  auto parent_indices = torch::empty(
+      {batch_size, beam_size},
+      torch::TensorOptions().dtype(torch::kLong).device(logits.device()));
+  auto next_tokens = torch::empty(
+      {batch_size, beam_size},
+      torch::TensorOptions().dtype(torch::kLong).device(logits.device()));
+  auto next_finished = torch::empty(
+      {batch_size, beam_size},
+      torch::TensorOptions().dtype(torch::kBool).device(logits.device()));
+  auto next_lengths = torch::empty(
+      {batch_size, beam_size},
+      torch::TensorOptions().dtype(torch::kLong).device(logits.device()));
+
+  beam_search_merge_kernel<kMaxBeamSearchBeamSize><<<static_cast<unsigned int>(batch_size), 1, 0, stream.stream()>>>(
+      cand_scores.data_ptr<float>(),
+      cand_tokens.data_ptr<int64_t>(),
+      finished_contig.data_ptr<bool>(),
+      lengths_contig.data_ptr<int64_t>(),
+      best_scores.data_ptr<float>(),
+      parent_indices.data_ptr<int64_t>(),
+      next_tokens.data_ptr<int64_t>(),
+      next_finished.data_ptr<bool>(),
+      next_lengths.data_ptr<int64_t>(),
+      batch_size,
+      static_cast<int>(beam_size),
+      eos_id,
+      pad_id);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto next_beams = torch::empty(
+      {rows, seq_len + 1},
+      torch::TensorOptions().dtype(torch::kLong).device(logits.device()));
+  const int gather_threads = static_cast<int>(std::min<int64_t>(seq_len + 1, kThreads));
+  beam_search_gather_append_kernel<<<static_cast<unsigned int>(rows), gather_threads, 0, stream.stream()>>>(
+      beams_contig.data_ptr<int64_t>(),
+      parent_indices.data_ptr<int64_t>(),
+      next_tokens.data_ptr<int64_t>(),
+      next_beams.data_ptr<int64_t>(),
+      batch_size,
+      static_cast<int>(beam_size),
+      seq_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto parent_rows = (
+      torch::arange(batch_size, parent_indices.options()).unsqueeze(1) * beam_size + parent_indices)
+                          .reshape({rows});
+  return {next_beams, best_scores, next_finished, next_lengths, parent_rows};
 }
 
 torch::Tensor CudaSampleWithPoliciesForward(

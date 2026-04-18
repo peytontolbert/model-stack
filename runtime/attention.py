@@ -6,6 +6,8 @@ from typing import Literal, Optional
 
 import torch
 
+from runtime.hardware import prefer_hopper_library_attention
+
 
 def _read_backend_from_env_or_file() -> Optional[str]:
     forced = os.getenv("ATTN_BACKEND")
@@ -28,19 +30,26 @@ def select_attention_backend(
     seq: int,
     heads: int,
     device: torch.device,
+    kv_seq: int | None = None,
 ) -> Literal["flash2", "triton", "xformers", "torch"]:
-    # Heuristic router: prefer FlashAttention-2 when available, else xFormers, else PyTorch SDPA
-    # First consult kernel registry (lazy, safe) then fall back to direct imports
+    del is_causal, heads
     forced = _read_backend_from_env_or_file()
     if forced in ("flash2", "triton", "xformers", "torch"):
-        return forced  # user-forced override takes precedence
+        return forced
     try:
         from kernel import has as kernel_has
     except Exception:
         kernel_has = lambda _name: False  # type: ignore
 
-    if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16) and seq >= 64:
-        # Prefer flash2, then triton, then xformers, else torch
+    effective_seq = max(int(seq), int(kv_seq if kv_seq is not None else seq))
+    prefer_hopper = prefer_hopper_library_attention(
+        device=device,
+        dtype=dtype,
+        q_seq=int(seq),
+        kv_seq=effective_seq,
+    )
+
+    if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16) and effective_seq >= 64:
         if kernel_has("attn.flash2"):
             return "flash2"
         try:
@@ -48,6 +57,8 @@ def select_attention_backend(
             return "flash2"
         except Exception:
             pass
+        if prefer_hopper:
+            return "torch"
         if kernel_has("attn.triton"):
             return "triton"
         try:
@@ -55,6 +66,9 @@ def select_attention_backend(
             return "triton"
         except Exception:
             pass
+
+    if prefer_hopper:
+        return "torch"
 
     if kernel_has("attn.xformers"):
         return "xformers"
@@ -88,7 +102,7 @@ def scaled_dot_product_attention(
             return mask.to(dtype=q_in.dtype)
         return mask
 
-    if (backend is None or backend == "torch") and float(dropout_p) == 0.0:
+    if backend is None and float(dropout_p) == 0.0:
         try:
             from runtime.ops import attention as native_attention
 
