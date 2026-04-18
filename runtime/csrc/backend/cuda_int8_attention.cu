@@ -5,20 +5,25 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include "cuda_device_arch.cuh"
+#include "cuda_hopper_advanced.cuh"
 
+#include <cuda/barrier>
 #include <cuda_pipeline_primitives.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <sm_61_intrinsics.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <utility>
 
 namespace {
 
 using namespace nvcuda;
+using block_barrier_t = cuda::barrier<cuda::thread_scope_block>;
 
 constexpr int kGenericThreads = 128;
 constexpr int kTensorCoreThreads = 32;
@@ -59,12 +64,71 @@ bool Int8AttentionSm90PipelineDisabled() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+bool Int8AttentionSm90BulkAsyncDisabled() {
+  if (Int8AttentionOptimizedDisabled()) {
+    return true;
+  }
+  const char* env = std::getenv("MODEL_STACK_DISABLE_INT8_ATTENTION_SM90_BULK_ASYNC");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+bool Int8AttentionPersistentDisabled() {
+  if (Int8AttentionOptimizedDisabled()) {
+    return true;
+  }
+  const char* env = std::getenv("MODEL_STACK_DISABLE_INT8_ATTENTION_PERSISTENT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+bool Int8AttentionPersistentEnabled() {
+  const char* env = std::getenv("MODEL_STACK_ENABLE_INT8_ATTENTION_PERSISTENT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+int Int8AttentionPersistentWaves() {
+  const char* env = std::getenv("MODEL_STACK_INT8_ATTENTION_PERSISTENT_WAVES");
+  if (env == nullptr || env[0] == '\0') {
+    return 2;
+  }
+  return std::max(1, static_cast<int>(std::strtol(env, nullptr, 10)));
+}
+
 int Int8AttentionSm90PipelineMinSeq() {
   const char* env = std::getenv("MODEL_STACK_SM90_ATTN_PIPELINE_MIN_SEQ");
   if (env == nullptr || env[0] == '\0') {
     return 64;
   }
   return std::max(1, static_cast<int>(std::strtol(env, nullptr, 10)));
+}
+
+int64_t Int8AttentionOptimizedMinWork() {
+  const char* env = std::getenv("MODEL_STACK_INT8_ATTENTION_OPTIMIZED_MIN_WORK");
+  if (env == nullptr || env[0] == '\0') {
+    return 32768;
+  }
+  return std::max<int64_t>(1, std::strtoll(env, nullptr, 10));
+}
+
+int64_t Int8AttentionOptimizedSmallSeqMinHeadDim() {
+  const char* env = std::getenv("MODEL_STACK_INT8_ATTENTION_OPTIMIZED_SMALL_SEQ_MIN_HEAD_DIM");
+  if (env == nullptr || env[0] == '\0') {
+    return 256;
+  }
+  return std::max<int64_t>(32, std::strtoll(env, nullptr, 10));
+}
+
+bool ShouldPreferInt8AttentionOptimizedPath(const torch::Tensor& q, const torch::Tensor& k) {
+  if (Int8AttentionOptimizedDisabled()) {
+    return false;
+  }
+  if (q.size(2) <= 1) {
+    return false;
+  }
+  const int64_t work = q.size(2) * k.size(2);
+  if (work >= Int8AttentionOptimizedMinWork()) {
+    return true;
+  }
+  return q.size(3) >= Int8AttentionOptimizedSmallSeqMinHeadDim();
 }
 
 bool SupportsInt8AttentionTensorCorePath(const torch::Tensor& q) {
@@ -93,6 +157,44 @@ bool SupportsInt8AttentionSm90PipelinePath(const torch::Tensor& q, const torch::
   }
   const auto min_seq = Int8AttentionSm90PipelineMinSeq();
   return std::max<int64_t>(q.size(2), k.size(2)) >= min_seq;
+}
+
+bool SupportsInt8AttentionSm90BulkAsyncPath(const torch::Tensor& q, const torch::Tensor& k) {
+  if (Int8AttentionSm90BulkAsyncDisabled()) {
+    return false;
+  }
+  if (!t10::cuda::DeviceIsSm90OrLater(q)) {
+    return false;
+  }
+  const auto head_dim = q.size(3);
+  if (head_dim < 16 || head_dim > 256 || (head_dim % 16) != 0) {
+    return false;
+  }
+  return std::max<int64_t>(q.size(2), k.size(2)) >= Int8AttentionSm90PipelineMinSeq();
+}
+
+bool SupportsInt8AttentionPersistentPath(const torch::Tensor& q, const torch::Tensor& k) {
+  if (Int8AttentionPersistentDisabled() || !Int8AttentionPersistentEnabled()) {
+    return false;
+  }
+  if (!t10::cuda::DeviceIsSm90OrLater(q)) {
+    return false;
+  }
+  if (q.size(2) <= 1) {
+    return false;
+  }
+  const auto head_dim = q.size(3);
+  if (head_dim < 16 || head_dim > 256 || (head_dim % 16) != 0) {
+    return false;
+  }
+  return ShouldPreferInt8AttentionOptimizedPath(q, k);
+}
+
+int64_t PersistentAttentionBlockCount(const torch::Tensor& q, int64_t total_blocks) {
+  cudaDeviceProp prop{};
+  C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, q.get_device()));
+  const int64_t target = static_cast<int64_t>(prop.multiProcessorCount) * Int8AttentionPersistentWaves();
+  return std::max<int64_t>(1, std::min<int64_t>(total_blocks, target));
 }
 
 template <int HeadDim>
@@ -134,7 +236,8 @@ bool SupportsInt8AttentionDecodeSpecializedPath(
     const torch::Tensor& q,
     bool has_bool_mask,
     bool has_additive_mask) {
-  if (Int8AttentionOptimizedDisabled()) {
+  const char* env = std::getenv("MODEL_STACK_ENABLE_INT8_ATTENTION_DECODE_SPECIALIZED");
+  if (Int8AttentionOptimizedDisabled() || env == nullptr || env[0] == '\0' || env[0] == '0') {
     return false;
   }
   if (has_bool_mask || has_additive_mask) {
@@ -219,6 +322,7 @@ __global__ void int8_attention_forward_generic_kernel(
 
   const int64_t q_row_idx = ((b * q_heads + h) * tgt_len) + t;
   const int8_t* q_row = q + (q_row_idx * head_dim);
+  const bool use_packed_dp4a = (head_dim % 4) == 0;
 
   float max_score = -std::numeric_limits<float>::infinity();
   bool has_valid = false;
@@ -233,8 +337,17 @@ __global__ void int8_attention_forward_generic_kernel(
     const int64_t k_row_idx = ((b * kv_heads + kv_h) * src_len) + s;
     const int8_t* k_row = k + (k_row_idx * head_dim);
     int acc = 0;
-    for (int64_t i = 0; i < head_dim; ++i) {
-      acc += static_cast<int>(q_row[i]) * static_cast<int>(k_row[i]);
+    if (use_packed_dp4a) {
+      const int64_t packed_chunks = head_dim / 4;
+      const int32_t* q_packed = reinterpret_cast<const int32_t*>(q_row);
+      const int32_t* k_packed = reinterpret_cast<const int32_t*>(k_row);
+      for (int64_t i = 0; i < packed_chunks; ++i) {
+        acc = DotInt8Packed4Attention(q_packed[i], k_packed[i], acc);
+      }
+    } else {
+      for (int64_t i = 0; i < head_dim; ++i) {
+        acc += static_cast<int>(q_row[i]) * static_cast<int>(k_row[i]);
+      }
     }
     float score =
         static_cast<float>(acc) * q_scale[q_row_idx] * k_scale[k_row_idx] * scale_value;
@@ -268,8 +381,17 @@ __global__ void int8_attention_forward_generic_kernel(
     const int64_t kv_row_idx = ((b * kv_heads + kv_h) * src_len) + s;
     const int8_t* k_row = k + (kv_row_idx * head_dim);
     int acc = 0;
-    for (int64_t i = 0; i < head_dim; ++i) {
-      acc += static_cast<int>(q_row[i]) * static_cast<int>(k_row[i]);
+    if (use_packed_dp4a) {
+      const int64_t packed_chunks = head_dim / 4;
+      const int32_t* q_packed = reinterpret_cast<const int32_t*>(q_row);
+      const int32_t* k_packed = reinterpret_cast<const int32_t*>(k_row);
+      for (int64_t i = 0; i < packed_chunks; ++i) {
+        acc = DotInt8Packed4Attention(q_packed[i], k_packed[i], acc);
+      }
+    } else {
+      for (int64_t i = 0; i < head_dim; ++i) {
+        acc += static_cast<int>(q_row[i]) * static_cast<int>(k_row[i]);
+      }
     }
     float score =
         static_cast<float>(acc) * q_scale[q_row_idx] * k_scale[kv_row_idx] * scale_value;
@@ -716,7 +838,7 @@ __global__ void int8_attention_forward_tensorcore_kernel(
   }
 }
 
-template <typename scalar_t, int HeadDim, bool HasBoolMask, bool HasAdditiveMask, bool IsCausal>
+template <typename scalar_t, int HeadDim, bool HasBoolMask, bool HasAdditiveMask, bool IsCausal, bool UseBulkAsync>
 __global__ void int8_attention_forward_sm90_pipeline_kernel(
     const int8_t* __restrict__ q,
     const float* __restrict__ q_scale,
@@ -754,9 +876,9 @@ __global__ void int8_attention_forward_sm90_pipeline_kernel(
   const int64_t head_repeat = q_heads / kv_heads;
   const int64_t kv_head_idx = head_idx / head_repeat;
 
-  __shared__ int8_t q_tile[kTensorCoreTileM * HeadDim];
-  __shared__ int8_t k_tile_col_major[kSm90PipelineStages][kTensorCoreTileN * HeadDim];
-  __shared__ int8_t v_tile[kSm90PipelineStages][kTensorCoreTileN * HeadDim];
+  __shared__ alignas(16) int8_t q_tile[kTensorCoreTileM * HeadDim];
+  __shared__ alignas(16) int8_t k_tile_col_major[kSm90PipelineStages][kTensorCoreTileN * HeadDim];
+  __shared__ alignas(16) int8_t v_tile[kSm90PipelineStages][kTensorCoreTileN * HeadDim];
   __shared__ float q_row_scale[kTensorCoreTileM];
   __shared__ float k_row_scale[kSm90PipelineStages][kTensorCoreTileN];
   __shared__ float v_row_scale[kSm90PipelineStages][kTensorCoreTileN];
@@ -766,6 +888,25 @@ __global__ void int8_attention_forward_sm90_pipeline_kernel(
   __shared__ int score_tile[kTensorCoreTileM * kTensorCoreTileN];
   __shared__ float weight_tile[kTensorCoreTileM * kTensorCoreTileN];
   __shared__ float out_accum[kTensorCoreTileM * HeadDim];
+  #pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ block_barrier_t k_copy_bar[kSm90PipelineStages];
+  #pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ block_barrier_t v_copy_bar[kSm90PipelineStages];
+
+  block_barrier_t::arrival_token k_tokens[kSm90PipelineStages];
+  block_barrier_t::arrival_token v_tokens[kSm90PipelineStages];
+  bool stage_pending[kSm90PipelineStages] = {false, false};
+
+  if constexpr (UseBulkAsync) {
+    if (lane < kSm90PipelineStages) {
+      init(&k_copy_bar[lane], static_cast<ptrdiff_t>(kTensorCoreThreads));
+      init(&v_copy_bar[lane], static_cast<ptrdiff_t>(kTensorCoreThreads));
+    }
+    if (lane == 0) {
+      t10::cuda::Sm90FenceProxyAsyncSharedCta();
+    }
+    __syncthreads();
+  }
 
   for (int idx = lane; idx < kTensorCoreTileM * HeadDim; idx += kTensorCoreThreads) {
     const int row = idx / HeadDim;
@@ -797,12 +938,34 @@ __global__ void int8_attention_forward_sm90_pipeline_kernel(
   __syncthreads();
 
   const int first_valid_k = static_cast<int>(src_len < kTensorCoreTileN ? src_len : kTensorCoreTileN);
-  async_copy_int8_attention_tile<HeadDim>(
-      k_tile_col_major[0],
-      v_tile[0],
-      k + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
-      v + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
-      first_valid_k);
+  const int first_copy_bytes = first_valid_k * HeadDim;
+  if constexpr (UseBulkAsync) {
+    if (lane == 0 && first_copy_bytes > 0) {
+      t10::cuda::Sm90CpAsyncBulkGlobalToShared(
+          k_tile_col_major[0],
+          k + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
+          static_cast<uint32_t>(first_copy_bytes),
+          k_copy_bar[0]);
+      t10::cuda::Sm90CpAsyncBulkGlobalToShared(
+          v_tile[0],
+          v + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
+          static_cast<uint32_t>(first_copy_bytes),
+          v_copy_bar[0]);
+      k_tokens[0] = t10::cuda::Sm90BarrierArriveTx(k_copy_bar[0], 1, static_cast<uint32_t>(first_copy_bytes));
+      v_tokens[0] = t10::cuda::Sm90BarrierArriveTx(v_copy_bar[0], 1, static_cast<uint32_t>(first_copy_bytes));
+    } else {
+      k_tokens[0] = k_copy_bar[0].arrive();
+      v_tokens[0] = v_copy_bar[0].arrive();
+    }
+    stage_pending[0] = true;
+  } else {
+    async_copy_int8_attention_tile<HeadDim>(
+        k_tile_col_major[0],
+        v_tile[0],
+        k + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
+        v + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
+        first_valid_k);
+  }
   if (lane < kTensorCoreTileN) {
     if (lane < first_valid_k) {
       const int64_t scale_idx = (((batch_idx * kv_heads) + kv_head_idx) * src_len) + lane;
@@ -813,9 +976,13 @@ __global__ void int8_attention_forward_sm90_pipeline_kernel(
       v_row_scale[0][lane] = 0.0f;
     }
   }
+  if constexpr (UseBulkAsync) {
+    __syncthreads();
+  } else {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  __pipeline_wait_prior(0);
+    __pipeline_wait_prior(0);
 #endif
+  }
   __syncthreads();
 
   for (int64_t s_tile_start = 0; s_tile_start < src_len; s_tile_start += kTensorCoreTileN) {
@@ -825,16 +992,49 @@ __global__ void int8_attention_forward_sm90_pipeline_kernel(
         (src_len - s_tile_start) < kTensorCoreTileN ? (src_len - s_tile_start) : kTensorCoreTileN);
     const int64_t next_s_tile_start = s_tile_start + kTensorCoreTileN;
 
+    if constexpr (UseBulkAsync) {
+      if (stage_pending[current_stage]) {
+        k_copy_bar[current_stage].wait(std::move(k_tokens[current_stage]));
+        v_copy_bar[current_stage].wait(std::move(v_tokens[current_stage]));
+        stage_pending[current_stage] = false;
+      }
+      __syncthreads();
+    }
+
     if (next_s_tile_start < src_len) {
       const int next_valid_k = static_cast<int>(
           (src_len - next_s_tile_start) < kTensorCoreTileN ? (src_len - next_s_tile_start) : kTensorCoreTileN);
       const int64_t next_base = ((((batch_idx * kv_heads) + kv_head_idx) * src_len) + next_s_tile_start) * HeadDim;
-      async_copy_int8_attention_tile<HeadDim>(
-          k_tile_col_major[next_stage],
-          v_tile[next_stage],
-          k + next_base,
-          v + next_base,
-          next_valid_k);
+      if constexpr (UseBulkAsync) {
+        const int next_copy_bytes = next_valid_k * HeadDim;
+        if (lane == 0 && next_copy_bytes > 0) {
+          t10::cuda::Sm90CpAsyncBulkGlobalToShared(
+              k_tile_col_major[next_stage],
+              k + next_base,
+              static_cast<uint32_t>(next_copy_bytes),
+              k_copy_bar[next_stage]);
+          t10::cuda::Sm90CpAsyncBulkGlobalToShared(
+              v_tile[next_stage],
+              v + next_base,
+              static_cast<uint32_t>(next_copy_bytes),
+              v_copy_bar[next_stage]);
+          k_tokens[next_stage] =
+              t10::cuda::Sm90BarrierArriveTx(k_copy_bar[next_stage], 1, static_cast<uint32_t>(next_copy_bytes));
+          v_tokens[next_stage] =
+              t10::cuda::Sm90BarrierArriveTx(v_copy_bar[next_stage], 1, static_cast<uint32_t>(next_copy_bytes));
+        } else {
+          k_tokens[next_stage] = k_copy_bar[next_stage].arrive();
+          v_tokens[next_stage] = v_copy_bar[next_stage].arrive();
+        }
+        stage_pending[next_stage] = true;
+      } else {
+        async_copy_int8_attention_tile<HeadDim>(
+            k_tile_col_major[next_stage],
+            v_tile[next_stage],
+            k + next_base,
+            v + next_base,
+            next_valid_k);
+      }
       if (lane < kTensorCoreTileN) {
         if (lane < next_valid_k) {
           const int64_t scale_idx = (((batch_idx * kv_heads) + kv_head_idx) * src_len) + next_s_tile_start + lane;
@@ -949,10 +1149,12 @@ __global__ void int8_attention_forward_sm90_pipeline_kernel(
       }
       out_accum[idx] = accum;
     }
-    if (next_s_tile_start < src_len) {
+    if constexpr (!UseBulkAsync) {
+      if (next_s_tile_start < src_len) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-      __pipeline_wait_prior(0);
+        __pipeline_wait_prior(0);
 #endif
+      }
     }
     __syncthreads();
   }
@@ -1238,7 +1440,7 @@ inline void launch_int8_attention_tensorcore(
       stream);
 }
 
-template <typename scalar_t, int HeadDim, bool HasBoolMask, bool HasAdditiveMask, bool IsCausal>
+template <typename scalar_t, int HeadDim, bool HasBoolMask, bool HasAdditiveMask, bool IsCausal, bool UseBulkAsync>
 inline void launch_int8_attention_sm90_pipeline_specialized(
     const torch::Tensor& q_contig,
     const torch::Tensor& q_scale_contig,
@@ -1257,7 +1459,7 @@ inline void launch_int8_attention_sm90_pipeline_specialized(
   const int64_t tiles_per_head = DivUpInt64(q_contig.size(2), kTensorCoreTileM);
   const dim3 blocks(static_cast<unsigned int>(q_contig.size(0) * q_contig.size(1) * tiles_per_head));
   const dim3 threads(kTensorCoreThreads);
-  int8_attention_forward_sm90_pipeline_kernel<scalar_t, HeadDim, HasBoolMask, HasAdditiveMask, IsCausal>
+  int8_attention_forward_sm90_pipeline_kernel<scalar_t, HeadDim, HasBoolMask, HasAdditiveMask, IsCausal, UseBulkAsync>
       <<<blocks, threads, 0, stream>>>(
           q_contig.data_ptr<int8_t>(),
           q_scale_contig.data_ptr<float>(),
@@ -1290,41 +1492,78 @@ inline void launch_int8_attention_sm90_pipeline(
     bool has_bool_mask,
     bool has_additive_mask,
     bool is_causal,
+    bool use_bulk_async,
     float scale_value,
     cudaStream_t stream) {
   if (has_bool_mask) {
     if (is_causal) {
-      launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, true, false, true>(
-          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
-          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+      if (use_bulk_async) {
+        launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, true, false, true, true>(
+            q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+            additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+      } else {
+        launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, true, false, true, false>(
+            q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+            additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+      }
       return;
     }
-    launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, true, false, false>(
-        q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
-        additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+    if (use_bulk_async) {
+      launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, true, false, false, true>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+    } else {
+      launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, true, false, false, false>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+    }
     return;
   }
   if (has_additive_mask) {
     if (is_causal) {
-      launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, false, true, true>(
-          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
-          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+      if (use_bulk_async) {
+        launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, false, true, true, true>(
+            q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+            additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+      } else {
+        launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, false, true, true, false>(
+            q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+            additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+      }
       return;
     }
-    launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, false, true, false>(
-        q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
-        additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+    if (use_bulk_async) {
+      launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, false, true, false, true>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+    } else {
+      launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, false, true, false, false>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+    }
     return;
   }
   if (is_causal) {
-    launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, false, false, true>(
-        q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
-        additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+    if (use_bulk_async) {
+      launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, false, false, true, true>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+    } else {
+      launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, false, false, true, false>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+    }
     return;
   }
-  launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, false, false, false>(
-      q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
-      additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+  if (use_bulk_async) {
+    launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, false, false, false, true>(
+        q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+        additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+  } else {
+    launch_int8_attention_sm90_pipeline_specialized<scalar_t, HeadDim, false, false, false, false>(
+        q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+        additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+  }
 }
 
 template <typename scalar_t>
@@ -1341,38 +1580,39 @@ inline bool launch_int8_attention_sm90_pipeline_if_supported(
     bool has_bool_mask,
     bool has_additive_mask,
     bool is_causal,
+    bool use_bulk_async,
     float scale_value,
     cudaStream_t stream) {
   switch (q_contig.size(3)) {
     case 32:
       launch_int8_attention_sm90_pipeline<scalar_t, 32>(
           q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
-          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, use_bulk_async, scale_value, stream);
       return true;
     case 64:
       launch_int8_attention_sm90_pipeline<scalar_t, 64>(
           q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
-          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, use_bulk_async, scale_value, stream);
       return true;
     case 96:
       launch_int8_attention_sm90_pipeline<scalar_t, 96>(
           q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
-          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, use_bulk_async, scale_value, stream);
       return true;
     case 128:
       launch_int8_attention_sm90_pipeline<scalar_t, 128>(
           q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
-          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, use_bulk_async, scale_value, stream);
       return true;
     case 192:
       launch_int8_attention_sm90_pipeline<scalar_t, 192>(
           q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
-          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, use_bulk_async, scale_value, stream);
       return true;
     case 256:
       launch_int8_attention_sm90_pipeline<scalar_t, 256>(
           q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
-          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, scale_value, stream);
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, use_bulk_async, scale_value, stream);
       return true;
     default:
       return false;
@@ -1586,11 +1826,14 @@ torch::Tensor CudaInt8AttentionForward(
   const float scale_value = static_cast<float>(
       scale.has_value() ? scale.value() : (1.0 / std::sqrt(static_cast<double>(q_contig.size(3)))));
   auto stream = c10::cuda::getCurrentCUDAStream(q.get_device());
+  const bool prefer_optimized = ShouldPreferInt8AttentionOptimizedPath(q_contig, k_contig);
   const bool prefer_decode_specialized =
       SupportsInt8AttentionDecodeSpecializedPath(q_contig, has_bool_mask, has_additive_mask);
-  const bool prefer_tensorcore = SupportsInt8AttentionTensorCorePath(q_contig);
+  const bool prefer_tensorcore = prefer_optimized && SupportsInt8AttentionTensorCorePath(q_contig);
   const bool prefer_sm90_pipeline =
       !prefer_decode_specialized && prefer_tensorcore && SupportsInt8AttentionSm90PipelinePath(q_contig, k_contig);
+  const bool prefer_sm90_bulk_async =
+      prefer_sm90_pipeline && SupportsInt8AttentionSm90BulkAsyncPath(q_contig, k_contig);
 
   switch (output_dtype) {
     case torch::kFloat32: {
@@ -1622,6 +1865,7 @@ torch::Tensor CudaInt8AttentionForward(
               has_bool_mask,
               has_additive_mask,
               is_causal,
+              prefer_sm90_bulk_async,
               scale_value,
               stream.stream());
       const bool launched_tensorcore =
@@ -1691,6 +1935,7 @@ torch::Tensor CudaInt8AttentionForward(
               has_bool_mask,
               has_additive_mask,
               is_causal,
+              prefer_sm90_bulk_async,
               scale_value,
               stream.stream());
       const bool launched_tensorcore =
@@ -1760,6 +2005,7 @@ torch::Tensor CudaInt8AttentionForward(
               has_bool_mask,
               has_additive_mask,
               is_causal,
+              prefer_sm90_bulk_async,
               scale_value,
               stream.stream());
       const bool launched_tensorcore =

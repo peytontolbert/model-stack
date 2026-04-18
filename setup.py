@@ -70,6 +70,49 @@ def _normalize_arch_list(arch_list: str) -> list[str]:
     return [token for token in normalized.split() if token]
 
 
+def _arch_token_kind(token: str) -> tuple[int, int, str] | None:
+    match = _CUDA_ARCH_RE.match(token.strip())
+    if match is None:
+        return None
+    return int(match.group("major")), int(match.group("minor") or "0"), str(match.group("suffix") or "").lower()
+
+
+def _arch_list_requests_sm90a(tokens: list[str]) -> bool:
+    for token in tokens:
+        parsed = _arch_token_kind(token)
+        if parsed is None:
+            continue
+        major, minor, suffix = parsed
+        if (major, minor) == (9, 0) and suffix == "a":
+            return True
+    return False
+
+
+def _arch_list_targets_sm90(tokens: list[str]) -> bool:
+    for token in tokens:
+        parsed = _arch_token_kind(token)
+        if parsed is None:
+            continue
+        major, minor, _ = parsed
+        if (major, minor) == (9, 0):
+            return True
+    return False
+
+
+def maybe_enable_sm90a_target(arch_list: str | None, cuda_version: tuple[int, int] | None) -> str | None:
+    if not env_enabled("MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL", "0"):
+        return arch_list
+    if arch_list is None:
+        return arch_list
+    if cuda_version is not None and cuda_version < (12, 0):
+        return arch_list
+    tokens = _normalize_arch_list(arch_list)
+    if not _arch_list_targets_sm90(tokens) or _arch_list_requests_sm90a(tokens):
+        return arch_list
+    tokens.append("9.0a")
+    return ";".join(tokens)
+
+
 def validate_cuda_arch_list(arch_list: str, cuda_version: tuple[int, int] | None) -> None:
     if cuda_version is None or cuda_version < (13, 0):
         return
@@ -103,6 +146,9 @@ def configure_cuda_build_environment(cuda_home: str | None) -> tuple[int, int] |
         os.environ["MAX_JOBS"] = model_stack_max_jobs
 
     cuda_version = detect_cuda_toolkit_version(cuda_home)
+    torch_arches = maybe_enable_sm90a_target(torch_arches, cuda_version)
+    if torch_arches is not None:
+        os.environ["TORCH_CUDA_ARCH_LIST"] = torch_arches
     if torch_arches is not None:
         validate_cuda_arch_list(torch_arches, cuda_version)
     return cuda_version
@@ -139,6 +185,10 @@ def native_extensions():
         sources.append("runtime/csrc/backend/cuda_activation.cu")
         sources.append("runtime/csrc/backend/cuda_gated_activation.cu")
         sources.append("runtime/csrc/backend/cuda_int4_linear.cu")
+        sources.append("runtime/csrc/backend/bitnet/bitnet_pack.cu")
+        sources.append("runtime/csrc/backend/bitnet/bitnet_linear_decode.cu")
+        sources.append("runtime/csrc/backend/bitnet/bitnet_linear_prefill.cu")
+        sources.append("runtime/csrc/backend/bitnet/bitnet_linear_dispatch.cu")
         sources.append("runtime/csrc/backend/cuda_int8_attention.cu")
         sources.append("runtime/csrc/backend/cuda_int8_linear.cu")
         sources.append("runtime/csrc/backend/cublaslt_linear.cu")
@@ -146,6 +196,8 @@ def native_extensions():
         if cuda_version is not None:
             define_macros.append(("MODEL_STACK_CUDA_VERSION_MAJOR", str(cuda_version[0])))
             define_macros.append(("MODEL_STACK_CUDA_VERSION_MINOR", str(cuda_version[1])))
+        if env_enabled("MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL", "0"):
+            define_macros.append(("MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL", "1"))
         extra_compile_args["nvcc"] = [
             "-O3",
             "-std=c++17",

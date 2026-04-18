@@ -41,6 +41,33 @@ class RuntimeLayerCacheView:
     def read(self, start: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
         return self.parent.read(self.layer_idx, int(start), int(end))
 
+    def supports_paged_attention_decode(self) -> bool:
+        return all(
+            hasattr(self.parent, name)
+            for name in ("layer_page_count", "layer_pages", "layer_block_table")
+        )
+
+    def paged_attention_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        attn_mask: torch.Tensor | None = None,
+        scale: float | None = None,
+    ) -> torch.Tensor:
+        from runtime.kv_cache import paged_attention_decode as runtime_paged_attention_decode
+
+        return runtime_paged_attention_decode(
+            self.parent,
+            self.layer_idx,
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            scale=scale,
+        )
+
     def length(self) -> int:
         native_cache = getattr(self.parent, "_native_cache", None)
         if native_cache is not None:

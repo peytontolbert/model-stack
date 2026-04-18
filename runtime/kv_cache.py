@@ -10,6 +10,7 @@ from runtime.native import create_native_paged_kv_cache_state
 from runtime.ops import kv_cache_write as runtime_kv_cache_write
 from runtime.ops import paged_kv_append as runtime_paged_kv_append
 from runtime.ops import paged_kv_compact as runtime_paged_kv_compact
+from runtime.ops import paged_attention_decode as runtime_paged_attention_decode
 from runtime.ops import paged_kv_read_last as runtime_paged_kv_read_last
 from runtime.ops import paged_kv_read_range as runtime_paged_kv_read_range
 
@@ -719,6 +720,36 @@ def kv_cache_evict(cache: PagedKVCache, max_tokens: int, policy: str = "fifo"):
     cache.evict(max_tokens, policy)
 
 
+def paged_attention_decode(
+    cache: PagedKVCache,
+    layer_idx: int,
+    q: torch.Tensor,
+    k_chunk: torch.Tensor,
+    v_chunk: torch.Tensor,
+    *,
+    attn_mask: Optional[torch.Tensor] = None,
+    scale: float | None = None,
+    block_ids: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    cache.append_batch(layer_idx, k_chunk, v_chunk, block_ids=block_ids)
+    block_ids_long = cache._normalize_block_ids(block_ids)
+    if block_ids_long.numel() == 0:
+        return torch.empty_like(q)
+    page_count = cache.layer_page_count(layer_idx)
+    live_lengths = cache.layer_lengths(layer_idx).index_select(0, block_ids_long)
+    block_table = cache.layer_block_table(layer_idx).index_select(0, block_ids_long).contiguous()
+    k_pages, v_pages = cache.layer_pages(layer_idx)
+    return runtime_paged_attention_decode(
+        q,
+        k_pages[:page_count],
+        v_pages[:page_count],
+        block_table,
+        live_lengths,
+        attn_mask,
+        scale=scale,
+    )
+
+
 __all__ = [
     "ContiguousKVCache",
     "PagedKVCache",
@@ -726,6 +757,7 @@ __all__ = [
     "reorder_kv_cache_rows_",
     "init_kv_cache",
     "kv_cache_append",
+    "paged_attention_decode",
     "kv_cache_evict",
     "kv_cache_slice",
 ]

@@ -149,6 +149,7 @@ def current_cuda_hardware_info() -> dict[str, Any]:
         "current_cuda_device_name": cuda_device_name(),
         "current_cuda_is_hopper": is_hopper_device(),
         "hopper_optimizations_enabled": hopper_optimizations_enabled(),
+        "sm90a_experimental_requested": _env_flag("MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL", "0"),
     }
 
 

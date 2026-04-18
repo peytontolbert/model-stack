@@ -697,6 +697,48 @@ def paged_kv_write(
     return pages_out
 
 
+def paged_attention_decode(
+    q: torch.Tensor,
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    block_table: torch.Tensor,
+    lengths: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    *,
+    scale: float | None = None,
+) -> torch.Tensor:
+    if has_native_op("paged_attention_decode"):
+        module = native_module()
+        if module is not None and hasattr(module, "paged_attention_decode_forward"):
+            return module.paged_attention_decode_forward(
+                q,
+                k_pages,
+                v_pages,
+                block_table,
+                lengths,
+                attn_mask,
+                scale,
+            )
+
+    lengths_long = lengths.to(device=q.device, dtype=torch.long).contiguous().view(-1)
+    max_len = int(lengths_long.max().item()) if lengths_long.numel() > 0 else 0
+    if max_len == 0:
+        return torch.zeros_like(q)
+
+    k = paged_kv_read_range(k_pages, block_table, lengths_long, 0, max_len)
+    v = paged_kv_read_range(v_pages, block_table, lengths_long, 0, max_len)
+    positions = torch.arange(max_len, device=q.device, dtype=torch.long).view(1, 1, 1, max_len)
+    invalid = positions >= lengths_long.view(-1, 1, 1, 1)
+    merged_mask = invalid
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            merged_mask = invalid | attn_mask.to(device=q.device, dtype=torch.bool)
+        else:
+            merged_mask = attn_mask.to(device=q.device, dtype=torch.float32)
+            merged_mask = merged_mask.masked_fill(invalid, float("-inf"))
+    return attention(q, k, v, attn_mask=merged_mask, is_causal=False, scale=scale)
+
+
 def attention(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -212,6 +212,7 @@ def test_native_int4_kernel_is_registered_in_source() -> None:
     cuda_int8_attention_source = _read("runtime/csrc/backend/cuda_int8_attention.cu")
     cublaslt_source = _read("runtime/csrc/backend/cublaslt_linear.cu")
     cuda_arch_source = _read("runtime/csrc/backend/cuda_device_arch.cuh")
+    cuda_hopper_source = _read("runtime/csrc/backend/cuda_hopper_advanced.cuh")
     decode_source = _read("runtime/csrc/backend/attention/cuda_attention_decode.cuh")
     prefill_source = _read("runtime/csrc/backend/attention/cuda_attention_prefill.cuh")
     setup_source = _read("setup.py")
@@ -238,6 +239,7 @@ def test_native_int4_kernel_is_registered_in_source() -> None:
     assert "info[\"int8_attention_kernel_family\"]" in native_source
     assert "info[\"int8_attention_tensorcore_tile\"]" in native_source
     assert "info[\"int8_attention_specializations\"]" in native_source
+    assert "info[\"int8_attention_decode_specialized_env\"]" in native_source
     assert "row_rescale" in cuda_int8_attention_source
     assert "m.def(\"int8_attention_forward\"" in native_source
     assert "CudaInt8AttentionForward(" in native_source
@@ -250,26 +252,57 @@ def test_native_int4_kernel_is_registered_in_source() -> None:
     assert "wmma::experimental::precision::s4" in cuda_source
     assert "int8_linear_forward_kernel" in cuda_int8_source
     assert "int8_linear_forward_tiled_kernel" in cuda_int8_source
+    assert "int8_linear_forward_sm90a_wgmma_kernel" in cuda_int8_source
     assert "int8_linear_forward_sm90_tensorcore_kernel" in cuda_int8_source
     assert "CublasLtInt8LinearForward" in cuda_int8_source
     assert "MODEL_STACK_INT8_LINEAR_CUBLASLT_MIN_OPS" in cuda_int8_source
+    assert "MODEL_STACK_ENABLE_INT8_LINEAR_WGMMA" in cuda_int8_source
+    assert "MODEL_STACK_DISABLE_INT8_LINEAR_WGMMA" in cuda_int8_source
+    assert "MODEL_STACK_INT8_LINEAR_WGMMA_MIN_OPS" in cuda_int8_source
     assert "MODEL_STACK_DISABLE_INT8_LINEAR_WMMA" in cuda_int8_source
     assert "#include <mma.h>" in cuda_int8_source
     assert "wmma::mma_sync" in cuda_int8_source
+    assert "WgmmaM64N8K32S32U8S8" in cuda_int8_source
+    assert "weight_correction" in cuda_int8_source
+    assert "MakeWgmmaSmemDesc" in cuda_int8_source
+    assert "AsyncProxyFenceSharedCta" in cuda_int8_source
     assert "RunCublasLtInt8LinearAccum" in cublaslt_source
     assert "CublasLtInt8LinearForward" in cublaslt_source
     assert "MODEL_STACK_DISABLE_INT8_LINEAR_CUBLASLT" in cublaslt_source
+    assert "MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL" in setup_source
+    assert "maybe_enable_sm90a_target" in setup_source
+    assert "9.0a" in setup_source
+    assert "BuildRequestsSm90aExperimental" in cuda_hopper_source
+    assert "ArchHasSm90aFeatures" in cuda_hopper_source
+    assert "WgmmaFenceSyncAligned" in cuda_hopper_source
+    assert "WgmmaCommitGroupSyncAligned" in cuda_hopper_source
+    assert "WgmmaWaitGroupSyncAligned" in cuda_hopper_source
+    assert "WgmmaDescriptor" in cuda_hopper_source
+    assert "MakeWgmmaSmemDesc" in cuda_hopper_source
+    assert "AsyncProxyFenceSharedCta" in cuda_hopper_source
+    assert "WgmmaM64N8K32S32U8S8" in cuda_hopper_source
     assert "int8_attention_forward_generic_kernel" in cuda_int8_attention_source
     assert "int8_attention_forward_tensorcore_kernel" in cuda_int8_attention_source
     assert "int8_attention_forward_sm90_pipeline_kernel" in cuda_int8_attention_source
     assert "launch_int8_attention_sm90_pipeline_if_supported" in cuda_int8_attention_source
+    assert "#include <cuda/barrier>" in cuda_int8_attention_source
     assert "#include <mma.h>" in cuda_int8_attention_source
     assert "#include <sm_61_intrinsics.h>" in cuda_int8_attention_source
     assert "wmma::mma_sync" in cuda_int8_attention_source
     assert "MODEL_STACK_DISABLE_INT8_ATTENTION_WMMA" in cuda_int8_attention_source
     assert "MODEL_STACK_DISABLE_INT8_ATTENTION_SM90_PIPELINE" in cuda_int8_attention_source
+    assert "MODEL_STACK_DISABLE_INT8_ATTENTION_SM90_BULK_ASYNC" in cuda_int8_attention_source
+    assert "MODEL_STACK_ENABLE_INT8_ATTENTION_DECODE_SPECIALIZED" in cuda_int8_attention_source
+    assert "MODEL_STACK_INT8_ATTENTION_OPTIMIZED_MIN_WORK" in cuda_int8_attention_source
+    assert "MODEL_STACK_INT8_ATTENTION_OPTIMIZED_SMALL_SEQ_MIN_HEAD_DIM" in cuda_int8_attention_source
     assert "MODEL_STACK_DISABLE_INT8_ATTENTION_OPTIMIZED" in cuda_int8_attention_source
     assert "__pipeline_memcpy_async" in cuda_int8_attention_source
+    assert "Sm90CpAsyncBulkGlobalToShared" in cuda_int8_attention_source
+    assert "cp_async_bulk_global_to_shared" in cuda_hopper_source
+    assert "Sm90BarrierArriveTx" in cuda_int8_attention_source
+    assert "barrier_arrive_tx" in cuda_hopper_source
+    assert "Sm90FenceProxyAsyncSharedCta" in cuda_int8_attention_source
+    assert "fence_proxy_async_shared_cta" in cuda_hopper_source
     assert "launch_int8_attention_tensorcore_specialized" in cuda_int8_attention_source
     assert "launch_int8_attention_decode_if_supported" in cuda_int8_attention_source
     assert "int8_attention_decode_nomask_kernel" in cuda_int8_attention_source
@@ -280,6 +313,7 @@ def test_native_int4_kernel_is_registered_in_source() -> None:
     assert "decode_attention_q1_hdim_sm90_forward_kernel" in decode_source
     assert "prefill_attention_hdim_sm90_forward_kernel" in prefill_source
     assert "sm90_specialized_ops" in native_source
+    assert "sm90a_advanced_ops" in native_source
     assert "attention_arches" in native_source
     assert "int4_linear_arches" in native_source
     assert "int4_linear_kernel_family" in native_source
@@ -290,8 +324,23 @@ def test_native_int4_kernel_is_registered_in_source() -> None:
     assert "int8_linear_kernel_family" in native_source
     assert "int8_linear_tensorcore_tile" in native_source
     assert "int8_linear_tensorcore_arches" in native_source
+    assert "int8_linear_wgmma_tile" in native_source
+    assert "int8_linear_wgmma_requires" in native_source
+    assert "int8_linear_wgmma_env" in native_source
+    assert "int8_linear_wgmma_min_ops_env" in native_source
+    assert "int8_linear_wgmma_activation_strategy" in native_source
     assert "int8_linear_large_gemm_backend" in native_source
+    assert "sm90a_experimental_build_requested" in native_source
+    assert "int8_linear_wgmma_build_requested" in native_source
+    assert "int8_attention_sm90_bulk_async" in native_source
+    assert "int8_attention_sm90_bulk_async_requires" in native_source
+    assert "int8_attention_wgmma_build_requested" in native_source
     assert "int8_attention_sm90_pipeline_stages" in native_source
+    assert "int8_attention_optimized_default" in native_source
+    assert "int8_attention_optimized_min_work_default" in native_source
+    assert "int8_attention_optimized_small_seq_min_head_dim_default" in native_source
+    assert "int8_attention_optimized_min_work_env" in native_source
+    assert "int8_attention_optimized_small_seq_min_head_dim_env" in native_source
     assert "runtime/csrc/backend/cuda_int4_linear.cu" in setup_source
     assert "runtime/csrc/backend/cuda_int8_attention.cu" in setup_source
     assert "runtime/csrc/backend/cuda_int8_linear.cu" in setup_source
@@ -301,3 +350,75 @@ def test_native_int4_kernel_is_registered_in_source() -> None:
     assert "\"int4_linear\"" in native_py_source
     assert "\"int8_linear\"" in native_py_source
     assert "\"int8_attention\"" in native_py_source
+
+
+def test_native_bitnet_cuda_kernel_sources_are_registered_in_source() -> None:
+    native_source = _read("runtime/csrc/model_stack_native.cpp")
+    setup_source = _read("setup.py")
+    pack_source = _read("runtime/csrc/backend/bitnet/bitnet_pack.cu")
+    decode_source = _read("runtime/csrc/backend/bitnet/bitnet_linear_decode.cu")
+    prefill_source = _read("runtime/csrc/backend/bitnet/bitnet_linear_prefill.cu")
+    dispatch_source = _read("runtime/csrc/backend/bitnet/bitnet_linear_dispatch.cu")
+    common_source = _read("runtime/csrc/backend/bitnet/bitnet_common.cuh")
+    formats_source = _read("runtime/csrc/backend/bitnet/bitnet_formats.h")
+    bench_linear_source = _read("tests/bench_bitnet_linear.py")
+    bench_attention_source = _read("tests/bench_bitnet_attention.py")
+    bench_decode_source = _read("tests/bench_bitnet_decode.py")
+
+    assert "#include \"backend/bitnet/bitnet_formats.h\"" in native_source
+    assert "t10::bitnet::CudaBitNetLinearForward(" in native_source
+    assert "t10::bitnet::CudaPackBitNetWeightForward(weight)" in native_source
+    assert "t10::bitnet::HasCudaBitNetLinearKernel()" in native_source
+    assert "bitnet_kernel_family" in native_source
+    assert "decode_persistent_prefill_tiled_splitk" in native_source
+    assert "bitnet_decode_rows_buckets" in native_source
+    assert "bitnet_decode_scheduler" in native_source
+    assert "bitnet_prefill_scheduler" in native_source
+    assert "bitnet_splitk_env" in native_source
+    assert "bitnet_persistent_decode_env" in native_source
+    assert "runtime/csrc/backend/bitnet/bitnet_pack.cu" in setup_source
+    assert "runtime/csrc/backend/bitnet/bitnet_linear_decode.cu" in setup_source
+    assert "runtime/csrc/backend/bitnet/bitnet_linear_prefill.cu" in setup_source
+    assert "runtime/csrc/backend/bitnet/bitnet_linear_dispatch.cu" in setup_source
+    assert "bitnet_pack_weight_kernel" in pack_source
+    assert "bitnet_linear_decode_scalar_kernel" in decode_source
+    assert "bitnet_linear_decode_persistent_kernel" in decode_source
+    assert "bitnet_linear_prefill_tiled_kernel" in prefill_source
+    assert "bitnet_linear_prefill_splitk_kernel" in prefill_source
+    assert "CudaBitNetLinearForward(" in dispatch_source
+    assert "ResolvePlan(" in dispatch_source
+    assert "KernelKind::kPrefillSplitK" in dispatch_source
+    assert "LaunchBitNetPrefillSplitKKernel" in dispatch_source
+    assert "LaunchBitNetDecodeKernel" in common_source
+    assert "LaunchBitNetPrefillKernel" in common_source
+    assert "KernelKindName" in common_source
+    assert "ResolvePlan(" in common_source
+    assert "kPrefillSplitK" in common_source
+    assert "MODEL_STACK_DISABLE_BITNET_SPLITK" in common_source
+    assert "MODEL_STACK_DISABLE_BITNET_PERSISTENT_DECODE" in common_source
+    assert "struct LayoutInfo" in formats_source
+    assert "def main() -> None:" in bench_linear_source
+    assert "def main() -> None:" in bench_attention_source
+    assert "def main() -> None:" in bench_decode_source
+
+
+def test_native_int8_attention_benchmark_script_is_registered_in_source() -> None:
+    bench_source = _read("tests/bench_int8_attention.py")
+
+    assert "def main() -> None:" in bench_source
+    assert "runtime_info()" in bench_source
+    assert "int8_matmul_qkv" in bench_source
+    assert "MODEL_STACK_DISABLE_INT8_ATTENTION_OPTIMIZED" in bench_source
+    assert "MODEL_STACK_ENABLE_INT8_ATTENTION_DECODE_SPECIALIZED" in bench_source
+
+
+def test_native_int8_linear_benchmark_script_is_registered_in_source() -> None:
+    bench_source = _read("tests/bench_int8_linear.py")
+
+    assert "def main() -> None:" in bench_source
+    assert "runtime_info()" in bench_source
+    assert "int8_linear_from_quantized_activation" in bench_source
+    assert "quantize_activation_int8_rowwise" in bench_source
+    assert "MODEL_STACK_ENABLE_INT8_LINEAR_WGMMA" in bench_source
+    assert "MODEL_STACK_DISABLE_INT8_LINEAR_WGMMA" in bench_source
+    assert "MODEL_STACK_DISABLE_INT8_LINEAR_CUBLASLT" in bench_source

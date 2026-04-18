@@ -8,6 +8,7 @@
 #include <mma.h>
 #include <sm_61_intrinsics.h>
 
+#include "cuda_hopper_advanced.cuh"
 #include "cuda_device_arch.cuh"
 
 #include <cstdlib>
@@ -37,6 +38,11 @@ constexpr int kTensorCoreTileM = 16;
 constexpr int kTensorCoreTileN = 16;
 constexpr int kTensorCoreTileK = 16;
 constexpr int kSm90TensorCoreColsPerWarp = 2;
+constexpr int kWgmmaThreads = 128;
+constexpr int kWgmmaTileM = 64;
+constexpr int kWgmmaTileN = 8;
+constexpr int kWgmmaTileK = 32;
+constexpr int kWgmmaLayoutNoSwizzle = 0;
 
 bool IsSupportedInt8LinearOutDtype(torch::ScalarType dtype) {
   return dtype == torch::kFloat32 || dtype == torch::kFloat16 || dtype == torch::kBFloat16;
@@ -47,10 +53,28 @@ bool Int8LinearTensorCoreDisabled() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+bool Int8LinearWgmmaDisabled() {
+  const char* env = std::getenv("MODEL_STACK_DISABLE_INT8_LINEAR_WGMMA");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+bool Int8LinearWgmmaEnabled() {
+  const char* env = std::getenv("MODEL_STACK_ENABLE_INT8_LINEAR_WGMMA");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 int64_t Int8LinearCublasLtMinOps() {
   const char* env = std::getenv("MODEL_STACK_INT8_LINEAR_CUBLASLT_MIN_OPS");
   if (env == nullptr || env[0] == '\0') {
     return 8'000'000;
+  }
+  return std::max<int64_t>(1, std::strtoll(env, nullptr, 10));
+}
+
+int64_t Int8LinearWgmmaMinOps() {
+  const char* env = std::getenv("MODEL_STACK_INT8_LINEAR_WGMMA_MIN_OPS");
+  if (env == nullptr || env[0] == '\0') {
+    return 131072;
   }
   return std::max<int64_t>(1, std::strtoll(env, nullptr, 10));
 }
@@ -101,6 +125,113 @@ __device__ inline int DotInt8Chunk4(const int8_t* lhs, const int8_t* rhs, int ac
   acc += static_cast<int>(lhs[3]) * static_cast<int>(rhs[3]);
   return acc;
 #endif
+}
+
+template <typename scalar_t>
+__global__ __launch_bounds__(kWgmmaThreads, 1) void int8_linear_forward_sm90a_wgmma_kernel(
+    const int8_t* __restrict__ qx,
+    const float* __restrict__ x_scale,
+    const int8_t* __restrict__ qweight,
+    const float* __restrict__ inv_scale,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ out,
+    int64_t rows,
+    int64_t out_features,
+    int64_t in_features) {
+  __shared__ __align__(16) uint8_t a_tile[kWgmmaTileM][kWgmmaTileK];
+  __shared__ __align__(16) int8_t b_tile[kWgmmaTileK][kWgmmaTileN];
+  __shared__ int weight_correction[kWgmmaTileN];
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int64_t row_start = static_cast<int64_t>(blockIdx.y) * kWgmmaTileM;
+  const int64_t col_start = static_cast<int64_t>(blockIdx.x) * kWgmmaTileN;
+
+  if (tid < kWgmmaTileN) {
+    weight_correction[tid] = 0;
+  }
+  __syncthreads();
+
+  int accum[4] = {0, 0, 0, 0};
+  #pragma unroll
+  for (int idx = 0; idx < 4; ++idx) {
+    t10::cuda::WgmmaFenceOperand(accum[idx]);
+  }
+  t10::cuda::WgmmaFenceSyncAligned();
+
+  for (int64_t k0 = 0; k0 < in_features; k0 += kWgmmaTileK) {
+    for (int idx = tid; idx < kWgmmaTileM * kWgmmaTileK; idx += kWgmmaThreads) {
+      const int tile_row = idx / kWgmmaTileK;
+      const int tile_k = idx % kWgmmaTileK;
+      const int64_t global_row = row_start + tile_row;
+      const int64_t global_k = k0 + tile_k;
+      uint8_t rebased = 0;
+      if (global_row < rows && global_k < in_features) {
+        rebased = static_cast<uint8_t>(static_cast<int>(qx[global_row * in_features + global_k]) + 128);
+      }
+      a_tile[tile_row][tile_k] = rebased;
+    }
+    for (int idx = tid; idx < kWgmmaTileK * kWgmmaTileN; idx += kWgmmaThreads) {
+      const int tile_k = idx / kWgmmaTileN;
+      const int tile_col = idx % kWgmmaTileN;
+      const int64_t global_k = k0 + tile_k;
+      const int64_t global_col = col_start + tile_col;
+      b_tile[tile_k][tile_col] =
+          (global_col < out_features && global_k < in_features)
+              ? qweight[global_col * in_features + global_k]
+              : static_cast<int8_t>(0);
+    }
+    __syncthreads();
+
+    if (tid < kWgmmaTileN) {
+      int sum = 0;
+      #pragma unroll
+      for (int kk = 0; kk < kWgmmaTileK; ++kk) {
+        sum += static_cast<int>(b_tile[kk][tid]);
+      }
+      weight_correction[tid] += sum * 128;
+    }
+    __syncthreads();
+
+    t10::cuda::AsyncProxyFenceSharedCta();
+    const auto desc_a = static_cast<uint64_t>(t10::cuda::MakeWgmmaSmemDesc(
+        a_tile,
+        kWgmmaLayoutNoSwizzle,
+        0,
+        kWgmmaTileK * static_cast<int>(sizeof(uint8_t))));
+    const auto desc_b = static_cast<uint64_t>(t10::cuda::MakeWgmmaSmemDesc(
+        b_tile,
+        kWgmmaLayoutNoSwizzle,
+        0,
+        kWgmmaTileN * static_cast<int>(sizeof(int8_t))));
+    t10::cuda::WgmmaM64N8K32S32U8S8(desc_a, desc_b, accum);
+    t10::cuda::WgmmaCommitGroupSyncAligned();
+    t10::cuda::WgmmaWaitGroupSyncAligned<0>();
+    __syncthreads();
+  }
+
+  const int64_t global_row = row_start + warp * 16 + (lane & 15);
+  const int local_col_base = (lane >> 4) * 4;
+  if (global_row >= rows) {
+    return;
+  }
+
+  const float row_scale = x_scale[global_row];
+  #pragma unroll
+  for (int idx = 0; idx < 4; ++idx) {
+    const int local_col = local_col_base + idx;
+    const int64_t global_col = col_start + local_col;
+    if (local_col >= kWgmmaTileN || global_col >= out_features) {
+      continue;
+    }
+    const int corrected_acc = accum[idx] - weight_correction[local_col];
+    float value = static_cast<float>(corrected_acc) * row_scale * inv_scale[global_col];
+    if (bias != nullptr) {
+      value += static_cast<float>(bias[global_col]);
+    }
+    out[global_row * out_features + global_col] = static_cast<scalar_t>(value);
+  }
 }
 
 template <typename scalar_t, int TileColsPerWarp>
@@ -309,6 +440,29 @@ inline bool UseSm90Int8TensorCoreKernel(
   return (rows * out_features * in_features) >= 131072;
 }
 
+inline bool UseSm90aInt8WgmmaKernel(
+    const torch::Tensor& reference,
+    int64_t rows,
+    int64_t out_features,
+    int64_t in_features) {
+  if (!t10::cuda::BuildRequestsSm90aExperimental()) {
+    return false;
+  }
+  if (!Int8LinearWgmmaEnabled() || Int8LinearWgmmaDisabled()) {
+    return false;
+  }
+  if (!t10::cuda::DeviceIsSm90OrLater(reference)) {
+    return false;
+  }
+  if (rows <= 0 || out_features <= 0 || in_features < kWgmmaTileK) {
+    return false;
+  }
+  if (out_features < kWgmmaTileN) {
+    return false;
+  }
+  return (rows * out_features * in_features) >= Int8LinearWgmmaMinOps();
+}
+
 inline bool UseCublasLtInt8Backend(
     const torch::Tensor& reference,
     int64_t rows,
@@ -387,7 +541,10 @@ torch::Tensor CudaInt8LinearForward(
   auto stream = c10::cuda::getCurrentCUDAStream(qx.get_device());
   const bool use_tiled = UseTiledInt8Kernel(rows, out_features, in_features);
   const bool use_cublaslt = UseCublasLtInt8Backend(qx_contig, rows, out_features, in_features);
+  const bool use_sm90a_wgmma =
+      !use_cublaslt && UseSm90aInt8WgmmaKernel(qx_contig, rows, out_features, in_features);
   const bool use_sm90_tensorcore =
+      !use_sm90a_wgmma &&
       !use_cublaslt && UseSm90Int8TensorCoreKernel(qx_contig, rows, out_features, in_features);
   const bool use_sm90 = !use_sm90_tensorcore && use_tiled && t10::cuda::DeviceIsSm90OrLater(qx_contig) &&
       in_features >= kSm90TileK;
@@ -416,7 +573,21 @@ torch::Tensor CudaInt8LinearForward(
         if (bias_cast.has_value() && bias_cast.value().defined()) {
           bias_ptr = bias_cast.value().data_ptr<scalar_t>();
         }
-        if (use_sm90_tensorcore) {
+        if (use_sm90a_wgmma) {
+          const dim3 wgmma_blocks(
+              static_cast<unsigned int>((out_features + kWgmmaTileN - 1) / kWgmmaTileN),
+              static_cast<unsigned int>((rows + kWgmmaTileM - 1) / kWgmmaTileM));
+          int8_linear_forward_sm90a_wgmma_kernel<scalar_t><<<wgmma_blocks, kWgmmaThreads, 0, stream.stream()>>>(
+              qx_contig.data_ptr<int8_t>(),
+              x_scale_contig.data_ptr<float>(),
+              qweight_contig.data_ptr<int8_t>(),
+              inv_scale_contig.data_ptr<float>(),
+              bias_ptr,
+              out_2d.data_ptr<scalar_t>(),
+              rows,
+              out_features,
+              in_features);
+        } else if (use_sm90_tensorcore) {
           const dim3 tc_blocks(
               static_cast<unsigned int>(
                   (out_features + (kTensorCoreTileN * kSm90TensorCoreColsPerWarp) - 1) /

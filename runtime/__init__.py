@@ -47,6 +47,7 @@ _EXPORTS = {
     "clone_kv_cache_rows": "runtime.kv_cache",
     "reorder_kv_cache_rows_": "runtime.kv_cache",
     "kv_cache_append": "runtime.kv_cache",
+    "paged_attention_decode": "runtime.kv_cache",
     "kv_cache_evict": "runtime.kv_cache",
     "kv_cache_slice": "runtime.kv_cache",
     "GenerationConfig": "runtime.generation",

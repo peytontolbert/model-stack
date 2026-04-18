@@ -332,117 +332,152 @@ class EagerAttention(nn.Module):
                 else:
                     qh, kh_new = runtime_apply_rotary(qh, kh_new, self._rope_cos[:T], self._rope_sin[:T])
 
-        appended_to_cache = False
-        if cache is not None:
-            if T > 0 and hasattr(cache, "append_and_read"):
-                kh_all, vh_all = cache.append_and_read(kh_new, vh_new, 0)
-                appended_to_cache = True
-            else:
-                k_old, v_old = cache.read(0, cache.length())
-                if k_old is not None and k_old.shape[2] > 0:
-                    kh_all = torch.cat([k_old, kh_new], dim=2)
-                    vh_all = torch.cat([v_old, vh_new], dim=2)
-                else:
-                    kh_all, vh_all = kh_new, vh_new
-        else:
-            kh_all, vh_all = kh_new, vh_new
-
-        def _expanded_kv_heads() -> tuple[torch.Tensor, torch.Tensor]:
-            if self.n_kv_heads == self.n_heads:
-                return kh_all, vh_all
-            repeat = self.n_heads // self.n_kv_heads
-            return (
-                kh_all.repeat_interleave(repeat, dim=1),
-                vh_all.repeat_interleave(repeat, dim=1),
-            )
-
-        S = kh_all.shape[2]
-        add = runtime_prepare_attention_mask(
-            mask,
-            batch_size=B,
-            num_heads=self.n_heads,
-            tgt_len=T,
-            src_len=S,
-            position_ids=position_ids,
-        )
         parity_exact = os.environ.get("ATTN_PARITY_EXACT", "0") == "1"
-        if parity_exact:
-            kh_attn, vh_attn = _expanded_kv_heads()
-            scores = torch.matmul(qh, kh_attn.transpose(2, 3)) * float(self.scaling)
-            if add is not None:
-                scores = scores + add.to(dtype=scores.dtype)
-            attn_probs = torch.nn.functional.softmax(scores.float(), dim=-1).to(dtype)
-            if self.training and self.attn_dropout_p > 0.0:
-                attn_probs = torch.nn.functional.dropout(attn_probs, p=self.attn_dropout_p)
-            out = torch.matmul(attn_probs, vh_attn)
-        else:
-            is_causal_flag = add is None
-            forced_backend = self.backend_override or _read_backend_from_env_or_file()
-            prefer_library_backend = prefer_hopper_library_attention(
-                device=device,
-                dtype=dtype,
-                q_seq=T,
-                kv_seq=S,
-                forced_backend=forced_backend,
+        appended_to_cache = False
+        add = None
+        out = None
+        if (
+            cache is not None
+            and T == 1
+            and not parity_exact
+            and hasattr(cache, "paged_attention_decode")
+            and getattr(cache, "supports_paged_attention_decode", lambda: False)()
+            and (self.attn_dropout_p if self.training else 0.0) == 0.0
+        ):
+            S = int(cache.length()) + T
+            add = runtime_prepare_attention_mask(
+                mask,
+                batch_size=B,
+                num_heads=self.n_heads,
+                tgt_len=T,
+                src_len=S,
+                position_ids=position_ids,
             )
-            use_runtime_attention = (
-                forced_backend is None
-                and (self.attn_dropout_p if self.training else 0.0) == 0.0
-                and not prefer_library_backend
-            )
-            if use_runtime_attention:
-                kh_backend, vh_backend = kh_all, vh_all
-                if self._supports_int8_attention_core():
-                    out = self._int8_attention(
-                        qh,
-                        kh_backend,
-                        vh_backend,
-                        attn_mask=add,
-                        is_causal=is_causal_flag,
-                        scale=float(self.scaling),
-                    )
-                else:
-                    out = runtime_attention(
-                        qh,
-                        kh_backend,
-                        vh_backend,
-                        attn_mask=add,
-                        is_causal=is_causal_flag,
-                        scale=float(self.scaling),
-                    )
-            else:
-                backend = forced_backend or select_attention_backend(
-                    is_causal=is_causal_flag,
-                    dtype=dtype,
-                    seq=T,
-                    heads=self.n_heads,
-                    device=device,
-                    kv_seq=S,
+            try:
+                out = cache.paged_attention_decode(
+                    qh,
+                    kh_new,
+                    vh_new,
+                    attn_mask=add,
+                    scale=float(self.scaling),
                 )
-                use_native_gqa = backend == "torch" and (self.attn_dropout_p if self.training else 0.0) == 0.0
-                if use_native_gqa:
-                    kh_backend, vh_backend = kh_all, vh_all
+                appended_to_cache = True
+            except Exception:
+                if trace:
+                    print("[attn] exception in paged decode attention path; falling back")
+                    traceback.print_exc()
+                out = None
+
+        if out is None:
+            if cache is not None:
+                if T > 0 and hasattr(cache, "append_and_read"):
+                    kh_all, vh_all = cache.append_and_read(kh_new, vh_new, 0)
+                    appended_to_cache = True
                 else:
-                    kh_backend, vh_backend = _expanded_kv_heads()
-                mask_for_backend = add
-                if mask_for_backend is not None and backend == "torch" and mask_for_backend.dtype != qh.dtype:
-                    mask_for_backend = mask_for_backend.to(dtype=qh.dtype)
-                try:
-                    out = scaled_dot_product_attention(
-                        qh,
-                        kh_backend,
-                        vh_backend,
-                        attn_mask=mask_for_backend,
-                        dropout_p=(self.attn_dropout_p if self.training else 0.0),
-                        backend=backend,
+                    k_old, v_old = cache.read(0, cache.length())
+                    if k_old is not None and k_old.shape[2] > 0:
+                        kh_all = torch.cat([k_old, kh_new], dim=2)
+                        vh_all = torch.cat([v_old, vh_new], dim=2)
+                    else:
+                        kh_all, vh_all = kh_new, vh_new
+            else:
+                kh_all, vh_all = kh_new, vh_new
+
+            def _expanded_kv_heads() -> tuple[torch.Tensor, torch.Tensor]:
+                if self.n_kv_heads == self.n_heads:
+                    return kh_all, vh_all
+                repeat = self.n_heads // self.n_kv_heads
+                return (
+                    kh_all.repeat_interleave(repeat, dim=1),
+                    vh_all.repeat_interleave(repeat, dim=1),
+                )
+
+            S = kh_all.shape[2]
+            add = runtime_prepare_attention_mask(
+                mask,
+                batch_size=B,
+                num_heads=self.n_heads,
+                tgt_len=T,
+                src_len=S,
+                position_ids=position_ids,
+            )
+            if parity_exact:
+                kh_attn, vh_attn = _expanded_kv_heads()
+                scores = torch.matmul(qh, kh_attn.transpose(2, 3)) * float(self.scaling)
+                if add is not None:
+                    scores = scores + add.to(dtype=scores.dtype)
+                attn_probs = torch.nn.functional.softmax(scores.float(), dim=-1).to(dtype)
+                if self.training and self.attn_dropout_p > 0.0:
+                    attn_probs = torch.nn.functional.dropout(attn_probs, p=self.attn_dropout_p)
+                out = torch.matmul(attn_probs, vh_attn)
+            else:
+                is_causal_flag = add is None
+                forced_backend = self.backend_override or _read_backend_from_env_or_file()
+                prefer_library_backend = prefer_hopper_library_attention(
+                    device=device,
+                    dtype=dtype,
+                    q_seq=T,
+                    kv_seq=S,
+                    forced_backend=forced_backend,
+                )
+                use_runtime_attention = (
+                    forced_backend is None
+                    and (self.attn_dropout_p if self.training else 0.0) == 0.0
+                    and not prefer_library_backend
+                )
+                if use_runtime_attention:
+                    kh_backend, vh_backend = kh_all, vh_all
+                    if self._supports_int8_attention_core():
+                        out = self._int8_attention(
+                            qh,
+                            kh_backend,
+                            vh_backend,
+                            attn_mask=add,
+                            is_causal=is_causal_flag,
+                            scale=float(self.scaling),
+                        )
+                    else:
+                        out = runtime_attention(
+                            qh,
+                            kh_backend,
+                            vh_backend,
+                            attn_mask=add,
+                            is_causal=is_causal_flag,
+                            scale=float(self.scaling),
+                        )
+                else:
+                    backend = forced_backend or select_attention_backend(
                         is_causal=is_causal_flag,
-                        scale=float(self.scaling),
+                        dtype=dtype,
+                        seq=T,
+                        heads=self.n_heads,
+                        device=device,
+                        kv_seq=S,
                     )
-                except Exception:
-                    if trace:
-                        print("[attn] exception in SDPA/backend call")
-                        traceback.print_exc()
-                    raise
+                    use_native_gqa = backend == "torch" and (self.attn_dropout_p if self.training else 0.0) == 0.0
+                    if use_native_gqa:
+                        kh_backend, vh_backend = kh_all, vh_all
+                    else:
+                        kh_backend, vh_backend = _expanded_kv_heads()
+                    mask_for_backend = add
+                    if mask_for_backend is not None and backend == "torch" and mask_for_backend.dtype != qh.dtype:
+                        mask_for_backend = mask_for_backend.to(dtype=qh.dtype)
+                    try:
+                        out = scaled_dot_product_attention(
+                            qh,
+                            kh_backend,
+                            vh_backend,
+                            attn_mask=mask_for_backend,
+                            dropout_p=(self.attn_dropout_p if self.training else 0.0),
+                            backend=backend,
+                            is_causal=is_causal_flag,
+                            scale=float(self.scaling),
+                        )
+                    except Exception:
+                        if trace:
+                            print("[attn] exception in SDPA/backend call")
+                            traceback.print_exc()
+                        raise
 
         if cache is not None and T > 0 and not appended_to_cache:
             cache.append(kh_new, vh_new)
