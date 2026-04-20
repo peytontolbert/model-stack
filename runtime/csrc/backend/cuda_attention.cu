@@ -3,6 +3,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include "attention/cuda_attention_common.cuh"
 #include "attention/cuda_attention_dispatch.cuh"
 #include "../descriptors/attention_desc.h"
 #include "../policy/attention_policy.h"
@@ -355,6 +356,118 @@ __global__ __launch_bounds__(Threads, 2) void paged_decode_attention_q1_forward_
 }
 
 template <typename scalar_t, bool HasMask>
+__global__ __launch_bounds__(t10::cuda::attention::kSmallRowThreads, 4) void paged_decode_attention_q1_smallseq_forward_kernel(
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k_pages,
+    const scalar_t* __restrict__ v_pages,
+    const int64_t* __restrict__ block_table,
+    const int64_t* __restrict__ lengths,
+    const void* __restrict__ mask,
+    int mask_kind,
+    scalar_t* __restrict__ out,
+    int64_t batch,
+    int64_t q_heads,
+    int64_t kv_heads,
+    int64_t max_blocks,
+    int64_t page_size,
+    int64_t mask_seq,
+    int64_t dh,
+    float scale) {
+  constexpr int Threads = t10::cuda::attention::kSmallRowThreads;
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  const int64_t total_rows = batch * q_heads;
+  if (row >= total_rows) {
+    return;
+  }
+
+  __shared__ float reduce_shared[Threads];
+  __shared__ float score_shared[Threads];
+  __shared__ float q_shared[Threads];
+  __shared__ int64_t page_base_shared[Threads];
+
+  const int lane = static_cast<int>(threadIdx.x);
+  const int64_t head_idx = row % q_heads;
+  const int64_t batch_idx = row / q_heads;
+  const int64_t row_len = lengths[batch_idx];
+  const int64_t q_base = ((batch_idx * q_heads) + head_idx) * dh;
+  if (row_len <= 0) {
+    for (int64_t d = lane; d < dh; d += Threads) {
+      out[q_base + d] = static_cast<scalar_t>(0);
+    }
+    return;
+  }
+
+  if (lane < dh) {
+    q_shared[lane] = static_cast<float>(q[q_base + lane]);
+  }
+  __syncthreads();
+
+  const int64_t head_group = q_heads / kv_heads;
+  const int64_t kv_head_idx = head_idx / head_group;
+  const int64_t mask_base = ((batch_idx * q_heads) + head_idx) * mask_seq;
+
+  float local_score = -INFINITY;
+  if (lane < row_len) {
+    const int64_t s = lane;
+    const int64_t block_idx = s / page_size;
+    const int64_t offset = s % page_size;
+    const int64_t page_id = block_table[batch_idx * max_blocks + block_idx];
+    const int64_t page_base = ((((page_id * kv_heads) + kv_head_idx) * page_size) + offset) * dh;
+    page_base_shared[lane] = page_base;
+    float score = 0.0f;
+    for (int64_t d = 0; d < dh; ++d) {
+      score += q_shared[d] * static_cast<float>(k_pages[page_base + d]);
+    }
+    score *= scale;
+    if constexpr (HasMask) {
+      if (mask_kind == 1) {
+        if (static_cast<const bool*>(mask)[mask_base + s]) {
+          score = -INFINITY;
+        }
+      } else if (mask_kind == 2) {
+        score += static_cast<float>(static_cast<const scalar_t*>(mask)[mask_base + s]);
+      } else if (mask_kind == 3) {
+        score += static_cast<const float*>(mask)[mask_base + s];
+      }
+    }
+    local_score = score;
+    score_shared[lane] = score;
+  } else {
+    score_shared[lane] = -INFINITY;
+  }
+
+  const float row_max = t10::cuda::attention::BlockReduceMax<Threads>(local_score, reduce_shared);
+  if (row_max == -INFINITY) {
+    for (int64_t d = lane; d < dh; d += Threads) {
+      out[q_base + d] = static_cast<scalar_t>(0);
+    }
+    return;
+  }
+
+  float local_sum = 0.0f;
+  if (lane < row_len) {
+    const float weight = expf(score_shared[lane] - row_max);
+    score_shared[lane] = weight;
+    local_sum = weight;
+  } else {
+    score_shared[lane] = 0.0f;
+  }
+  const float denom = fmaxf(t10::cuda::attention::BlockReduceSum<Threads>(local_sum, reduce_shared), 1.0e-20f);
+  if (lane < row_len) {
+    score_shared[lane] /= denom;
+  }
+  __syncthreads();
+
+  for (int64_t d = lane; d < dh; d += Threads) {
+    float acc = 0.0f;
+    for (int64_t s = 0; s < row_len; ++s) {
+      acc += score_shared[s] * static_cast<float>(v_pages[page_base_shared[s] + d]);
+    }
+    out[q_base + d] = static_cast<scalar_t>(acc);
+  }
+}
+
+template <typename scalar_t, bool HasMask>
 void LaunchPagedDecodeAttentionQ1(
     const torch::Tensor& q_contig,
     const torch::Tensor& k_pages_contig,
@@ -371,24 +484,45 @@ void LaunchPagedDecodeAttentionQ1(
   const dim3 blocks(static_cast<unsigned int>(q_contig.size(0) * q_contig.size(1)));
   switch (threads) {
     case t10::cuda::attention::kSmallRowThreads:
-      paged_decode_attention_q1_forward_kernel<scalar_t, t10::cuda::attention::kSmallRowThreads, HasMask>
-          <<<blocks, t10::cuda::attention::kSmallRowThreads, 0, stream>>>(
-              q_contig.data_ptr<scalar_t>(),
-              k_pages_contig.data_ptr<scalar_t>(),
-              v_pages_contig.data_ptr<scalar_t>(),
-              block_table_contig.data_ptr<int64_t>(),
-              lengths_contig.data_ptr<int64_t>(),
-              mask_ptr,
-              mask_kind,
-              out.data_ptr<scalar_t>(),
-              q_contig.size(0),
-              q_contig.size(1),
-              k_pages_contig.size(1),
-              block_table_contig.size(1),
-              k_pages_contig.size(2),
-              mask_seq,
-              q_contig.size(3),
-              scale_value);
+      if (mask_seq <= t10::cuda::attention::kSmallRowThreads && q_contig.size(3) <= t10::cuda::attention::kSmallRowThreads) {
+        paged_decode_attention_q1_smallseq_forward_kernel<scalar_t, HasMask>
+            <<<blocks, t10::cuda::attention::kSmallRowThreads, 0, stream>>>(
+                q_contig.data_ptr<scalar_t>(),
+                k_pages_contig.data_ptr<scalar_t>(),
+                v_pages_contig.data_ptr<scalar_t>(),
+                block_table_contig.data_ptr<int64_t>(),
+                lengths_contig.data_ptr<int64_t>(),
+                mask_ptr,
+                mask_kind,
+                out.data_ptr<scalar_t>(),
+                q_contig.size(0),
+                q_contig.size(1),
+                k_pages_contig.size(1),
+                block_table_contig.size(1),
+                k_pages_contig.size(2),
+                mask_seq,
+                q_contig.size(3),
+                scale_value);
+      } else {
+        paged_decode_attention_q1_forward_kernel<scalar_t, t10::cuda::attention::kSmallRowThreads, HasMask>
+            <<<blocks, t10::cuda::attention::kSmallRowThreads, 0, stream>>>(
+                q_contig.data_ptr<scalar_t>(),
+                k_pages_contig.data_ptr<scalar_t>(),
+                v_pages_contig.data_ptr<scalar_t>(),
+                block_table_contig.data_ptr<int64_t>(),
+                lengths_contig.data_ptr<int64_t>(),
+                mask_ptr,
+                mask_kind,
+                out.data_ptr<scalar_t>(),
+                q_contig.size(0),
+                q_contig.size(1),
+                k_pages_contig.size(1),
+                block_table_contig.size(1),
+                k_pages_contig.size(2),
+                mask_seq,
+                q_contig.size(3),
+                scale_value);
+      }
       return;
     case t10::cuda::attention::kMediumRowThreads:
       paged_decode_attention_q1_forward_kernel<scalar_t, t10::cuda::attention::kMediumRowThreads, HasMask>
@@ -446,7 +580,8 @@ torch::Tensor CudaPagedAttentionDecodeForward(
     const torch::Tensor& block_table,
     const torch::Tensor& lengths,
     const c10::optional<torch::Tensor>& attn_mask,
-    const c10::optional<double>& scale) {
+    const c10::optional<double>& scale,
+    int64_t known_mask_seq) {
   TORCH_CHECK(UseCudaPagedAttentionDecodeKernel(q, k_pages, v_pages, block_table, lengths, attn_mask),
               "CudaPagedAttentionDecodeForward: unsupported tensor configuration");
 
@@ -460,7 +595,7 @@ torch::Tensor CudaPagedAttentionDecodeForward(
   torch::Tensor mask_contig;
   int mask_kind = 0;
   const void* mask_ptr = nullptr;
-  int64_t mask_seq = lengths_contig.numel() > 0 ? lengths_contig.max().item<int64_t>() : 0;
+  int64_t mask_seq = known_mask_seq >= 0 ? known_mask_seq : (lengths_contig.numel() > 0 ? lengths_contig.max().item<int64_t>() : 0);
   if (attn_mask.has_value() && attn_mask.value().defined()) {
     mask_contig = attn_mask.value().contiguous();
     mask_seq = mask_contig.size(3);

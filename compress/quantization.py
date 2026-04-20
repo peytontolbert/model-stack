@@ -3,6 +3,7 @@
 Features:
 - INT8 per-channel symmetric quantization for weights
 - INT4 packed per-channel symmetric quantization for weights
+- NF4 packed codebook quantization for weights
 - Fake-quant FP8/FP4 helpers for experimentation
 - QuantizedLinear* wrappers for weight-only inference
 """
@@ -13,9 +14,16 @@ from typing import Dict, Iterable, Optional, Tuple
 import torch
 import torch.nn as nn
 from runtime.ops import linear as runtime_linear
+from runtime.ops import bitnet_transform_input as runtime_bitnet_transform_input
 from runtime.ops import pack_bitnet_weight as runtime_pack_bitnet_weight
 from runtime.quant import bitnet_linear as runtime_bitnet_linear
+from runtime.quant import bitnet_int8_linear_from_float as runtime_bitnet_int8_linear_from_float
+from runtime.quant import bitnet_linear_from_float as runtime_bitnet_linear_from_float
+from runtime.quant import nf4_dequantize as runtime_nf4_dequantize
+from runtime.quant import nf4_linear as runtime_nf4_linear
+from runtime.quant import nf4_quantize as runtime_nf4_quantize
 from runtime.quant import int4_linear as runtime_int4_linear
+from runtime.quant import int8_linear as runtime_int8_linear
 from runtime.quant import int8_linear_from_quantized_activation as runtime_int8_linear_from_quantized_activation
 from runtime.quant import quantize_activation_int8_rowwise as runtime_quantize_activation_int8_rowwise
 from runtime.quant import fp8_linear as runtime_fp8_linear
@@ -204,6 +212,14 @@ def _unpack_int4_signed(packed: torch.Tensor, original_last_dim: int) -> torch.T
     return (unpacked - 8).to(dtype=torch.int8)
 
 
+def _pack_nf4_codes(qcodes: torch.Tensor) -> torch.Tensor:
+    return _pack_int4_signed(qcodes.to(dtype=torch.int16) - 8)
+
+
+def _unpack_nf4_codes(packed: torch.Tensor, original_last_dim: int) -> torch.Tensor:
+    return (_unpack_int4_signed(packed, original_last_dim).to(dtype=torch.int16) + 8).to(dtype=torch.uint8)
+
+
 def _unpack_bitnet_signed(packed: torch.Tensor, original_last_dim: int) -> torch.Tensor:
     if packed.dtype != torch.uint8:
         raise TypeError("packed BitNet tensor must use uint8 storage")
@@ -260,6 +276,91 @@ def _dequantize_bitnet_weight(
     unpacked = _unpack_bitnet_signed(packed_weight, original_last_dim=logical_in)[:logical_out]
     row_scales = _bitnet_row_scales(scale_values, layout_header, segment_offsets)
     return unpacked.to(dtype=torch.float32).mul(row_scales.unsqueeze(-1)).to(dtype=dtype)
+
+
+def _bitnet_row_scale_symmetric(
+    row: torch.Tensor,
+    *,
+    calibration: str,
+    percentile: float,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    method = str(calibration).strip().lower()
+    if method == "absmax":
+        clip = row.abs().amax()
+    elif method == "percentile":
+        clip = percentile_scale(row, p=float(percentile))
+    elif method == "mse":
+        clip = mse_scale(row)
+    else:
+        raise ValueError(f"Unknown BitNet calibration method: {calibration}")
+    return clip.clamp_min(eps).to(dtype=torch.float32)
+
+
+def _bitnet_quantize_rows(
+    weight: torch.Tensor,
+    *,
+    calibration: str,
+    percentile: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    weight_f = weight.float()
+    method = str(calibration).strip().lower()
+    if method == "absmax":
+        row_scales = weight_f.abs().amax(dim=1).clamp_min(1e-8).to(dtype=torch.float32)
+    else:
+        row_scales = torch.stack(
+            [
+                _bitnet_row_scale_symmetric(row, calibration=method, percentile=percentile)
+                for row in weight_f
+            ],
+            dim=0,
+        )
+    q = torch.round(weight_f / _reshape_channel_values(row_scales, weight_f, 0)).clamp_(-1, 1).to(dtype=torch.int8)
+    return q, row_scales
+
+
+def _pack_bitnet_quantized(
+    qweight: torch.Tensor,
+    *,
+    scale_values: torch.Tensor,
+    scale_granularity: int,
+    scale_group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if qweight.ndim != 2:
+        raise ValueError("BitNet qweight must be rank-2")
+    logical_out, logical_in = int(qweight.shape[0]), int(qweight.shape[1])
+    padded_out = ((logical_out + 15) // 16) * 16
+    padded_in = ((logical_in + 31) // 32) * 32
+    codes = torch.ones((padded_out, padded_in), device=qweight.device, dtype=torch.uint8)
+    codes[:logical_out, :logical_in] = qweight.to(dtype=torch.int16).clamp_(-1, 1).add(1).to(dtype=torch.uint8)
+    packed_weight = (
+        codes[:, 0::4]
+        | (codes[:, 1::4] << 2)
+        | (codes[:, 2::4] << 4)
+        | (codes[:, 3::4] << 6)
+    ).contiguous()
+    packed_scale_values = scale_values.to(device=qweight.device, dtype=torch.float32).contiguous()
+    layout_header = torch.tensor(
+        [
+            1,
+            16,
+            32,
+            logical_out,
+            logical_in,
+            padded_out,
+            padded_in,
+            int(scale_granularity),
+            int(scale_group_size),
+            1,
+            80,
+            1,
+            0,
+        ],
+        device=qweight.device,
+        dtype=torch.int32,
+    )
+    segment_offsets = torch.tensor([0, logical_out], device=qweight.device, dtype=torch.int32)
+    return packed_weight, packed_scale_values, layout_header, segment_offsets
 
 
 def _symmetric_per_channel_weight_quantize_int4(
@@ -350,6 +451,38 @@ def calibrate_int4_scales(
     raise ValueError("Unknown calibration method")
 
 
+def calibrate_nf4_scales(
+    weight: torch.Tensor,
+    method: str = "absmax",
+    ch_axis: int = 0,
+    p: float = 0.999,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Return per-channel dequant multipliers for NF4 codebook quantization."""
+    axis = _normalize_axis(ch_axis, weight.ndim)
+    reduce_dims = _channel_reduce_dims(weight.ndim, axis)
+    if method == "absmax":
+        clip = weight.abs().amax(dim=reduce_dims, keepdim=False)
+        return clip.clamp_min(eps).to(dtype=torch.float32)
+    if method == "percentile":
+        out = []
+        for idx in range(weight.size(axis)):
+            slicer = [slice(None)] * weight.ndim
+            slicer[axis] = idx
+            wch = weight[tuple(slicer)]
+            out.append(percentile_scale(wch, p=float(p)).clamp_min(eps).to(dtype=torch.float32))
+        return torch.stack(out, dim=0)
+    if method == "mse":
+        out = []
+        for idx in range(weight.size(axis)):
+            slicer = [slice(None)] * weight.ndim
+            slicer[axis] = idx
+            wch = weight[tuple(slicer)]
+            out.append(mse_scale(wch).clamp_min(eps).to(dtype=torch.float32))
+        return torch.stack(out, dim=0)
+    raise ValueError("Unknown calibration method")
+
+
 def _dequantize_int8_per_channel(
     qweight: torch.Tensor, inv_scale: torch.Tensor, ch_axis: int = 0
 ) -> torch.Tensor:
@@ -366,6 +499,17 @@ def _dequantize_int4_per_channel(
     qweight = _unpack_int4_signed(qweight_packed, original_last_dim)
     scale = _reshape_channel_values(inv_scale, qweight, ch_axis).to(device=qweight.device, dtype=torch.float32)
     return qweight.to(dtype=torch.float32) * scale
+
+
+def _dequantize_nf4_per_channel(
+    qweight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    original_last_dim: int,
+    ch_axis: int = 0,
+) -> torch.Tensor:
+    qcodes = _unpack_nf4_codes(qweight_packed, original_last_dim)
+    scale = _reshape_channel_values(weight_scale, qcodes, ch_axis).to(device=qcodes.device, dtype=torch.float32)
+    return runtime_nf4_dequantize(qcodes, scale).to(dtype=torch.float32)
 
 
 def fake_quantize_fp8(
@@ -559,15 +703,45 @@ def _int4_quantize_dequantize(
     return _dequantize_int4_per_channel(qweight, inv_scale, original_last_dim=int(weight.shape[-1]), ch_axis=0)
 
 
-def _bitnet_quantize_dequantize(weight: torch.Tensor) -> torch.Tensor:
-    packed_weight, scale_values, layout_header, segment_offsets = runtime_pack_bitnet_weight(weight)
-    return _dequantize_bitnet_weight(
-        packed_weight,
-        scale_values,
-        layout_header,
-        segment_offsets,
-        dtype=weight.dtype,
+def _nf4_quantize_dequantize(
+    weight: torch.Tensor,
+    *,
+    calibration: str,
+    percentile: float,
+) -> torch.Tensor:
+    weight_scale = calibrate_nf4_scales(weight, method=calibration, ch_axis=0, p=percentile)
+    qweight, _ = runtime_nf4_quantize(weight, _reshape_channel_values(weight_scale, weight, 0))
+    packed = _pack_nf4_codes(qweight)
+    return _dequantize_nf4_per_channel(
+        packed,
+        weight_scale,
+        original_last_dim=int(weight.shape[-1]),
+        ch_axis=0,
+    ).to(dtype=weight.dtype)
+
+
+def _bitnet_quantize_dequantize(
+    weight: torch.Tensor,
+    *,
+    calibration: str = "absmax",
+    percentile: float = 0.999,
+) -> torch.Tensor:
+    method = str(calibration).strip().lower()
+    if method == "absmax":
+        packed_weight, scale_values, layout_header, segment_offsets = runtime_pack_bitnet_weight(weight)
+        return _dequantize_bitnet_weight(
+            packed_weight,
+            scale_values,
+            layout_header,
+            segment_offsets,
+            dtype=weight.dtype,
+        )
+    qweight, row_scales = _bitnet_quantize_rows(
+        weight,
+        calibration=method,
+        percentile=float(percentile),
     )
+    return qweight.to(dtype=torch.float32).mul(row_scales.unsqueeze(-1)).to(dtype=weight.dtype)
 
 
 def _fp8_quantize_dequantize(
@@ -628,6 +802,24 @@ def _row_inv_scale_symmetric(
     return (clip.clamp_min(eps) / qmax).to(dtype=torch.float32)
 
 
+def _row_scale_nf4(
+    row: torch.Tensor,
+    *,
+    calibration: str,
+    percentile: float,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    if calibration == "absmax":
+        clip = row.abs().amax()
+    elif calibration == "percentile":
+        clip = percentile_scale(row, p=float(percentile))
+    elif calibration == "mse":
+        clip = mse_scale(row)
+    else:
+        raise ValueError("Unknown calibration method")
+    return clip.clamp_min(eps).to(dtype=torch.float32)
+
+
 def _gptq_dequantize_rows(
     weight: torch.Tensor,
     calibration_inputs: torch.Tensor,
@@ -668,6 +860,52 @@ def _gptq_dequantize_rows(
         dequant_rows.append(out)
         inv_scales.append(inv_scale)
     return torch.stack(dequant_rows, dim=0), torch.stack(inv_scales, dim=0)
+
+
+def _gptq_dequantize_rows_nf4(
+    weight: torch.Tensor,
+    calibration_inputs: torch.Tensor,
+    *,
+    calibration: str,
+    percentile: float,
+    damp: float = 0.01,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = _flatten_calibration_inputs(calibration_inputs, in_features=int(weight.shape[-1]))
+    if x is None or x.numel() == 0:
+        raise ValueError("GPTQ optimization requires non-empty calibration_inputs")
+    x = x.to(device=weight.device, dtype=torch.float32)
+    h = x.t().matmul(x) / max(int(x.shape[0]), 1)
+    diag_mean = h.diag().mean().clamp_min(1e-6)
+    h = h + torch.eye(h.shape[0], device=h.device, dtype=h.dtype) * (float(damp) * diag_mean)
+    h_inv = torch.linalg.inv(h)
+    h_diag = h_inv.diag().clamp_min(1e-6)
+    codebook = runtime_nf4_dequantize(
+        torch.arange(16, device=weight.device, dtype=torch.uint8),
+        torch.tensor(1.0, device=weight.device, dtype=torch.float32),
+    ).to(dtype=torch.float32)
+    code_min = float(codebook[0].item())
+    code_max = float(codebook[-1].item())
+    dequant_rows = []
+    weight_scales = []
+    for row in weight.float():
+        row_scale = _row_scale_nf4(
+            row,
+            calibration=calibration,
+            percentile=percentile,
+        )
+        work = row.clone()
+        out = torch.empty_like(work)
+        for idx in range(work.numel()):
+            norm = (work[idx] / row_scale).clamp_(code_min, code_max)
+            code_idx = torch.argmin((codebook - norm).abs())
+            dq = codebook[code_idx] * row_scale
+            out[idx] = dq
+            if idx + 1 < work.numel():
+                err = (work[idx] - dq) / h_diag[idx]
+                work[idx + 1 :] -= err * h_inv[idx, idx + 1 :]
+        dequant_rows.append(out)
+        weight_scales.append(row_scale)
+    return torch.stack(dequant_rows, dim=0), torch.stack(weight_scales, dim=0)
 
 
 @torch.no_grad()
@@ -760,10 +998,14 @@ class QuantizedLinearInt8(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
         self._cached_weight_key: tuple[object, ...] | None = None
         self._cached_weight: torch.Tensor | None = None
+        self._cached_shared_int8_input_signature_key: tuple[object, ...] | None = None
+        self._cached_shared_int8_input_signature: tuple[object, ...] | None = None
 
     def _invalidate_weight_cache(self) -> None:
         self._cached_weight_key = None
         self._cached_weight = None
+        self._cached_shared_int8_input_signature_key = None
+        self._cached_shared_int8_input_signature = None
 
     def _assign_quantized_state(self, qweight: torch.Tensor, inv_scale: torch.Tensor, bias: torch.Tensor | None = None) -> None:
         self.qweight.copy_(qweight.to(device=self.qweight.device, dtype=self.qweight.dtype))
@@ -968,16 +1210,39 @@ class QuantizedLinearInt8(nn.Module):
         mode_name = str(self.act_quant_mode).strip().lower()
         if int(self.act_quant_bits) != 8 or mode_name not in {"dynamic_int8", "static_int8"}:
             return None
-        return (
-            int(self.spin_enabled_flag.item()),
-            tuple(self.spin_signs.detach().cpu().tolist()),
-            tuple(self.pre_scale.detach().cpu().tolist()),
+        cache_key = (
             mode_name,
-            str(self.act_quant_method),
             int(self.act_quant_bits),
+            int(self.spin_enabled_flag.item()),
+            _parameter_signature(self.spin_signs),
+            _parameter_signature(self.pre_scale),
+            str(self.act_quant_method),
             float(self.act_quant_percentile),
-            tuple(self.act_scale.detach().cpu().reshape(-1).tolist()),
+            _parameter_signature(self.act_scale),
         )
+        if (
+            self._cached_shared_int8_input_signature_key != cache_key
+            or self._cached_shared_int8_input_signature is None
+        ):
+            signature = (
+                int(self.spin_enabled_flag.item()),
+                tuple(self.spin_signs.detach().cpu().tolist()),
+                tuple(self.pre_scale.detach().cpu().tolist()),
+                mode_name,
+                int(self.act_quant_bits),
+            )
+            if mode_name == "dynamic_int8":
+                signature = signature + (
+                    str(self.act_quant_method),
+                    float(self.act_quant_percentile),
+                )
+            else:
+                signature = signature + (
+                    tuple(self.act_scale.detach().cpu().reshape(-1).tolist()),
+                )
+            self._cached_shared_int8_input_signature_key = cache_key
+            self._cached_shared_int8_input_signature = signature
+        return self._cached_shared_int8_input_signature
 
     def runtime_quantize_int8_input(
         self,
@@ -1058,14 +1323,19 @@ class QuantizedLinearInt8(nn.Module):
         target_device = x.device
         mode_name = str(self.act_quant_mode).strip().lower()
         if int(self.act_quant_bits) == 8 and mode_name in {"dynamic_int8", "static_int8"}:
-            qx, row_scale, _ = self.runtime_quantize_int8_input(x)
-            return runtime_int8_linear_from_quantized_activation(
-                qx,
-                row_scale,
+            x_local = x.to(device=target_device, dtype=target_dtype)
+            if _spin_enabled(self.spin_enabled_flag):
+                x_local = apply_spin_transform(x_local, self.spin_signs.to(device=target_device))
+            if _pre_scale_active(self.pre_scale):
+                x_local = _apply_pre_scale_to_input(x_local, self.pre_scale.to(device=target_device))
+            return runtime_int8_linear(
+                x_local,
                 self.qweight,
                 self.inv_scale,
                 bias=self.runtime_bias(dtype=target_dtype, device=target_device),
-                out_dtype=target_dtype,
+                act_scale=self.act_scale.to(device=target_device) if mode_name == "static_int8" else None,
+                act_method=self.act_quant_method,
+                act_percentile=float(self.act_quant_percentile),
             )
         x_local = x.to(device=target_device, dtype=target_dtype)
         if _spin_enabled(self.spin_enabled_flag):
@@ -1391,6 +1661,301 @@ class QuantizedLinearInt4(nn.Module):
         return self.runtime_linear(x)
 
 
+class QuantizedLinearNF4(nn.Module):
+    """Weight-only packed NF4 linear with per-out-feature scaling."""
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.quant_calibration = "absmax"
+        self.quant_percentile = 0.999
+        self.weight_opt = "none"
+        self.act_quant_mode = "none"
+        self.act_quant_method = "absmax"
+        self.act_quant_percentile = 0.999
+        self.act_quant_bits = 8
+        self.register_buffer("qweight_packed", torch.empty(out_features, (in_features + 1) // 2, dtype=torch.uint8))
+        self.register_buffer("weight_scale", torch.ones(out_features, dtype=torch.float32))
+        self.register_buffer("spin_signs", torch.ones(in_features, dtype=torch.float32))
+        self.register_buffer("spin_enabled_flag", torch.zeros((), dtype=torch.uint8))
+        self.register_buffer("pre_scale", torch.ones(in_features, dtype=torch.float32))
+        self.register_buffer("act_scale", torch.ones((), dtype=torch.float32))
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self._cached_weight_key: tuple[object, ...] | None = None
+        self._cached_weight: torch.Tensor | None = None
+
+    def _invalidate_weight_cache(self) -> None:
+        self._cached_weight_key = None
+        self._cached_weight = None
+
+    def _assign_quantized_state(
+        self,
+        qweight_packed: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> None:
+        self.qweight_packed.copy_(qweight_packed.to(device=self.qweight_packed.device, dtype=self.qweight_packed.dtype))
+        self.weight_scale.copy_(weight_scale.to(device=self.weight_scale.device, dtype=self.weight_scale.dtype))
+        if self.bias is not None and bias is not None:
+            self.bias.copy_(bias.to(device=self.bias.device, dtype=self.bias.dtype))
+        self._invalidate_weight_cache()
+
+    def _assign_float_state(
+        self,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        calibration_inputs: torch.Tensor | None = None,
+    ) -> None:
+        weight_local = weight.float()
+        if _spin_enabled(self.spin_enabled_flag):
+            weight_local = apply_spin_transform(weight_local, self.spin_signs.to(device=weight.device))
+        flat_inputs = _flatten_calibration_inputs(calibration_inputs, in_features=self.in_features)
+        requested_weight_opt = str(self.weight_opt).strip().lower()
+        pre_scale = torch.ones(self.in_features, device=weight_local.device, dtype=torch.float32)
+        if requested_weight_opt == "awq" and flat_inputs is not None:
+            pre_scale = awq_optimize_pre_scale(
+                weight_local,
+                flat_inputs.to(device=weight_local.device, dtype=torch.float32),
+                quantize_dequantize=lambda w: _nf4_quantize_dequantize(
+                    w,
+                    calibration=self.quant_calibration,
+                    percentile=float(self.quant_percentile),
+                ),
+            )
+        self.pre_scale.copy_(pre_scale.to(device=self.pre_scale.device, dtype=self.pre_scale.dtype))
+        weight_local = _apply_pre_scale_to_weight(weight_local, pre_scale)
+        if requested_weight_opt == "gptq" and flat_inputs is not None:
+            dequant_weight, weight_scale = _gptq_dequantize_rows_nf4(
+                weight_local,
+                flat_inputs.to(device=weight_local.device, dtype=torch.float32),
+                calibration=self.quant_calibration,
+                percentile=float(self.quant_percentile),
+            )
+            qcodes, _ = runtime_nf4_quantize(dequant_weight, _reshape_channel_values(weight_scale, dequant_weight, 0))
+        else:
+            weight_scale = calibrate_nf4_scales(
+                weight_local,
+                method=self.quant_calibration,
+                ch_axis=0,
+                p=float(self.quant_percentile),
+            )
+            qcodes, _ = runtime_nf4_quantize(weight_local, _reshape_channel_values(weight_scale, weight_local, 0))
+        self._assign_quantized_state(_pack_nf4_codes(qcodes), weight_scale, bias)
+        if self.act_quant_mode == "static_int8" and flat_inputs is not None:
+            act_inputs = flat_inputs.to(device=weight_local.device, dtype=torch.float32)
+            if _spin_enabled(self.spin_enabled_flag):
+                act_inputs = apply_spin_transform(act_inputs, self.spin_signs.to(device=weight_local.device))
+            if _pre_scale_active(pre_scale):
+                act_inputs = _apply_pre_scale_to_input(act_inputs, pre_scale)
+            self.act_scale.copy_(
+                calibrate_activation_scale(
+                    act_inputs,
+                    method=self.act_quant_method,
+                    bits=int(self.act_quant_bits),
+                    p=float(self.act_quant_percentile),
+                ).to(device=self.act_scale.device, dtype=self.act_scale.dtype)
+            )
+        else:
+            self.act_scale.fill_(1.0)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        qweight_packed_key = prefix + "qweight_packed"
+        weight_scale_key = prefix + "weight_scale"
+        weight_key = prefix + "weight"
+        bias_key = prefix + "bias"
+        if qweight_packed_key in state_dict and weight_scale_key in state_dict:
+            inserted = _inject_missing_state_defaults(
+                state_dict,
+                {
+                    prefix + "spin_signs": self.spin_signs,
+                    prefix + "spin_enabled_flag": self.spin_enabled_flag,
+                    prefix + "pre_scale": self.pre_scale,
+                    prefix + "act_scale": self.act_scale,
+                },
+            )
+            try:
+                super()._load_from_state_dict(
+                    state_dict,
+                    prefix,
+                    local_metadata,
+                    strict,
+                    missing_keys,
+                    unexpected_keys,
+                    error_msgs,
+                )
+            finally:
+                _remove_injected_state_defaults(state_dict, inserted)
+            self._invalidate_weight_cache()
+            return
+        if weight_key in state_dict:
+            try:
+                weight = state_dict.pop(weight_key)
+                bias = state_dict.pop(bias_key, None)
+                self._assign_float_state(weight, bias)
+            except Exception as exc:
+                error_msgs.append(f"While quantizing checkpoint tensor for {prefix[:-1] or prefix}: {exc}")
+            return
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self._invalidate_weight_cache()
+
+    def _dequantized_weight(self, dtype: torch.dtype, device: torch.device | None = None) -> torch.Tensor:
+        target_device = self.qweight_packed.device if device is None else torch.device(device)
+        key = (
+            str(target_device),
+            str(dtype),
+            tuple(self.qweight_packed.shape),
+            int(getattr(self.qweight_packed, "_version", 0)),
+            int(getattr(self.weight_scale, "_version", 0)),
+            int(self.qweight_packed.data_ptr()),
+            int(self.weight_scale.data_ptr()),
+        )
+        if self._cached_weight_key != key or self._cached_weight is None:
+            qweight_packed = (
+                self.qweight_packed if self.qweight_packed.device == target_device else self.qweight_packed.to(device=target_device)
+            )
+            weight_scale = self.weight_scale if self.weight_scale.device == target_device else self.weight_scale.to(device=target_device)
+            self._cached_weight = _dequantize_nf4_per_channel(
+                qweight_packed,
+                weight_scale,
+                original_last_dim=self.in_features,
+                ch_axis=0,
+            ).to(device=target_device, dtype=dtype).contiguous()
+            self._cached_weight_key = key
+        return self._cached_weight
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.runtime_weight()
+
+    def runtime_weight(
+        self,
+        *,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        target_dtype = torch.float32 if dtype is None else dtype
+        target_device = self.qweight_packed.device if device is None else torch.device(device)
+        weight = self._dequantized_weight(target_dtype, device=target_device)
+        if _pre_scale_active(self.pre_scale):
+            weight = _undo_pre_scale_from_weight(weight, self.pre_scale.to(device=target_device))
+        if _spin_enabled(self.spin_enabled_flag):
+            return undo_spin_transform(weight, self.spin_signs.to(device=target_device))
+        return weight
+
+    def runtime_bias(
+        self,
+        *,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor | None:
+        if self.bias is None:
+            return None
+        return self.bias.to(
+            device=self.bias.device if device is None else torch.device(device),
+            dtype=self.bias.dtype if dtype is None else dtype,
+        )
+
+    def runtime_signature(self):
+        return (
+            "nf4_codebook_packed",
+            _parameter_signature(self.qweight_packed),
+            _parameter_signature(self.weight_scale),
+            str(self.weight_opt),
+            int(self.spin_enabled_flag.item()),
+            _parameter_signature(self.spin_signs),
+            _parameter_signature(self.pre_scale),
+            str(self.act_quant_mode),
+            str(self.act_quant_method),
+            int(self.act_quant_bits),
+            _parameter_signature(self.act_scale),
+            _parameter_signature(self.bias),
+        )
+
+    def runtime_supports_packed_backend(self, backend: str) -> bool:
+        del backend
+        return False
+
+    @torch.no_grad()
+    def from_float(
+        self,
+        module: nn.Linear,
+        calibration: str = "absmax",
+        percentile: float = 0.999,
+        calibration_inputs: torch.Tensor | None = None,
+        weight_opt: str = "none",
+        activation_quant: str = "none",
+        activation_quant_bits: int = 8,
+        activation_quant_method: str = "absmax",
+        activation_quant_percentile: float = 0.999,
+        spin: bool = False,
+        spin_random: bool = True,
+        spin_seed: int = 0,
+    ) -> "QuantizedLinearNF4":
+        assert module.in_features == self.in_features and module.out_features == self.out_features
+        self.quant_calibration = str(calibration)
+        self.quant_percentile = float(percentile)
+        self.weight_opt = str(weight_opt)
+        self.act_quant_mode = str(activation_quant)
+        self.act_quant_bits = int(activation_quant_bits)
+        self.act_quant_method = str(activation_quant_method)
+        self.act_quant_percentile = float(activation_quant_percentile)
+        _configure_spin_state(
+            self.spin_enabled_flag,
+            self.spin_signs,
+            enabled=bool(spin),
+            random_signs=bool(spin_random),
+            seed=int(spin_seed),
+        )
+        self._assign_float_state(module.weight.data, None if module.bias is None else module.bias.data, calibration_inputs)
+        return self
+
+    def runtime_linear(self, x: torch.Tensor, *, backend: str | None = None) -> torch.Tensor:
+        del backend
+        target_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
+        target_device = x.device
+        x_local = x.to(device=target_device, dtype=target_dtype)
+        if _spin_enabled(self.spin_enabled_flag):
+            x_local = apply_spin_transform(x_local, self.spin_signs.to(device=target_device))
+        if _pre_scale_active(self.pre_scale):
+            x_local = _apply_pre_scale_to_input(x_local, self.pre_scale.to(device=target_device))
+        x_local = _apply_activation_quantization(
+            x_local,
+            mode=self.act_quant_mode,
+            act_scale=self.act_scale.to(device=target_device),
+            bits=int(self.act_quant_bits),
+            method=self.act_quant_method,
+            percentile=float(self.act_quant_percentile),
+        )
+        bias = self.runtime_bias(dtype=target_dtype, device=target_device)
+        return runtime_nf4_linear(
+            x_local,
+            self.qweight_packed,
+            self.weight_scale,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.runtime_linear(x)
+
+
 class QuantizedLinearBitNet(nn.Module):
     """Weight-only BitNet linear using 2-bit ternary packed storage."""
 
@@ -1417,10 +1982,51 @@ class QuantizedLinearBitNet(nn.Module):
         self.layout_meta: dict[str, int] | None = None
         self._cached_weight_key: tuple[object, ...] | None = None
         self._cached_weight: torch.Tensor | None = None
+        self._cached_int8_backend_key: tuple[object, ...] | None = None
+        self._cached_int8_backend_qweight: torch.Tensor | None = None
+        self._cached_int8_backend_inv_scale: torch.Tensor | None = None
+        self._cached_shared_int8_input_signature_key: tuple[object, ...] | None = None
+        self._cached_shared_int8_input_signature: tuple[object, ...] | None = None
+        self._cached_spin_enabled_key: tuple[object, ...] | None = None
+        self._cached_spin_enabled_value: bool | None = None
+        self._cached_pre_scale_active_key: tuple[object, ...] | None = None
+        self._cached_pre_scale_active_value: bool | None = None
 
     def _invalidate_weight_cache(self) -> None:
         self._cached_weight_key = None
         self._cached_weight = None
+        self._cached_int8_backend_key = None
+        self._cached_int8_backend_qweight = None
+        self._cached_int8_backend_inv_scale = None
+        self._cached_shared_int8_input_signature_key = None
+        self._cached_shared_int8_input_signature = None
+        self._cached_spin_enabled_key = None
+        self._cached_spin_enabled_value = None
+        self._cached_pre_scale_active_key = None
+        self._cached_pre_scale_active_value = None
+
+    def _spin_enabled_runtime(self) -> bool:
+        key = (
+            str(self.spin_enabled_flag.device),
+            int(getattr(self.spin_enabled_flag, "_version", 0)),
+            int(self.spin_enabled_flag.data_ptr()) if self.spin_enabled_flag.numel() > 0 else 0,
+        )
+        if self._cached_spin_enabled_key != key or self._cached_spin_enabled_value is None:
+            self._cached_spin_enabled_value = _spin_enabled(self.spin_enabled_flag)
+            self._cached_spin_enabled_key = key
+        return bool(self._cached_spin_enabled_value)
+
+    def _pre_scale_active_runtime(self) -> bool:
+        key = (
+            str(self.pre_scale.device),
+            int(getattr(self.pre_scale, "_version", 0)),
+            tuple(self.pre_scale.shape),
+            int(self.pre_scale.data_ptr()) if self.pre_scale.numel() > 0 else 0,
+        )
+        if self._cached_pre_scale_active_key != key or self._cached_pre_scale_active_value is None:
+            self._cached_pre_scale_active_value = _pre_scale_active(self.pre_scale)
+            self._cached_pre_scale_active_key = key
+        return bool(self._cached_pre_scale_active_value)
 
     def _assign_packed_state(
         self,
@@ -1460,24 +2066,36 @@ class QuantizedLinearBitNet(nn.Module):
         calibration_inputs: torch.Tensor | None = None,
     ) -> None:
         weight_local = weight.float()
-        if _spin_enabled(self.spin_enabled_flag):
+        if self._spin_enabled_runtime():
             weight_local = apply_spin_transform(weight_local, self.spin_signs.to(device=weight.device))
         flat_inputs = _flatten_calibration_inputs(calibration_inputs, in_features=self.in_features)
-        if str(self.weight_opt).strip().lower() in {"awq", "gptq"} and flat_inputs is not None:
+        requested_weight_opt = str(self.weight_opt).strip().lower()
+        calibration_name = str(self.quant_calibration).strip().lower()
+        if requested_weight_opt == "awq" and flat_inputs is not None:
             pre_scale = awq_optimize_pre_scale(
                 weight_local,
                 flat_inputs.to(device=weight_local.device, dtype=torch.float32),
-                quantize_dequantize=_bitnet_quantize_dequantize,
+                quantize_dequantize=lambda w: _bitnet_quantize_dequantize(
+                    w,
+                    calibration=calibration_name,
+                    percentile=float(self.quant_percentile),
+                ),
             )
         else:
             pre_scale = torch.ones(self.in_features, device=weight_local.device, dtype=torch.float32)
         self.pre_scale.copy_(pre_scale.to(device=self.pre_scale.device, dtype=self.pre_scale.dtype))
         weight_local = _apply_pre_scale_to_weight(weight_local, pre_scale)
-        packed_weight, scale_values, layout_header, segment_offsets = runtime_pack_bitnet_weight(weight_local)
+        packed_weight, scale_values, layout_header, segment_offsets = runtime_pack_bitnet_weight(
+            weight_local,
+            calibration=calibration_name,
+            percentile=float(self.quant_percentile),
+            weight_opt="gptq" if requested_weight_opt == "gptq" else "none",
+            calibration_inputs=None if flat_inputs is None else flat_inputs.to(device=weight_local.device, dtype=torch.float32),
+        )
         self._assign_packed_state(packed_weight, scale_values, layout_header, segment_offsets, bias)
         if self.act_quant_mode == "static_int8" and flat_inputs is not None:
             act_inputs = flat_inputs.to(device=weight_local.device, dtype=torch.float32)
-            if _spin_enabled(self.spin_enabled_flag):
+            if self._spin_enabled_runtime():
                 act_inputs = apply_spin_transform(act_inputs, self.spin_signs.to(device=weight_local.device))
             if _pre_scale_active(pre_scale):
                 act_inputs = _apply_pre_scale_to_input(act_inputs, pre_scale)
@@ -1603,9 +2221,9 @@ class QuantizedLinearBitNet(nn.Module):
         target_dtype = torch.float32 if dtype is None else dtype
         target_device = self.packed_weight.device if device is None else torch.device(device)
         weight = self._dequantized_weight(target_dtype, device=target_device)
-        if _pre_scale_active(self.pre_scale):
+        if self._pre_scale_active_runtime():
             weight = _undo_pre_scale_from_weight(weight, self.pre_scale.to(device=target_device))
-        if _spin_enabled(self.spin_enabled_flag):
+        if self._spin_enabled_runtime():
             return undo_spin_transform(weight, self.spin_signs.to(device=target_device))
         return weight
 
@@ -1623,6 +2241,8 @@ class QuantizedLinearBitNet(nn.Module):
         )
 
     def runtime_signature(self):
+        spin_enabled = self._spin_enabled_runtime()
+        pre_scale_active = self._pre_scale_active_runtime()
         return (
             "bitnet_w2a8",
             _parameter_signature(self.packed_weight),
@@ -1630,9 +2250,9 @@ class QuantizedLinearBitNet(nn.Module):
             _parameter_signature(self.layout_header),
             _parameter_signature(self.segment_offsets),
             str(self.weight_opt),
-            int(self.spin_enabled_flag.item()),
-            _parameter_signature(self.spin_signs),
-            _parameter_signature(self.pre_scale),
+            int(spin_enabled),
+            _parameter_signature(self.spin_signs) if spin_enabled else None,
+            _parameter_signature(self.pre_scale) if pre_scale_active else None,
             str(self.act_quant_mode),
             str(self.act_quant_method),
             int(self.act_quant_bits),
@@ -1641,9 +2261,86 @@ class QuantizedLinearBitNet(nn.Module):
             _parameter_signature(self.bias),
         )
 
+    def _uses_int8_packed_backend(self) -> bool:
+        mode_name = str(self.act_quant_mode).strip().lower()
+        return (not self._spin_enabled_runtime()) and mode_name in {"dynamic_int8", "static_int8"}
+
+    def _int8_backend_weight(
+        self,
+        *,
+        device: torch.device | str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        target_device = self.packed_weight.device if device is None else torch.device(device)
+        key = (
+            str(target_device),
+            tuple(self.packed_weight.shape),
+            tuple(self.scale_values.shape),
+            tuple(self.layout_header.shape),
+            tuple(self.segment_offsets.shape),
+            int(getattr(self.packed_weight, "_version", 0)),
+            int(getattr(self.scale_values, "_version", 0)),
+            int(getattr(self.layout_header, "_version", 0)),
+            int(getattr(self.segment_offsets, "_version", 0)),
+            int(self.packed_weight.data_ptr()) if self.packed_weight.numel() > 0 else 0,
+            int(self.scale_values.data_ptr()) if self.scale_values.numel() > 0 else 0,
+            int(self.layout_header.data_ptr()) if self.layout_header.numel() > 0 else 0,
+            int(self.segment_offsets.data_ptr()) if self.segment_offsets.numel() > 0 else 0,
+        )
+        if (
+            self._cached_int8_backend_key != key
+            or self._cached_int8_backend_qweight is None
+            or self._cached_int8_backend_inv_scale is None
+        ):
+            packed_weight = (
+                self.packed_weight if self.packed_weight.device == target_device else self.packed_weight.to(device=target_device)
+            )
+            scale_values = (
+                self.scale_values if self.scale_values.device == target_device else self.scale_values.to(device=target_device)
+            )
+            layout_header = (
+                self.layout_header if self.layout_header.device == target_device else self.layout_header.to(device=target_device)
+            )
+            segment_offsets = (
+                self.segment_offsets if self.segment_offsets.device == target_device else self.segment_offsets.to(device=target_device)
+            )
+            logical_in = int(layout_header[4].item())
+            logical_out = int(layout_header[3].item())
+            self._cached_int8_backend_qweight = (
+                _unpack_bitnet_signed(packed_weight, original_last_dim=logical_in)[:logical_out]
+                .to(device=target_device, dtype=torch.int8)
+                .contiguous()
+            )
+            self._cached_int8_backend_inv_scale = (
+                _bitnet_row_scales(scale_values, layout_header, segment_offsets)
+                .to(device=target_device, dtype=torch.float32)
+                .contiguous()
+            )
+            self._cached_int8_backend_key = key
+        return self._cached_int8_backend_qweight, self._cached_int8_backend_inv_scale
+
     def runtime_packed_linear_signature(self, backend: str):
         if not self.runtime_supports_packed_backend(backend):
             return None
+        spin_enabled = self._spin_enabled_runtime()
+        pre_scale_active = self._pre_scale_active_runtime()
+        if self._uses_int8_packed_backend():
+            return (
+                "bitnet_w2a8_int8",
+                str(backend).strip().lower(),
+                _parameter_signature(self.packed_weight),
+                _parameter_signature(self.scale_values),
+                _parameter_signature(self.layout_header),
+                _parameter_signature(self.segment_offsets),
+                int(spin_enabled),
+                _parameter_signature(self.spin_signs) if spin_enabled else None,
+                _parameter_signature(self.pre_scale) if pre_scale_active else None,
+                str(self.act_quant_mode),
+                str(self.act_quant_method),
+                int(self.act_quant_bits),
+                float(self.act_quant_percentile),
+                _parameter_signature(self.act_scale),
+                _parameter_signature(self.bias),
+            )
         return (
             "bitnet_w2a8",
             str(backend).strip().lower(),
@@ -1651,9 +2348,9 @@ class QuantizedLinearBitNet(nn.Module):
             _parameter_signature(self.scale_values),
             _parameter_signature(self.layout_header),
             _parameter_signature(self.segment_offsets),
-            int(self.spin_enabled_flag.item()),
-            _parameter_signature(self.spin_signs),
-            _parameter_signature(self.pre_scale),
+            int(spin_enabled),
+            _parameter_signature(self.spin_signs) if spin_enabled else None,
+            _parameter_signature(self.pre_scale) if pre_scale_active else None,
             str(self.act_quant_mode),
             str(self.act_quant_method),
             int(self.act_quant_bits),
@@ -1672,6 +2369,31 @@ class QuantizedLinearBitNet(nn.Module):
         if not self.runtime_supports_packed_backend(backend):
             return None
         target_device = self.packed_weight.device if device is None else torch.device(device)
+        spin_enabled = self._spin_enabled_runtime()
+        pre_scale_active = self._pre_scale_active_runtime()
+        bias = self.runtime_bias(
+            dtype=self.bias.dtype if dtype is None else dtype,
+            device=target_device,
+        )
+        if isinstance(bias, torch.Tensor):
+            bias = bias.detach().contiguous()
+        if self._uses_int8_packed_backend():
+            qweight, inv_scale = self._int8_backend_weight(device=target_device)
+            return {
+                "format": "bitnet_w2a8_int8",
+                "backend": str(backend).strip().lower(),
+                "qweight": qweight.contiguous(),
+                "inv_scale": inv_scale.contiguous(),
+                "bias": bias,
+                "spin_enabled": False,
+                "spin_signs": None,
+                "pre_scale": self.pre_scale.to(device=target_device, dtype=torch.float32).contiguous() if pre_scale_active else None,
+                "act_quant_mode": str(self.act_quant_mode),
+                "act_quant_method": str(self.act_quant_method),
+                "act_quant_bits": int(self.act_quant_bits),
+                "act_quant_percentile": float(self.act_quant_percentile),
+                "act_scale": self.act_scale.to(device=target_device, dtype=torch.float32).contiguous(),
+            }
         packed_weight = self.packed_weight if self.packed_weight.device == target_device else self.packed_weight.to(device=target_device)
         scale_values = self.scale_values if self.scale_values.device == target_device else self.scale_values.to(device=target_device)
         layout_header = self.layout_header if self.layout_header.device == target_device else self.layout_header.to(device=target_device)
@@ -1685,13 +2407,10 @@ class QuantizedLinearBitNet(nn.Module):
             "scale_values": scale_values.contiguous(),
             "layout_header": layout_header.contiguous(),
             "segment_offsets": segment_offsets.contiguous(),
-            "bias": self.runtime_bias(
-                dtype=self.bias.dtype if dtype is None else dtype,
-                device=target_device,
-            ),
-            "spin_enabled": bool(int(self.spin_enabled_flag.item())),
-            "spin_signs": self.spin_signs.to(device=target_device, dtype=torch.float32).contiguous(),
-            "pre_scale": self.pre_scale.to(device=target_device, dtype=torch.float32).contiguous(),
+            "bias": bias,
+            "spin_enabled": spin_enabled,
+            "spin_signs": self.spin_signs.to(device=target_device, dtype=torch.float32).contiguous() if spin_enabled else None,
+            "pre_scale": self.pre_scale.to(device=target_device, dtype=torch.float32).contiguous() if pre_scale_active else None,
             "act_quant_mode": str(self.act_quant_mode),
             "act_quant_method": str(self.act_quant_method),
             "act_quant_bits": int(self.act_quant_bits),
@@ -1701,6 +2420,108 @@ class QuantizedLinearBitNet(nn.Module):
 
     def runtime_supports_packed_backend(self, backend: str) -> bool:
         return str(backend).strip().lower() == "bitnet"
+
+    def runtime_shared_int8_input_signature(self):
+        mode_name = str(self.act_quant_mode).strip().lower()
+        bits = int(self.act_quant_bits)
+        if bits < 2 or bits > 8 or mode_name not in {"dynamic_int8", "static_int8"}:
+            return None
+        spin_enabled = self._spin_enabled_runtime()
+        pre_scale_active = self._pre_scale_active_runtime()
+        cache_key = (
+            mode_name,
+            bits,
+            int(spin_enabled),
+            _parameter_signature(self.spin_signs) if spin_enabled else None,
+            _parameter_signature(self.pre_scale) if pre_scale_active else None,
+            str(self.act_quant_method),
+            float(self.act_quant_percentile),
+            _parameter_signature(self.act_scale),
+        )
+        if (
+            self._cached_shared_int8_input_signature_key != cache_key
+            or self._cached_shared_int8_input_signature is None
+        ):
+            signature = (
+                int(spin_enabled),
+                tuple(self.spin_signs.detach().cpu().tolist()) if spin_enabled else (),
+                tuple(self.pre_scale.detach().cpu().tolist()) if pre_scale_active else (),
+                mode_name,
+                bits,
+            )
+            if mode_name == "dynamic_int8":
+                signature = signature + (
+                    str(self.act_quant_method),
+                    float(self.act_quant_percentile),
+                )
+            else:
+                signature = signature + (
+                    tuple(self.act_scale.detach().cpu().reshape(-1).tolist()),
+                )
+            self._cached_shared_int8_input_signature_key = cache_key
+            self._cached_shared_int8_input_signature = signature
+        return self._cached_shared_int8_input_signature
+
+    def runtime_quantize_int8_input(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.dtype]:
+        target_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
+        target_device = x.device
+        x_local = x.to(device=target_device, dtype=target_dtype)
+        if self._spin_enabled_runtime():
+            x_local = apply_spin_transform(x_local, self.spin_signs.to(device=target_device))
+        if self._pre_scale_active_runtime():
+            x_local = _apply_pre_scale_to_input(x_local, self.pre_scale.to(device=target_device))
+
+        mode_name = str(self.act_quant_mode).strip().lower()
+        bits = int(self.act_quant_bits)
+        if bits < 2 or bits > 8 or mode_name not in {"dynamic_int8", "static_int8"}:
+            raise RuntimeError(
+                "runtime_quantize_int8_input requires activation_quant in {dynamic_int8, static_int8} with bits in [2, 8]"
+            )
+
+        flat = x_local.reshape(-1, x_local.shape[-1])
+        rows = int(flat.shape[0])
+        if mode_name == "dynamic_int8":
+            scale = calibrate_activation_scale(
+                x_local,
+                method=self.act_quant_method,
+                bits=bits,
+                p=float(self.act_quant_percentile),
+            ).reshape(1)
+            row_scale = scale.to(device=target_device, dtype=torch.float32).expand(rows).contiguous()
+        else:
+            scale = self.act_scale.to(device=target_device, dtype=torch.float32).reshape(-1)
+            if scale.numel() == 1:
+                row_scale = scale.expand(rows).contiguous()
+            elif scale.numel() == rows:
+                row_scale = scale.contiguous()
+            else:
+                raise ValueError("BitNet static_int8 act_scale must have 1 or rows elements")
+
+        qmax = float(_quant_max(bits))
+        qx = torch.round(flat.float() / row_scale.unsqueeze(-1)).clamp_(-qmax, qmax).to(dtype=torch.int8)
+        return qx.reshape_as(x_local), row_scale, target_dtype
+
+    def runtime_linear_from_quantized_input(
+        self,
+        qx: torch.Tensor,
+        row_scale: torch.Tensor,
+        *,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        target_dtype = torch.float32 if out_dtype is None else out_dtype
+        qweight, inv_scale = self._int8_backend_weight(device=qx.device)
+        bias = self.runtime_bias(dtype=target_dtype, device=qx.device)
+        return runtime_int8_linear_from_quantized_activation(
+            qx,
+            row_scale,
+            qweight,
+            inv_scale,
+            bias,
+            out_dtype=target_dtype,
+        )
 
     @torch.no_grad()
     def from_float(
@@ -1733,34 +2554,59 @@ class QuantizedLinearBitNet(nn.Module):
             random_signs=bool(spin_random),
             seed=int(spin_seed),
         )
+        self._cached_spin_enabled_key = None
+        self._cached_spin_enabled_value = bool(spin)
+        self._cached_pre_scale_active_key = None
+        self._cached_pre_scale_active_value = None
         self._assign_float_state(module.weight.data, None if module.bias is None else module.bias.data, calibration_inputs)
         return self
 
     def runtime_linear(self, x: torch.Tensor, *, backend: str | None = None) -> torch.Tensor:
         del backend
+        mode_name = str(self.act_quant_mode).strip().lower()
+        if self._uses_int8_packed_backend():
+            target_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
+            target_device = x.device
+            qweight, inv_scale = self._int8_backend_weight(device=target_device)
+            pre_scale = self.pre_scale.to(device=target_device) if self._pre_scale_active_runtime() else None
+            act_scale = self.act_scale.to(device=target_device) if mode_name == "static_int8" else None
+            return runtime_bitnet_int8_linear_from_float(
+                x.to(device=target_device, dtype=target_dtype),
+                qweight,
+                inv_scale,
+                self.runtime_bias(dtype=target_dtype, device=target_device),
+                pre_scale=pre_scale,
+                act_quant_mode=self.act_quant_mode,
+                act_scale=act_scale,
+                act_quant_bits=int(self.act_quant_bits),
+                act_quant_method=self.act_quant_method,
+                act_quant_percentile=float(self.act_quant_percentile),
+            )
+
         target_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
         target_device = x.device
-        x_local = x.to(device=target_device, dtype=target_dtype)
-        if _spin_enabled(self.spin_enabled_flag):
-            x_local = apply_spin_transform(x_local, self.spin_signs.to(device=target_device))
-        if _pre_scale_active(self.pre_scale):
-            x_local = _apply_pre_scale_to_input(x_local, self.pre_scale.to(device=target_device))
-        x_local = _apply_activation_quantization(
-            x_local,
-            mode=self.act_quant_mode,
-            act_scale=self.act_scale.to(device=target_device),
-            bits=int(self.act_quant_bits),
-            method=self.act_quant_method,
-            percentile=float(self.act_quant_percentile),
+        spin_enabled = self._spin_enabled_runtime()
+        spin_signs = self.spin_signs.to(device=target_device) if spin_enabled else None
+        pre_scale = self.pre_scale.to(device=target_device) if self._pre_scale_active_runtime() else None
+        act_scale = self.act_scale.to(device=target_device) if mode_name == "static_int8" else None
+        x_local = runtime_bitnet_transform_input(
+            x.to(device=target_device, dtype=target_dtype),
+            spin_enabled=spin_enabled,
+            spin_signs=spin_signs,
+            pre_scale=pre_scale,
+            act_quant_mode=self.act_quant_mode,
+            act_scale=act_scale,
+            act_quant_bits=int(self.act_quant_bits),
+            act_quant_method=self.act_quant_method,
+            act_quant_percentile=float(self.act_quant_percentile),
         )
-        bias = self.runtime_bias(dtype=target_dtype, device=target_device)
         return runtime_bitnet_linear(
             x_local,
             self.packed_weight,
             self.scale_values,
             self.layout_header,
             self.segment_offsets,
-            bias=bias,
+            bias=self.runtime_bias(dtype=target_dtype, device=target_device),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -2145,6 +2991,22 @@ def quantize_linear_modules(
                 spin_random=spin_random,
                 spin_seed=module_spin_seed,
             )
+        elif quant_scheme == "nf4":
+            ql = QuantizedLinearNF4(module.in_features, module.out_features, bias=(module.bias is not None))
+            ql.from_float(
+                module,
+                calibration=calibration,
+                percentile=percentile,
+                calibration_inputs=module_calibration_inputs,
+                weight_opt=weight_opt,
+                activation_quant=activation_quant,
+                activation_quant_bits=activation_quant_bits,
+                activation_quant_method=activation_quant_method,
+                activation_quant_percentile=activation_quant_percentile,
+                spin=spin,
+                spin_random=spin_random,
+                spin_seed=module_spin_seed,
+            )
         elif quant_scheme == "fp8":
             ql = QuantizedLinearFP8(module.in_features, module.out_features, bias=(module.bias is not None))
             ql.from_float(
@@ -2183,9 +3045,11 @@ __all__ = [
     "collect_linear_calibration_inputs",
     "calibrate_fp8_scale",
     "calibrate_int4_scales",
+    "calibrate_nf4_scales",
     "QuantizedLinearInt8",
     "QuantizedLinearBitNet",
     "QuantizedLinearInt4",
+    "QuantizedLinearNF4",
     "QuantizedLinearFP8",
     "quantize_linear_modules",
     "calibrate_int8_scales",

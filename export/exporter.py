@@ -85,6 +85,8 @@ def _maybe_apply_quantization(model: torch.nn.Module, cfg: ExportConfig) -> None
         apply_compression(model, quant={**quant_cfg, "scheme": "int8"})
     elif quantize == "int4":
         apply_compression(model, quant={**quant_cfg, "scheme": "int4"})
+    elif quantize == "nf4":
+        apply_compression(model, quant={**quant_cfg, "scheme": "nf4"})
     elif quantize == "fp8":
         apply_compression(model, quant={**quant_cfg, "scheme": "fp8"})
     elif quantize == "bitnet":

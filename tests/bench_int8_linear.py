@@ -86,8 +86,9 @@ def main() -> None:
 
     qx, row_scale = quantize_activation_int8_rowwise(x)
     qweight, inv_scale = _quantize_weight_per_output_channel(weight)
+    row_scale_view = row_scale.view(*x.shape[:-1], 1)
     quant_ref = torch.nn.functional.linear(
-        qx.float() * row_scale.reshape(-1, 1),
+        qx.float() * row_scale_view,
         qweight.float() * inv_scale.unsqueeze(-1),
         bias.float(),
     ).view(args.batch, args.seq, args.out_features).to(dtype=dtype)

@@ -190,6 +190,39 @@ def test_clone_kv_cache_rows_uses_native_cache_clone_rows_fast_path():
     assert cloned.batch == 3
 
 
+def test_clone_kv_cache_rows_preserves_native_paged_lengths():
+    if not runtime_pkg.native_paged_kv_cache_available():
+        pytest.skip("native paged KV cache unavailable")
+
+    spec = cache_mod.KVCacheSpec(
+        batch=1,
+        n_layers=1,
+        n_kv_heads=1,
+        head_dim=2,
+        pagesize=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        backend="native-paged",
+    )
+    cache = cache_mod.create_kv_cache(spec)
+    assert isinstance(cache, runtime_kv_cache_mod.PagedKVCache)
+
+    cache.append_batch(
+        0,
+        torch.tensor([[[[1.0, 10.0], [2.0, 20.0]]]], dtype=torch.float32),
+        torch.tensor([[[[11.0, 110.0], [12.0, 120.0]]]], dtype=torch.float32),
+        block_ids=torch.tensor([0], dtype=torch.long),
+    )
+
+    cloned = runtime_kv_cache_mod.clone_kv_cache_rows(cache, torch.tensor([0], dtype=torch.long))
+
+    assert cloned.layer_lengths(0).tolist() == [2]
+    assert cloned.layer_max_length(0) == 2
+    k, v = cloned.read_batch(0, 0, 2)
+    assert torch.equal(k, torch.tensor([[[[1.0, 10.0], [2.0, 20.0]]]], dtype=torch.float32))
+    assert torch.equal(v, torch.tensor([[[[11.0, 110.0], [12.0, 120.0]]]], dtype=torch.float32))
+
+
 def test_clone_kv_cache_rows_clones_selected_contiguous_rows():
     cache = runtime_kv_cache_mod.ContiguousKVCache(
         batch=2,
@@ -872,6 +905,30 @@ def test_runtime_layer_view_is_runtime_owned(monkeypatch):
     assert isinstance(layer, cache_mod.RuntimeLayerCacheView)
     assert layer.layer_idx == 1
     assert layer.parent is cache
+
+
+def test_runtime_layer_view_uses_native_layer_max_length_without_touching_lengths():
+    class FakeNativeLayer:
+        def max_length(self):
+            return 7
+
+        def lengths(self):
+            raise AssertionError("lengths() should not be used when max_length() is available")
+
+    cache = runtime_kv_cache_mod.PagedKVCache(
+        batch=2,
+        n_layers=1,
+        n_kv_heads=1,
+        head_dim=2,
+        pagesize=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        native_cache_state=None,
+        native_layer_states=[FakeNativeLayer()],
+        backend_name="native-paged",
+    )
+
+    assert cache.layer(0).length() == 7
 
 
 def test_evict_kv_cache_delegates_to_cache_object():
@@ -2772,6 +2829,39 @@ def test_runtime_generation_session_python_append_preserves_explicit_2d_attentio
     assert torch.equal(session.attention_mask, torch.zeros((1, 4), dtype=torch.bool))
 
 
+def test_runtime_generation_session_discards_python_executor_wrappers(monkeypatch):
+    class FakePythonSession:
+        native_executor_kind = "python"
+
+        def __init__(self, model, seq, attention_mask=None, cache=None, trace=False):
+            del model, trace
+            self.seq = seq
+            self.attention_mask = attention_mask
+            self.cache = cache
+
+    monkeypatch.setattr(
+        runtime_generation_mod,
+        "create_native_model_session",
+        lambda model, seq, attention_mask=None, cache=None, trace=False: FakePythonSession(
+            model,
+            seq,
+            attention_mask,
+            cache,
+            trace,
+        ),
+    )
+
+    session = runtime_generation_mod.RuntimeGenerationSession(
+        torch.nn.Identity(),
+        torch.tensor([[1, 2]], dtype=torch.long),
+        attention_mask=torch.tensor([[1, 1]], dtype=torch.long),
+    )
+
+    assert session.uses_native_session is False
+    assert session.native_executor_kind == "python"
+    assert torch.equal(session.seq, torch.tensor([[1, 2]], dtype=torch.long))
+
+
 def test_prefix_causal_lm_accepts_attention_mask_alias():
     model = runtime_modeling_mod.build_model(_cfg(), task="prefix-lm")
     out = model(
@@ -3048,6 +3138,54 @@ def test_runtime_generation_session_native_causal_executor_skips_python_forward(
 
     full = session.full_next_logits()
     assert full.shape == (1, model.cfg.vocab_size)
+
+
+def test_runtime_generation_session_python_decode_uses_step_token_attention_mask():
+    seen = {}
+
+    class FakeModel:
+        def __call__(
+            self,
+            input_ids,
+            *,
+            attn_mask=None,
+            attention_mask=None,
+            cache=None,
+            position_ids=None,
+            cache_position=None,
+            return_dict=False,
+        ):
+            seen["input_shape"] = tuple(input_ids.shape)
+            seen["attn_mask"] = attn_mask
+            seen["attention_mask"] = None if attention_mask is None else attention_mask.clone()
+            seen["cache"] = cache
+            seen["position_ids"] = None if position_ids is None else position_ids.clone()
+            seen["cache_position"] = None if cache_position is None else cache_position.clone()
+            seen["return_dict"] = return_dict
+            return torch.zeros((input_ids.shape[0], input_ids.shape[1], 7), dtype=torch.float32)
+
+    session = runtime_generation_mod.RuntimeGenerationSession(
+        model=FakeModel(),
+        seq=torch.tensor([[1, 2, 3]], dtype=torch.long),
+        attention_mask=torch.tensor([[1, 1, 1]], dtype=torch.long),
+        cache=object(),
+        trace=False,
+    )
+
+    out = session.decode_next_logits()
+
+    assert out is not None
+    assert out.shape == (1, 7)
+    assert seen["input_shape"] == (1, 1)
+    assert seen["attn_mask"] is None
+    assert seen["attention_mask"] is not None
+    assert tuple(seen["attention_mask"].shape) == (1, 1)
+    assert torch.equal(seen["attention_mask"], torch.ones((1, 1), dtype=torch.long))
+    assert seen["cache"] is session.cache
+    assert torch.equal(seen["position_ids"], torch.tensor([[2]], dtype=torch.long))
+    assert torch.equal(seen["cache_position"], torch.tensor([2], dtype=torch.long))
+    assert seen["return_dict"] is False
+    assert tuple(session.attention_mask.shape) == (1, 3)
 
 
 def test_runtime_generation_session_advances_beam_via_native_session(monkeypatch):

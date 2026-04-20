@@ -69,6 +69,8 @@ class RuntimeLayerCacheView:
         )
 
     def length(self) -> int:
+        if hasattr(self.parent, "layer_max_length"):
+            return int(self.parent.layer_max_length(self.layer_idx))
         native_cache = getattr(self.parent, "_native_cache", None)
         if native_cache is not None:
             return int(native_cache.max_length(self.layer_idx))

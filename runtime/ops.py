@@ -1196,6 +1196,123 @@ def sample_with_policies(
     return sample_next_token(x, bool(do_sample))
 
 
+def speculative_accept(
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    *,
+    bonus_probs: torch.Tensor | None = None,
+    bonus_enabled: torch.Tensor | None = None,
+    method: str = "rejection_sampler",
+    posterior_threshold: float = 0.09,
+    posterior_alpha: float = 0.3,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if has_native_op("sampling"):
+        module = native_module()
+        if module is not None and hasattr(module, "speculative_accept_forward"):
+            try:
+                return module.speculative_accept_forward(
+                    target_probs,
+                    draft_probs,
+                    draft_token_ids,
+                    bonus_probs,
+                    bonus_enabled,
+                    str(method),
+                    float(posterior_threshold),
+                    float(posterior_alpha),
+                )
+            except TypeError:
+                # Support older in-place native builds until the extension is rebuilt.
+                try:
+                    return module.speculative_accept_forward(
+                        target_probs,
+                        draft_probs,
+                        draft_token_ids,
+                        bonus_probs,
+                        bonus_enabled,
+                        str(method),
+                    )
+                except TypeError:
+                    pass
+
+    probs_t = target_probs.to(torch.float32)
+    probs_q = draft_probs.to(torch.float32)
+    token_ids = draft_token_ids.to(torch.long)
+    batch_size = int(token_ids.shape[0])
+    draft_len = int(token_ids.shape[1])
+    max_out = draft_len + 1
+    out_tokens = torch.full((batch_size, max_out), -1, dtype=torch.long, device=token_ids.device)
+    out_lengths = torch.zeros((batch_size,), dtype=torch.long, device=token_ids.device)
+    accepted_counts = torch.zeros((batch_size,), dtype=torch.long, device=token_ids.device)
+    method_name = str(method).strip().lower()
+    if method_name in {"probabilistic", "rejection"}:
+        method_name = "rejection_sampler"
+
+    for batch_idx in range(batch_size):
+        accepted = 0
+        emitted: list[int] = []
+        for step_idx in range(draft_len):
+            candidate = int(token_ids[batch_idx, step_idx].item())
+            p = probs_t[batch_idx, step_idx]
+            if method_name == "strict":
+                expected = int(torch.argmax(p).item())
+                if expected == candidate:
+                    emitted.append(candidate)
+                    accepted += 1
+                    continue
+                emitted.append(expected)
+                break
+            if method_name == "typical_acceptance_sampler":
+                epsilon = 1e-5
+                candidate_prob = float(p[candidate].item())
+                posterior_entropy = float((-(p * torch.log(p + epsilon))).sum().item())
+                threshold = min(float(posterior_threshold), math.exp(-posterior_entropy) * float(posterior_alpha))
+                if candidate_prob > threshold:
+                    emitted.append(candidate)
+                    accepted += 1
+                    continue
+                sample_probs = p / p.sum().clamp_min(1e-8)
+                sampled = int(torch.multinomial(sample_probs, num_samples=1).item())
+                emitted.append(sampled)
+                break
+            q = probs_q[batch_idx, step_idx]
+            qx = float(q[candidate].item())
+            px = float(p[candidate].item())
+            accept_prob = 1.0 if qx <= 1e-12 else min(px / qx, 1.0)
+            if float(torch.rand((), device=token_ids.device).item()) <= accept_prob:
+                emitted.append(candidate)
+                accepted += 1
+                continue
+            residual = torch.clamp(p - q, min=0.0)
+            residual_mass = float(residual.sum().item())
+            if residual_mass <= 1e-8:
+                sample_probs = p / p.sum().clamp_min(1e-8)
+            else:
+                sample_probs = residual / residual_mass
+            sampled = int(torch.multinomial(sample_probs, num_samples=1).item())
+            emitted.append(sampled)
+            break
+
+        if accepted == draft_len and bonus_probs is not None:
+            enabled = True
+            if bonus_enabled is not None:
+                enabled = bool(bonus_enabled[batch_idx].item())
+            if enabled:
+                if method_name == "strict":
+                    emitted.append(int(torch.argmax(bonus_probs[batch_idx]).item()))
+                else:
+                    bonus = bonus_probs[batch_idx].to(torch.float32)
+                    bonus = bonus / bonus.sum().clamp_min(1e-8)
+                    emitted.append(int(torch.multinomial(bonus, num_samples=1).item()))
+
+        if emitted:
+            emitted_tensor = torch.tensor(emitted, device=token_ids.device, dtype=torch.long)
+            out_tokens[batch_idx, : emitted_tensor.numel()] = emitted_tensor
+            out_lengths[batch_idx] = int(emitted_tensor.numel())
+        accepted_counts[batch_idx] = int(accepted)
+    return out_tokens, out_lengths, accepted_counts
+
+
 def presence_frequency_penalty(
     logits: torch.Tensor,
     counts: torch.Tensor,
@@ -1493,10 +1610,29 @@ def pack_bitnet_weight(
     scale_values: torch.Tensor | None = None,
     layout_header: torch.Tensor | None = None,
     segment_offsets: torch.Tensor | None = None,
+    *,
+    calibration: str = "absmax",
+    percentile: float = 0.999,
+    weight_opt: str = "none",
+    calibration_inputs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if scale_values is not None or layout_header is not None or segment_offsets is not None:
-        raise NotImplementedError("Explicit BitNet metadata overrides are not yet supported in the Python fallback")
-    if has_native_op("pack_bitnet_weight"):
+    calibration_name = str(calibration).strip().lower()
+    weight_opt_name = str(weight_opt).strip().lower()
+    has_overrides = scale_values is not None or layout_header is not None or segment_offsets is not None
+    if has_overrides:
+        if scale_values is None or layout_header is None or segment_offsets is None:
+            raise ValueError("pack_bitnet_weight explicit metadata overrides require scale_values, layout_header, and segment_offsets")
+        if weight_opt_name != "none":
+            raise ValueError("pack_bitnet_weight does not support weight_opt when explicit metadata overrides are provided")
+        if calibration_inputs is not None:
+            raise ValueError("pack_bitnet_weight does not support calibration_inputs when explicit metadata overrides are provided")
+    use_native_absmax = (
+        not has_overrides
+        and calibration_name == "absmax"
+        and weight_opt_name == "none"
+        and calibration_inputs is None
+    )
+    if use_native_absmax and has_native_op("pack_bitnet_weight"):
         module = native_module()
         if module is not None and hasattr(module, "pack_bitnet_weight_forward"):
             try:
@@ -1513,40 +1649,205 @@ def pack_bitnet_weight(
     if not weight.dtype.is_floating_point:
         raise TypeError("pack_bitnet_weight expects a floating-point weight tensor")
     logical_out, logical_in = int(weight.shape[0]), int(weight.shape[1])
-    padded_out = ((logical_out + 15) // 16) * 16
-    padded_in = ((logical_in + 31) // 32) * 32
-    scale = weight.detach().abs().amax().clamp_min(1e-8).to(device=weight.device, dtype=torch.float32)
-    quantized = torch.round(weight.float() / scale).clamp_(-1, 1).to(dtype=torch.int16)
-    codes = torch.ones((padded_out, padded_in), device=weight.device, dtype=torch.uint8)
-    codes[:logical_out, :logical_in] = (quantized + 1).to(dtype=torch.uint8)
-    packed_weight = (
-        codes[:, 0::4]
-        | (codes[:, 1::4] << 2)
-        | (codes[:, 2::4] << 4)
-        | (codes[:, 3::4] << 6)
-    ).contiguous()
-    packed_scale_values = scale.reshape(1).contiguous()
+    weight_f = weight.float()
+
+    def _flatten_calibration_inputs_local(inputs: torch.Tensor | None) -> torch.Tensor | None:
+        if inputs is None:
+            return None
+        if not isinstance(inputs, torch.Tensor):
+            raise TypeError("calibration_inputs must be a tensor")
+        if inputs.ndim < 2 or int(inputs.shape[-1]) != logical_in:
+            raise ValueError("calibration_inputs must have last dimension equal to weight.shape[1]")
+        return inputs.detach().reshape(-1, inputs.shape[-1]).to(device=weight.device, dtype=torch.float32).contiguous()
+
+    def _bitnet_row_scale_symmetric_local(row: torch.Tensor) -> torch.Tensor:
+        if calibration_name == "absmax":
+            clip = row.abs().amax()
+        elif calibration_name == "percentile":
+            clip = _percentile_scale(row, p=float(percentile))
+        elif calibration_name == "mse":
+            clip = _mse_scale(row)
+        else:
+            raise ValueError(f"Unknown BitNet calibration method: {calibration}")
+        return clip.clamp_min(1e-8).to(dtype=torch.float32)
+
+    def _bitnet_quantize_rows_local(src: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if calibration_name == "absmax":
+            row_scales = src.abs().amax(dim=1).clamp_min(1e-8).to(dtype=torch.float32)
+        else:
+            row_scales = torch.stack([_bitnet_row_scale_symmetric_local(row) for row in src], dim=0)
+        q = torch.round(src / row_scales.unsqueeze(-1)).clamp_(-1, 1).to(dtype=torch.int8)
+        return q, row_scales
+
+    def _pack_bitnet_quantized_local(
+        qweight: torch.Tensor,
+        packed_scale_values: torch.Tensor,
+        packed_layout_header: torch.Tensor,
+        packed_segment_offsets: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        header = packed_layout_header.to(device=weight.device, dtype=torch.int32).contiguous()
+        offsets = packed_segment_offsets.to(device=weight.device, dtype=torch.int32).contiguous()
+        logical_out_local = int(header[3].item())
+        logical_in_local = int(header[4].item())
+        padded_out_local = int(header[5].item())
+        padded_in_local = int(header[6].item())
+        scale_granularity = int(header[7].item())
+        scale_group_size = int(header[8].item())
+        interleave_mode = int(header[9].item())
+        segment_count = int(header[11].item())
+        if int(header[0].item()) != 1:
+            raise ValueError(f"Unsupported BitNet format_version: {int(header[0].item())}")
+        if logical_out_local != logical_out or logical_in_local != logical_in:
+            raise ValueError("Explicit BitNet metadata logical dimensions must match the provided weight")
+        if padded_out_local < logical_out_local or padded_in_local < logical_in_local:
+            raise ValueError("Explicit BitNet metadata padded dimensions must be at least the logical dimensions")
+        if interleave_mode != 1:
+            raise ValueError(f"Unsupported BitNet interleave_mode: {interleave_mode}")
+        if offsets.numel() != segment_count + 1:
+            raise ValueError("Explicit BitNet segment_offsets length mismatch")
+        if int(offsets[0].item()) != 0 or int(offsets[-1].item()) != logical_out_local:
+            raise ValueError("Explicit BitNet segment_offsets must start at 0 and end at logical_out_features")
+        if bool((offsets[1:] < offsets[:-1]).any()):
+            raise ValueError("Explicit BitNet segment_offsets must be non-decreasing")
+        scale_vals = packed_scale_values.to(device=weight.device, dtype=torch.float32).contiguous()
+        if scale_granularity == 0:
+            if scale_vals.numel() < 1:
+                raise ValueError("BitNet per-matrix scaling requires at least one scale value")
+        elif scale_granularity == 1:
+            if scale_vals.numel() != segment_count:
+                raise ValueError("BitNet per-segment scaling size mismatch")
+        elif scale_granularity == 2:
+            if scale_group_size <= 0:
+                raise ValueError("BitNet per-output-group scaling requires a positive scale_group_size")
+            expected_groups = (logical_out_local + scale_group_size - 1) // scale_group_size
+            if scale_vals.numel() != expected_groups:
+                raise ValueError("BitNet per-output-group scaling size mismatch")
+        else:
+            raise ValueError(f"Unsupported BitNet scale granularity: {scale_granularity}")
+        codes = torch.ones((padded_out_local, padded_in_local), device=weight.device, dtype=torch.uint8)
+        codes[:logical_out_local, :logical_in_local] = qweight.to(dtype=torch.int16).clamp_(-1, 1).add(1).to(dtype=torch.uint8)
+        packed = (
+            codes[:, 0::4]
+            | (codes[:, 1::4] << 2)
+            | (codes[:, 2::4] << 4)
+            | (codes[:, 3::4] << 6)
+        ).contiguous()
+        return packed, scale_vals, header, offsets
+
+    if has_overrides:
+        header_local = layout_header.to(device=weight.device, dtype=torch.int32)
+        offsets_local = segment_offsets.to(device=weight.device, dtype=torch.int32)
+        scale_values_local = scale_values.to(device=weight.device, dtype=torch.float32)
+        if header_local.ndim != 1 or int(header_local.numel()) < 13:
+            raise ValueError("Explicit BitNet layout_header must be rank-1 with at least 13 entries")
+        if offsets_local.ndim != 1 or int(offsets_local.numel()) < 2:
+            raise ValueError("Explicit BitNet segment_offsets must be rank-1 with at least two entries")
+        if scale_values_local.ndim != 1:
+            raise ValueError("Explicit BitNet scale_values must be rank-1")
+        scale_granularity = int(header_local[7].item())
+        scale_group_size = int(header_local[8].item())
+        row_scales = torch.zeros(logical_out, device=weight.device, dtype=torch.float32)
+        if scale_granularity == 0:
+            row_scales.fill_(float(scale_values_local[0].item()))
+        elif scale_granularity == 1:
+            for idx in range(offsets_local.numel() - 1):
+                start = int(offsets_local[idx].item())
+                end = int(offsets_local[idx + 1].item())
+                row_scales[start:end] = scale_values_local[idx]
+        elif scale_granularity == 2:
+            for idx in range(scale_values_local.numel()):
+                start = idx * scale_group_size
+                end = min(logical_out, start + scale_group_size)
+                row_scales[start:end] = scale_values_local[idx]
+        else:
+            raise ValueError(f"Unsupported BitNet scale granularity: {scale_granularity}")
+        qweight = torch.round(weight_f / row_scales.unsqueeze(-1).clamp_min(1e-8)).clamp_(-1, 1).to(dtype=torch.int8)
+        return _pack_bitnet_quantized_local(qweight, scale_values_local, header_local, offsets_local)
+
+    flat_inputs = _flatten_calibration_inputs_local(calibration_inputs)
+    if weight_opt_name == "gptq":
+        if flat_inputs is None or flat_inputs.numel() == 0:
+            raise ValueError("BitNet GPTQ packing requires non-empty calibration_inputs")
+        x = flat_inputs
+        h = x.t().matmul(x) / max(int(x.shape[0]), 1)
+        diag_mean = h.diag().mean().clamp_min(1e-6)
+        h = h + torch.eye(h.shape[0], device=h.device, dtype=h.dtype) * (0.01 * diag_mean)
+        h_inv = torch.linalg.inv(h)
+        h_diag = h_inv.diag().clamp_min(1e-6)
+        row_scales_list = []
+        dequant_rows = []
+        qmax = float(_quant_max(2))
+        for row in weight_f:
+            row_scale = _bitnet_row_scale_symmetric_local(row)
+            work = row.clone()
+            out = torch.empty_like(work)
+            for idx in range(work.numel()):
+                q = torch.round(work[idx] / row_scale).clamp_(-qmax, qmax)
+                dq = q * row_scale
+                out[idx] = dq
+                if idx + 1 < work.numel():
+                    err = (work[idx] - dq) / h_diag[idx]
+                    work[idx + 1 :] -= err * h_inv[idx, idx + 1 :]
+            row_scales_list.append(row_scale)
+            dequant_rows.append(out)
+        row_scales = torch.stack(row_scales_list, dim=0)
+        dequant = torch.stack(dequant_rows, dim=0)
+        qweight = torch.round(dequant / row_scales.unsqueeze(-1)).clamp_(-1, 1).to(dtype=torch.int8)
+        packed_layout_header = torch.tensor(
+            [1, 16, 32, logical_out, logical_in, ((logical_out + 15) // 16) * 16, ((logical_in + 31) // 32) * 32, 2, 1, 1, 80, 1, 0],
+            device=weight.device,
+            dtype=torch.int32,
+        )
+        packed_segment_offsets = torch.tensor([0, logical_out], device=weight.device, dtype=torch.int32)
+        return _pack_bitnet_quantized_local(qweight, row_scales, packed_layout_header, packed_segment_offsets)
+    if weight_opt_name not in {"", "none"}:
+        raise ValueError(f"Unsupported BitNet weight_opt for public packing: {weight_opt}")
+
+    if calibration_name == "absmax":
+        logical_out, logical_in = int(weight.shape[0]), int(weight.shape[1])
+        padded_out = ((logical_out + 15) // 16) * 16
+        padded_in = ((logical_in + 31) // 32) * 32
+        scale = weight.detach().abs().amax().clamp_min(1e-8).to(device=weight.device, dtype=torch.float32)
+        quantized = torch.round(weight_f / scale).clamp_(-1, 1).to(dtype=torch.int16)
+        codes = torch.ones((padded_out, padded_in), device=weight.device, dtype=torch.uint8)
+        codes[:logical_out, :logical_in] = (quantized + 1).to(dtype=torch.uint8)
+        packed_weight = (
+            codes[:, 0::4]
+            | (codes[:, 1::4] << 2)
+            | (codes[:, 2::4] << 4)
+            | (codes[:, 3::4] << 6)
+        ).contiguous()
+        packed_scale_values = scale.reshape(1).contiguous()
+        packed_layout_header = torch.tensor(
+            [
+                1,
+                16,
+                32,
+                logical_out,
+                logical_in,
+                padded_out,
+                padded_in,
+                0,
+                logical_out,
+                1,
+                80,
+                1,
+                0,
+            ],
+            device=weight.device,
+            dtype=torch.int32,
+        )
+        packed_segment_offsets = torch.tensor([0, logical_out], device=weight.device, dtype=torch.int32)
+        return packed_weight, packed_scale_values, packed_layout_header, packed_segment_offsets
+
+    qweight, row_scales = _bitnet_quantize_rows_local(weight_f)
     packed_layout_header = torch.tensor(
-        [
-            1,
-            16,
-            32,
-            logical_out,
-            logical_in,
-            padded_out,
-            padded_in,
-            0,
-            logical_out,
-            1,
-            80,
-            1,
-            0,
-        ],
+        [1, 16, 32, logical_out, logical_in, ((logical_out + 15) // 16) * 16, ((logical_in + 31) // 32) * 32, 2, 1, 1, 80, 1, 0],
         device=weight.device,
         dtype=torch.int32,
     )
     packed_segment_offsets = torch.tensor([0, logical_out], device=weight.device, dtype=torch.int32)
-    return packed_weight, packed_scale_values, packed_layout_header, packed_segment_offsets
+    return _pack_bitnet_quantized_local(qweight, row_scales, packed_layout_header, packed_segment_offsets)
 
 
 def split_heads(
@@ -1597,6 +1898,18 @@ def _quant_max(bits: int) -> int:
     return (1 << (bits - 1)) - 1
 
 
+def _percentile_scale(x: torch.Tensor, p: float = 0.999) -> torch.Tensor:
+    xa = x.abs().float()
+    q = float(max(0.0, min(1.0, p)))
+    k = max(int(q * (xa.numel() - 1)), 0)
+    return xa.reshape(-1).kthvalue(k + 1).values.to(dtype=x.dtype)
+
+
+def _mse_scale(x: torch.Tensor) -> torch.Tensor:
+    # Keep parity with tensor.numerics.mse_scale(), which is currently an absmax fallback.
+    return x.abs().amax(dim=tuple(range(x.ndim)), keepdim=False).clamp_min(1e-8)
+
+
 def _calibrate_activation_scale(
     x: torch.Tensor,
     *,
@@ -1604,12 +1917,15 @@ def _calibrate_activation_scale(
     bits: int,
     percentile: float,
 ) -> torch.Tensor:
-    del percentile
     method_name = str(method).strip().lower()
     qmax = float(_quant_max(bits))
     values = x.detach().float()
     if method_name in {"", "absmax"}:
         clip = values.abs().amax()
+    elif method_name == "percentile":
+        clip = _percentile_scale(values, p=float(percentile))
+    elif method_name == "mse":
+        clip = _mse_scale(values)
     else:
         raise ValueError(f"Unsupported packed activation calibration method: {method}")
     return (clip.clamp_min(1e-8) / qmax).to(dtype=torch.float32)
@@ -1714,25 +2030,66 @@ def _apply_packed_activation_quantization(
     raise ValueError(f"Unknown packed activation quantization mode: {mode}")
 
 
-def _apply_packed_linear_input_spec(x: torch.Tensor, spec: dict) -> torch.Tensor:
+def bitnet_transform_input(
+    x: torch.Tensor,
+    *,
+    spin_enabled: bool = False,
+    spin_signs: torch.Tensor | None = None,
+    pre_scale: torch.Tensor | None = None,
+    act_quant_mode: str = "none",
+    act_scale: torch.Tensor | None = None,
+    act_quant_bits: int = 8,
+    act_quant_method: str = "absmax",
+    act_quant_percentile: float = 0.999,
+) -> torch.Tensor:
     x_local = x
-    if bool(spec.get("spin_enabled", False)):
-        spin_signs = spec.get("spin_signs")
+    if getattr(x_local, "is_cuda", False) and not _should_use_eager_autograd_fallback(x_local):
+        module = native_module()
+        if has_native_op("bitnet_transform_input") and module is not None and hasattr(module, "bitnet_transform_input_forward"):
+            try:
+                return module.bitnet_transform_input_forward(
+                    x_local,
+                    bool(spin_enabled),
+                    spin_signs if isinstance(spin_signs, torch.Tensor) else None,
+                    pre_scale if isinstance(pre_scale, torch.Tensor) else None,
+                    str(act_quant_mode),
+                    str(act_quant_method),
+                    int(act_quant_bits),
+                    float(act_quant_percentile),
+                    act_scale if isinstance(act_scale, torch.Tensor) else None,
+                )
+            except RuntimeError:
+                pass
+
+    if bool(spin_enabled):
         if not isinstance(spin_signs, torch.Tensor):
-            raise ValueError("Packed linear spec with spin_enabled requires spin_signs")
+            raise ValueError("BitNet input transform with spin_enabled requires spin_signs")
         x_local = _apply_spin_transform(x_local, spin_signs)
-    pre_scale = spec.get("pre_scale")
     if isinstance(pre_scale, torch.Tensor) and _packed_pre_scale_active(pre_scale):
         x_local = _apply_pre_scale_to_input(x_local, pre_scale)
     x_local = _apply_packed_activation_quantization(
         x_local,
-        mode=str(spec.get("act_quant_mode", "none")),
-        act_scale=spec.get("act_scale") if isinstance(spec.get("act_scale"), torch.Tensor) else None,
-        bits=int(spec.get("act_quant_bits", 8)),
-        method=str(spec.get("act_quant_method", "absmax")),
-        percentile=float(spec.get("act_quant_percentile", 0.999)),
+        mode=str(act_quant_mode),
+        act_scale=act_scale if isinstance(act_scale, torch.Tensor) else None,
+        bits=int(act_quant_bits),
+        method=str(act_quant_method),
+        percentile=float(act_quant_percentile),
     )
     return x_local
+
+
+def _apply_packed_linear_input_spec(x: torch.Tensor, spec: dict) -> torch.Tensor:
+    return bitnet_transform_input(
+        x,
+        spin_enabled=bool(spec.get("spin_enabled", False)),
+        spin_signs=spec.get("spin_signs") if isinstance(spec.get("spin_signs"), torch.Tensor) else None,
+        pre_scale=spec.get("pre_scale") if isinstance(spec.get("pre_scale"), torch.Tensor) else None,
+        act_quant_mode=str(spec.get("act_quant_mode", "none")),
+        act_scale=spec.get("act_scale") if isinstance(spec.get("act_scale"), torch.Tensor) else None,
+        act_quant_bits=int(spec.get("act_quant_bits", 8)),
+        act_quant_method=str(spec.get("act_quant_method", "absmax")),
+        act_quant_percentile=float(spec.get("act_quant_percentile", 0.999)),
+    )
 
 
 def linear_from_packed_spec(
@@ -1747,6 +2104,8 @@ def linear_from_packed_spec(
     if format_name == "bitnet_w2a8":
         x_local = _apply_packed_linear_input_spec(x, spec)
         return _bitnet_linear_from_transformed_input(x_local, spec)
+    if format_name == "bitnet_w2a8_int8":
+        return _bitnet_int8_linear_from_float_input(x, spec)
     raise NotImplementedError(f"Packed linear format {format_name} is not implemented")
 
 
@@ -1766,6 +2125,444 @@ def _bitnet_linear_from_transformed_input(
     )
 
 
+def _quantize_int8_codes_with_scale(
+    x: torch.Tensor,
+    *,
+    scale: torch.Tensor,
+    bits: int,
+) -> torch.Tensor:
+    qmax = float(_quant_max(int(bits)))
+    flat = x.reshape(-1, x.shape[-1])
+    row_scale = scale.to(device=x.device, dtype=torch.float32).reshape(-1).clamp_min(1e-8)
+    if row_scale.numel() != flat.shape[0]:
+        raise ValueError("BitNet packed int8 quantization scale must have one entry per flattened row")
+    qx = torch.round(flat.float() / row_scale.unsqueeze(-1)).clamp_(-qmax, qmax).to(dtype=torch.int8)
+    return qx.reshape_as(x)
+
+
+def _bitnet_int8_quantize_input(
+    x: torch.Tensor,
+    spec: dict,
+) -> tuple[torch.Tensor, torch.Tensor, torch.dtype]:
+    mode = str(spec.get("act_quant_mode", "none")).strip().lower()
+    if mode not in {"dynamic_int8", "static_int8"}:
+        raise RuntimeError(f"bitnet_w2a8_int8 requires dynamic_int8 or static_int8 input mode, got {mode}")
+
+    target_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
+    x_local = x.to(dtype=target_dtype)
+    pre_scale = spec.get("pre_scale")
+    if isinstance(pre_scale, torch.Tensor) and _packed_pre_scale_active(pre_scale):
+        x_local = _apply_pre_scale_to_input(x_local, pre_scale)
+
+    rows = x_local.reshape(-1, x_local.shape[-1]).shape[0]
+    bits = int(spec.get("act_quant_bits", 8))
+    if mode == "dynamic_int8":
+        scale = _calibrate_activation_scale(
+            x_local,
+            method=str(spec.get("act_quant_method", "absmax")),
+            bits=bits,
+            percentile=float(spec.get("act_quant_percentile", 0.999)),
+        ).reshape(1)
+        row_scale = scale.expand(rows).contiguous()
+    else:
+        act_scale = spec.get("act_scale")
+        if not isinstance(act_scale, torch.Tensor):
+            raise ValueError("Packed static_int8 BitNet spec requires act_scale")
+        scale = act_scale.to(device=x_local.device, dtype=torch.float32).reshape(-1)
+        if scale.numel() == 1:
+            row_scale = scale.expand(rows).contiguous()
+        elif scale.numel() == rows:
+            row_scale = scale.contiguous()
+        else:
+            raise ValueError("Packed static_int8 BitNet act_scale must have 1 or rows elements")
+    qx = _quantize_int8_codes_with_scale(x_local, scale=row_scale, bits=bits)
+    return qx, row_scale, target_dtype
+
+
+def _bitnet_int8_linear_from_quantized_input(
+    qx: torch.Tensor,
+    row_scale: torch.Tensor,
+    spec: dict,
+    *,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    from runtime.quant import int8_linear_from_quantized_activation as runtime_int8_linear_from_quantized_activation
+
+    return runtime_int8_linear_from_quantized_activation(
+        qx,
+        row_scale,
+        spec["qweight"],
+        spec["inv_scale"],
+        spec.get("bias"),
+        out_dtype=out_dtype,
+    )
+
+
+def _bitnet_int8_linear_from_float_input(
+    x: torch.Tensor,
+    spec: dict,
+) -> torch.Tensor:
+    target_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
+    target_device = spec["qweight"].device
+    x_cast = x.to(device=target_device, dtype=target_dtype)
+    bias = spec.get("bias")
+    pre_scale = spec.get("pre_scale") if isinstance(spec.get("pre_scale"), torch.Tensor) else None
+    act_scale = spec.get("act_scale") if isinstance(spec.get("act_scale"), torch.Tensor) else None
+
+    if not _should_use_eager_autograd_fallback(x_cast, spec["qweight"], bias):
+        if has_native_op("bitnet_int8_linear_from_float"):
+            module = native_module()
+            if module is not None and hasattr(module, "bitnet_int8_linear_from_float_forward"):
+                return module.bitnet_int8_linear_from_float_forward(
+                    x_cast,
+                    spec["qweight"],
+                    spec["inv_scale"],
+                    bias,
+                    pre_scale,
+                    str(spec.get("act_quant_mode", "dynamic_int8")),
+                    str(spec.get("act_quant_method", "absmax")),
+                    int(spec.get("act_quant_bits", 8)),
+                    float(spec.get("act_quant_percentile", 0.999)),
+                    act_scale,
+                    target_dtype,
+                )
+
+    qx, row_scale, out_dtype = _bitnet_int8_quantize_input(x, spec)
+    return _bitnet_int8_linear_from_quantized_input(qx, row_scale, spec, out_dtype=out_dtype)
+
+
+def _bitnet_row_scales_from_spec(spec: dict) -> torch.Tensor:
+    layout_header = spec["layout_header"]
+    scale_values = spec["scale_values"]
+    segment_offsets = spec["segment_offsets"]
+    logical_out = int(layout_header[3].item())
+    scale_granularity = int(layout_header[7].item())
+    scale_group_size = int(layout_header[8].item())
+    out = torch.zeros(logical_out, device=scale_values.device, dtype=torch.float32)
+    values = scale_values.flatten()
+    if scale_granularity == 0:
+        out.fill_(float(values[0].item()))
+        return out
+    if scale_granularity == 1:
+        for idx in range(segment_offsets.numel() - 1):
+            start = int(segment_offsets[idx].item())
+            end = int(segment_offsets[idx + 1].item())
+            out[start:end] = values[idx]
+        return out
+    if scale_granularity == 2:
+        if scale_group_size <= 0:
+            raise ValueError("BitNet packed spec with per-output-group scaling requires a positive scale_group_size")
+        for idx in range(values.numel()):
+            start = idx * scale_group_size
+            end = min(logical_out, start + scale_group_size)
+            out[start:end] = values[idx]
+        return out
+    raise ValueError(f"Unsupported BitNet scale granularity in packed spec: {scale_granularity}")
+
+
+def _bitnet_qkv_input_transform_signature(spec: dict) -> tuple:
+    def _tensor_signature(value) -> tuple:
+        if not isinstance(value, torch.Tensor):
+            return ("none",)
+        return (
+            tuple(value.shape),
+            str(value.dtype),
+            str(value.device),
+            tuple(value.detach().cpu().reshape(-1).tolist()),
+        )
+
+    mode = str(spec.get("act_quant_mode", "none")).strip().lower()
+    if mode in {"", "none", "off"}:
+        act_signature = ("none",)
+    elif mode == "dynamic_int8":
+        act_signature = (
+            "dynamic_int8",
+            str(spec.get("act_quant_method", "absmax")).strip().lower(),
+            int(spec.get("act_quant_bits", 8)),
+            float(spec.get("act_quant_percentile", 0.999)),
+        )
+    elif mode == "static_int8":
+        act_signature = (
+            "static_int8",
+            int(spec.get("act_quant_bits", 8)),
+            _tensor_signature(spec.get("act_scale")),
+        )
+    else:
+        act_signature = (
+            mode,
+            str(spec.get("act_quant_method", "absmax")).strip().lower(),
+            int(spec.get("act_quant_bits", 8)),
+            float(spec.get("act_quant_percentile", 0.999)),
+            _tensor_signature(spec.get("act_scale")),
+        )
+
+    return (
+        bool(spec.get("spin_enabled", False)),
+        _tensor_signature(spec.get("spin_signs")),
+        _tensor_signature(spec.get("pre_scale")),
+        act_signature,
+    )
+
+
+def _fuse_bitnet_qkv_specs(
+    q_spec: dict,
+    k_spec: dict,
+    v_spec: dict,
+) -> dict | None:
+    specs = (q_spec, k_spec, v_spec)
+    if {str(spec.get("format")) for spec in specs} != {"bitnet_w2a8"}:
+        return None
+    signatures = {_bitnet_qkv_input_transform_signature(spec) for spec in specs}
+    if len(signatures) != 1:
+        return None
+
+    q_header = q_spec["layout_header"]
+    k_header = k_spec["layout_header"]
+    v_header = v_spec["layout_header"]
+    logical_in = int(q_header[4].item())
+    padded_in = int(q_header[6].item())
+    tile_n = int(q_header[1].item())
+    tile_k = int(q_header[2].item())
+    interleave_mode = int(q_header[9].item())
+    if any(int(header[4].item()) != logical_in for header in (k_header, v_header)):
+        return None
+    if any(int(header[6].item()) != padded_in for header in (k_header, v_header)):
+        return None
+    if any(int(header[1].item()) != tile_n or int(header[2].item()) != tile_k for header in (k_header, v_header)):
+        return None
+    if any(int(header[9].item()) != interleave_mode for header in (k_header, v_header)):
+        return None
+
+    q_size = int(q_header[3].item())
+    k_size = int(k_header[3].item())
+    v_size = int(v_header[3].item())
+    logical_out = q_size + k_size + v_size
+    padded_out = ((logical_out + 15) // 16) * 16
+    packed_cols = int(q_spec["packed_weight"].shape[1])
+    fused_weight = torch.full(
+        (padded_out, packed_cols),
+        0x55,
+        device=q_spec["packed_weight"].device,
+        dtype=torch.uint8,
+    )
+
+    cursor = 0
+    for spec, logical_rows in ((q_spec, q_size), (k_spec, k_size), (v_spec, v_size)):
+        fused_weight[cursor : cursor + logical_rows].copy_(spec["packed_weight"][:logical_rows])
+        cursor += logical_rows
+
+    row_scales = torch.cat(
+        [
+            _bitnet_row_scales_from_spec(q_spec),
+            _bitnet_row_scales_from_spec(k_spec),
+            _bitnet_row_scales_from_spec(v_spec),
+        ],
+        dim=0,
+    ).to(device=fused_weight.device, dtype=torch.float32).contiguous()
+
+    bias_any = any(isinstance(spec.get("bias"), torch.Tensor) for spec in specs)
+    fused_bias = None
+    if bias_any:
+        bias_parts = []
+        for spec, logical_rows in ((q_spec, q_size), (k_spec, k_size), (v_spec, v_size)):
+            bias = spec.get("bias")
+            if isinstance(bias, torch.Tensor):
+                bias_parts.append(bias.to(device=fused_weight.device, dtype=torch.float32).reshape(-1)[:logical_rows].contiguous())
+            else:
+                bias_parts.append(torch.zeros(logical_rows, device=fused_weight.device, dtype=torch.float32))
+        fused_bias = torch.cat(bias_parts, dim=0).contiguous()
+
+    arch_min = max(int(spec["layout_header"][10].item()) for spec in specs)
+    layout_header = torch.tensor(
+        [1, tile_n, tile_k, logical_out, logical_in, padded_out, padded_in, 2, 1, interleave_mode, arch_min, 1, 0],
+        device=fused_weight.device,
+        dtype=torch.int32,
+    )
+    segment_offsets = torch.tensor([0, logical_out], device=fused_weight.device, dtype=torch.int32)
+
+    fused_spec = {
+        "format": "bitnet_qkv_fused",
+        "backend": "bitnet",
+        "packed_weight": fused_weight.contiguous(),
+        "scale_values": row_scales,
+        "layout_header": layout_header.contiguous(),
+        "segment_offsets": segment_offsets.contiguous(),
+        "packed_bias": fused_bias,
+        "q_size": q_size,
+        "k_size": k_size,
+        "v_size": v_size,
+        "spin_enabled": bool(q_spec.get("spin_enabled", False)),
+        "spin_signs": q_spec.get("spin_signs"),
+        "pre_scale": q_spec.get("pre_scale"),
+        "act_quant_mode": str(q_spec.get("act_quant_mode", "none")),
+        "act_quant_method": str(q_spec.get("act_quant_method", "absmax")),
+        "act_quant_bits": int(q_spec.get("act_quant_bits", 8)),
+        "act_quant_percentile": float(q_spec.get("act_quant_percentile", 0.999)),
+        "act_scale": q_spec.get("act_scale"),
+    }
+    return fused_spec
+
+
+def _fuse_bitnet_int8_qkv_specs(
+    q_spec: dict,
+    k_spec: dict,
+    v_spec: dict,
+) -> dict | None:
+    specs = (q_spec, k_spec, v_spec)
+    if {str(spec.get("format")) for spec in specs} != {"bitnet_w2a8_int8"}:
+        return None
+    signatures = {_bitnet_qkv_input_transform_signature(spec) for spec in specs}
+    if len(signatures) != 1:
+        return None
+
+    q_size = int(q_spec["qweight"].shape[0])
+    k_size = int(k_spec["qweight"].shape[0])
+    v_size = int(v_spec["qweight"].shape[0])
+    fused_bias = None
+    if any(isinstance(spec.get("bias"), torch.Tensor) for spec in specs):
+        bias_parts = []
+        for spec, logical_rows in ((q_spec, q_size), (k_spec, k_size), (v_spec, v_size)):
+            bias = spec.get("bias")
+            if isinstance(bias, torch.Tensor):
+                bias_parts.append(
+                    bias.to(device=spec["qweight"].device, dtype=torch.float32).reshape(-1)[:logical_rows].contiguous()
+                )
+            else:
+                bias_parts.append(torch.zeros(logical_rows, device=spec["qweight"].device, dtype=torch.float32))
+        fused_bias = torch.cat(bias_parts, dim=0).contiguous()
+
+    return {
+        "format": "bitnet_qkv_fused_int8",
+        "backend": "bitnet",
+        "qweight": torch.cat([q_spec["qweight"], k_spec["qweight"], v_spec["qweight"]], dim=0).contiguous(),
+        "inv_scale": torch.cat([q_spec["inv_scale"], k_spec["inv_scale"], v_spec["inv_scale"]], dim=0).contiguous(),
+        "packed_bias": fused_bias,
+        "q_size": q_size,
+        "k_size": k_size,
+        "v_size": v_size,
+        "spin_enabled": False,
+        "spin_signs": q_spec.get("spin_signs"),
+        "pre_scale": q_spec.get("pre_scale"),
+        "act_quant_mode": str(q_spec.get("act_quant_mode", "none")),
+        "act_quant_method": str(q_spec.get("act_quant_method", "absmax")),
+        "act_quant_bits": int(q_spec.get("act_quant_bits", 8)),
+        "act_quant_percentile": float(q_spec.get("act_quant_percentile", 0.999)),
+        "act_scale": q_spec.get("act_scale"),
+    }
+
+
+def bitnet_fused_qkv_packed_heads_projection(
+    x: torch.Tensor,
+    spec: dict,
+    *,
+    q_heads: int,
+    kv_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x_local = _apply_packed_linear_input_spec(x, spec)
+    packed_bias = spec.get("packed_bias")
+
+    if not _should_use_eager_autograd_fallback(
+        x_local,
+        spec["packed_weight"],
+        packed_bias,
+    ):
+        if has_native_op("bitnet_fused_qkv_packed_heads_projection"):
+            module = native_module()
+            if module is not None and hasattr(module, "bitnet_fused_qkv_packed_heads_projection_forward"):
+                q, k, v = module.bitnet_fused_qkv_packed_heads_projection_forward(
+                    x_local,
+                    spec["packed_weight"],
+                    spec["scale_values"],
+                    spec["layout_header"],
+                    spec["segment_offsets"],
+                    packed_bias,
+                    int(spec["q_size"]),
+                    int(spec["k_size"]),
+                    int(spec["v_size"]),
+                    int(q_heads),
+                    int(kv_heads),
+                )
+                return q, k, v
+
+    fused = _bitnet_linear_from_transformed_input(
+        x_local,
+        {
+            "packed_weight": spec["packed_weight"],
+            "scale_values": spec["scale_values"],
+            "layout_header": spec["layout_header"],
+            "segment_offsets": spec["segment_offsets"],
+            "bias": packed_bias,
+        },
+    )
+    q_size = int(spec["q_size"])
+    k_size = int(spec["k_size"])
+    v_size = int(spec["v_size"])
+    return (
+        split_heads(fused[..., :q_size], q_heads),
+        split_heads(fused[..., q_size : q_size + k_size], kv_heads),
+        split_heads(fused[..., q_size + k_size : q_size + k_size + v_size], kv_heads),
+    )
+
+
+def bitnet_fused_qkv_int8_packed_heads_projection(
+    x: torch.Tensor,
+    spec: dict,
+    *,
+    q_heads: int,
+    kv_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not _should_use_eager_autograd_fallback(
+        x,
+        spec["qweight"],
+        spec.get("packed_bias"),
+    ):
+        if has_native_op("bitnet_int8_fused_qkv_packed_heads_projection"):
+            module = native_module()
+            if module is not None and hasattr(module, "bitnet_int8_fused_qkv_packed_heads_projection_forward"):
+                q, k, v = module.bitnet_int8_fused_qkv_packed_heads_projection_forward(
+                    x,
+                    spec["qweight"],
+                    spec["inv_scale"],
+                    spec.get("packed_bias"),
+                    spec.get("pre_scale"),
+                    str(spec.get("act_quant_mode", "dynamic_int8")),
+                    str(spec.get("act_quant_method", "absmax")),
+                    int(spec.get("act_quant_bits", 8)),
+                    float(spec.get("act_quant_percentile", 0.999)),
+                    spec.get("act_scale"),
+                    int(spec["q_size"]),
+                    int(spec["k_size"]),
+                    int(spec["v_size"]),
+                    int(q_heads),
+                    int(kv_heads),
+                    x.dtype if x.dtype.is_floating_point else torch.float32,
+                )
+                return q, k, v
+
+    fused = _bitnet_int8_linear_from_float_input(
+        x,
+        {
+            "qweight": spec["qweight"],
+            "inv_scale": spec["inv_scale"],
+            "bias": spec.get("packed_bias"),
+            "pre_scale": spec.get("pre_scale"),
+            "act_quant_mode": spec.get("act_quant_mode", "dynamic_int8"),
+            "act_quant_method": spec.get("act_quant_method", "absmax"),
+            "act_quant_bits": spec.get("act_quant_bits", 8),
+            "act_quant_percentile": spec.get("act_quant_percentile", 0.999),
+            "act_scale": spec.get("act_scale"),
+        },
+    )
+    q_size = int(spec["q_size"])
+    k_size = int(spec["k_size"])
+    v_size = int(spec["v_size"])
+    return (
+        split_heads(fused[..., :q_size], q_heads),
+        split_heads(fused[..., q_size : q_size + k_size], kv_heads),
+        split_heads(fused[..., q_size + k_size : q_size + k_size + v_size], kv_heads),
+    )
+
+
 def bitnet_qkv_packed_heads_projection(
     x: torch.Tensor,
     q_spec: dict,
@@ -1775,6 +2572,25 @@ def bitnet_qkv_packed_heads_projection(
     q_heads: int,
     kv_heads: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if {str(q_spec.get("format")), str(k_spec.get("format")), str(v_spec.get("format"))} == {"bitnet_w2a8_int8"}:
+        q_signature = _bitnet_qkv_input_transform_signature(q_spec)
+        shared_quant = (
+            q_signature == _bitnet_qkv_input_transform_signature(k_spec)
+            and q_signature == _bitnet_qkv_input_transform_signature(v_spec)
+        )
+        qx, row_scale, out_dtype = _bitnet_int8_quantize_input(x, q_spec)
+        if shared_quant:
+            kx, k_scale = qx, row_scale
+            vx, v_scale = qx, row_scale
+        else:
+            kx, k_scale, _ = _bitnet_int8_quantize_input(x, k_spec)
+            vx, v_scale, _ = _bitnet_int8_quantize_input(x, v_spec)
+        return (
+            split_heads(_bitnet_int8_linear_from_quantized_input(qx, row_scale, q_spec, out_dtype=out_dtype), q_heads),
+            split_heads(_bitnet_int8_linear_from_quantized_input(kx, k_scale, k_spec, out_dtype=out_dtype), kv_heads),
+            split_heads(_bitnet_int8_linear_from_quantized_input(vx, v_scale, v_spec, out_dtype=out_dtype), kv_heads),
+        )
+
     qx = _apply_packed_linear_input_spec(x, q_spec)
     kx = _apply_packed_linear_input_spec(x, k_spec)
     vx = _apply_packed_linear_input_spec(x, v_spec)
@@ -1977,6 +2793,9 @@ def resolve_packed_qkv_module_spec(
         }
 
     if formats == {"bitnet_w2a8"} and resolved_backend == "bitnet":
+        fused_spec = _fuse_bitnet_qkv_specs(q_spec, k_spec, v_spec)
+        if fused_spec is not None:
+            return fused_spec
         return {
             "format": "bitnet_qkv",
             "backend": resolved_backend,
@@ -1986,6 +2805,20 @@ def resolve_packed_qkv_module_spec(
             "q_size": int(q_spec["layout_header"][3].item()),
             "k_size": int(k_spec["layout_header"][3].item()),
             "v_size": int(v_spec["layout_header"][3].item()),
+        }
+    if formats == {"bitnet_w2a8_int8"} and resolved_backend == "bitnet":
+        fused_spec = _fuse_bitnet_int8_qkv_specs(q_spec, k_spec, v_spec)
+        if fused_spec is not None:
+            return fused_spec
+        return {
+            "format": "bitnet_qkv",
+            "backend": resolved_backend,
+            "q_spec": q_spec,
+            "k_spec": k_spec,
+            "v_spec": v_spec,
+            "q_size": int(q_spec["qweight"].shape[0]),
+            "k_size": int(k_spec["qweight"].shape[0]),
+            "v_size": int(v_spec["qweight"].shape[0]),
         }
     return None
 
@@ -2019,6 +2852,20 @@ def qkv_packed_spec_heads_projection(
             spec["q_spec"],
             spec["k_spec"],
             spec["v_spec"],
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+        )
+    if format_name == "bitnet_qkv_fused":
+        return bitnet_fused_qkv_packed_heads_projection(
+            x,
+            spec,
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+        )
+    if format_name == "bitnet_qkv_fused_int8":
+        return bitnet_fused_qkv_int8_packed_heads_projection(
+            x,
+            spec,
             q_heads=q_heads,
             kv_heads=kv_heads,
         )
@@ -2162,7 +3009,7 @@ def head_output_packed_projection(
     format_name = str(spec.get("format"))
     if format_name == "dense_packed":
         return head_output_projection(x, spec["packed_weight"], spec.get("bias"), backend=backend)
-    if format_name == "bitnet_w2a8":
+    if format_name in {"bitnet_w2a8", "bitnet_w2a8_int8"}:
         return linear_from_packed_spec(merge_heads(x), spec, backend=backend)
     raise NotImplementedError(f"Packed output projection format {format_name} is not implemented")
 

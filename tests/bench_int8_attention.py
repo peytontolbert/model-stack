@@ -45,6 +45,8 @@ def _run_case(
     iters: int,
     use_mask: bool,
     opt_in_decode: bool,
+    opt_in_persistent: bool,
+    opt_in_wgmma: bool,
 ) -> None:
     device = torch.device("cuda")
     qf = torch.randn(batch, heads, q_seq, head_dim, device=device, dtype=dtype)
@@ -62,6 +64,14 @@ def _run_case(
         return int8_matmul_qkv(q, k, v, q_scale, k_scale, v_scale, attn_mask, out_dtype=dtype)
 
     os.environ.pop("MODEL_STACK_DISABLE_INT8_ATTENTION_OPTIMIZED", None)
+    os.environ["MODEL_STACK_DISABLE_INT8_ATTENTION_PERSISTENT"] = "1"
+    os.environ.pop("MODEL_STACK_ENABLE_INT8_ATTENTION_PERSISTENT", None)
+    if opt_in_wgmma:
+        os.environ["MODEL_STACK_ENABLE_INT8_ATTENTION_WGMMA"] = "1"
+        os.environ.pop("MODEL_STACK_DISABLE_INT8_ATTENTION_WGMMA", None)
+    else:
+        os.environ["MODEL_STACK_DISABLE_INT8_ATTENTION_WGMMA"] = "1"
+        os.environ.pop("MODEL_STACK_ENABLE_INT8_ATTENTION_WGMMA", None)
     if opt_in_decode:
         os.environ["MODEL_STACK_ENABLE_INT8_ATTENTION_DECODE_SPECIALIZED"] = "1"
     else:
@@ -69,25 +79,47 @@ def _run_case(
     out_default = run_once()
     default_ms = _timeit(run_once, warmup=warmup, iters=iters)
 
+    persistent_ms = None
+    max_err_persistent = None
+    if opt_in_persistent:
+        os.environ["MODEL_STACK_ENABLE_INT8_ATTENTION_PERSISTENT"] = "1"
+        os.environ.pop("MODEL_STACK_DISABLE_INT8_ATTENTION_PERSISTENT", None)
+        out_persistent = run_once()
+        persistent_ms = _timeit(run_once, warmup=warmup, iters=iters)
+        max_err_persistent = float((out_persistent - out_default).abs().max().item())
+
     os.environ["MODEL_STACK_DISABLE_INT8_ATTENTION_OPTIMIZED"] = "1"
+    os.environ["MODEL_STACK_DISABLE_INT8_ATTENTION_PERSISTENT"] = "1"
+    os.environ.pop("MODEL_STACK_ENABLE_INT8_ATTENTION_PERSISTENT", None)
+    os.environ["MODEL_STACK_DISABLE_INT8_ATTENTION_WGMMA"] = "1"
+    os.environ.pop("MODEL_STACK_ENABLE_INT8_ATTENTION_WGMMA", None)
     os.environ.pop("MODEL_STACK_ENABLE_INT8_ATTENTION_DECODE_SPECIALIZED", None)
     out_generic = run_once()
     generic_ms = _timeit(run_once, warmup=warmup, iters=iters)
 
     max_err = float((out_default - out_generic).abs().max().item())
-    speedup = generic_ms / default_ms if default_ms > 0 else float("inf")
+    optimized_speedup = generic_ms / default_ms if default_ms > 0 else float("inf")
+    persistent_speedup = generic_ms / persistent_ms if persistent_ms and persistent_ms > 0 else None
     print(
         f"shape=batch={batch} heads={heads} q_seq={q_seq} kv_seq={kv_seq} head_dim={head_dim} "
-        f"mask={use_mask} decode_opt_in={opt_in_decode}"
+        f"mask={use_mask} decode_opt_in={opt_in_decode} persistent_opt_in={opt_in_persistent} "
+        f"wgmma_opt_in={opt_in_wgmma}"
     )
     print(f"default_ms={default_ms:.4f}")
+    if persistent_ms is not None:
+        print(f"persistent_ms={persistent_ms:.4f}")
     print(f"generic_ms={generic_ms:.4f}")
-    print(f"speedup={speedup:.3f}x")
-    print(f"max_abs_err={max_err:.6f}")
+    print(f"optimized_speedup_vs_generic={optimized_speedup:.3f}x")
+    if persistent_speedup is not None:
+        print(f"persistent_speedup_vs_generic={persistent_speedup:.3f}x")
+        print(f"persistent_vs_default_max_abs_err={max_err_persistent:.6f}")
+    print(f"default_vs_generic_max_abs_err={max_err:.6f}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark native int8 attention dispatch against the generic fallback.")
+    parser = argparse.ArgumentParser(
+        description="Benchmark native int8 attention dispatch, persistent scheduling, and the generic fallback."
+    )
     parser.add_argument("--batch", type=int, default=4)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--q-seq", type=int, default=128)
@@ -101,6 +133,16 @@ def main() -> None:
         "--decode-opt-in",
         action="store_true",
         help="Enable the experimental q_len==1 decode-specialized kernel.",
+    )
+    parser.add_argument(
+        "--persistent-opt-in",
+        action="store_true",
+        help="Enable the experimental SM90 persistent CTA scheduler for optimized attention kernels.",
+    )
+    parser.add_argument(
+        "--wgmma-opt-in",
+        action="store_true",
+        help="Enable the experimental SM90a WGMMA int8 attention kernel.",
     )
     args = parser.parse_args()
 
@@ -121,7 +163,16 @@ def main() -> None:
 
     info = runtime_info()
     print(f"kernel_family={info.get('int8_attention_kernel_family')}")
+    print(f"scheduler={info.get('int8_attention_scheduler')}")
     print(f"specializations={info.get('int8_attention_specializations')}")
+    print(f"wgmma_env={info.get('int8_attention_wgmma_env')}")
+    print(f"wgmma_disable_env={info.get('int8_attention_wgmma_disable_env')}")
+    print(f"wgmma_min_work_env={info.get('int8_attention_wgmma_min_work_env')}")
+    print(f"wgmma_tile={info.get('int8_attention_wgmma_tile')}")
+    print(f"persistent_env={info.get('int8_attention_persistent_env')}")
+    print(f"persistent_disable_env={info.get('int8_attention_persistent_disable_env')}")
+    print(f"persistent_waves_env={info.get('int8_attention_persistent_waves_env')}")
+    print(f"persistent_waves_default={info.get('int8_attention_persistent_waves_default')}")
     print(f"optimized_min_work_default={info.get('int8_attention_optimized_min_work_default')}")
     print(
         "optimized_small_seq_min_head_dim_default="
@@ -140,6 +191,8 @@ def main() -> None:
         iters=int(args.iters),
         use_mask=bool(args.mask),
         opt_in_decode=bool(args.decode_opt_in),
+        opt_in_persistent=bool(args.persistent_opt_in),
+        opt_in_wgmma=bool(args.wgmma_opt_in),
     )
 
 

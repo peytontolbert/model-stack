@@ -64,6 +64,9 @@ torch::Tensor CudaEmbeddingForward(
     const torch::Tensor& weight,
     const torch::Tensor& indices,
     int64_t padding_idx);
+torch::Tensor CudaEmbeddingForwardUnchecked(
+    const torch::Tensor& weight,
+    const torch::Tensor& indices);
 bool HasCudaEmbeddingKernel();
 torch::Tensor CudaTemperatureForward(
     const torch::Tensor& logits,
@@ -109,6 +112,15 @@ torch::Tensor CudaSampleWithPoliciesForward(
     double repetition_penalty,
     double presence_penalty,
     double frequency_penalty);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> CudaSpeculativeAcceptForward(
+    const torch::Tensor& target_probs,
+    const torch::Tensor& draft_probs,
+    const torch::Tensor& draft_token_ids,
+    const c10::optional<torch::Tensor>& bonus_probs,
+    const c10::optional<torch::Tensor>& bonus_enabled,
+    const std::string& method,
+    double posterior_threshold,
+    double posterior_alpha);
 bool HasCudaSamplingKernel();
 std::vector<torch::Tensor> CudaAppendTokensForward(
     const torch::Tensor& seq,
@@ -140,6 +152,19 @@ torch::Tensor CudaInt4LinearForward(
     const torch::Tensor& inv_scale,
     const c10::optional<torch::Tensor>& bias);
 bool HasCudaInt4LinearKernel();
+torch::Tensor CudaNf4LinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& weight_scale,
+    const c10::optional<torch::Tensor>& bias);
+bool HasCudaNf4LinearKernel();
+torch::Tensor CudaFp8LinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_fp8,
+    double weight_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::ScalarType>& out_dtype);
+bool HasCudaFp8LinearKernel();
 torch::Tensor CudaInt8LinearForward(
     const torch::Tensor& qx,
     const torch::Tensor& x_scale,
@@ -148,6 +173,14 @@ torch::Tensor CudaInt8LinearForward(
     const c10::optional<torch::Tensor>& bias,
     const c10::optional<torch::ScalarType>& out_dtype);
 bool HasCudaInt8LinearKernel();
+torch::Tensor CudaInt8LinearFromFloatForward(
+    const torch::Tensor& x,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& provided_scale,
+    const c10::optional<torch::ScalarType>& out_dtype);
+bool HasCudaInt8QuantFrontendKernel();
 torch::Tensor CudaInt8AttentionForward(
     const torch::Tensor& q,
     const torch::Tensor& q_scale,
@@ -160,6 +193,17 @@ torch::Tensor CudaInt8AttentionForward(
     const c10::optional<double>& scale,
     const c10::optional<torch::ScalarType>& out_dtype);
 bool HasCudaInt8AttentionKernel();
+torch::Tensor CudaInt8AttentionFromFloatForward(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    const c10::optional<double>& scale,
+    const c10::optional<torch::ScalarType>& out_dtype,
+    const c10::optional<torch::Tensor>& q_provided_scale,
+    const c10::optional<torch::Tensor>& k_provided_scale,
+    const c10::optional<torch::Tensor>& v_provided_scale);
 torch::Tensor CudaActivationForward(
     const torch::Tensor& x,
     const std::string& activation);
@@ -217,7 +261,8 @@ torch::Tensor CudaPagedAttentionDecodeForward(
     const torch::Tensor& block_table,
     const torch::Tensor& lengths,
     const c10::optional<torch::Tensor>& attn_mask,
-    const c10::optional<double>& scale);
+    const c10::optional<double>& scale,
+    int64_t known_mask_seq = -1);
 bool HasCudaPagedAttentionDecodeKernel();
 namespace t10::bitnet {
 torch::Tensor CudaBitNetLinearForward(
@@ -228,9 +273,98 @@ torch::Tensor CudaBitNetLinearForward(
     const torch::Tensor& segment_offsets,
     const c10::optional<torch::Tensor>& bias,
     const c10::optional<torch::ScalarType>& out_dtype);
+torch::Tensor CudaBitNetTransformInputForward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    const c10::optional<torch::Tensor>& act_scale);
+std::tuple<torch::Tensor, torch::Tensor> CudaBitNetQuantizeActivationInt8CodesForward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    const c10::optional<torch::Tensor>& act_scale);
+std::tuple<torch::Tensor, torch::Tensor> CudaBitNetQuantizeGatedActivationInt8CodesForward(
+    const torch::Tensor& x,
+    const std::string& activation,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    const c10::optional<torch::Tensor>& act_scale);
+torch::Tensor CudaBitNetInt8LinearFromFloatRow1Forward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    const c10::optional<torch::Tensor>& act_scale,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::ScalarType>& out_dtype);
+torch::Tensor CudaBitNetLinearFromFloatForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& layout_header,
+    const torch::Tensor& segment_offsets,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    const c10::optional<torch::Tensor>& act_scale,
+    const c10::optional<torch::ScalarType>& out_dtype);
+torch::Tensor BitNetInt8LinearFromFloatForward(
+    const torch::Tensor& x,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    double act_quant_percentile,
+    const c10::optional<torch::Tensor>& act_scale,
+    const c10::optional<torch::ScalarType>& out_dtype);
+std::vector<torch::Tensor> BitNetInt8FusedQkvPackedHeadsProjectionForward(
+    const torch::Tensor& x,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& packed_bias,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    double act_quant_percentile,
+    const c10::optional<torch::Tensor>& act_scale,
+    int64_t q_size,
+    int64_t k_size,
+    int64_t v_size,
+    int64_t q_heads,
+    int64_t kv_heads,
+    const c10::optional<torch::ScalarType>& out_dtype);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> CudaPackBitNetWeightForward(
     const torch::Tensor& weight);
+std::vector<torch::Tensor> CudaBitNetFusedQkvPackedHeadsProjectionForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& layout_header,
+    const torch::Tensor& segment_offsets,
+    const c10::optional<torch::Tensor>& packed_bias,
+    int64_t q_size,
+    int64_t k_size,
+    int64_t v_size,
+    int64_t q_heads,
+    int64_t kv_heads);
 bool HasCudaBitNetLinearKernel();
+bool HasCudaBitNetInputFrontendKernel();
+bool HasCudaBitNetFusedQkvKernel();
 }  // namespace t10::bitnet
 #else
 bool HasCudaRmsNormKernel() {
@@ -266,7 +400,16 @@ bool HasCublasLtLinearBackend() {
 bool HasCudaInt4LinearKernel() {
   return false;
 }
+bool HasCudaNf4LinearKernel() {
+  return false;
+}
+bool HasCudaFp8LinearKernel() {
+  return false;
+}
 bool HasCudaInt8LinearKernel() {
+  return false;
+}
+bool HasCudaInt8QuantFrontendKernel() {
   return false;
 }
 bool HasCudaInt8AttentionKernel() {
@@ -291,7 +434,13 @@ bool HasCudaPagedAttentionDecodeKernel() {
   return false;
 }
 namespace t10::bitnet {
+bool HasCudaBitNetInputFrontendKernel() {
+  return false;
+}
 bool HasCudaBitNetLinearKernel() {
+  return false;
+}
+bool HasCudaBitNetFusedQkvKernel() {
   return false;
 }
 }  // namespace t10::bitnet
@@ -461,10 +610,18 @@ std::map<std::string, bool> NativeOpMap() {
       {"gated_activation", true},
       {"embedding", true},
       {"linear", true},
+      {"bitnet_transform_input", true},
       {"bitnet_linear", true},
+      {"bitnet_linear_from_float", true},
+      {"bitnet_int8_linear_from_float", true},
+      {"bitnet_int8_fused_qkv_packed_heads_projection", true},
       {"int4_linear", true},
+      {"nf4_linear", true},
+      {"fp8_linear", true},
       {"int8_linear", true},
+      {"int8_linear_from_float", true},
       {"int8_attention", true},
+      {"int8_attention_from_float", true},
       {"pack_bitnet_weight", true},
       {"pack_linear_weight", true},
       {"mlp", true},
@@ -472,6 +629,7 @@ std::map<std::string, bool> NativeOpMap() {
       {"pack_qkv_weights", true},
       {"qkv_packed_heads_projection", true},
       {"bitnet_qkv_packed_heads_projection", true},
+      {"bitnet_fused_qkv_packed_heads_projection", true},
       {"qkv_heads_projection", true},
       {"split_heads", true},
       {"merge_heads", true},
@@ -579,6 +737,83 @@ torch::Tensor ReferenceInt4LinearForward(
   return ReferenceLinearForward(x, weight, bias_cast);
 }
 
+std::pair<torch::Tensor, torch::Tensor> ReferenceQuantizeActivationInt8Rowwise(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& provided_scale) {
+  const auto cols = x.size(-1);
+  const auto rows = x.numel() / cols;
+  auto x_float = x.to(torch::kFloat32);
+  auto x_2d = x_float.reshape({rows, cols});
+  torch::Tensor row_scale;
+  if (provided_scale.has_value() && provided_scale.value().defined()) {
+    row_scale = provided_scale.value().to(x.device(), torch::kFloat32).reshape({-1});
+    TORCH_CHECK(
+        row_scale.numel() == 1 || row_scale.numel() == rows,
+        "ReferenceQuantizeActivationInt8Rowwise: provided_scale must have 1 or rows elements");
+    if (row_scale.numel() == 1) {
+      row_scale = row_scale.expand({rows}).clone();
+    }
+    row_scale = row_scale.clamp_min(1e-8).contiguous();
+  } else {
+    row_scale = (x_2d.abs().amax(-1).clamp_min(1e-8) / 127.0f).to(torch::kFloat32).contiguous();
+  }
+  auto qx = torch::round(x_2d / row_scale.unsqueeze(1)).clamp(-127.0f, 127.0f).to(torch::kInt8);
+  std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
+  return {qx.view(out_sizes), row_scale};
+}
+
+torch::Tensor ReferenceNf4LinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& weight_scale,
+    const c10::optional<torch::Tensor>& bias) {
+  constexpr float kNf4Codebook[16] = {
+      -1.0f, -0.6961928f, -0.52507305f, -0.3949175f,
+      -0.28444138f, -0.18477343f, -0.09105004f, 0.0f,
+      0.0795803f, 0.1609302f, 0.2461123f, 0.33791524f,
+      0.44070983f, 0.5626170f, 0.72295684f, 1.0f};
+  const auto in_features = x.size(-1);
+  auto packed_cpu = packed_weight.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8)).contiguous();
+  auto scale_cpu = weight_scale.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32)).contiguous();
+  auto weight_cpu = torch::empty(
+      {packed_cpu.size(0), in_features},
+      torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+
+  auto packed_acc = packed_cpu.accessor<uint8_t, 2>();
+  auto scale_acc = scale_cpu.accessor<float, 1>();
+  auto weight_acc = weight_cpu.accessor<float, 2>();
+  for (int64_t out_idx = 0; out_idx < packed_cpu.size(0); ++out_idx) {
+    for (int64_t in_idx = 0; in_idx < in_features; ++in_idx) {
+      const auto packed_value = packed_acc[out_idx][in_idx / 2];
+      const auto nibble = (in_idx % 2) == 0 ? (packed_value & 0x0F) : ((packed_value >> 4) & 0x0F);
+      weight_acc[out_idx][in_idx] = kNf4Codebook[nibble] * scale_acc[out_idx];
+    }
+  }
+
+  auto weight = weight_cpu.to(x.device(), x.scalar_type());
+  c10::optional<torch::Tensor> bias_cast = c10::nullopt;
+  if (bias.has_value() && bias.value().defined()) {
+    bias_cast = bias.value().to(x.device(), x.scalar_type());
+  }
+  return ReferenceLinearForward(x, weight, bias_cast);
+}
+
+torch::Tensor ReferenceFp8LinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_fp8,
+    double weight_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  const auto output_dtype = out_dtype.value_or(x.scalar_type());
+  auto x_cast = x.to(x.device(), output_dtype);
+  auto weight = (weight_fp8.to(x.device(), output_dtype) * static_cast<float>(weight_scale)).contiguous();
+  c10::optional<torch::Tensor> bias_cast = c10::nullopt;
+  if (bias.has_value() && bias.value().defined()) {
+    bias_cast = bias.value().to(x.device(), output_dtype);
+  }
+  return ReferenceLinearForward(x_cast, weight, bias_cast);
+}
+
 torch::Tensor ReferenceInt8LinearForward(
     const torch::Tensor& qx,
     const torch::Tensor& x_scale,
@@ -612,6 +847,23 @@ torch::Tensor ReferenceInt8LinearForward(
     out = out.to(out_dtype.value());
   }
   return out;
+}
+
+torch::Tensor ReferenceInt8LinearFromFloatForward(
+    const torch::Tensor& x,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& provided_scale,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  auto quantized = ReferenceQuantizeActivationInt8Rowwise(x, provided_scale);
+  return ReferenceInt8LinearForward(
+      quantized.first,
+      quantized.second,
+      qweight,
+      inv_scale,
+      bias,
+      out_dtype);
 }
 
 torch::Tensor ReferenceInt8AttentionForward(
@@ -662,6 +914,33 @@ torch::Tensor ReferenceInt8AttentionForward(
     out = out.to(out_dtype.value());
   }
   return out;
+}
+
+torch::Tensor ReferenceInt8AttentionFromFloatForward(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    const c10::optional<double>& scale,
+    const c10::optional<torch::ScalarType>& out_dtype,
+    const c10::optional<torch::Tensor>& q_provided_scale,
+    const c10::optional<torch::Tensor>& k_provided_scale,
+    const c10::optional<torch::Tensor>& v_provided_scale) {
+  auto qq = ReferenceQuantizeActivationInt8Rowwise(q, q_provided_scale);
+  auto kk = ReferenceQuantizeActivationInt8Rowwise(k, k_provided_scale);
+  auto vv = ReferenceQuantizeActivationInt8Rowwise(v, v_provided_scale);
+  return ReferenceInt8AttentionForward(
+      qq.first,
+      qq.second,
+      kk.first,
+      kk.second,
+      vv.first,
+      vv.second,
+      attn_mask,
+      is_causal,
+      scale,
+      out_dtype);
 }
 
 torch::Tensor ReferenceBitNetLinearForward(
@@ -873,13 +1152,27 @@ torch::Tensor HeadOutputProjectionForward(
     const std::string& backend);
 
 std::string DetectNativeExecutorKind(const py::object& model);
+bool ModelUsesAttentionBiases(const py::object& model);
 c10::optional<torch::Tensor> TryNativeCausalModelForward(
     const py::object& model,
     const torch::Tensor& input_ids,
     const py::object& attention_mask,
     const py::object& cache,
     const py::object& position_ids,
-    const py::object& cache_position);
+    const py::object& cache_position,
+    bool skip_model_support_check = false,
+    bool model_uses_attention_biases = false);
+struct PreparedNativeCausalModel;
+std::shared_ptr<PreparedNativeCausalModel> TryPrepareNativeCausalModel(const py::object& model);
+c10::optional<torch::Tensor> TryPreparedNativeCausalModelForward(
+    const std::shared_ptr<PreparedNativeCausalModel>& prepared,
+    const torch::Tensor& input_ids,
+    const py::object& attention_mask,
+    const py::object& cache,
+    const py::object& position_ids_obj,
+    const py::object& cache_position_obj,
+    bool model_uses_attention_biases,
+    int64_t known_decode_position = -1);
 std::string ResolveAttentionMaskMode(
     const py::object& attention_mask,
     int64_t batch_size,
@@ -902,13 +1195,20 @@ class NativeModelSession {
         cache_(std::move(cache)),
         trace_(trace),
         native_executor_kind_(DetectNativeExecutorKind(model_)),
-        attention_mask_mode_(ResolveAttentionMaskMode(attention_mask_, BatchSize(), SeqLen())) {}
+        model_uses_attention_biases_(ModelUsesAttentionBiases(model_)),
+        attention_mask_mode_(ResolveAttentionMaskMode(attention_mask_, BatchSize(), SeqLen())),
+        prepared_native_causal_model_(
+            native_executor_kind_ == "causal_lm" ? TryPrepareNativeCausalModel(model_) : nullptr),
+        decode_token_buffer_(ResolveDecodeTokenBuffer(seq_, cache_)) {}
 
   int64_t BatchSize() const { return seq_.defined() ? seq_.size(0) : 0; }
   int64_t SeqLen() const { return seq_.defined() ? seq_.size(1) : 0; }
 
   torch::Tensor GetSeq() const { return seq_; }
-  void SetSeq(const torch::Tensor& seq) { seq_ = seq; }
+  void SetSeq(const torch::Tensor& seq) {
+    seq_ = seq;
+    decode_token_buffer_ = ResolveDecodeTokenBuffer(seq_, cache_);
+  }
 
   py::object GetAttentionMask() const { return attention_mask_; }
   void SetAttentionMask(py::object attention_mask) {
@@ -917,11 +1217,17 @@ class NativeModelSession {
   }
 
   py::object GetCache() const { return cache_; }
-  void SetCache(py::object cache) { cache_ = std::move(cache); }
+  void SetCache(py::object cache) {
+    cache_ = std::move(cache);
+    decode_token_buffer_ = ResolveDecodeTokenBuffer(seq_, cache_);
+  }
 
   std::string NativeExecutorKind() const { return native_executor_kind_; }
 
-  void DisableCache() { cache_ = py::none(); }
+  void DisableCache() {
+    cache_ = py::none();
+    decode_token_buffer_ = torch::Tensor();
+  }
 
   py::object PrefillNextLogits() const {
     if (cache_.is_none()) {
@@ -942,12 +1248,14 @@ class NativeModelSession {
       seq_ = py::cast<torch::Tensor>(next[0]);
       attention_mask_ = py::cast(AppendExplicitDecodeAttentionMaskForward(py::cast<torch::Tensor>(attention_mask_), c10::nullopt));
       attention_mask_mode_ = "explicit";
+      decode_token_buffer_ = ResolveDecodeTokenBuffer(next_id, cache_);
       return;
     }
     auto next = AppendTokensForward(seq_, next_id, OptionalTensorFromPyObject(attention_mask_), c10::nullopt);
     seq_ = py::cast<torch::Tensor>(next[0]);
     attention_mask_ = next[1].is_none() ? py::none() : next[1];
     attention_mask_mode_ = attention_mask_.is_none() ? std::string("none") : std::string("token");
+    decode_token_buffer_ = ResolveDecodeTokenBuffer(next_id, cache_);
   }
 
   py::tuple DecodePositions() const {
@@ -961,13 +1269,30 @@ class NativeModelSession {
     if (cache_.is_none()) {
       return py::none();
     }
-    auto pos = DecodePositions();
-    auto logits = CallModel(
-        seq_.slice(1, std::max<int64_t>(SeqLen() - 1, 0), SeqLen()).contiguous(),
-        attention_mask_,
-        cache_,
-        pos[0],
-        pos[1]);
+    auto decode_tokens = decode_token_buffer_.defined()
+        ? decode_token_buffer_
+        : seq_.slice(1, std::max<int64_t>(SeqLen() - 1, 0), SeqLen()).contiguous();
+    torch::Tensor logits;
+    if (native_executor_kind_ == "causal_lm" &&
+        prepared_native_causal_model_ != nullptr &&
+        attention_mask_mode_ == "none" &&
+        !model_uses_attention_biases_) {
+      logits = CallModel(
+          decode_tokens,
+          attention_mask_,
+          cache_,
+          py::none(),
+          py::none(),
+          SeqLen() - 1);
+    } else {
+      auto pos = DecodePositions();
+      logits = CallModel(
+          decode_tokens,
+          attention_mask_,
+          cache_,
+          pos[0],
+          pos[1]);
+    }
     return py::cast(logits.index({at::indexing::Slice(), -1, at::indexing::Slice()}));
   }
 
@@ -1032,15 +1357,28 @@ class NativeModelSession {
       const py::object& attention_mask,
       const py::object& cache,
       const py::object& position_ids,
-      const py::object& cache_position) const {
+      const py::object& cache_position,
+      int64_t known_decode_position = -1) const {
     if (native_executor_kind_ == "causal_lm") {
-      auto native_logits = TryNativeCausalModelForward(
-          model_,
-          tokens,
-          attention_mask,
-          cache,
-          position_ids,
-          cache_position);
+      auto native_logits = prepared_native_causal_model_ != nullptr
+          ? TryPreparedNativeCausalModelForward(
+                prepared_native_causal_model_,
+                tokens,
+                attention_mask,
+                cache,
+                position_ids,
+                cache_position,
+                model_uses_attention_biases_,
+                known_decode_position)
+          : TryNativeCausalModelForward(
+                model_,
+                tokens,
+                attention_mask,
+                cache,
+                position_ids,
+                cache_position,
+                true,
+                model_uses_attention_biases_);
       if (native_logits.has_value()) {
         return native_logits.value();
       }
@@ -1062,7 +1400,17 @@ class NativeModelSession {
   py::object cache_;
   bool trace_;
   std::string native_executor_kind_;
+  bool model_uses_attention_biases_;
   std::string attention_mask_mode_;
+  std::shared_ptr<PreparedNativeCausalModel> prepared_native_causal_model_;
+  torch::Tensor decode_token_buffer_;
+
+  static torch::Tensor ResolveDecodeTokenBuffer(const torch::Tensor& seq, const py::object& cache) {
+    if (!seq.defined() || cache.is_none() || seq.dim() < 2 || seq.size(1) <= 0) {
+      return torch::Tensor();
+    }
+    return seq.slice(1, std::max<int64_t>(seq.size(1) - 1, 0), seq.size(1)).contiguous();
+  }
 };
 
 
@@ -1075,9 +1423,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "activation", "gated_activation", "embedding", "linear", "bitnet_linear", "int4_linear", "int8_linear", "int8_attention", "pack_bitnet_weight", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "bitnet_qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "paged_attention_decode", "attention_decode", "attention_prefill", "sampling", "beam_search_step", "incremental_beam_search"};
+      "activation", "gated_activation", "embedding", "linear", "bitnet_transform_input", "bitnet_linear", "bitnet_linear_from_float", "bitnet_int8_linear_from_float", "bitnet_int8_fused_qkv_packed_heads_projection", "int4_linear", "nf4_linear", "fp8_linear", "int8_linear", "int8_linear_from_float", "int8_attention", "int8_attention_from_float", "pack_bitnet_weight", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "bitnet_qkv_packed_heads_projection", "bitnet_fused_qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "paged_attention_decode", "attention_decode", "attention_prefill", "sampling", "beam_search_step", "incremental_beam_search"};
   info["planned_ops"] = std::vector<std::string>{
-      "activation", "gated_activation", "embedding", "linear", "bitnet_linear", "int4_linear", "int8_linear", "int8_attention", "pack_bitnet_weight", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "bitnet_qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "paged_attention_decode", "attention_decode",
+      "activation", "gated_activation", "embedding", "linear", "bitnet_transform_input", "bitnet_linear", "bitnet_linear_from_float", "bitnet_int8_linear_from_float", "bitnet_int8_fused_qkv_packed_heads_projection", "int4_linear", "nf4_linear", "fp8_linear", "int8_linear", "int8_linear_from_float", "int8_attention", "int8_attention_from_float", "pack_bitnet_weight", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "bitnet_qkv_packed_heads_projection", "bitnet_fused_qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "paged_attention_decode", "attention_decode",
       "attention_prefill", "sampling", "beam_search_step", "incremental_beam_search"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_backends_supported"] = SupportedLinearBackends();
@@ -1094,6 +1442,8 @@ py::dict RuntimeInfo() {
   info["bitnet_decode_rows_buckets"] = std::vector<int>{1, 2, 4, 8};
   info["bitnet_decode_scheduler"] = std::string("persistent_cta");
   info["bitnet_prefill_scheduler"] = std::string("tiled_or_splitk");
+  info["bitnet_attention_kernel_family"] = std::string("fused_qkv_projection_plus_native_attention");
+  info["bitnet_attention_qkv_scheduler"] = std::string("decode_or_prefill_fused_qkv_dispatch");
   info["bitnet_splitk_env"] = std::string("MODEL_STACK_DISABLE_BITNET_SPLITK");
   info["bitnet_persistent_decode_env"] = std::string("MODEL_STACK_DISABLE_BITNET_PERSISTENT_DECODE");
   info["attention_arches"] =
@@ -1117,11 +1467,24 @@ py::dict RuntimeInfo() {
 #else
       std::vector<std::string>{"sm50+", "sm90_specialized"};
 #endif
-  info["int4_linear_kernel_family"] = std::string("packed_byte_decode_sm90_with_optional_imma_act_quant");
+  info["int4_linear_kernel_family"] = std::string("packed_byte_decode_sm90_with_default_w4a4_imma_path");
   info["int4_linear_sm90_tile"] = std::vector<int>{8, 128, 128};
   info["int4_linear_imma_tile"] = std::vector<int>{8, 8, 32};
-  info["int4_linear_imma_requires"] = std::vector<std::string>{"sm90", "dynamic_int4_activation_quantization"};
+  info["int4_linear_imma_requires"] = std::vector<std::string>{"sm90"};
+  info["int4_linear_imma_disable_env"] = std::string("MODEL_STACK_DISABLE_INT4_IMMA_ACT_QUANT");
   info["int4_linear_weight_storage"] = std::string("uint8_packed_symmetric_per_channel");
+  info["nf4_linear_dtypes"] = HasCudaNf4LinearKernel()
+      ? std::vector<std::string>{"float32", "float16", "bfloat16"}
+      : std::vector<std::string>{};
+  info["nf4_linear_arches"] = std::vector<std::string>{"sm50+"};
+  info["nf4_linear_kernel_family"] = std::string("packed_nf4_codebook_decode");
+  info["nf4_linear_weight_storage"] = std::string("uint8_packed_nf4_per_channel");
+  info["fp8_linear_dtypes"] = HasCudaFp8LinearKernel()
+      ? std::vector<std::string>{"float32", "float16", "bfloat16"}
+      : std::vector<std::string>{};
+  info["fp8_linear_arches"] = std::vector<std::string>{"sm50+"};
+  info["fp8_linear_kernel_family"] = std::string("scaled_fp8_weight_linear");
+  info["fp8_linear_weight_storage"] = std::string("fake_fp8_float_tensor_plus_scalar_scale");
   info["int8_linear_dtypes"] = HasCudaInt8LinearKernel()
       ? std::vector<std::string>{"float32", "float16", "bfloat16"}
       : std::vector<std::string>{};
@@ -1143,18 +1506,35 @@ py::dict RuntimeInfo() {
   info["int8_linear_wgmma_build_requested"] = info["sm90a_experimental_build_requested"];
   info["int8_linear_weight_storage"] = std::string("int8_symmetric_per_channel");
   info["int8_linear_activation_storage"] = std::string("int8_symmetric_per_row");
+  info["int8_linear_frontend_kernel_family"] = std::string("rowwise_quant_frontend_plus_native_int8_linear");
   info["int8_linear_wgmma_activation_strategy"] =
       std::string("rebias_s8_to_u8_minus_128_weight_sum");
   info["int8_attention_dtypes"] = HasCudaInt8AttentionKernel()
       ? std::vector<std::string>{"float32", "float16", "bfloat16"}
       : std::vector<std::string>{};
   info["int8_attention_qkv_storage"] = std::string("int8_symmetric_per_row");
-  info["int8_attention_kernel_family"] = std::string("sm90_bulk_async_wmma_online_softmax_with_generic_fallback");
+  info["int8_attention_frontend_kernel_family"] =
+      std::string("rowwise_quant_frontend_plus_native_int8_attention");
+  info["int8_attention_kernel_family"] =
+      std::string("sm90a_wgmma_experimental_with_sm90_bulk_async_wmma_online_softmax_and_generic_fallback");
   info["int8_attention_tensorcore_tile"] = std::vector<int>{16, 16, 16};
   info["int8_attention_tensorcore_head_dims"] = std::vector<int>{32, 64, 96, 128, 192, 256};
+  info["int8_attention_wgmma_tile"] = std::vector<int>{64, 8, 32};
+  info["int8_attention_wgmma_head_dims"] = std::vector<int>{32, 64, 96, 128};
+  info["int8_attention_wgmma_requires"] =
+      std::vector<std::string>{"sm90a", "u8_q_rebias", "s8_k_correction", "shared_descriptor_wgmma"};
+  info["int8_attention_wgmma_env"] = std::string("MODEL_STACK_ENABLE_INT8_ATTENTION_WGMMA");
+  info["int8_attention_wgmma_disable_env"] = std::string("MODEL_STACK_DISABLE_INT8_ATTENTION_WGMMA");
+  info["int8_attention_wgmma_min_work_env"] = std::string("MODEL_STACK_INT8_ATTENTION_WGMMA_MIN_WORK");
   info["int8_attention_sm90_pipeline_stages"] = 2;
   info["int8_attention_sm90_bulk_async"] = true;
   info["int8_attention_sm90_bulk_async_requires"] = std::vector<std::string>{"sm90", "16b_alignment", "bulk_async_barrier"};
+  info["int8_attention_scheduler"] = std::string("cta_grid_or_persistent");
+  info["int8_attention_persistent_env"] = std::string("MODEL_STACK_ENABLE_INT8_ATTENTION_PERSISTENT");
+  info["int8_attention_persistent_disable_env"] = std::string("MODEL_STACK_DISABLE_INT8_ATTENTION_PERSISTENT");
+  info["int8_attention_persistent_waves_env"] = std::string("MODEL_STACK_INT8_ATTENTION_PERSISTENT_WAVES");
+  info["int8_attention_persistent_waves_default"] = static_cast<int64_t>(2);
+  info["int8_attention_persistent_requires"] = std::vector<std::string>{"sm90", "optimized_path", "grid_stride_tiles"};
   info["int8_attention_wgmma_build_requested"] = info["sm90a_experimental_build_requested"];
   info["int8_attention_optimized_default"] = true;
   info["int8_attention_optimized_min_work_default"] = static_cast<int64_t>(32768);
@@ -1230,14 +1610,44 @@ py::dict RuntimeInfo() {
     cuda_backend_ops.push_back("linear");
     cuda_backend_ops.push_back("qkv_projection");
   }
+  if (t10::bitnet::HasCudaBitNetFusedQkvKernel()) {
+    cuda_backend_ops.push_back("bitnet_fused_qkv_packed_heads_projection");
+  }
+  if (t10::bitnet::HasCudaBitNetInputFrontendKernel()) {
+    cuda_backend_ops.push_back("bitnet_transform_input");
+  }
+  if (t10::bitnet::HasCudaBitNetLinearKernel()) {
+    cuda_backend_ops.push_back("bitnet_linear");
+  }
+  if (t10::bitnet::HasCudaBitNetLinearKernel() && t10::bitnet::HasCudaBitNetInputFrontendKernel()) {
+    cuda_backend_ops.push_back("bitnet_linear_from_float");
+  }
   if (HasCudaInt4LinearKernel()) {
     cuda_backend_ops.push_back("int4_linear");
+  }
+  if (HasCudaNf4LinearKernel()) {
+    cuda_backend_ops.push_back("nf4_linear");
+  }
+  if (HasCudaFp8LinearKernel()) {
+    cuda_backend_ops.push_back("fp8_linear");
   }
   if (HasCudaInt8LinearKernel()) {
     cuda_backend_ops.push_back("int8_linear");
   }
+  if (HasCudaInt8LinearKernel()) {
+    cuda_backend_ops.push_back("bitnet_int8_linear_from_float");
+  }
+  if (HasCudaInt8LinearKernel()) {
+    cuda_backend_ops.push_back("bitnet_int8_fused_qkv_packed_heads_projection");
+  }
+  if (HasCudaInt8LinearKernel() && HasCudaInt8QuantFrontendKernel()) {
+    cuda_backend_ops.push_back("int8_linear_from_float");
+  }
   if (HasCudaInt8AttentionKernel()) {
     cuda_backend_ops.push_back("int8_attention");
+  }
+  if (HasCudaInt8AttentionKernel() && HasCudaInt8QuantFrontendKernel()) {
+    cuda_backend_ops.push_back("int8_attention_from_float");
   }
   if (HasCudaActivationKernel()) {
     cuda_backend_ops.push_back("activation");
@@ -1278,6 +1688,15 @@ torch::Tensor NoRepeatNgramMaskForward(
     int64_t vocab_size,
     int64_t n);
 torch::Tensor SampleNextTokenForward(const torch::Tensor& logits, bool do_sample);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> SpeculativeAcceptForward(
+    const torch::Tensor& target_probs,
+    const torch::Tensor& draft_probs,
+    const torch::Tensor& draft_token_ids,
+    const c10::optional<torch::Tensor>& bonus_probs,
+    const c10::optional<torch::Tensor>& bonus_enabled,
+    const std::string& method,
+    double posterior_threshold,
+    double posterior_alpha);
 torch::Tensor RepetitionPenaltyForward(
     const torch::Tensor& logits,
     const torch::Tensor& token_ids,
@@ -1682,6 +2101,63 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> PagedKvAssignBlocksForward(
   return std::make_tuple(next_table, selected_active, next_page_id + missing_count);
 }
 
+std::tuple<torch::Tensor, torch::Tensor, int64_t> PagedKvAssignBlocksForwardUnchecked(
+    const torch::Tensor& block_table,
+    const torch::Tensor& block_ids,
+    const torch::Tensor& starts,
+    int64_t total,
+    int64_t page_size,
+    int64_t next_page_id) {
+  auto table_long = block_table.to(torch::kLong).contiguous();
+  auto block_ids_long = block_ids.to(torch::kLong).contiguous();
+  auto starts_long = starts.to(torch::kLong).contiguous();
+  if (block_ids_long.numel() == 0 || total == 0) {
+    auto empty = torch::empty({block_ids_long.size(0), 0}, table_long.options());
+    return std::make_tuple(table_long, empty, next_page_id);
+  }
+
+  const auto rows = block_ids_long.size(0);
+  auto end_positions = starts_long + (total - 1);
+  auto start_blocks = at::floor_divide(starts_long, page_size);
+  auto end_blocks = at::floor_divide(end_positions, page_size);
+  const auto needed_blocks = end_blocks.max().item<int64_t>() + 1;
+
+  int64_t next_blocks = table_long.size(1);
+  if (next_blocks < needed_blocks) {
+    next_blocks = std::max<int64_t>(1, next_blocks > 0 ? next_blocks : 1);
+    while (next_blocks < needed_blocks) {
+      next_blocks *= 2;
+    }
+  }
+
+  auto next_table = table_long;
+  if (next_blocks != table_long.size(1)) {
+    next_table = torch::full({table_long.size(0), next_blocks}, -1, table_long.options());
+    if (table_long.numel() > 0) {
+      next_table.slice(1, 0, table_long.size(1)).copy_(table_long);
+    }
+  } else {
+    next_table = table_long.clone();
+  }
+
+  auto selected = next_table.index_select(0, block_ids_long).clone();
+  auto selected_prefix = selected.slice(1, 0, needed_blocks).clone();
+  auto active_slots = torch::arange(needed_blocks, table_long.options()).view({1, needed_blocks});
+  auto active_mask =
+      active_slots.ge(start_blocks.view({rows, 1})) & active_slots.le(end_blocks.view({rows, 1}));
+  auto missing_mask = active_mask & selected_prefix.lt(0);
+  const auto missing_count = missing_mask.sum().item<int64_t>();
+  if (missing_count > 0) {
+    auto new_ids = torch::arange(next_page_id, next_page_id + missing_count, table_long.options());
+    selected_prefix.masked_scatter_(missing_mask, new_ids);
+  }
+
+  selected.slice(1, 0, needed_blocks).copy_(selected_prefix);
+  next_table.index_copy_(0, block_ids_long, selected);
+  auto selected_active = selected_prefix.clamp_min(0).contiguous();
+  return std::make_tuple(next_table, selected_active, next_page_id + missing_count);
+}
+
 torch::Tensor PagedKvReservePagesForward(
     const torch::Tensor& pages,
     int64_t used_pages,
@@ -1840,7 +2316,21 @@ torch::Tensor PagedKvWriteForward(
     const torch::Tensor& block_table,
     const torch::Tensor& positions,
     const torch::Tensor& values);
+torch::Tensor PagedKvWriteForwardUnchecked(
+    const torch::Tensor& pages,
+    const torch::Tensor& block_table,
+    const torch::Tensor& positions,
+    const torch::Tensor& values);
 std::vector<torch::Tensor> PagedKvAppendForward(
+    const torch::Tensor& k_pages,
+    const torch::Tensor& v_pages,
+    const torch::Tensor& block_table,
+    const torch::Tensor& lengths,
+    int64_t page_count,
+    const torch::Tensor& k_chunk,
+    const torch::Tensor& v_chunk,
+    const torch::Tensor& block_ids);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t> PagedKvAppendForwardUnchecked(
     const torch::Tensor& k_pages,
     const torch::Tensor& v_pages,
     const torch::Tensor& block_table,
@@ -1867,7 +2357,8 @@ class PagedKvLayerState {
       : batch_(batch),
         heads_(heads),
         head_dim_(head_dim),
-        page_size_(std::max<int64_t>(page_size, 1)) {
+        page_size_(std::max<int64_t>(page_size, 1)),
+        max_length_(0) {
     TORCH_CHECK(example.defined(), "PagedKvLayerState: example tensor must be defined");
     auto page_options = example.options();
     auto long_options = page_options.dtype(torch::kLong);
@@ -1886,14 +2377,85 @@ class PagedKvLayerState {
     block_table_ = torch::empty({batch_, 0}, long_options);
     lengths_ = torch::zeros({batch_}, long_options);
     page_count_ = 0;
+    max_length_ = 0;
   }
 
   void Append(
       const torch::Tensor& k_chunk,
       const torch::Tensor& v_chunk,
       const c10::optional<torch::Tensor>& block_ids) {
+    const auto total = k_chunk.size(2);
+    const bool single_row_fast_path = batch_ == 1 && (!block_ids.has_value() || !block_ids.value().defined());
+    if (single_row_fast_path) {
+      int64_t next_max_length = max_length_;
+      if (total > 0) {
+        next_max_length = max_length_ + total;
+      }
+      auto k_chunk_local = k_chunk.to(k_pages_.options()).contiguous();
+      auto v_chunk_local = v_chunk.to(v_pages_.options()).contiguous();
+      if (total > 0) {
+        const int64_t start = max_length_;
+        const int64_t end = start + total;
+        const int64_t assigned_blocks = (max_length_ + page_size_ - 1) / page_size_;
+        const int64_t needed_blocks = (end + page_size_ - 1) / page_size_;
+        int64_t next_blocks = block_table_.size(1);
+        if (next_blocks < needed_blocks) {
+          next_blocks = std::max<int64_t>(1, next_blocks > 0 ? next_blocks : 1);
+          while (next_blocks < needed_blocks) {
+            next_blocks *= 2;
+          }
+        }
+
+        auto next_block_table = block_table_;
+        if (next_blocks != block_table_.size(1)) {
+          next_block_table = torch::full({batch_, next_blocks}, -1, block_table_.options());
+          if (block_table_.numel() > 0) {
+            next_block_table.slice(1, 0, block_table_.size(1)).copy_(block_table_);
+          }
+        } else {
+          next_block_table = block_table_.clone();
+        }
+
+        const int64_t missing_count = std::max<int64_t>(0, needed_blocks - assigned_blocks);
+        if (missing_count > 0) {
+          auto new_ids = missing_count == 1
+              ? torch::full({1}, page_count_, block_table_.options())
+              : torch::arange(page_count_, page_count_ + missing_count, block_table_.options());
+          next_block_table[0].slice(0, assigned_blocks, needed_blocks).copy_(new_ids);
+        }
+
+        auto selected_block_table = next_block_table.slice(1, 0, needed_blocks).contiguous();
+        auto positions = total == 1
+            ? torch::full({1, 1}, start, block_table_.options())
+            : (torch::arange(total, block_table_.options()) + start).view({1, total});
+        auto next_page_count = page_count_ + missing_count;
+        auto next_k_pages = PagedKvReservePagesForward(k_pages_, page_count_, next_page_count);
+        auto next_v_pages = PagedKvReservePagesForward(v_pages_, page_count_, next_page_count);
+        next_k_pages = PagedKvWriteForwardUnchecked(next_k_pages, selected_block_table, positions, k_chunk_local);
+        next_v_pages = PagedKvWriteForwardUnchecked(next_v_pages, selected_block_table, positions, v_chunk_local);
+        k_pages_ = next_k_pages;
+        v_pages_ = next_v_pages;
+        block_table_ = next_block_table;
+        lengths_ = torch::full({batch_}, end, block_table_.options());
+        page_count_ = next_page_count;
+      }
+      max_length_ = next_max_length;
+      return;
+    }
+
     auto ids = NormalizeBlockIds(block_ids, k_chunk.size(0));
-    auto result = PagedKvAppendForward(
+    auto starts_long = lengths_.index_select(0, ids);
+    int64_t next_max_length = max_length_;
+    const bool updates_all_rows =
+        !block_ids.has_value() || !block_ids.value().defined() || ids.numel() == batch_;
+    if (ids.numel() > 0 && total > 0) {
+      if (updates_all_rows) {
+        next_max_length = max_length_ + total;
+      } else {
+        next_max_length = std::max(max_length_, starts_long.max().item<int64_t>() + total);
+      }
+    }
+    auto result = PagedKvAppendForwardUnchecked(
         k_pages_,
         v_pages_,
         block_table_,
@@ -1902,11 +2464,12 @@ class PagedKvLayerState {
         k_chunk.to(k_pages_.options()).contiguous(),
         v_chunk.to(v_pages_.options()).contiguous(),
         ids);
-    k_pages_ = result[0];
-    v_pages_ = result[1];
-    block_table_ = result[2];
-    lengths_ = result[3];
-    page_count_ = result[4].item<int64_t>();
+    k_pages_ = std::get<0>(result);
+    v_pages_ = std::get<1>(result);
+    block_table_ = std::get<2>(result);
+    lengths_ = std::get<3>(result);
+    page_count_ = std::get<4>(result);
+    max_length_ = next_max_length;
   }
 
   std::vector<torch::Tensor> ReadRange(
@@ -1993,6 +2556,7 @@ class PagedKvLayerState {
     block_table_ = reordered->block_table_;
     lengths_ = reordered->lengths_;
     page_count_ = reordered->page_count_;
+    max_length_ = reordered->max_length_;
   }
 
   void Compact(int64_t keep) {
@@ -2007,6 +2571,7 @@ class PagedKvLayerState {
     block_table_ = result[2];
     lengths_ = result[3];
     page_count_ = k_pages_.size(0);
+    max_length_ = std::min(max_length_, std::max<int64_t>(keep, 0));
   }
 
   torch::Tensor KPages() const { return k_pages_; }
@@ -2014,6 +2579,7 @@ class PagedKvLayerState {
   torch::Tensor BlockTable() const { return block_table_; }
   torch::Tensor Lengths() const { return lengths_; }
   int64_t PageCount() const { return page_count_; }
+  int64_t MaxLength() const { return max_length_; }
 
  private:
   torch::Tensor NormalizeBlockIds(
@@ -2067,6 +2633,7 @@ class PagedKvLayerState {
   torch::Tensor block_table_;
   torch::Tensor lengths_;
   int64_t page_count_;
+  int64_t max_length_;
 };
 
 class PagedKvCacheState {
@@ -2157,8 +2724,7 @@ class PagedKvCacheState {
   int64_t PageCount(int64_t layer_idx) const { return Layer(layer_idx)->PageCount(); }
 
   int64_t MaxLength(int64_t layer_idx) const {
-    auto lengths = Layer(layer_idx)->Lengths();
-    return lengths.numel() > 0 ? lengths.max().item<int64_t>() : 0;
+    return Layer(layer_idx)->MaxLength();
   }
 
   int64_t NumLayers() const { return layers_count_; }
@@ -2276,6 +2842,47 @@ std::vector<torch::Tensor> PagedKvAppendForward(
       next_lengths,
       torch::tensor(next_page_count, block_table_long.options()),
   };
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t> PagedKvAppendForwardUnchecked(
+    const torch::Tensor& k_pages,
+    const torch::Tensor& v_pages,
+    const torch::Tensor& block_table,
+    const torch::Tensor& lengths,
+    int64_t page_count,
+    const torch::Tensor& k_chunk,
+    const torch::Tensor& v_chunk,
+    const torch::Tensor& block_ids) {
+  auto block_table_long = block_table.to(torch::kLong).contiguous();
+  auto lengths_long = lengths.to(torch::kLong).contiguous();
+  auto block_ids_long = block_ids.to(torch::kLong).contiguous();
+  auto k_chunk_contig = k_chunk.contiguous();
+  auto v_chunk_contig = v_chunk.contiguous();
+  const auto total = k_chunk_contig.size(2);
+  if (total == 0 || block_ids_long.numel() == 0) {
+    return std::make_tuple(k_pages, v_pages, block_table_long, lengths_long, page_count);
+  }
+
+  auto starts_long = lengths_long.index_select(0, block_ids_long);
+  auto base = torch::arange(total, block_table_long.options()).view({1, total});
+  auto positions = starts_long.view({block_ids_long.size(0), 1}) + base;
+  auto assign_result = PagedKvAssignBlocksForwardUnchecked(
+      block_table_long,
+      block_ids_long,
+      starts_long,
+      total,
+      k_pages.size(2),
+      page_count);
+  auto next_block_table = std::get<0>(assign_result);
+  auto selected_block_table = std::get<1>(assign_result);
+  auto next_page_count = std::get<2>(assign_result);
+  auto next_k_pages = PagedKvReservePagesForward(k_pages, page_count, next_page_count);
+  auto next_v_pages = PagedKvReservePagesForward(v_pages, page_count, next_page_count);
+  next_k_pages = PagedKvWriteForwardUnchecked(next_k_pages, selected_block_table, positions, k_chunk_contig);
+  next_v_pages = PagedKvWriteForwardUnchecked(next_v_pages, selected_block_table, positions, v_chunk_contig);
+  auto next_lengths = lengths_long.clone();
+  next_lengths.index_copy_(0, block_ids_long, starts_long + total);
+  return std::make_tuple(next_k_pages, next_v_pages, next_block_table, next_lengths, next_page_count);
 }
 
 std::vector<torch::Tensor> PagedKvCompactForward(
@@ -2470,6 +3077,37 @@ torch::Tensor PagedKvWriteForward(
     TORCH_CHECK(max_pos < block_table_long.size(1) * pages.size(2),
                 "paged_kv_write_forward: positions exceed logical block-table capacity");
   }
+
+#if MODEL_STACK_WITH_CUDA
+  if (pages.is_cuda() && block_table_long.is_cuda() && positions_long.is_cuda() && values.is_cuda() &&
+      HasCudaKvCacheKernel()) {
+    return CudaPagedKvWriteForward(pages, block_table_long, positions_long, values);
+  }
+#endif
+
+  auto pages_out = pages.contiguous();
+  const auto write_seq = values.size(2);
+  for (int64_t b = 0; b < values.size(0); ++b) {
+    for (int64_t t = 0; t < write_seq; ++t) {
+      const auto pos = positions_long.dim() == 1 ? positions_long[t].item<int64_t>()
+                                                 : positions_long.index({b, t}).item<int64_t>();
+      const auto block_idx = pos / pages.size(2);
+      const auto page_offset = pos % pages.size(2);
+      const auto page_id = block_table_long.index({b, block_idx}).item<int64_t>();
+      pages_out.index_put_({page_id, at::indexing::Slice(), page_offset, at::indexing::Slice()},
+                           values.index({b, at::indexing::Slice(), t, at::indexing::Slice()}));
+    }
+  }
+  return pages_out;
+}
+
+torch::Tensor PagedKvWriteForwardUnchecked(
+    const torch::Tensor& pages,
+    const torch::Tensor& block_table,
+    const torch::Tensor& positions,
+    const torch::Tensor& values) {
+  auto block_table_long = block_table.to(torch::kLong).contiguous();
+  auto positions_long = positions.to(torch::kLong).contiguous();
 
 #if MODEL_STACK_WITH_CUDA
   if (pages.is_cuda() && block_table_long.is_cuda() && positions_long.is_cuda() && values.is_cuda() &&
@@ -3086,6 +3724,165 @@ torch::Tensor SampleNextTokenForward(const torch::Tensor& logits, bool do_sample
   return std::get<1>(torch::max(logits, -1, true));
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> SpeculativeAcceptForward(
+    const torch::Tensor& target_probs,
+    const torch::Tensor& draft_probs,
+    const torch::Tensor& draft_token_ids,
+    const c10::optional<torch::Tensor>& bonus_probs,
+    const c10::optional<torch::Tensor>& bonus_enabled,
+    const std::string& method,
+    double posterior_threshold,
+    double posterior_alpha) {
+  TORCH_CHECK(target_probs.defined(), "speculative_accept_forward: target_probs must be defined");
+  TORCH_CHECK(draft_probs.defined(), "speculative_accept_forward: draft_probs must be defined");
+  TORCH_CHECK(draft_token_ids.defined(), "speculative_accept_forward: draft_token_ids must be defined");
+  TORCH_CHECK(target_probs.dim() == 3, "speculative_accept_forward: target_probs must be rank-3 (B, K, V)");
+  TORCH_CHECK(draft_probs.dim() == 3, "speculative_accept_forward: draft_probs must be rank-3 (B, K, V)");
+  TORCH_CHECK(draft_token_ids.dim() == 2, "speculative_accept_forward: draft_token_ids must be rank-2 (B, K)");
+  TORCH_CHECK(target_probs.size(0) == draft_probs.size(0) && target_probs.size(1) == draft_probs.size(1) &&
+                  target_probs.size(2) == draft_probs.size(2),
+              "speculative_accept_forward: target/draft probability shapes must match");
+  TORCH_CHECK(target_probs.size(0) == draft_token_ids.size(0) && target_probs.size(1) == draft_token_ids.size(1),
+              "speculative_accept_forward: batch/speculative length mismatch");
+  if (bonus_probs.has_value() && bonus_probs.value().defined()) {
+    TORCH_CHECK(bonus_probs.value().dim() == 2, "speculative_accept_forward: bonus_probs must be rank-2 (B, V)");
+    TORCH_CHECK(bonus_probs.value().size(0) == target_probs.size(0) && bonus_probs.value().size(1) == target_probs.size(2),
+                "speculative_accept_forward: bonus_probs shape mismatch");
+  }
+  if (bonus_enabled.has_value() && bonus_enabled.value().defined()) {
+    TORCH_CHECK(bonus_enabled.value().numel() == target_probs.size(0),
+                "speculative_accept_forward: bonus_enabled must have one flag per batch row");
+  }
+
+#if MODEL_STACK_WITH_CUDA
+  if (target_probs.is_cuda() && draft_probs.is_cuda() && draft_token_ids.is_cuda() && HasCudaSamplingKernel()) {
+    TORCH_CHECK(!bonus_probs.has_value() || !bonus_probs.value().defined() || bonus_probs.value().is_cuda(),
+                "speculative_accept_forward: CUDA path requires bonus_probs on CUDA when provided");
+    TORCH_CHECK(!bonus_enabled.has_value() || !bonus_enabled.value().defined() || bonus_enabled.value().is_cuda(),
+                "speculative_accept_forward: CUDA path requires bonus_enabled on CUDA when provided");
+    return CudaSpeculativeAcceptForward(
+        target_probs,
+        draft_probs,
+        draft_token_ids,
+        bonus_probs,
+        bonus_enabled,
+        method,
+        posterior_threshold,
+        posterior_alpha);
+  }
+#endif
+
+  std::string method_name = method;
+  std::transform(method_name.begin(), method_name.end(), method_name.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  if (method_name == "probabilistic" || method_name == "rejection") {
+    method_name = "rejection_sampler";
+  }
+  if (method_name.empty()) {
+    method_name = "rejection_sampler";
+  }
+
+  auto probs_t = target_probs.to(torch::kFloat32);
+  auto probs_q = draft_probs.to(torch::kFloat32);
+  auto token_ids = draft_token_ids.to(torch::kLong);
+  torch::Tensor bonus = torch::Tensor();
+  if (bonus_probs.has_value() && bonus_probs.value().defined()) {
+    bonus = bonus_probs.value().to(torch::kFloat32);
+  }
+  torch::Tensor bonus_mask = torch::Tensor();
+  if (bonus_enabled.has_value() && bonus_enabled.value().defined()) {
+    bonus_mask = bonus_enabled.value().to(torch::kBool).reshape({-1});
+  }
+
+  const auto batch_size = token_ids.size(0);
+  const auto draft_len = token_ids.size(1);
+  auto out_tokens = torch::full({batch_size, draft_len + 1}, -1,
+                                token_ids.options().dtype(torch::kLong));
+  auto out_lengths = torch::zeros({batch_size}, token_ids.options().dtype(torch::kLong));
+  auto accepted_counts = torch::zeros({batch_size}, token_ids.options().dtype(torch::kLong));
+
+  for (int64_t b = 0; b < batch_size; ++b) {
+    int64_t accepted = 0;
+    std::vector<int64_t> emitted;
+    emitted.reserve(static_cast<size_t>(draft_len + 1));
+    for (int64_t i = 0; i < draft_len; ++i) {
+      const int64_t candidate = token_ids.index({b, i}).item<int64_t>();
+      auto p = probs_t.index({b, i});
+      if (method_name == "strict") {
+        const int64_t expected = std::get<1>(torch::max(p, -1, true)).item<int64_t>();
+        if (candidate == expected) {
+          emitted.push_back(candidate);
+          accepted += 1;
+          continue;
+        }
+        emitted.push_back(expected);
+        break;
+      }
+      if (method_name == "typical_acceptance_sampler") {
+        constexpr double kEpsilon = 1e-5;
+        const double candidate_prob = p.index({candidate}).item<double>();
+        const double posterior_entropy = -(p * torch::log(p + kEpsilon)).sum().item<double>();
+        const double threshold = std::min(posterior_threshold, std::exp(-posterior_entropy) * posterior_alpha);
+        if (candidate_prob > threshold) {
+          emitted.push_back(candidate);
+          accepted += 1;
+          continue;
+        }
+        auto sample_probs = p / p.sum().clamp_min(1e-8);
+        emitted.push_back(torch::multinomial(sample_probs, 1).item<int64_t>());
+        break;
+      }
+      auto q = probs_q.index({b, i});
+      const double qx = q.index({candidate}).item<double>();
+      const double px = p.index({candidate}).item<double>();
+      const double accept_prob = qx <= 1e-12 ? 1.0 : std::min(px / qx, 1.0);
+      const double draw = torch::rand({}, torch::TensorOptions().dtype(torch::kFloat32).device(token_ids.device())).item<double>();
+      if (draw <= accept_prob) {
+        emitted.push_back(candidate);
+        accepted += 1;
+        continue;
+      }
+      auto residual = torch::clamp(p - q, 0.0);
+      const double residual_mass = residual.sum().item<double>();
+      torch::Tensor sample_probs;
+      if (residual_mass <= 1e-8) {
+        sample_probs = p / p.sum().clamp_min(1e-8);
+      } else {
+        sample_probs = residual / residual_mass;
+      }
+      const int64_t sampled = torch::multinomial(sample_probs, 1).item<int64_t>();
+      emitted.push_back(sampled);
+      break;
+    }
+
+    if (accepted == draft_len && bonus.defined()) {
+      bool enabled = true;
+      if (bonus_mask.defined()) {
+        enabled = bonus_mask.index({b}).item<bool>();
+      }
+      if (enabled) {
+        auto bonus_row = bonus.index({b});
+        if (method_name == "strict") {
+          emitted.push_back(std::get<1>(torch::max(bonus_row, -1, true)).item<int64_t>());
+        } else {
+          auto normalized = bonus_row / bonus_row.sum().clamp_min(1e-8);
+          emitted.push_back(torch::multinomial(normalized, 1).item<int64_t>());
+        }
+      }
+    }
+
+    if (!emitted.empty()) {
+      auto emitted_tensor = torch::tensor(emitted, token_ids.options().dtype(torch::kLong));
+      out_tokens.index_put_({b, torch::indexing::Slice(0, emitted_tensor.size(0))}, emitted_tensor);
+      out_lengths.index_put_({b}, static_cast<int64_t>(emitted_tensor.numel()));
+    }
+    accepted_counts.index_put_({b}, accepted);
+  }
+
+  return std::make_tuple(out_tokens, out_lengths, accepted_counts);
+}
+
 torch::Tensor RepetitionPenaltyForward(
     const torch::Tensor& logits,
     const torch::Tensor& token_ids,
@@ -3415,6 +4212,69 @@ torch::Tensor Int4LinearForward(
   return ReferenceInt4LinearForward(x, packed_weight, inv_scale, bias);
 }
 
+torch::Tensor Nf4LinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& weight_scale,
+    const c10::optional<torch::Tensor>& bias) {
+  TORCH_CHECK(x.defined() && packed_weight.defined() && weight_scale.defined(),
+              "nf4_linear_forward: x, packed_weight, and weight_scale must be defined");
+  TORCH_CHECK(x.dim() >= 2, "nf4_linear_forward: x must have rank >= 2");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
+                  x.scalar_type() == torch::kBFloat16,
+              "nf4_linear_forward: x must use float32, float16, or bfloat16");
+  TORCH_CHECK(packed_weight.dim() == 2, "nf4_linear_forward: packed_weight must be rank-2");
+  TORCH_CHECK(packed_weight.scalar_type() == torch::kUInt8,
+              "nf4_linear_forward: packed_weight must use uint8 storage");
+  TORCH_CHECK(weight_scale.dim() == 1, "nf4_linear_forward: weight_scale must be rank-1");
+  TORCH_CHECK(weight_scale.scalar_type() == torch::kFloat32,
+              "nf4_linear_forward: weight_scale must use float32 storage");
+  TORCH_CHECK(weight_scale.size(0) == packed_weight.size(0),
+              "nf4_linear_forward: weight_scale size mismatch");
+  TORCH_CHECK(packed_weight.size(1) == (x.size(-1) + 1) / 2,
+              "nf4_linear_forward: packed_weight column count mismatch");
+  if (bias.has_value() && bias.value().defined()) {
+    const auto& b = bias.value();
+    TORCH_CHECK(b.dim() == 1, "nf4_linear_forward: bias must be rank-1");
+    TORCH_CHECK(b.size(0) == packed_weight.size(0), "nf4_linear_forward: bias size mismatch");
+  }
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && packed_weight.is_cuda() && weight_scale.is_cuda() && HasCudaNf4LinearKernel()) {
+    return CudaNf4LinearForward(x, packed_weight, weight_scale, bias);
+  }
+#endif
+  return ReferenceNf4LinearForward(x, packed_weight, weight_scale, bias);
+}
+
+torch::Tensor Fp8LinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_fp8,
+    double weight_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  TORCH_CHECK(x.defined() && weight_fp8.defined(), "fp8_linear_forward: x and weight_fp8 must be defined");
+  TORCH_CHECK(x.dim() >= 2, "fp8_linear_forward: x must have rank >= 2");
+  TORCH_CHECK(weight_fp8.dim() == 2, "fp8_linear_forward: weight_fp8 must be rank-2");
+  TORCH_CHECK(x.size(-1) == weight_fp8.size(1), "fp8_linear_forward: input feature size mismatch");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
+                  x.scalar_type() == torch::kBFloat16,
+              "fp8_linear_forward: x must use float32, float16, or bfloat16");
+  TORCH_CHECK(weight_fp8.scalar_type() == torch::kFloat32 || weight_fp8.scalar_type() == torch::kFloat16 ||
+                  weight_fp8.scalar_type() == torch::kBFloat16,
+              "fp8_linear_forward: weight_fp8 must use float32, float16, or bfloat16");
+  if (bias.has_value() && bias.value().defined()) {
+    const auto& b = bias.value();
+    TORCH_CHECK(b.dim() == 1, "fp8_linear_forward: bias must be rank-1");
+    TORCH_CHECK(b.size(0) == weight_fp8.size(0), "fp8_linear_forward: bias size mismatch");
+  }
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && weight_fp8.is_cuda() && HasCudaFp8LinearKernel()) {
+    return CudaFp8LinearForward(x, weight_fp8, weight_scale, bias, out_dtype);
+  }
+#endif
+  return ReferenceFp8LinearForward(x, weight_fp8, weight_scale, bias, out_dtype);
+}
+
 torch::Tensor Int8LinearForward(
     const torch::Tensor& qx,
     const torch::Tensor& x_scale,
@@ -3448,6 +4308,48 @@ torch::Tensor Int8LinearForward(
   }
 #endif
   return ReferenceInt8LinearForward(qx, x_scale, qweight, inv_scale, bias, out_dtype);
+}
+
+torch::Tensor Int8LinearFromFloatForward(
+    const torch::Tensor& x,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& provided_scale,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  TORCH_CHECK(x.defined() && qweight.defined() && inv_scale.defined(),
+              "int8_linear_from_float_forward: x, qweight, and inv_scale must be defined");
+  TORCH_CHECK(x.dim() >= 2, "int8_linear_from_float_forward: x must have rank >= 2");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
+                  x.scalar_type() == torch::kBFloat16,
+              "int8_linear_from_float_forward: x must use float32, float16, or bfloat16");
+  TORCH_CHECK(qweight.dim() == 2, "int8_linear_from_float_forward: qweight must be rank-2");
+  TORCH_CHECK(qweight.scalar_type() == torch::kInt8,
+              "int8_linear_from_float_forward: qweight must use int8 storage");
+  TORCH_CHECK(inv_scale.dim() == 1, "int8_linear_from_float_forward: inv_scale must be rank-1");
+  TORCH_CHECK(inv_scale.scalar_type() == torch::kFloat32,
+              "int8_linear_from_float_forward: inv_scale must use float32 storage");
+  TORCH_CHECK(inv_scale.size(0) == qweight.size(0),
+              "int8_linear_from_float_forward: inv_scale size mismatch");
+  TORCH_CHECK(qweight.size(1) == x.size(-1), "int8_linear_from_float_forward: qweight column count mismatch");
+  if (provided_scale.has_value() && provided_scale.value().defined()) {
+    const auto& s = provided_scale.value();
+    TORCH_CHECK(s.scalar_type() == torch::kFloat32,
+                "int8_linear_from_float_forward: provided_scale must use float32 storage");
+    TORCH_CHECK(s.numel() == 1 || s.numel() == (x.numel() / x.size(-1)),
+                "int8_linear_from_float_forward: provided_scale must have 1 or rows elements");
+  }
+  if (bias.has_value() && bias.value().defined()) {
+    const auto& b = bias.value();
+    TORCH_CHECK(b.dim() == 1, "int8_linear_from_float_forward: bias must be rank-1");
+    TORCH_CHECK(b.size(0) == qweight.size(0), "int8_linear_from_float_forward: bias size mismatch");
+  }
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && qweight.is_cuda() && inv_scale.is_cuda() && HasCudaInt8QuantFrontendKernel()) {
+    return CudaInt8LinearFromFloatForward(x, qweight, inv_scale, bias, provided_scale, out_dtype);
+  }
+#endif
+  return ReferenceInt8LinearFromFloatForward(x, qweight, inv_scale, bias, provided_scale, out_dtype);
 }
 
 torch::Tensor Int8AttentionForward(
@@ -3484,6 +4386,60 @@ torch::Tensor Int8AttentionForward(
   }
 #endif
   return ReferenceInt8AttentionForward(q, q_scale, k, k_scale, v, v_scale, attn_mask, is_causal, scale, out_dtype);
+}
+
+torch::Tensor Int8AttentionFromFloatForward(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    const c10::optional<double>& scale,
+    const c10::optional<torch::ScalarType>& out_dtype,
+    const c10::optional<torch::Tensor>& q_provided_scale,
+    const c10::optional<torch::Tensor>& k_provided_scale,
+    const c10::optional<torch::Tensor>& v_provided_scale) {
+  TORCH_CHECK(q.defined() && k.defined() && v.defined(),
+              "int8_attention_from_float_forward: q, k, and v must be defined");
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+              "int8_attention_from_float_forward: q, k, and v must be rank-4");
+  TORCH_CHECK(q.scalar_type() == torch::kFloat32 || q.scalar_type() == torch::kFloat16 ||
+                  q.scalar_type() == torch::kBFloat16,
+              "int8_attention_from_float_forward: q must use float32, float16, or bfloat16");
+  TORCH_CHECK(k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
+              "int8_attention_from_float_forward: q, k, and v must share dtype");
+  TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0),
+              "int8_attention_from_float_forward: batch size mismatch");
+  TORCH_CHECK(k.size(1) == v.size(1), "int8_attention_from_float_forward: kv head mismatch");
+  TORCH_CHECK(q.size(1) % k.size(1) == 0, "int8_attention_from_float_forward: q heads must be a multiple of kv heads");
+  TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3),
+              "int8_attention_from_float_forward: head_dim mismatch");
+#if MODEL_STACK_WITH_CUDA
+  if (q.is_cuda() && k.is_cuda() && v.is_cuda() && HasCudaInt8QuantFrontendKernel()) {
+    return CudaInt8AttentionFromFloatForward(
+        q,
+        k,
+        v,
+        attn_mask,
+        is_causal,
+        scale,
+        out_dtype,
+        q_provided_scale,
+        k_provided_scale,
+        v_provided_scale);
+  }
+#endif
+  return ReferenceInt8AttentionFromFloatForward(
+      q,
+      k,
+      v,
+      attn_mask,
+      is_causal,
+      scale,
+      out_dtype,
+      q_provided_scale,
+      k_provided_scale,
+      v_provided_scale);
 }
 
 torch::Tensor BitNetLinearForward(
@@ -3822,6 +4778,67 @@ std::vector<torch::Tensor> BitNetQkvPackedHeadsProjectionForward(
   };
 }
 
+std::vector<torch::Tensor> BitNetFusedQkvPackedHeadsProjectionForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& layout_header,
+    const torch::Tensor& segment_offsets,
+    const c10::optional<torch::Tensor>& packed_bias,
+    int64_t q_size,
+    int64_t k_size,
+    int64_t v_size,
+    int64_t q_heads,
+    int64_t kv_heads) {
+  TORCH_CHECK(x.defined() && packed_weight.defined() && scale_values.defined() && layout_header.defined() &&
+                  segment_offsets.defined(),
+              "bitnet_fused_qkv_packed_heads_projection_forward: tensors must be defined");
+  TORCH_CHECK(x.dim() == 3, "bitnet_fused_qkv_packed_heads_projection_forward: x must have shape (B, T, D)");
+  TORCH_CHECK(q_size > 0 && k_size > 0 && v_size > 0,
+              "bitnet_fused_qkv_packed_heads_projection_forward: q/k/v sizes must be positive");
+  TORCH_CHECK(q_heads > 0 && kv_heads > 0,
+              "bitnet_fused_qkv_packed_heads_projection_forward: q_heads and kv_heads must be positive");
+  TORCH_CHECK(q_size + k_size + v_size == layout_header.to(torch::kInt32).contiguous()[3].item<int32_t>(),
+              "bitnet_fused_qkv_packed_heads_projection_forward: fused output width mismatch");
+  if (packed_bias.has_value() && packed_bias.value().defined()) {
+    TORCH_CHECK(packed_bias.value().dim() == 1,
+                "bitnet_fused_qkv_packed_heads_projection_forward: packed_bias must be rank-1");
+    TORCH_CHECK(packed_bias.value().size(0) == q_size + k_size + v_size,
+                "bitnet_fused_qkv_packed_heads_projection_forward: packed_bias size mismatch");
+  }
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && packed_weight.is_cuda() && scale_values.is_cuda() && layout_header.is_cuda() &&
+      segment_offsets.is_cuda() && t10::bitnet::HasCudaBitNetFusedQkvKernel()) {
+    return t10::bitnet::CudaBitNetFusedQkvPackedHeadsProjectionForward(
+        x,
+        packed_weight,
+        scale_values,
+        layout_header,
+        segment_offsets,
+        packed_bias,
+        q_size,
+        k_size,
+        v_size,
+        q_heads,
+        kv_heads);
+  }
+#endif
+  auto fused = BitNetLinearForward(
+      x,
+      packed_weight,
+      scale_values,
+      layout_header,
+      segment_offsets,
+      packed_bias,
+      c10::nullopt,
+      false);
+  return {
+      SplitHeadsForward(fused.slice(-1, 0, q_size), q_heads),
+      SplitHeadsForward(fused.slice(-1, q_size, q_size + k_size), kv_heads),
+      SplitHeadsForward(fused.slice(-1, q_size + k_size, q_size + k_size + v_size), kv_heads),
+  };
+}
+
 torch::Tensor EmbeddingForward(
     const torch::Tensor& weight,
     const torch::Tensor& indices,
@@ -3838,6 +4855,22 @@ torch::Tensor EmbeddingForward(
   return at::embedding(weight, indices.to(torch::kLong), padding_idx, false, false);
 }
 
+torch::Tensor EmbeddingForwardUnchecked(
+    const torch::Tensor& weight,
+    const torch::Tensor& indices,
+    int64_t padding_idx) {
+  TORCH_CHECK(weight.defined() && indices.defined(), "embedding_forward_unchecked: weight and indices must be defined");
+  TORCH_CHECK(weight.dim() == 2, "embedding_forward_unchecked: weight must be rank-2");
+  TORCH_CHECK(indices.scalar_type() == torch::kLong || indices.scalar_type() == torch::kInt,
+              "embedding_forward_unchecked: indices must be int32 or int64");
+#if MODEL_STACK_WITH_CUDA
+  if (weight.is_cuda() && indices.is_cuda() && HasCudaEmbeddingKernel()) {
+    return CudaEmbeddingForwardUnchecked(weight, indices);
+  }
+#endif
+  return at::embedding(weight, indices.to(torch::kLong), padding_idx, false, false);
+}
+
 torch::Tensor SplitHeadsForward(
     const torch::Tensor& x,
     int64_t num_heads) {
@@ -3846,13 +4879,21 @@ torch::Tensor SplitHeadsForward(
   TORCH_CHECK(num_heads > 0, "split_heads_forward: num_heads must be positive");
   TORCH_CHECK(x.size(2) % num_heads == 0, "split_heads_forward: model dim must be divisible by num_heads");
   const auto head_dim = x.size(2) / num_heads;
-  return x.contiguous().view({x.size(0), x.size(1), num_heads, head_dim}).permute({0, 2, 1, 3}).contiguous();
+  auto x_contig = x.contiguous();
+  if (x_contig.size(1) == 1) {
+    return x_contig.view({x.size(0), num_heads, 1, head_dim});
+  }
+  return x_contig.view({x.size(0), x.size(1), num_heads, head_dim}).permute({0, 2, 1, 3}).contiguous();
 }
 
 torch::Tensor MergeHeadsForward(const torch::Tensor& x) {
   TORCH_CHECK(x.defined(), "merge_heads_forward: x must be defined");
   TORCH_CHECK(x.dim() == 4, "merge_heads_forward: x must have shape (B, H, T, Dh)");
-  return x.permute({0, 2, 1, 3}).contiguous().view({x.size(0), x.size(2), x.size(1) * x.size(3)});
+  auto x_contig = x.contiguous();
+  if (x_contig.size(2) == 1) {
+    return x_contig.view({x.size(0), 1, x.size(1) * x.size(3)});
+  }
+  return x_contig.permute({0, 2, 1, 3}).contiguous().view({x.size(0), x.size(2), x.size(1) * x.size(3)});
 }
 
 std::vector<torch::Tensor> QkvHeadsProjectionForward(
@@ -3965,6 +5006,8 @@ struct BitNetModuleState {
   torch::Tensor scale_values;
   torch::Tensor layout_header;
   torch::Tensor segment_offsets;
+  torch::Tensor qweight;
+  torch::Tensor inv_scale;
   c10::optional<torch::Tensor> bias = c10::nullopt;
   bool spin_enabled = false;
   torch::Tensor spin_signs;
@@ -4010,14 +5053,22 @@ bool TryLoadBitNetModuleState(const py::object& module, BitNetModuleState* state
     out.layout_header = TensorAttr(module, "layout_header");
     out.segment_offsets = TensorAttr(module, "segment_offsets");
     out.bias = TensorAttrOptional(module, "bias");
-    auto spin_enabled_flag = TensorAttrOptional(module, "spin_enabled_flag");
-    if (spin_enabled_flag.has_value() && spin_enabled_flag.value().defined() && spin_enabled_flag.value().numel() > 0) {
-      out.spin_enabled = spin_enabled_flag.value().item<int64_t>() != 0;
+    if (PyCallableAttr(module, "_spin_enabled_runtime")) {
+      out.spin_enabled = py::cast<bool>(module.attr("_spin_enabled_runtime")());
+    } else {
+      auto spin_enabled_flag = TensorAttrOptional(module, "spin_enabled_flag");
+      if (spin_enabled_flag.has_value() && spin_enabled_flag.value().defined() && spin_enabled_flag.value().numel() > 0) {
+        out.spin_enabled = spin_enabled_flag.value().item<int64_t>() != 0;
+      }
     }
-    if (py::hasattr(module, "spin_signs")) {
+    if (out.spin_enabled && py::hasattr(module, "spin_signs")) {
       out.spin_signs = TensorAttr(module, "spin_signs");
     }
-    if (py::hasattr(module, "pre_scale")) {
+    bool pre_scale_active = true;
+    if (PyCallableAttr(module, "_pre_scale_active_runtime")) {
+      pre_scale_active = py::cast<bool>(module.attr("_pre_scale_active_runtime")());
+    }
+    if (pre_scale_active && py::hasattr(module, "pre_scale")) {
       out.pre_scale = TensorAttr(module, "pre_scale");
     }
     out.act_quant_mode = PyStringAttr(module, "act_quant_mode", "none");
@@ -4026,6 +5077,26 @@ bool TryLoadBitNetModuleState(const py::object& module, BitNetModuleState* state
     out.act_quant_bits = PyIntAttr(module, "act_quant_bits", 8);
     if (py::hasattr(module, "act_scale")) {
       out.act_scale = TensorAttr(module, "act_scale");
+    }
+    if (PyCallableAttr(module, "_uses_int8_packed_backend") &&
+        py::cast<bool>(module.attr("_uses_int8_packed_backend")())) {
+      auto cached_qweight = PyAttrOrNone(module, "_cached_int8_backend_qweight");
+      auto cached_inv_scale = PyAttrOrNone(module, "_cached_int8_backend_inv_scale");
+      if (!cached_qweight.is_none() && !cached_inv_scale.is_none()) {
+        auto qweight = py::cast<torch::Tensor>(cached_qweight);
+        auto inv_scale = py::cast<torch::Tensor>(cached_inv_scale);
+        if (qweight.defined() && inv_scale.defined() &&
+            qweight.device() == out.packed_weight.device() &&
+            inv_scale.device() == out.packed_weight.device()) {
+          out.qweight = qweight;
+          out.inv_scale = inv_scale;
+        }
+      }
+      if (!out.qweight.defined() || !out.inv_scale.defined()) {
+        auto int8_backend = py::cast<py::tuple>(module.attr("_int8_backend_weight")("device"_a = out.packed_weight.device()));
+        out.qweight = py::cast<torch::Tensor>(int8_backend[0]);
+        out.inv_scale = py::cast<torch::Tensor>(int8_backend[1]);
+      }
     }
     *state = std::move(out);
     return true;
@@ -4179,6 +5250,29 @@ bool BitNetModuleDirectSupported(const py::object& module, BitNetModuleState* st
   return true;
 }
 
+bool BitNetCudaTransformInputSupported(const BitNetModuleState& state) {
+#if MODEL_STACK_WITH_CUDA
+  if (!t10::bitnet::HasCudaBitNetInputFrontendKernel()) {
+    return false;
+  }
+  if (state.spin_enabled) {
+    return false;
+  }
+  const auto mode = NormalizeBackendName(state.act_quant_mode);
+  if (mode.empty() || mode == "none" || mode == "off") {
+    return true;
+  }
+  if (mode == "static_int8") {
+    return state.act_quant_bits >= 2 && state.act_scale.defined();
+  }
+  if (mode == "dynamic_int8") {
+    const auto method = NormalizeBackendName(state.act_quant_method);
+    return state.act_quant_bits >= 2 && (method.empty() || method == "absmax" || method == "mse");
+  }
+#endif
+  return false;
+}
+
 torch::Tensor ApplyBitNetModuleInputTransforms(const torch::Tensor& x, const BitNetModuleState& state) {
   auto target_dtype = x.scalar_type();
   if (!(target_dtype == torch::kFloat32 || target_dtype == torch::kFloat16 || target_dtype == torch::kBFloat16)) {
@@ -4207,19 +5301,816 @@ torch::Tensor ApplyBitNetModuleInputTransforms(const torch::Tensor& x, const Bit
   TORCH_CHECK(false, "Unsupported native BitNet activation quantization mode: ", state.act_quant_mode);
 }
 
+torch::Tensor BitNetTransformInputForward(
+    const torch::Tensor& x,
+    bool spin_enabled,
+    const c10::optional<torch::Tensor>& spin_signs,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    double act_quant_percentile,
+    const c10::optional<torch::Tensor>& act_scale) {
+  TORCH_CHECK(x.defined(), "bitnet_transform_input_forward: x must be defined");
+  TORCH_CHECK(x.dim() >= 1, "bitnet_transform_input_forward: x must have rank >= 1");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
+                  x.scalar_type() == torch::kBFloat16,
+              "bitnet_transform_input_forward: x must use float32, float16, or bfloat16");
+
+  BitNetModuleState state;
+  state.spin_enabled = spin_enabled;
+  state.spin_signs = spin_signs.value_or(torch::Tensor());
+  state.pre_scale = pre_scale.value_or(torch::Tensor());
+  state.act_quant_mode = act_quant_mode;
+  state.act_quant_method = act_quant_method;
+  state.act_quant_bits = act_quant_bits;
+  state.act_quant_percentile = act_quant_percentile;
+  state.act_scale = act_scale.value_or(torch::Tensor());
+
+  TORCH_CHECK(BitNetModuleDirectSupported(state),
+              "bitnet_transform_input_forward: unsupported BitNet activation transform");
+  if (state.spin_enabled) {
+    TORCH_CHECK(state.spin_signs.defined() && state.spin_signs.numel() == x.size(-1),
+                "bitnet_transform_input_forward: spin_signs must match x last dimension when spin is enabled");
+  }
+  if (state.pre_scale.defined() && state.pre_scale.numel() > 0) {
+    TORCH_CHECK(state.pre_scale.numel() == x.size(-1),
+                "bitnet_transform_input_forward: pre_scale must match x last dimension");
+  }
+  if (NormalizeBackendName(state.act_quant_mode) == "static_int8" && state.act_scale.defined()) {
+    TORCH_CHECK(state.act_scale.scalar_type() == torch::kFloat32,
+                "bitnet_transform_input_forward: act_scale must use float32 storage");
+    TORCH_CHECK(state.act_scale.numel() == 1 || state.act_scale.numel() == (x.numel() / x.size(-1)),
+                "bitnet_transform_input_forward: act_scale must have 1 or rows elements");
+  }
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && BitNetCudaTransformInputSupported(state)) {
+    return t10::bitnet::CudaBitNetTransformInputForward(
+        x,
+        state.pre_scale.defined() && state.pre_scale.numel() > 0 ? c10::optional<torch::Tensor>(state.pre_scale) : c10::nullopt,
+        NormalizeBackendName(state.act_quant_mode),
+        NormalizeBackendName(state.act_quant_method),
+        state.act_quant_bits,
+        state.act_scale.defined() ? c10::optional<torch::Tensor>(state.act_scale) : c10::nullopt);
+  }
+#endif
+  return ApplyBitNetModuleInputTransforms(x, state);
+}
+
+std::pair<torch::Tensor, torch::Tensor> QuantizeBitNetActivationInt8Codes(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    double act_quant_percentile,
+    const c10::optional<torch::Tensor>& act_scale) {
+  TORCH_CHECK(x.defined(), "bitnet_int8_linear_from_float_forward: x must be defined");
+  TORCH_CHECK(x.dim() >= 2, "bitnet_int8_linear_from_float_forward: x must have rank >= 2");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
+                  x.scalar_type() == torch::kBFloat16,
+              "bitnet_int8_linear_from_float_forward: x must use float32, float16, or bfloat16");
+
+  const auto mode = NormalizeBackendName(act_quant_mode);
+  TORCH_CHECK(
+      mode == "dynamic_int8" || mode == "static_int8",
+      "bitnet_int8_linear_from_float_forward: act_quant_mode must be dynamic_int8 or static_int8, got ",
+      act_quant_mode);
+  TORCH_CHECK(
+      act_quant_bits >= 2 && act_quant_bits <= 8,
+      "bitnet_int8_linear_from_float_forward: act_quant_bits must be in [2, 8]");
+
+  auto x_local = x.to(torch::TensorOptions().device(x.device()).dtype(x.scalar_type())).contiguous();
+  if (pre_scale.has_value() && pre_scale.value().defined() && pre_scale.value().numel() > 0) {
+    const auto scale = pre_scale.value().reshape({-1});
+    TORCH_CHECK(
+        scale.numel() == x.size(-1),
+        "bitnet_int8_linear_from_float_forward: pre_scale must match x last dimension");
+    if (BitNetPreScaleActive(scale)) {
+      x_local = ApplyBitNetPreScaleToInput(x_local, scale);
+    }
+  }
+
+  const auto rows = x_local.numel() / x_local.size(-1);
+  auto flat = x_local.reshape({rows, x_local.size(-1)});
+  torch::Tensor row_scale;
+  if (mode == "dynamic_int8") {
+    auto scale = CalibrateBitNetActivationScale(
+        x_local,
+        act_quant_method,
+        act_quant_bits,
+        act_quant_percentile);
+    row_scale = scale.reshape({1}).expand({rows}).clone().contiguous();
+  } else {
+    TORCH_CHECK(
+        act_scale.has_value() && act_scale.value().defined(),
+        "bitnet_int8_linear_from_float_forward: static_int8 requires act_scale");
+    auto scale = act_scale.value().to(torch::TensorOptions().device(x.device()).dtype(torch::kFloat32)).reshape({-1});
+    TORCH_CHECK(
+        scale.numel() == 1 || scale.numel() == rows,
+        "bitnet_int8_linear_from_float_forward: act_scale must have 1 or rows elements");
+    row_scale = (scale.numel() == 1 ? scale.expand({rows}).clone() : scale.contiguous()).clamp_min_(1.0e-8);
+  }
+
+  const auto qmax = static_cast<double>(BitNetQuantMax(act_quant_bits));
+  auto qx = torch::round(flat.to(torch::kFloat32) / row_scale.unsqueeze(1))
+                .clamp_(-qmax, qmax)
+                .to(torch::kInt8)
+                .view(x_local.sizes())
+                .contiguous();
+  return {qx, row_scale.to(torch::TensorOptions().device(x.device()).dtype(torch::kFloat32)).contiguous()};
+}
+
+torch::Tensor BitNetTransformInputFromState(const torch::Tensor& x, const BitNetModuleState& state) {
+  return BitNetTransformInputForward(
+      x,
+      state.spin_enabled,
+      state.spin_signs.defined() ? c10::optional<torch::Tensor>(state.spin_signs) : c10::nullopt,
+      state.pre_scale.defined() ? c10::optional<torch::Tensor>(state.pre_scale) : c10::nullopt,
+      state.act_quant_mode,
+      state.act_quant_method,
+      state.act_quant_bits,
+      state.act_quant_percentile,
+      state.act_scale.defined() ? c10::optional<torch::Tensor>(state.act_scale) : c10::nullopt);
+}
+
+torch::Tensor BitNetInt8LinearFromFloatForward(
+    const torch::Tensor& x,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    double act_quant_percentile,
+    const c10::optional<torch::Tensor>& act_scale,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  TORCH_CHECK(
+      x.defined() && qweight.defined() && inv_scale.defined(),
+      "bitnet_int8_linear_from_float_forward: x, qweight, and inv_scale must be defined");
+  TORCH_CHECK(x.dim() >= 2, "bitnet_int8_linear_from_float_forward: x must have rank >= 2");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
+                  x.scalar_type() == torch::kBFloat16,
+              "bitnet_int8_linear_from_float_forward: x must use float32, float16, or bfloat16");
+  TORCH_CHECK(qweight.dim() == 2, "bitnet_int8_linear_from_float_forward: qweight must be rank-2");
+  TORCH_CHECK(
+      qweight.scalar_type() == torch::kInt8,
+      "bitnet_int8_linear_from_float_forward: qweight must use int8 storage");
+  TORCH_CHECK(inv_scale.dim() == 1, "bitnet_int8_linear_from_float_forward: inv_scale must be rank-1");
+  TORCH_CHECK(
+      inv_scale.scalar_type() == torch::kFloat32,
+      "bitnet_int8_linear_from_float_forward: inv_scale must use float32 storage");
+  TORCH_CHECK(
+      inv_scale.size(0) == qweight.size(0),
+      "bitnet_int8_linear_from_float_forward: inv_scale size mismatch");
+  TORCH_CHECK(
+      qweight.size(1) == x.size(-1),
+      "bitnet_int8_linear_from_float_forward: qweight column count mismatch");
+  if (bias.has_value() && bias.value().defined()) {
+    const auto& b = bias.value();
+    TORCH_CHECK(b.dim() == 1, "bitnet_int8_linear_from_float_forward: bias must be rank-1");
+    TORCH_CHECK(b.size(0) == qweight.size(0), "bitnet_int8_linear_from_float_forward: bias size mismatch");
+  }
+
+#if MODEL_STACK_WITH_CUDA
+  const auto mode = NormalizeBackendName(act_quant_mode);
+  const auto method = NormalizeBackendName(act_quant_method);
+  const bool cuda_dynamic_supported =
+      mode == "dynamic_int8" && (method.empty() || method == "absmax" || method == "mse");
+  const bool cuda_static_supported = mode == "static_int8" && act_scale.has_value() && act_scale.value().defined();
+  // Intentionally stay on the split CUDA path here. The standalone BitNet row-1
+  // from-float kernel is numerically correct, but on Ampere decode it loses to
+  // "quantize once -> int8 backend" in the full model loop because the int8
+  // backend can take the better small-GEMM route.
+  if (x.is_cuda() && qweight.is_cuda() && inv_scale.is_cuda() && (cuda_dynamic_supported || cuda_static_supported)) {
+    auto quantized = t10::bitnet::CudaBitNetQuantizeActivationInt8CodesForward(
+        x,
+        pre_scale,
+        mode,
+        method,
+        act_quant_bits,
+        act_scale);
+    return Int8LinearForward(
+        std::get<0>(quantized),
+        std::get<1>(quantized),
+        qweight,
+        inv_scale,
+        bias,
+        out_dtype);
+  }
+#endif
+
+  auto quantized = QuantizeBitNetActivationInt8Codes(
+      x,
+      pre_scale,
+      act_quant_mode,
+      act_quant_method,
+      act_quant_bits,
+      act_quant_percentile,
+      act_scale);
+  return Int8LinearForward(
+      quantized.first,
+      quantized.second,
+      qweight,
+      inv_scale,
+      bias,
+      out_dtype);
+}
+
+std::vector<torch::Tensor> BitNetInt8FusedQkvPackedHeadsProjectionForward(
+    const torch::Tensor& x,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& packed_bias,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    double act_quant_percentile,
+    const c10::optional<torch::Tensor>& act_scale,
+    int64_t q_size,
+    int64_t k_size,
+    int64_t v_size,
+    int64_t q_heads,
+    int64_t kv_heads,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  TORCH_CHECK(x.defined(), "bitnet_int8_fused_qkv_packed_heads_projection_forward: x must be defined");
+  TORCH_CHECK(
+      x.dim() == 3,
+      "bitnet_int8_fused_qkv_packed_heads_projection_forward: x must have shape (B, T, D)");
+  TORCH_CHECK(
+      q_size > 0 && k_size > 0 && v_size > 0,
+      "bitnet_int8_fused_qkv_packed_heads_projection_forward: q/k/v sizes must be positive");
+  TORCH_CHECK(
+      q_heads > 0 && kv_heads > 0,
+      "bitnet_int8_fused_qkv_packed_heads_projection_forward: q_heads and kv_heads must be positive");
+  TORCH_CHECK(
+      qweight.defined() && inv_scale.defined(),
+      "bitnet_int8_fused_qkv_packed_heads_projection_forward: qweight and inv_scale must be defined");
+  TORCH_CHECK(
+      qweight.dim() == 2 && inv_scale.dim() == 1,
+      "bitnet_int8_fused_qkv_packed_heads_projection_forward: qweight must be rank-2 and inv_scale must be rank-1");
+  TORCH_CHECK(
+      qweight.size(0) == q_size + k_size + v_size,
+      "bitnet_int8_fused_qkv_packed_heads_projection_forward: fused output width mismatch");
+  if (packed_bias.has_value() && packed_bias.value().defined()) {
+    TORCH_CHECK(
+        packed_bias.value().dim() == 1,
+        "bitnet_int8_fused_qkv_packed_heads_projection_forward: packed_bias must be rank-1");
+    TORCH_CHECK(
+        packed_bias.value().size(0) == qweight.size(0),
+        "bitnet_int8_fused_qkv_packed_heads_projection_forward: packed_bias size mismatch");
+  }
+  auto fused = BitNetInt8LinearFromFloatForward(
+      x,
+      qweight,
+      inv_scale,
+      packed_bias,
+      pre_scale,
+      act_quant_mode,
+      act_quant_method,
+      act_quant_bits,
+      act_quant_percentile,
+      act_scale,
+      out_dtype);
+  return {
+      SplitHeadsForward(fused.slice(-1, 0, q_size), q_heads),
+      SplitHeadsForward(fused.slice(-1, q_size, q_size + k_size), kv_heads),
+      SplitHeadsForward(fused.slice(-1, q_size + k_size, q_size + k_size + v_size), kv_heads),
+  };
+}
+
+torch::Tensor BitNetLinearFromFloatForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& layout_header,
+    const torch::Tensor& segment_offsets,
+    const c10::optional<torch::Tensor>& bias,
+    bool spin_enabled,
+    const c10::optional<torch::Tensor>& spin_signs,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    double act_quant_percentile,
+    const c10::optional<torch::Tensor>& act_scale,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+#if MODEL_STACK_WITH_CUDA
+  const auto mode = NormalizeBackendName(act_quant_mode);
+  const auto method = NormalizeBackendName(act_quant_method);
+  const bool no_transform = !spin_enabled &&
+      !(pre_scale.has_value() && pre_scale.value().defined() && pre_scale.value().numel() > 0) &&
+      (mode.empty() || mode == "none" || mode == "off");
+  const bool static_fused_supported = !spin_enabled && mode == "static_int8" && act_scale.has_value() &&
+      act_scale.value().defined() && act_quant_bits >= 2 && act_quant_bits <= 8;
+  const bool dynamic_fused_supported =
+      !spin_enabled && mode == "dynamic_int8" && act_quant_bits >= 2 && act_quant_bits <= 8 &&
+      (method.empty() || method == "absmax" || method == "mse");
+  if (x.is_cuda() && packed_weight.is_cuda() && scale_values.is_cuda() && layout_header.is_cuda() &&
+      segment_offsets.is_cuda() && t10::bitnet::HasCudaBitNetLinearKernel() &&
+      (no_transform || static_fused_supported || dynamic_fused_supported ||
+       ((!spin_enabled) && t10::bitnet::HasCudaBitNetInputFrontendKernel() &&
+        (mode.empty() || mode == "none" || mode == "off" || mode == "static_int8" || mode == "dynamic_int8")))) {
+    return t10::bitnet::CudaBitNetLinearFromFloatForward(
+        x,
+        packed_weight,
+        scale_values,
+        layout_header,
+        segment_offsets,
+        bias,
+        pre_scale,
+        mode,
+        method,
+        act_quant_bits,
+        act_scale,
+        out_dtype);
+  }
+#endif
+  auto x_local = BitNetTransformInputForward(
+      x,
+      spin_enabled,
+      spin_signs,
+      pre_scale,
+      act_quant_mode,
+      act_quant_method,
+      act_quant_bits,
+      act_quant_percentile,
+      act_scale);
+  return BitNetLinearForward(
+      x_local,
+      packed_weight,
+      scale_values,
+      layout_header,
+      segment_offsets,
+      bias,
+      out_dtype,
+      false);
+}
+
+int64_t BitNetLayoutHeaderScalar(const torch::Tensor& layout_header, int64_t idx) {
+  auto header_cpu = layout_header.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kLong)).contiguous();
+  return header_cpu[idx].item<int64_t>();
+}
+
+bool BitNetOptionalTensorEqual(const torch::Tensor& lhs, const torch::Tensor& rhs) {
+  if (!lhs.defined() && !rhs.defined()) {
+    return true;
+  }
+  if (lhs.defined() != rhs.defined()) {
+    return false;
+  }
+  return torch::equal(lhs, rhs);
+}
+
+bool BitNetOptionalTensorEqual(
+    const c10::optional<torch::Tensor>& lhs,
+    const c10::optional<torch::Tensor>& rhs) {
+  if (lhs.has_value() != rhs.has_value()) {
+    return false;
+  }
+  if (!lhs.has_value()) {
+    return true;
+  }
+  return BitNetOptionalTensorEqual(lhs.value(), rhs.value());
+}
+
+bool BitNetModuleStatesShareInputTransforms(
+    const BitNetModuleState& q_state,
+    const BitNetModuleState& k_state,
+    const BitNetModuleState& v_state) {
+  auto normalized_mode = [](const BitNetModuleState& state) {
+    auto mode = NormalizeBackendName(state.act_quant_mode);
+    return mode.empty() || mode == "off" ? std::string("none") : mode;
+  };
+  auto activation_signature_matches = [&](const BitNetModuleState& lhs, const BitNetModuleState& rhs) {
+    const auto lhs_mode = normalized_mode(lhs);
+    const auto rhs_mode = normalized_mode(rhs);
+    if (lhs_mode != rhs_mode) {
+      return false;
+    }
+    if (lhs_mode == "none") {
+      return true;
+    }
+    if (lhs_mode == "dynamic_int8") {
+      return NormalizeBackendName(lhs.act_quant_method) == NormalizeBackendName(rhs.act_quant_method) &&
+          lhs.act_quant_bits == rhs.act_quant_bits &&
+          std::abs(lhs.act_quant_percentile - rhs.act_quant_percentile) <= 1.0e-9;
+    }
+    if (lhs_mode == "static_int8") {
+      return lhs.act_quant_bits == rhs.act_quant_bits &&
+          BitNetOptionalTensorEqual(lhs.act_scale, rhs.act_scale);
+    }
+    return NormalizeBackendName(lhs.act_quant_method) == NormalizeBackendName(rhs.act_quant_method) &&
+        lhs.act_quant_bits == rhs.act_quant_bits &&
+        std::abs(lhs.act_quant_percentile - rhs.act_quant_percentile) <= 1.0e-9 &&
+        BitNetOptionalTensorEqual(lhs.act_scale, rhs.act_scale);
+  };
+  auto compatible_with_q = [&](const BitNetModuleState& other) {
+    return q_state.spin_enabled == other.spin_enabled &&
+        BitNetOptionalTensorEqual(q_state.spin_signs, other.spin_signs) &&
+        BitNetOptionalTensorEqual(q_state.pre_scale, other.pre_scale) &&
+        activation_signature_matches(q_state, other);
+  };
+  return compatible_with_q(k_state) && compatible_with_q(v_state);
+}
+
+bool BitNetStateUsesInt8PackedPath(const BitNetModuleState& state) {
+  const auto mode = NormalizeBackendName(state.act_quant_mode);
+  return !state.spin_enabled && (mode == "dynamic_int8" || mode == "static_int8");
+}
+
+std::uintptr_t BitNetTensorPtrKey(const torch::Tensor& tensor) {
+  return tensor.defined() && tensor.numel() > 0 ? reinterpret_cast<std::uintptr_t>(tensor.data_ptr()) : 0;
+}
+
+std::uintptr_t BitNetTensorPtrKey(const c10::optional<torch::Tensor>& tensor) {
+  return tensor.has_value() ? BitNetTensorPtrKey(tensor.value()) : 0;
+}
+
+struct BitNetInt8QkvFuseCacheEntry {
+  bool valid = false;
+  std::uintptr_t q_qweight = 0;
+  std::uintptr_t k_qweight = 0;
+  std::uintptr_t v_qweight = 0;
+  std::uintptr_t q_inv_scale = 0;
+  std::uintptr_t k_inv_scale = 0;
+  std::uintptr_t v_inv_scale = 0;
+  std::uintptr_t q_bias = 0;
+  std::uintptr_t k_bias = 0;
+  std::uintptr_t v_bias = 0;
+  std::uintptr_t q_pre_scale = 0;
+  std::uintptr_t q_act_scale = 0;
+  int64_t q_rows = 0;
+  int64_t k_rows = 0;
+  int64_t v_rows = 0;
+  int64_t logical_in = 0;
+  int64_t act_quant_bits = 0;
+  double act_quant_percentile = 0.0;
+  std::string act_quant_mode;
+  std::string act_quant_method;
+  BitNetModuleState fused_state;
+  int64_t q_size = 0;
+  int64_t k_size = 0;
+  int64_t v_size = 0;
+};
+
+torch::Tensor ExpandBitNetRowScales(const BitNetModuleState& state) {
+  const auto logical_out = BitNetLayoutHeaderScalar(state.layout_header, 3);
+  const auto scale_granularity = BitNetLayoutHeaderScalar(state.layout_header, 7);
+  const auto scale_group_size = BitNetLayoutHeaderScalar(state.layout_header, 8);
+  auto out = torch::zeros({logical_out}, torch::TensorOptions().device(state.scale_values.device()).dtype(torch::kFloat32));
+  auto values = state.scale_values.to(torch::TensorOptions().device(state.scale_values.device()).dtype(torch::kFloat32)).reshape({-1});
+  if (scale_granularity == 0) {
+    out.fill_(values[0].item<float>());
+    return out;
+  }
+  if (scale_granularity == 1) {
+    auto offsets = state.segment_offsets.to(torch::TensorOptions().device(state.scale_values.device()).dtype(torch::kInt64)).reshape({-1});
+    for (int64_t idx = 0; idx + 1 < offsets.numel(); ++idx) {
+      const auto start = offsets[idx].item<int64_t>();
+      const auto end = offsets[idx + 1].item<int64_t>();
+      out.slice(0, start, end).fill_(values[idx].item<float>());
+    }
+    return out;
+  }
+  if (scale_granularity == 2) {
+    TORCH_CHECK(scale_group_size > 0, "BitNet per-output-group scaling requires a positive scale_group_size");
+    for (int64_t idx = 0; idx < values.numel(); ++idx) {
+      const auto start = idx * scale_group_size;
+      const auto end = std::min<int64_t>(logical_out, start + scale_group_size);
+      out.slice(0, start, end).fill_(values[idx].item<float>());
+    }
+    return out;
+  }
+  TORCH_CHECK(false, "Unsupported BitNet scale granularity for fused QKV state: ", scale_granularity);
+}
+
+bool TryFuseBitNetQkvStates(
+    const BitNetModuleState& q_state,
+    const BitNetModuleState& k_state,
+    const BitNetModuleState& v_state,
+    BitNetModuleState* fused_state,
+    int64_t* q_size_out,
+    int64_t* k_size_out,
+    int64_t* v_size_out) {
+  if (fused_state == nullptr || q_size_out == nullptr || k_size_out == nullptr || v_size_out == nullptr) {
+    return false;
+  }
+  if (!BitNetModuleStatesShareInputTransforms(q_state, k_state, v_state)) {
+    return false;
+  }
+  const bool int8_qkv =
+      BitNetStateUsesInt8PackedPath(q_state) &&
+      BitNetStateUsesInt8PackedPath(k_state) &&
+      BitNetStateUsesInt8PackedPath(v_state) &&
+      q_state.qweight.defined() && k_state.qweight.defined() && v_state.qweight.defined() &&
+      q_state.inv_scale.defined() && k_state.inv_scale.defined() && v_state.inv_scale.defined();
+  if (int8_qkv) {
+    const auto q_size = q_state.qweight.size(0);
+    const auto k_size = k_state.qweight.size(0);
+    const auto v_size = v_state.qweight.size(0);
+    const auto logical_in = q_state.qweight.size(1);
+    if (q_state.qweight.dim() != 2 || k_state.qweight.dim() != 2 || v_state.qweight.dim() != 2 ||
+        q_state.inv_scale.dim() != 1 || k_state.inv_scale.dim() != 1 || v_state.inv_scale.dim() != 1 ||
+        k_state.qweight.size(1) != logical_in || v_state.qweight.size(1) != logical_in ||
+        q_state.inv_scale.size(0) != q_size || k_state.inv_scale.size(0) != k_size ||
+        v_state.inv_scale.size(0) != v_size) {
+      return false;
+    }
+    static thread_local BitNetInt8QkvFuseCacheEntry cache;
+    const bool cache_hit =
+        cache.valid &&
+        cache.q_qweight == BitNetTensorPtrKey(q_state.qweight) &&
+        cache.k_qweight == BitNetTensorPtrKey(k_state.qweight) &&
+        cache.v_qweight == BitNetTensorPtrKey(v_state.qweight) &&
+        cache.q_inv_scale == BitNetTensorPtrKey(q_state.inv_scale) &&
+        cache.k_inv_scale == BitNetTensorPtrKey(k_state.inv_scale) &&
+        cache.v_inv_scale == BitNetTensorPtrKey(v_state.inv_scale) &&
+        cache.q_bias == BitNetTensorPtrKey(q_state.bias) &&
+        cache.k_bias == BitNetTensorPtrKey(k_state.bias) &&
+        cache.v_bias == BitNetTensorPtrKey(v_state.bias) &&
+        cache.q_pre_scale == BitNetTensorPtrKey(q_state.pre_scale) &&
+        cache.q_act_scale == BitNetTensorPtrKey(q_state.act_scale) &&
+        cache.q_rows == q_size &&
+        cache.k_rows == k_size &&
+        cache.v_rows == v_size &&
+        cache.logical_in == logical_in &&
+        cache.act_quant_bits == q_state.act_quant_bits &&
+        cache.act_quant_percentile == q_state.act_quant_percentile &&
+        cache.act_quant_mode == q_state.act_quant_mode &&
+        cache.act_quant_method == q_state.act_quant_method;
+    if (cache_hit) {
+      *fused_state = cache.fused_state;
+      *q_size_out = cache.q_size;
+      *k_size_out = cache.k_size;
+      *v_size_out = cache.v_size;
+      return true;
+    }
+    c10::optional<torch::Tensor> fused_bias = c10::nullopt;
+    if (q_state.bias.has_value() || k_state.bias.has_value() || v_state.bias.has_value()) {
+      std::vector<torch::Tensor> parts;
+      parts.reserve(3);
+      auto append_bias = [&](const BitNetModuleState& state, int64_t logical_rows) {
+        if (state.bias.has_value() && state.bias.value().defined()) {
+          parts.push_back(state.bias.value().to(torch::TensorOptions().device(q_state.qweight.device()).dtype(torch::kFloat32)).reshape({-1}).slice(0, 0, logical_rows));
+        } else {
+          parts.push_back(torch::zeros({logical_rows}, torch::TensorOptions().device(q_state.qweight.device()).dtype(torch::kFloat32)));
+        }
+      };
+      append_bias(q_state, q_size);
+      append_bias(k_state, k_size);
+      append_bias(v_state, v_size);
+      fused_bias = torch::cat(parts).contiguous();
+    }
+
+    BitNetModuleState out;
+    out.qweight = torch::cat({q_state.qweight, k_state.qweight, v_state.qweight}, 0).contiguous();
+    out.inv_scale = torch::cat({q_state.inv_scale, k_state.inv_scale, v_state.inv_scale}, 0).contiguous();
+    out.bias = fused_bias;
+    out.spin_enabled = false;
+    out.pre_scale = q_state.pre_scale;
+    out.act_quant_mode = q_state.act_quant_mode;
+    out.act_quant_method = q_state.act_quant_method;
+    out.act_quant_percentile = q_state.act_quant_percentile;
+    out.act_quant_bits = q_state.act_quant_bits;
+    out.act_scale = q_state.act_scale;
+    cache.valid = true;
+    cache.q_qweight = BitNetTensorPtrKey(q_state.qweight);
+    cache.k_qweight = BitNetTensorPtrKey(k_state.qweight);
+    cache.v_qweight = BitNetTensorPtrKey(v_state.qweight);
+    cache.q_inv_scale = BitNetTensorPtrKey(q_state.inv_scale);
+    cache.k_inv_scale = BitNetTensorPtrKey(k_state.inv_scale);
+    cache.v_inv_scale = BitNetTensorPtrKey(v_state.inv_scale);
+    cache.q_bias = BitNetTensorPtrKey(q_state.bias);
+    cache.k_bias = BitNetTensorPtrKey(k_state.bias);
+    cache.v_bias = BitNetTensorPtrKey(v_state.bias);
+    cache.q_pre_scale = BitNetTensorPtrKey(q_state.pre_scale);
+    cache.q_act_scale = BitNetTensorPtrKey(q_state.act_scale);
+    cache.q_rows = q_size;
+    cache.k_rows = k_size;
+    cache.v_rows = v_size;
+    cache.logical_in = logical_in;
+    cache.act_quant_bits = q_state.act_quant_bits;
+    cache.act_quant_percentile = q_state.act_quant_percentile;
+    cache.act_quant_mode = q_state.act_quant_mode;
+    cache.act_quant_method = q_state.act_quant_method;
+    cache.fused_state = out;
+    cache.q_size = q_size;
+    cache.k_size = k_size;
+    cache.v_size = v_size;
+    *fused_state = cache.fused_state;
+    *q_size_out = cache.q_size;
+    *k_size_out = cache.k_size;
+    *v_size_out = cache.v_size;
+    return true;
+  }
+  const auto q_size = BitNetLayoutHeaderScalar(q_state.layout_header, 3);
+  const auto k_size = BitNetLayoutHeaderScalar(k_state.layout_header, 3);
+  const auto v_size = BitNetLayoutHeaderScalar(v_state.layout_header, 3);
+  const auto logical_in = BitNetLayoutHeaderScalar(q_state.layout_header, 4);
+  const auto padded_in = BitNetLayoutHeaderScalar(q_state.layout_header, 6);
+  const auto tile_n = BitNetLayoutHeaderScalar(q_state.layout_header, 1);
+  const auto tile_k = BitNetLayoutHeaderScalar(q_state.layout_header, 2);
+  const auto interleave_mode = BitNetLayoutHeaderScalar(q_state.layout_header, 9);
+  if (BitNetLayoutHeaderScalar(k_state.layout_header, 4) != logical_in ||
+      BitNetLayoutHeaderScalar(v_state.layout_header, 4) != logical_in ||
+      BitNetLayoutHeaderScalar(k_state.layout_header, 6) != padded_in ||
+      BitNetLayoutHeaderScalar(v_state.layout_header, 6) != padded_in ||
+      BitNetLayoutHeaderScalar(k_state.layout_header, 1) != tile_n ||
+      BitNetLayoutHeaderScalar(v_state.layout_header, 1) != tile_n ||
+      BitNetLayoutHeaderScalar(k_state.layout_header, 2) != tile_k ||
+      BitNetLayoutHeaderScalar(v_state.layout_header, 2) != tile_k ||
+      BitNetLayoutHeaderScalar(k_state.layout_header, 9) != interleave_mode ||
+      BitNetLayoutHeaderScalar(v_state.layout_header, 9) != interleave_mode) {
+    return false;
+  }
+  const auto logical_out = q_size + k_size + v_size;
+  const auto padded_out = ((logical_out + 15) / 16) * 16;
+  const auto packed_cols = q_state.packed_weight.size(1);
+  if (k_state.packed_weight.size(1) != packed_cols || v_state.packed_weight.size(1) != packed_cols) {
+    return false;
+  }
+
+  auto packed_weight = torch::full(
+      {padded_out, packed_cols},
+      static_cast<uint8_t>(0x55),
+      torch::TensorOptions().device(q_state.packed_weight.device()).dtype(torch::kUInt8));
+  int64_t cursor = 0;
+  packed_weight.slice(0, cursor, cursor + q_size).copy_(q_state.packed_weight.slice(0, 0, q_size));
+  cursor += q_size;
+  packed_weight.slice(0, cursor, cursor + k_size).copy_(k_state.packed_weight.slice(0, 0, k_size));
+  cursor += k_size;
+  packed_weight.slice(0, cursor, cursor + v_size).copy_(v_state.packed_weight.slice(0, 0, v_size));
+
+  auto scale_values = torch::cat({
+      ExpandBitNetRowScales(q_state),
+      ExpandBitNetRowScales(k_state),
+      ExpandBitNetRowScales(v_state),
+  }).to(torch::TensorOptions().device(q_state.scale_values.device()).dtype(torch::kFloat32)).contiguous();
+  auto layout_header = torch::tensor(
+      {
+          static_cast<int32_t>(1),
+          static_cast<int32_t>(tile_n),
+          static_cast<int32_t>(tile_k),
+          static_cast<int32_t>(logical_out),
+          static_cast<int32_t>(logical_in),
+          static_cast<int32_t>(padded_out),
+          static_cast<int32_t>(padded_in),
+          static_cast<int32_t>(2),
+          static_cast<int32_t>(1),
+          static_cast<int32_t>(interleave_mode),
+          static_cast<int32_t>(std::max({
+              BitNetLayoutHeaderScalar(q_state.layout_header, 10),
+              BitNetLayoutHeaderScalar(k_state.layout_header, 10),
+              BitNetLayoutHeaderScalar(v_state.layout_header, 10),
+          })),
+          static_cast<int32_t>(1),
+          static_cast<int32_t>(0),
+      },
+      torch::TensorOptions().device(q_state.packed_weight.device()).dtype(torch::kInt32));
+  auto segment_offsets = torch::tensor(
+      {static_cast<int32_t>(0), static_cast<int32_t>(logical_out)},
+      torch::TensorOptions().device(q_state.packed_weight.device()).dtype(torch::kInt32));
+
+  c10::optional<torch::Tensor> fused_bias = c10::nullopt;
+  if (q_state.bias.has_value() || k_state.bias.has_value() || v_state.bias.has_value()) {
+    std::vector<torch::Tensor> parts;
+    parts.reserve(3);
+    auto append_bias = [&](const BitNetModuleState& state, int64_t logical_rows) {
+      if (state.bias.has_value() && state.bias.value().defined()) {
+        parts.push_back(state.bias.value().to(torch::TensorOptions().device(packed_weight.device()).dtype(torch::kFloat32)).reshape({-1}).slice(0, 0, logical_rows));
+      } else {
+        parts.push_back(torch::zeros({logical_rows}, torch::TensorOptions().device(packed_weight.device()).dtype(torch::kFloat32)));
+      }
+    };
+    append_bias(q_state, q_size);
+    append_bias(k_state, k_size);
+    append_bias(v_state, v_size);
+    fused_bias = torch::cat(parts).contiguous();
+  }
+
+  BitNetModuleState out;
+  out.packed_weight = packed_weight.contiguous();
+  out.scale_values = scale_values;
+  out.layout_header = layout_header.contiguous();
+  out.segment_offsets = segment_offsets.contiguous();
+  out.bias = fused_bias;
+  out.spin_enabled = q_state.spin_enabled;
+  out.spin_signs = q_state.spin_signs;
+  out.pre_scale = q_state.pre_scale;
+  out.act_quant_mode = q_state.act_quant_mode;
+  out.act_quant_method = q_state.act_quant_method;
+  out.act_quant_percentile = q_state.act_quant_percentile;
+  out.act_quant_bits = q_state.act_quant_bits;
+  out.act_scale = q_state.act_scale;
+  if (q_state.qweight.defined() && k_state.qweight.defined() && v_state.qweight.defined()) {
+    out.qweight = torch::cat({q_state.qweight, k_state.qweight, v_state.qweight}, 0).contiguous();
+  }
+  if (q_state.inv_scale.defined() && k_state.inv_scale.defined() && v_state.inv_scale.defined()) {
+    out.inv_scale = torch::cat({q_state.inv_scale, k_state.inv_scale, v_state.inv_scale}, 0).contiguous();
+  }
+  *fused_state = std::move(out);
+  *q_size_out = q_size;
+  *k_size_out = k_size;
+  *v_size_out = v_size;
+  return true;
+}
+
+torch::Tensor BitNetLinearStateForward(
+    const torch::Tensor& x,
+    const BitNetModuleState& state,
+    const c10::optional<torch::ScalarType>& out_dtype = c10::nullopt);
+
 torch::Tensor BitNetLinearModuleForward(const torch::Tensor& x, const py::object& module) {
   BitNetModuleState state;
   TORCH_CHECK(BitNetModuleDirectSupported(module, &state), "BitNet module is not directly supported in native executor");
-  auto x_local = ApplyBitNetModuleInputTransforms(x, state);
-  return BitNetLinearForward(
-      x_local,
+  return BitNetLinearStateForward(x, state);
+}
+
+torch::Tensor BitNetLinearStateForward(
+    const torch::Tensor& x,
+    const BitNetModuleState& state,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  const auto resolved_out_dtype =
+      out_dtype.has_value() ? out_dtype : c10::optional<torch::ScalarType>(x.scalar_type());
+  if (BitNetStateUsesInt8PackedPath(state) && state.qweight.defined() && state.inv_scale.defined()) {
+    return BitNetInt8LinearFromFloatForward(
+        x,
+        state.qweight,
+        state.inv_scale,
+        state.bias,
+        state.pre_scale.defined() ? c10::optional<torch::Tensor>(state.pre_scale) : c10::nullopt,
+        state.act_quant_mode,
+        state.act_quant_method,
+        state.act_quant_bits,
+        state.act_quant_percentile,
+        state.act_scale.defined() ? c10::optional<torch::Tensor>(state.act_scale) : c10::nullopt,
+        resolved_out_dtype);
+  }
+  return BitNetLinearFromFloatForward(
+      x,
       state.packed_weight,
       state.scale_values,
       state.layout_header,
       state.segment_offsets,
       state.bias,
-      c10::nullopt,
-      false);
+      state.spin_enabled,
+      state.spin_signs.defined() ? c10::optional<torch::Tensor>(state.spin_signs) : c10::nullopt,
+      state.pre_scale.defined() ? c10::optional<torch::Tensor>(state.pre_scale) : c10::nullopt,
+      state.act_quant_mode,
+      state.act_quant_method,
+      state.act_quant_bits,
+      state.act_quant_percentile,
+      state.act_scale.defined() ? c10::optional<torch::Tensor>(state.act_scale) : c10::nullopt,
+      resolved_out_dtype);
+}
+
+c10::optional<torch::Tensor> TryBitNetGatedInt8LinearStateForward(
+    const torch::Tensor& x,
+    const std::string& activation,
+    const BitNetModuleState& state,
+    const c10::optional<torch::ScalarType>& out_dtype = c10::nullopt) {
+#if MODEL_STACK_WITH_CUDA
+  if (!x.is_cuda() || !BitNetStateUsesInt8PackedPath(state) || state.spin_enabled ||
+      !state.qweight.defined() || !state.inv_scale.defined() || x.dim() < 2 || (x.size(-1) % 2) != 0 ||
+      !t10::bitnet::HasCudaBitNetInputFrontendKernel()) {
+    return c10::nullopt;
+  }
+  const auto mode = NormalizeBackendName(state.act_quant_mode);
+  const auto method = NormalizeBackendName(state.act_quant_method);
+  const auto rows = x.size(-1) > 0 ? x.numel() / x.size(-1) : 0;
+  const bool static_supported = mode == "static_int8" && state.act_scale.defined();
+  const bool dynamic_supported =
+      mode == "dynamic_int8" && rows == 1 && (method.empty() || method == "absmax" || method == "mse");
+  const auto resolved_out_dtype =
+      out_dtype.has_value() ? out_dtype : c10::optional<torch::ScalarType>(x.scalar_type());
+  if (!static_supported && !dynamic_supported) {
+    return c10::nullopt;
+  }
+  auto quantized = t10::bitnet::CudaBitNetQuantizeGatedActivationInt8CodesForward(
+      x,
+      activation,
+      state.pre_scale.defined() ? c10::optional<torch::Tensor>(state.pre_scale) : c10::nullopt,
+      state.act_quant_mode,
+      state.act_quant_method,
+      state.act_quant_bits,
+      state.act_scale.defined() ? c10::optional<torch::Tensor>(state.act_scale) : c10::nullopt);
+  return Int8LinearForward(
+      std::get<0>(quantized),
+      std::get<1>(quantized),
+      state.qweight,
+      state.inv_scale,
+      state.bias,
+      resolved_out_dtype);
+#else
+  (void)x;
+  (void)activation;
+  (void)state;
+  (void)out_dtype;
+  return c10::nullopt;
+#endif
 }
 
 torch::Tensor PythonLinearModuleForward(
@@ -4234,8 +6125,9 @@ torch::Tensor LinearLikeModuleForward(
     const torch::Tensor& x,
     const py::object& module,
     const std::string& backend) {
-  if (BitNetModuleDirectSupported(module)) {
-    return BitNetLinearModuleForward(x, module);
+  BitNetModuleState bitnet_state;
+  if (BitNetModuleDirectSupported(module, &bitnet_state)) {
+    return BitNetLinearStateForward(x, bitnet_state);
   }
   if (ModuleHasRuntimeLinear(module)) {
     return PythonLinearModuleForward(x, module, backend);
@@ -4252,6 +6144,107 @@ bool AttentionQkvSupportsPackedBitNet(const py::object& attn) {
   return true;
 }
 
+bool AttentionUsesBitNetInt8AttentionCore(const py::object& attn) {
+  BitNetModuleState q_state;
+  BitNetModuleState k_state;
+  BitNetModuleState v_state;
+  return BitNetModuleDirectSupported(attn.attr("w_q"), &q_state) &&
+      BitNetModuleDirectSupported(attn.attr("w_k"), &k_state) &&
+      BitNetModuleDirectSupported(attn.attr("w_v"), &v_state) &&
+      BitNetStateUsesInt8PackedPath(q_state) &&
+      BitNetStateUsesInt8PackedPath(k_state) &&
+      BitNetStateUsesInt8PackedPath(v_state);
+}
+
+std::vector<torch::Tensor> AttentionPackedBitNetQkvForwardFromStates(
+    const torch::Tensor& x,
+    const BitNetModuleState& q_state,
+    const BitNetModuleState& k_state,
+    const BitNetModuleState& v_state,
+    int64_t q_heads,
+    int64_t kv_heads) {
+  if (BitNetStateUsesInt8PackedPath(q_state) &&
+      BitNetStateUsesInt8PackedPath(k_state) &&
+      BitNetStateUsesInt8PackedPath(v_state)) {
+    BitNetModuleState fused_state;
+    int64_t q_size = 0;
+    int64_t k_size = 0;
+    int64_t v_size = 0;
+    if (TryFuseBitNetQkvStates(q_state, k_state, v_state, &fused_state, &q_size, &k_size, &v_size) &&
+        fused_state.qweight.defined() && fused_state.inv_scale.defined()) {
+      return BitNetInt8FusedQkvPackedHeadsProjectionForward(
+          x,
+          fused_state.qweight,
+          fused_state.inv_scale,
+          fused_state.bias,
+          fused_state.pre_scale.defined() ? c10::optional<torch::Tensor>(fused_state.pre_scale) : c10::nullopt,
+          fused_state.act_quant_mode,
+          fused_state.act_quant_method,
+          fused_state.act_quant_bits,
+          fused_state.act_quant_percentile,
+          fused_state.act_scale.defined() ? c10::optional<torch::Tensor>(fused_state.act_scale) : c10::nullopt,
+          q_size,
+          k_size,
+          v_size,
+          q_heads,
+          kv_heads,
+          c10::optional<torch::ScalarType>(x.scalar_type()));
+    }
+    auto q = BitNetLinearStateForward(x, q_state);
+    auto k = BitNetLinearStateForward(x, k_state);
+    auto v = BitNetLinearStateForward(x, v_state);
+    return {
+        SplitHeadsForward(q, q_heads),
+        SplitHeadsForward(k, kv_heads),
+        SplitHeadsForward(v, kv_heads),
+    };
+  }
+  BitNetModuleState fused_state;
+  int64_t q_size = 0;
+  int64_t k_size = 0;
+  int64_t v_size = 0;
+  if (TryFuseBitNetQkvStates(q_state, k_state, v_state, &fused_state, &q_size, &k_size, &v_size)) {
+    auto x_local = BitNetTransformInputFromState(x, fused_state);
+    return BitNetFusedQkvPackedHeadsProjectionForward(
+        x_local,
+        fused_state.packed_weight,
+        fused_state.scale_values,
+        fused_state.layout_header,
+        fused_state.segment_offsets,
+        fused_state.bias,
+        q_size,
+        k_size,
+        v_size,
+        q_heads,
+        kv_heads);
+  }
+  auto q_x = BitNetTransformInputFromState(x, q_state);
+  auto k_x = BitNetTransformInputFromState(x, k_state);
+  auto v_x = BitNetTransformInputFromState(x, v_state);
+  return BitNetQkvPackedHeadsProjectionForward(
+      q_x,
+      q_state.packed_weight,
+      q_state.scale_values,
+      q_state.layout_header,
+      q_state.segment_offsets,
+      q_state.bias,
+      k_x,
+      k_state.packed_weight,
+      k_state.scale_values,
+      k_state.layout_header,
+      k_state.segment_offsets,
+      k_state.bias,
+      v_x,
+      v_state.packed_weight,
+      v_state.scale_values,
+      v_state.layout_header,
+      v_state.segment_offsets,
+      v_state.bias,
+      q_heads,
+      kv_heads,
+      c10::nullopt);
+}
+
 std::vector<torch::Tensor> AttentionPackedBitNetQkvForward(
     const torch::Tensor& x,
     const py::object& attn,
@@ -4263,31 +6256,7 @@ std::vector<torch::Tensor> AttentionPackedBitNetQkvForward(
   if (BitNetModuleDirectSupported(attn.attr("w_q"), &q_state) &&
       BitNetModuleDirectSupported(attn.attr("w_k"), &k_state) &&
       BitNetModuleDirectSupported(attn.attr("w_v"), &v_state)) {
-    auto q_x = ApplyBitNetModuleInputTransforms(x, q_state);
-    auto k_x = ApplyBitNetModuleInputTransforms(x, k_state);
-    auto v_x = ApplyBitNetModuleInputTransforms(x, v_state);
-    return BitNetQkvPackedHeadsProjectionForward(
-        q_x,
-        q_state.packed_weight,
-        q_state.scale_values,
-        q_state.layout_header,
-        q_state.segment_offsets,
-        q_state.bias,
-        k_x,
-        k_state.packed_weight,
-        k_state.scale_values,
-        k_state.layout_header,
-        k_state.segment_offsets,
-        k_state.bias,
-        v_x,
-        v_state.packed_weight,
-        v_state.scale_values,
-        v_state.layout_header,
-        v_state.segment_offsets,
-        v_state.bias,
-        q_heads,
-        kv_heads,
-        c10::nullopt);
+    return AttentionPackedBitNetQkvForwardFromStates(x, q_state, k_state, v_state, q_heads, kv_heads);
   }
   auto runtime_ops = RuntimeOpsModule();
   auto spec = runtime_ops.attr("resolve_packed_qkv_module_spec")(
@@ -4312,8 +6281,9 @@ std::vector<torch::Tensor> AttentionPackedBitNetQkvForward(
 torch::Tensor AttentionPackedBitNetOutputForward(
     const torch::Tensor& x,
     const py::object& module) {
-  if (BitNetModuleDirectSupported(module)) {
-    return BitNetLinearModuleForward(MergeHeadsForward(x), module);
+  BitNetModuleState state;
+  if (BitNetModuleDirectSupported(module, &state)) {
+    return BitNetLinearStateForward(MergeHeadsForward(x), state);
   }
   auto runtime_ops = RuntimeOpsModule();
   auto spec = runtime_ops.attr("resolve_packed_linear_module_spec")(
@@ -4500,11 +6470,325 @@ bool IsSupportedMoEMlpModule(const py::object& moe) {
   return true;
 }
 
+bool ModuleUsesBitNetInt8PackedPath(const py::object& module) {
+  BitNetModuleState state;
+  return BitNetModuleDirectSupported(module, &state) && BitNetStateUsesInt8PackedPath(state);
+}
+
+bool ModelUsesBitNetInt8PackedPath(const py::object& model) {
+  if (py::hasattr(model, "lm_head") && ModuleUsesBitNetInt8PackedPath(model.attr("lm_head"))) {
+    return true;
+  }
+  for (auto block_handle : model.attr("blocks")) {
+    py::object block = py::reinterpret_borrow<py::object>(block_handle);
+    if (py::hasattr(block, "attn")) {
+      auto attn = block.attr("attn");
+      for (const char* name : {"w_q", "w_k", "w_v", "w_o"}) {
+        if (py::hasattr(attn, name) && ModuleUsesBitNetInt8PackedPath(attn.attr(name))) {
+          return true;
+        }
+      }
+    }
+    if (py::hasattr(block, "mlp")) {
+      auto mlp = block.attr("mlp");
+      for (const char* name : {"w_in", "w_out"}) {
+        if (py::hasattr(mlp, name) && ModuleUsesBitNetInt8PackedPath(mlp.attr(name))) {
+          return true;
+        }
+      }
+    }
+    if (py::hasattr(block, "moe")) {
+      auto moe = block.attr("moe");
+      if (py::hasattr(moe, "router") && ModuleUsesBitNetInt8PackedPath(moe.attr("router"))) {
+        return true;
+      }
+      if (py::hasattr(moe, "experts")) {
+        for (auto expert_handle : moe.attr("experts")) {
+          py::object expert = py::reinterpret_borrow<py::object>(expert_handle);
+          for (const char* name : {"w_in", "w_out"}) {
+            if (py::hasattr(expert, name) && ModuleUsesBitNetInt8PackedPath(expert.attr(name))) {
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+bool BlockUsesAttentionBiases(const py::object& block) {
+  if (!py::hasattr(block, "bc")) {
+    return false;
+  }
+  auto bc = block.attr("bc");
+  if (PyBoolAttr(bc, "use_alibi", false)) {
+    return true;
+  }
+  auto rpb_table = PyAttrOrNone(block, "rpb_table");
+  return !rpb_table.is_none();
+}
+
+bool ModelUsesAttentionBiases(const py::object& model) {
+  if (!py::hasattr(model, "blocks")) {
+    return false;
+  }
+  for (auto block_handle : model.attr("blocks")) {
+    py::object block = py::reinterpret_borrow<py::object>(block_handle);
+    if (BlockUsesAttentionBiases(block)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+struct PreparedLinearLikeModule {
+  py::object module = py::none();
+  bool direct_bitnet = false;
+  BitNetModuleState bitnet_state;
+  bool has_runtime_linear = false;
+  bool supports_bitnet_packed = false;
+};
+
+bool PrepareLinearLikeModule(const py::object& module, PreparedLinearLikeModule* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  PreparedLinearLikeModule prepared;
+  prepared.module = module;
+  prepared.has_runtime_linear = ModuleHasRuntimeLinear(module);
+  prepared.supports_bitnet_packed = ModuleSupportsPackedBackend(module, "bitnet");
+  if (BitNetModuleDirectSupported(module, &prepared.bitnet_state)) {
+    prepared.direct_bitnet = true;
+    *out = std::move(prepared);
+    return true;
+  }
+  if (prepared.has_runtime_linear || py::hasattr(module, "weight")) {
+    *out = std::move(prepared);
+    return true;
+  }
+  return false;
+}
+
+torch::Tensor PreparedLinearLikeForward(
+    const torch::Tensor& x,
+    const PreparedLinearLikeModule& prepared,
+    const std::string& backend) {
+  if (prepared.direct_bitnet) {
+    return BitNetLinearStateForward(x, prepared.bitnet_state);
+  }
+  if (prepared.has_runtime_linear) {
+    return PythonLinearModuleForward(x, prepared.module, backend);
+  }
+  return LinearForward(
+      x,
+      TensorAttr(prepared.module, "weight"),
+      TensorAttrOptional(prepared.module, "bias"),
+      backend);
+}
+
+struct PreparedAttentionModule {
+  py::object attn = py::none();
+  PreparedLinearLikeModule w_q;
+  PreparedLinearLikeModule w_k;
+  PreparedLinearLikeModule w_v;
+  PreparedLinearLikeModule w_o;
+  int64_t q_heads = 0;
+  int64_t kv_heads = 0;
+  int64_t head_dim = 0;
+  double attention_scale = 1.0;
+  bool use_rope = false;
+  double rope_theta = 1e6;
+  double rope_attention_scaling = 1.0;
+  std::string rope_scaling_type;
+  bool has_rope_scaling_factor = false;
+  double rope_scaling_factor = 1.0;
+  bool direct_bitnet_qkv = false;
+  bool direct_fused_bitnet_qkv = false;
+  BitNetModuleState fused_bitnet_qkv_state;
+  int64_t fused_q_size = 0;
+  int64_t fused_k_size = 0;
+  int64_t fused_v_size = 0;
+  bool use_bitnet_int8_attention_core = false;
+  bool use_packed_bitnet_qkv = false;
+  bool direct_bitnet_output = false;
+};
+
+bool PrepareAttentionModule(const py::object& attn, PreparedAttentionModule* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  PreparedAttentionModule prepared;
+  prepared.attn = attn;
+  prepared.q_heads = PyIntAttr(attn, "n_heads", 0);
+  prepared.kv_heads = PyIntAttr(attn, "n_kv_heads", prepared.q_heads);
+  prepared.head_dim = PyIntAttr(attn, "head_dim", 0);
+  if (prepared.q_heads <= 0 || prepared.kv_heads <= 0 || prepared.head_dim <= 0) {
+    return false;
+  }
+  prepared.attention_scale = PyFloatAttr(attn, "scaling", std::pow(static_cast<double>(prepared.head_dim), -0.5));
+  prepared.use_rope = PyBoolAttr(attn, "use_rope", false);
+  prepared.rope_theta = PyFloatAttr(attn, "rope_theta", 1e6);
+  prepared.rope_attention_scaling = PyFloatAttr(attn, "rope_attention_scaling", 1.0);
+  prepared.rope_scaling_type = PyStringAttr(attn, "rope_scaling_type", "");
+  auto rope_scaling_factor_obj = PyAttrOrNone(attn, "rope_scaling_factor");
+  if (!rope_scaling_factor_obj.is_none()) {
+    prepared.has_rope_scaling_factor = true;
+    prepared.rope_scaling_factor = py::cast<double>(rope_scaling_factor_obj);
+  }
+  if (!PrepareLinearLikeModule(attn.attr("w_q"), &prepared.w_q) ||
+      !PrepareLinearLikeModule(attn.attr("w_k"), &prepared.w_k) ||
+      !PrepareLinearLikeModule(attn.attr("w_v"), &prepared.w_v) ||
+      !PrepareLinearLikeModule(attn.attr("w_o"), &prepared.w_o)) {
+    return false;
+  }
+  prepared.direct_bitnet_qkv =
+      prepared.w_q.direct_bitnet &&
+      prepared.w_k.direct_bitnet &&
+      prepared.w_v.direct_bitnet;
+  if (prepared.direct_bitnet_qkv) {
+    prepared.direct_fused_bitnet_qkv = TryFuseBitNetQkvStates(
+        prepared.w_q.bitnet_state,
+        prepared.w_k.bitnet_state,
+        prepared.w_v.bitnet_state,
+        &prepared.fused_bitnet_qkv_state,
+        &prepared.fused_q_size,
+        &prepared.fused_k_size,
+        &prepared.fused_v_size);
+  }
+  prepared.use_bitnet_int8_attention_core =
+      prepared.direct_bitnet_qkv &&
+      BitNetStateUsesInt8PackedPath(prepared.w_q.bitnet_state) &&
+      BitNetStateUsesInt8PackedPath(prepared.w_k.bitnet_state) &&
+      BitNetStateUsesInt8PackedPath(prepared.w_v.bitnet_state);
+  prepared.use_packed_bitnet_qkv =
+      prepared.w_q.supports_bitnet_packed &&
+      prepared.w_k.supports_bitnet_packed &&
+      prepared.w_v.supports_bitnet_packed;
+  prepared.direct_bitnet_output = prepared.w_o.direct_bitnet;
+  *out = std::move(prepared);
+  return true;
+}
+
+struct PreparedMlpModule {
+  py::object mlp = py::none();
+  PreparedLinearLikeModule w_in;
+  PreparedLinearLikeModule w_out;
+  std::string activation = "gelu";
+  bool gated = false;
+};
+
+bool PrepareMlpModule(const py::object& mlp, PreparedMlpModule* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  PreparedMlpModule prepared;
+  prepared.mlp = mlp;
+  prepared.activation = PyStringAttr(mlp, "activation_name", "gelu");
+  prepared.gated = PyBoolAttr(mlp, "gated", false);
+  if (!PrepareLinearLikeModule(mlp.attr("w_in"), &prepared.w_in) ||
+      !PrepareLinearLikeModule(mlp.attr("w_out"), &prepared.w_out)) {
+    return false;
+  }
+  *out = std::move(prepared);
+  return true;
+}
+
+enum class PreparedBlockKind {
+  kStandard,
+  kParallel,
+};
+
+struct PreparedNativeBlock {
+  PreparedBlockKind kind = PreparedBlockKind::kStandard;
+  py::object block = py::none();
+  py::object bc = py::none();
+  py::object n = py::none();
+  py::object n1 = py::none();
+  py::object n2 = py::none();
+  PreparedAttentionModule attn;
+  PreparedMlpModule mlp;
+  double residual_scale = 1.0;
+  std::string norm_policy = "prenorm";
+};
+
+bool PrepareNativeBlock(const py::object& block, PreparedNativeBlock* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  const auto block_type = PyTypeName(block);
+  const bool standard_block =
+      block_type == "TransformerBlock" || block_type == "LlamaBlock" || block_type == "GPTBlock";
+  const bool parallel_block = block_type == "ParallelTransformerBlock";
+  if (!standard_block && !parallel_block) {
+    return false;
+  }
+  PreparedNativeBlock prepared;
+  prepared.kind = parallel_block ? PreparedBlockKind::kParallel : PreparedBlockKind::kStandard;
+  prepared.block = block;
+  prepared.bc = block.attr("bc");
+  prepared.residual_scale = PyFloatAttr(prepared.bc, "residual_scale", 1.0);
+  prepared.norm_policy = PyStringAttr(prepared.bc, "norm_policy", "prenorm");
+  if (!PrepareAttentionModule(block.attr("attn"), &prepared.attn) ||
+      !PrepareMlpModule(block.attr("mlp"), &prepared.mlp)) {
+    return false;
+  }
+  if (parallel_block) {
+    prepared.n = block.attr("n");
+  } else {
+    prepared.n1 = block.attr("n1");
+    prepared.n2 = block.attr("n2");
+  }
+  *out = std::move(prepared);
+  return true;
+}
+
+struct PreparedNativeCausalModel {
+  py::object model = py::none();
+  torch::Tensor embed_weight;
+  int64_t padding_idx = -1;
+  py::object norm = py::none();
+  PreparedLinearLikeModule lm_head;
+  std::vector<PreparedNativeBlock> blocks;
+};
+
+std::shared_ptr<PreparedNativeCausalModel> TryPrepareNativeCausalModel(const py::object& model) {
+  try {
+    auto prepared = std::make_shared<PreparedNativeCausalModel>();
+    prepared->model = model;
+    auto embed = model.attr("embed");
+    prepared->embed_weight = TensorAttr(embed, "weight");
+    auto padding_idx_obj = PyAttrOrNone(embed, "padding_idx");
+    if (!padding_idx_obj.is_none()) {
+      prepared->padding_idx = py::cast<int64_t>(padding_idx_obj);
+    }
+    prepared->norm = model.attr("norm");
+    if (!PrepareLinearLikeModule(model.attr("lm_head"), &prepared->lm_head)) {
+      return nullptr;
+    }
+    prepared->blocks.reserve(static_cast<size_t>(py::len(model.attr("blocks"))));
+    for (auto block_handle : model.attr("blocks")) {
+      PreparedNativeBlock block;
+      if (!PrepareNativeBlock(py::reinterpret_borrow<py::object>(block_handle), &block)) {
+        return nullptr;
+      }
+      prepared->blocks.push_back(std::move(block));
+    }
+    return prepared;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+bool SupportsNativeCausalRuntimeInputs(const py::object& attention_mask, const py::object& cache) {
+  return IsSupportedAttentionMask(attention_mask) && HasNativeCacheSupport(cache);
+}
+
 bool IsSupportedNativeCausalModel(const py::object& model, const py::object& attention_mask, const py::object& cache) {
   if (PyBoolAttr(model, "training", false)) {
     return false;
   }
-  if (!IsSupportedAttentionMask(attention_mask) || !HasNativeCacheSupport(cache)) {
+  if (!SupportsNativeCausalRuntimeInputs(attention_mask, cache)) {
     return false;
   }
   for (const char* name : {"embed", "blocks", "norm", "lm_head"}) {
@@ -4571,47 +6855,250 @@ std::string DetectNativeExecutorKind(const py::object& model) {
   return IsSupportedNativeCausalModel(model, py::none(), py::none()) ? std::string("causal_lm") : std::string("python");
 }
 
-int64_t NativeCacheLayerLength(const py::object& cache, int64_t layer_idx) {
-  auto native_cache = PyAttrOrNone(cache, "_native_cache");
-  if (!native_cache.is_none()) {
-    return py::cast<int64_t>(native_cache.attr("max_length")(layer_idx));
+std::shared_ptr<PagedKvCacheState> TryCastNativePagedKvCacheState(const py::handle& obj) {
+  if (obj.is_none()) {
+    return nullptr;
   }
-  auto native_layers = PyAttrOrNone(cache, "_native_layers");
-  if (!native_layers.is_none()) {
-    py::object layer = native_layers[py::int_(layer_idx)];
-    auto lengths = py::cast<torch::Tensor>(layer.attr("lengths")());
-    return lengths.numel() > 0 ? lengths.max().item<int64_t>() : 0;
+  try {
+    return py::cast<std::shared_ptr<PagedKvCacheState>>(obj);
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+std::shared_ptr<PagedKvLayerState> TryCastNativePagedKvLayerState(const py::handle& obj) {
+  if (obj.is_none()) {
+    return nullptr;
+  }
+  try {
+    return py::cast<std::shared_ptr<PagedKvLayerState>>(obj);
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+struct ResolvedNativeCache {
+  py::object native_cache = py::none();
+  py::object native_layers = py::none();
+  std::shared_ptr<PagedKvCacheState> native_cache_state;
+
+  bool HasState() const {
+    return native_cache_state != nullptr || !native_layers.is_none();
+  }
+
+  std::shared_ptr<PagedKvLayerState> LayerState(int64_t layer_idx) const {
+    if (native_cache_state != nullptr) {
+      return nullptr;
+    }
+    if (native_layers.is_none()) {
+      return nullptr;
+    }
+    try {
+      return TryCastNativePagedKvLayerState(native_layers[py::int_(layer_idx)]);
+    } catch (...) {
+      return nullptr;
+    }
+  }
+};
+
+ResolvedNativeCache ResolveNativeCache(const py::object& cache) {
+  ResolvedNativeCache resolved;
+  if (cache.is_none()) {
+    return resolved;
+  }
+  resolved.native_cache = PyAttrOrNone(cache, "_native_cache");
+  if (!resolved.native_cache.is_none()) {
+    resolved.native_cache_state = TryCastNativePagedKvCacheState(resolved.native_cache);
+    return resolved;
+  }
+  resolved.native_layers = PyAttrOrNone(cache, "_native_layers");
+  return resolved;
+}
+
+int64_t NativeCacheLayerLength(const ResolvedNativeCache& cache, int64_t layer_idx) {
+  if (cache.native_cache_state != nullptr) {
+    return cache.native_cache_state->MaxLength(layer_idx);
+  }
+  if (!cache.native_cache.is_none()) {
+    return py::cast<int64_t>(cache.native_cache.attr("max_length")(layer_idx));
+  }
+  if (auto native_layer_state = cache.LayerState(layer_idx)) {
+    return native_layer_state->MaxLength();
+  }
+  if (!cache.native_layers.is_none()) {
+    py::object layer = cache.native_layers[py::int_(layer_idx)];
+    return py::cast<int64_t>(layer.attr("max_length")());
   }
   return 0;
 }
 
-void NativeCacheAppendLayer(const py::object& cache, int64_t layer_idx, const torch::Tensor& k, const torch::Tensor& v) {
-  auto native_cache = PyAttrOrNone(cache, "_native_cache");
-  if (!native_cache.is_none()) {
-    native_cache.attr("append")(layer_idx, k, v);
+int64_t NativeCacheLayerLength(const py::object& cache, int64_t layer_idx) {
+  return NativeCacheLayerLength(ResolveNativeCache(cache), layer_idx);
+}
+
+void NativeCacheAppendLayer(
+    const ResolvedNativeCache& cache,
+    int64_t layer_idx,
+    const torch::Tensor& k,
+    const torch::Tensor& v) {
+  if (cache.native_cache_state != nullptr) {
+    cache.native_cache_state->Append(layer_idx, k, v, c10::nullopt);
     return;
   }
-  auto native_layers = PyAttrOrNone(cache, "_native_layers");
-  if (!native_layers.is_none()) {
-    py::object layer = native_layers[py::int_(layer_idx)];
+  if (!cache.native_cache.is_none()) {
+    cache.native_cache.attr("append")(layer_idx, k, v);
+    return;
+  }
+  if (auto native_layer_state = cache.LayerState(layer_idx)) {
+    native_layer_state->Append(k, v, c10::nullopt);
+    return;
+  }
+  if (!cache.native_layers.is_none()) {
+    py::object layer = cache.native_layers[py::int_(layer_idx)];
     layer.attr("append")(k, v);
   }
 }
 
-std::pair<torch::Tensor, torch::Tensor> NativeCacheReadLayerAll(const py::object& cache, int64_t layer_idx) {
+void NativeCacheAppendLayer(const py::object& cache, int64_t layer_idx, const torch::Tensor& k, const torch::Tensor& v) {
+  NativeCacheAppendLayer(ResolveNativeCache(cache), layer_idx, k, v);
+}
+
+std::pair<torch::Tensor, torch::Tensor> NativeCacheReadLayerAll(
+    const ResolvedNativeCache& cache,
+    int64_t layer_idx) {
   const auto length = NativeCacheLayerLength(cache, layer_idx);
-  auto native_cache = PyAttrOrNone(cache, "_native_cache");
-  if (!native_cache.is_none()) {
-    auto out = py::cast<py::tuple>(native_cache.attr("read_range")(layer_idx, 0, length));
+  if (cache.native_cache_state != nullptr) {
+    auto out = cache.native_cache_state->ReadRange(layer_idx, 0, length, c10::nullopt);
+    return {out[0], out[1]};
+  }
+  if (!cache.native_cache.is_none()) {
+    auto out = py::cast<py::tuple>(cache.native_cache.attr("read_range")(layer_idx, 0, length));
     return {py::cast<torch::Tensor>(out[0]), py::cast<torch::Tensor>(out[1])};
   }
-  auto native_layers = PyAttrOrNone(cache, "_native_layers");
-  if (!native_layers.is_none()) {
-    py::object layer = native_layers[py::int_(layer_idx)];
+  if (auto native_layer_state = cache.LayerState(layer_idx)) {
+    auto out = native_layer_state->ReadRange(0, length, c10::nullopt);
+    return {out[0], out[1]};
+  }
+  if (!cache.native_layers.is_none()) {
+    py::object layer = cache.native_layers[py::int_(layer_idx)];
     auto out = py::cast<py::tuple>(layer.attr("read_range")(0, length));
     return {py::cast<torch::Tensor>(out[0]), py::cast<torch::Tensor>(out[1])};
   }
   throw std::runtime_error("native cache state unavailable for supported causal executor");
+}
+
+std::pair<torch::Tensor, torch::Tensor> NativeCacheReadLayerAll(const py::object& cache, int64_t layer_idx) {
+  return NativeCacheReadLayerAll(ResolveNativeCache(cache), layer_idx);
+}
+
+c10::optional<torch::Tensor> NativeCachePagedAttentionDecodeLayer(
+    const ResolvedNativeCache& cache,
+    int64_t layer_idx,
+    const torch::Tensor& q,
+    const c10::optional<torch::Tensor>& attn_mask,
+    const c10::optional<double>& scale) {
+  auto normalize_mask = [&](const c10::optional<torch::Tensor>& mask_opt, int64_t max_len) {
+    if (!mask_opt.has_value() || !mask_opt.value().defined()) {
+      return mask_opt;
+    }
+    auto mask = mask_opt.value();
+    if (mask.dim() != 4) {
+      return mask_opt;
+    }
+    if (mask.size(0) == 1 && q.size(0) > 1) {
+      mask = mask.expand({q.size(0), mask.size(1), mask.size(2), mask.size(3)});
+    }
+    if (mask.size(1) == 1 && q.size(1) > 1) {
+      mask = mask.expand({mask.size(0), q.size(1), mask.size(2), mask.size(3)});
+    }
+    if (mask.size(2) > q.size(2)) {
+      mask = mask.slice(2, mask.size(2) - q.size(2), mask.size(2));
+    }
+    if (max_len > 0 && mask.size(3) > max_len) {
+      mask = mask.slice(3, mask.size(3) - max_len, mask.size(3));
+    }
+    return c10::optional<torch::Tensor>(mask.contiguous());
+  };
+  auto cuda_paged_decode = [&](const torch::Tensor& k_pages,
+                               const torch::Tensor& v_pages,
+                               const torch::Tensor& block_table,
+                               const torch::Tensor& lengths,
+                               const c10::optional<torch::Tensor>& normalized_mask,
+                               int64_t known_mask_seq) -> c10::optional<torch::Tensor> {
+#if MODEL_STACK_WITH_CUDA
+    if (q.is_cuda() && k_pages.is_cuda() && v_pages.is_cuda() && block_table.is_cuda() && lengths.is_cuda() &&
+        (!normalized_mask.has_value() || !normalized_mask.value().defined() || normalized_mask.value().is_cuda()) &&
+        HasCudaPagedAttentionDecodeKernel()) {
+      auto block_table_safe = block_table.to(torch::kLong).contiguous();
+      block_table_safe.clamp_min_(0);
+      auto lengths_long = lengths.to(torch::kLong).contiguous().view(-1);
+      return CudaPagedAttentionDecodeForward(
+          q,
+          k_pages,
+          v_pages,
+          block_table_safe,
+          lengths_long,
+          normalized_mask,
+          scale,
+          known_mask_seq);
+    }
+#endif
+    return c10::nullopt;
+  };
+  if (cache.native_cache_state != nullptr) {
+    const auto page_count = cache.native_cache_state->PageCount(layer_idx);
+    const auto max_len = cache.native_cache_state->MaxLength(layer_idx);
+    auto k_pages = cache.native_cache_state->KPages(layer_idx).slice(0, 0, page_count);
+    auto v_pages = cache.native_cache_state->VPages(layer_idx).slice(0, 0, page_count);
+    auto block_table = cache.native_cache_state->BlockTable(layer_idx);
+    auto lengths = cache.native_cache_state->Lengths(layer_idx);
+    auto normalized_mask = normalize_mask(attn_mask, max_len);
+    if (auto out = cuda_paged_decode(k_pages, v_pages, block_table, lengths, normalized_mask, max_len)) {
+      return out;
+    }
+    return PagedAttentionDecodeForward(q, k_pages, v_pages, block_table, lengths, normalized_mask, scale);
+  }
+  if (!cache.native_cache.is_none()) {
+    const auto page_count = py::cast<int64_t>(cache.native_cache.attr("page_count")(layer_idx));
+    const auto max_len = py::cast<int64_t>(cache.native_cache.attr("max_length")(layer_idx));
+    auto k_pages = py::cast<torch::Tensor>(cache.native_cache.attr("k_pages")(layer_idx)).slice(0, 0, page_count);
+    auto v_pages = py::cast<torch::Tensor>(cache.native_cache.attr("v_pages")(layer_idx)).slice(0, 0, page_count);
+    auto block_table = py::cast<torch::Tensor>(cache.native_cache.attr("block_table")(layer_idx));
+    auto lengths = py::cast<torch::Tensor>(cache.native_cache.attr("lengths")(layer_idx));
+    auto normalized_mask = normalize_mask(attn_mask, max_len);
+    if (auto out = cuda_paged_decode(k_pages, v_pages, block_table, lengths, normalized_mask, max_len)) {
+      return out;
+    }
+    return PagedAttentionDecodeForward(q, k_pages, v_pages, block_table, lengths, normalized_mask, scale);
+  }
+  if (auto native_layer_state = cache.LayerState(layer_idx)) {
+    const auto page_count = native_layer_state->PageCount();
+    const auto max_len = native_layer_state->MaxLength();
+    auto k_pages = native_layer_state->KPages().slice(0, 0, page_count);
+    auto v_pages = native_layer_state->VPages().slice(0, 0, page_count);
+    auto block_table = native_layer_state->BlockTable();
+    auto lengths = native_layer_state->Lengths();
+    auto normalized_mask = normalize_mask(attn_mask, max_len);
+    if (auto out = cuda_paged_decode(k_pages, v_pages, block_table, lengths, normalized_mask, max_len)) {
+      return out;
+    }
+    return PagedAttentionDecodeForward(q, k_pages, v_pages, block_table, lengths, normalized_mask, scale);
+  }
+  if (!cache.native_layers.is_none()) {
+    py::object layer = cache.native_layers[py::int_(layer_idx)];
+    const auto page_count = py::cast<int64_t>(layer.attr("page_count")());
+    const auto max_len = py::cast<int64_t>(layer.attr("max_length")());
+    auto k_pages = py::cast<torch::Tensor>(layer.attr("k_pages")()).slice(0, 0, page_count);
+    auto v_pages = py::cast<torch::Tensor>(layer.attr("v_pages")()).slice(0, 0, page_count);
+    auto block_table = py::cast<torch::Tensor>(layer.attr("block_table")());
+    auto lengths = py::cast<torch::Tensor>(layer.attr("lengths")());
+    auto normalized_mask = normalize_mask(attn_mask, max_len);
+    if (auto out = cuda_paged_decode(k_pages, v_pages, block_table, lengths, normalized_mask, max_len)) {
+      return out;
+    }
+    return PagedAttentionDecodeForward(q, k_pages, v_pages, block_table, lengths, normalized_mask, scale);
+  }
+  return c10::nullopt;
 }
 
 c10::optional<torch::Tensor> NativeCachePagedAttentionDecodeLayer(
@@ -4620,26 +7107,7 @@ c10::optional<torch::Tensor> NativeCachePagedAttentionDecodeLayer(
     const torch::Tensor& q,
     const c10::optional<torch::Tensor>& attn_mask,
     const c10::optional<double>& scale) {
-  auto native_cache = PyAttrOrNone(cache, "_native_cache");
-  if (!native_cache.is_none()) {
-    const auto page_count = py::cast<int64_t>(native_cache.attr("page_count")(layer_idx));
-    auto k_pages = py::cast<torch::Tensor>(native_cache.attr("k_pages")(layer_idx)).slice(0, 0, page_count);
-    auto v_pages = py::cast<torch::Tensor>(native_cache.attr("v_pages")(layer_idx)).slice(0, 0, page_count);
-    auto block_table = py::cast<torch::Tensor>(native_cache.attr("block_table")(layer_idx));
-    auto lengths = py::cast<torch::Tensor>(native_cache.attr("lengths")(layer_idx));
-    return PagedAttentionDecodeForward(q, k_pages, v_pages, block_table, lengths, attn_mask, scale);
-  }
-  auto native_layers = PyAttrOrNone(cache, "_native_layers");
-  if (!native_layers.is_none()) {
-    py::object layer = native_layers[py::int_(layer_idx)];
-    const auto page_count = py::cast<int64_t>(layer.attr("page_count")());
-    auto k_pages = py::cast<torch::Tensor>(layer.attr("k_pages")()).slice(0, 0, page_count);
-    auto v_pages = py::cast<torch::Tensor>(layer.attr("v_pages")()).slice(0, 0, page_count);
-    auto block_table = py::cast<torch::Tensor>(layer.attr("block_table")());
-    auto lengths = py::cast<torch::Tensor>(layer.attr("lengths")());
-    return PagedAttentionDecodeForward(q, k_pages, v_pages, block_table, lengths, attn_mask, scale);
-  }
-  return c10::nullopt;
+  return NativeCachePagedAttentionDecodeLayer(ResolveNativeCache(cache), layer_idx, q, attn_mask, scale);
 }
 
 torch::Tensor ToAdditiveMask(const torch::Tensor& mask) {
@@ -4770,6 +7238,383 @@ c10::optional<torch::Tensor> ApplySupportedAttentionBiases(
   return mask;
 }
 
+std::vector<torch::Tensor> ResolveAttentionRotaryEmbedding(
+    const py::object& attn,
+    const torch::Tensor& x,
+    int64_t head_dim,
+    double base_theta,
+    double attention_scaling,
+    torch::ScalarType target_dtype,
+    const c10::optional<torch::Tensor>& position_ids,
+    const c10::optional<int64_t>& known_single_position) {
+  const auto seq_len = x.size(1);
+  int64_t needed = seq_len;
+  torch::Tensor gather_pos;
+  bool single_position = false;
+  int64_t single_position_idx = 0;
+  if (known_single_position.has_value()) {
+    single_position = true;
+    single_position_idx = known_single_position.value();
+    needed = single_position_idx + 1;
+  } else if (position_ids.has_value() && position_ids.value().defined()) {
+    gather_pos = position_ids.value().to(torch::TensorOptions().dtype(torch::kLong).device(x.device()));
+    if (gather_pos.dim() == 2) {
+      gather_pos = gather_pos[0];
+    }
+    if (gather_pos.numel() == 1) {
+      single_position = true;
+      single_position_idx = gather_pos.reshape({-1})[0].item<int64_t>();
+      needed = single_position_idx + 1;
+    } else if (gather_pos.numel() > 0) {
+      needed = gather_pos.max().item<int64_t>() + 1;
+    }
+  }
+
+  auto rope_cos_obj = PyAttrOrNone(attn, "_rope_cos");
+  auto rope_sin_obj = PyAttrOrNone(attn, "_rope_sin");
+  torch::Tensor cache_cos;
+  torch::Tensor cache_sin;
+  if (!rope_cos_obj.is_none() && !rope_sin_obj.is_none()) {
+    try {
+      cache_cos = py::cast<torch::Tensor>(rope_cos_obj);
+      cache_sin = py::cast<torch::Tensor>(rope_sin_obj);
+    } catch (...) {
+      cache_cos = torch::Tensor();
+      cache_sin = torch::Tensor();
+    }
+  }
+
+  const bool cache_usable = cache_cos.defined() && cache_sin.defined() &&
+      cache_cos.dim() == 2 && cache_sin.dim() == 2 &&
+      cache_cos.size(0) >= needed && cache_sin.size(0) >= needed &&
+      cache_cos.size(1) == head_dim && cache_sin.size(1) == head_dim &&
+      cache_cos.device() == x.device() && cache_sin.device() == x.device() &&
+      cache_cos.scalar_type() == target_dtype && cache_sin.scalar_type() == target_dtype;
+
+  if (!cache_usable) {
+    auto reference = torch::empty({1, needed, x.size(-1)}, x.options().dtype(target_dtype));
+    auto full = ResolveRotaryEmbeddingForward(
+        reference,
+        head_dim,
+        base_theta,
+        attention_scaling,
+        c10::nullopt);
+    cache_cos = full[0];
+    cache_sin = full[1];
+    try {
+      py::setattr(attn, "_rope_cos", py::cast(cache_cos));
+      py::setattr(attn, "_rope_sin", py::cast(cache_sin));
+    } catch (...) {
+    }
+  }
+
+  if (single_position) {
+    return {
+        cache_cos.slice(0, single_position_idx, single_position_idx + 1),
+        cache_sin.slice(0, single_position_idx, single_position_idx + 1),
+    };
+  }
+  if (gather_pos.defined()) {
+    return {
+        at::index_select(cache_cos, 0, gather_pos.reshape({-1})).view({seq_len, head_dim}),
+        at::index_select(cache_sin, 0, gather_pos.reshape({-1})).view({seq_len, head_dim}),
+    };
+  }
+  return {
+      cache_cos.slice(0, 0, seq_len),
+      cache_sin.slice(0, 0, seq_len),
+  };
+}
+
+torch::Tensor ExecutePreparedAttention(
+    const PreparedAttentionModule& prepared,
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& mask,
+    const py::object& cache,
+    const ResolvedNativeCache* resolved_cache,
+    int64_t layer_idx,
+    const c10::optional<torch::Tensor>& position_ids,
+    const c10::optional<int64_t>& known_single_position) {
+  std::vector<torch::Tensor> qkv;
+  if (prepared.use_packed_bitnet_qkv) {
+    if (prepared.direct_bitnet_qkv) {
+      if (prepared.direct_fused_bitnet_qkv) {
+        if (prepared.fused_bitnet_qkv_state.qweight.defined() && prepared.fused_bitnet_qkv_state.inv_scale.defined()) {
+          qkv = BitNetInt8FusedQkvPackedHeadsProjectionForward(
+              x,
+              prepared.fused_bitnet_qkv_state.qweight,
+              prepared.fused_bitnet_qkv_state.inv_scale,
+              prepared.fused_bitnet_qkv_state.bias,
+              prepared.fused_bitnet_qkv_state.pre_scale.defined()
+                  ? c10::optional<torch::Tensor>(prepared.fused_bitnet_qkv_state.pre_scale)
+                  : c10::nullopt,
+              prepared.fused_bitnet_qkv_state.act_quant_mode,
+              prepared.fused_bitnet_qkv_state.act_quant_method,
+              prepared.fused_bitnet_qkv_state.act_quant_bits,
+              prepared.fused_bitnet_qkv_state.act_quant_percentile,
+              prepared.fused_bitnet_qkv_state.act_scale.defined()
+                  ? c10::optional<torch::Tensor>(prepared.fused_bitnet_qkv_state.act_scale)
+                  : c10::nullopt,
+              prepared.fused_q_size,
+              prepared.fused_k_size,
+              prepared.fused_v_size,
+              prepared.q_heads,
+              prepared.kv_heads,
+              c10::optional<torch::ScalarType>(x.scalar_type()));
+        } else {
+          qkv = BitNetFusedQkvPackedHeadsProjectionForward(
+              x,
+              prepared.fused_bitnet_qkv_state.packed_weight,
+              prepared.fused_bitnet_qkv_state.scale_values,
+              prepared.fused_bitnet_qkv_state.layout_header,
+              prepared.fused_bitnet_qkv_state.segment_offsets,
+              prepared.fused_bitnet_qkv_state.bias,
+              prepared.fused_q_size,
+              prepared.fused_k_size,
+              prepared.fused_v_size,
+              prepared.q_heads,
+              prepared.kv_heads);
+        }
+      } else {
+        qkv = AttentionPackedBitNetQkvForwardFromStates(
+            x,
+            prepared.w_q.bitnet_state,
+            prepared.w_k.bitnet_state,
+            prepared.w_v.bitnet_state,
+            prepared.q_heads,
+            prepared.kv_heads);
+      }
+    } else {
+      qkv = AttentionPackedBitNetQkvForward(x, prepared.attn, prepared.q_heads, prepared.kv_heads);
+    }
+  } else {
+    auto q = PreparedLinearLikeForward(x, prepared.w_q, "auto");
+    auto k = PreparedLinearLikeForward(x, prepared.w_k, "auto");
+    auto v = PreparedLinearLikeForward(x, prepared.w_v, "auto");
+    qkv = {
+        SplitHeadsForward(q, prepared.q_heads),
+        SplitHeadsForward(k, prepared.kv_heads),
+        SplitHeadsForward(v, prepared.kv_heads),
+    };
+  }
+
+  auto qh = qkv[0];
+  auto kh_new = qkv[1];
+  auto vh_new = qkv[2];
+  const auto attention_scale = c10::optional<double>(prepared.attention_scale);
+
+  if (prepared.use_rope) {
+    double base_theta = prepared.rope_theta;
+    if (prepared.rope_scaling_type == "linear" && prepared.has_rope_scaling_factor) {
+      base_theta *= prepared.rope_scaling_factor;
+    }
+    auto cos_sin = ResolveAttentionRotaryEmbedding(
+        prepared.attn,
+        x,
+        prepared.head_dim,
+        base_theta,
+        prepared.rope_attention_scaling,
+        qh.scalar_type(),
+        position_ids,
+        known_single_position);
+    auto rotated = ApplyRotaryForward(qh, kh_new, cos_sin[0], cos_sin[1]);
+    qh = rotated[0];
+    kh_new = rotated[1];
+  }
+
+  auto project_output = [&](const torch::Tensor& heads_out) {
+    if (prepared.direct_bitnet_output) {
+      return BitNetLinearStateForward(MergeHeadsForward(heads_out), prepared.w_o.bitnet_state);
+    }
+    if (prepared.w_o.supports_bitnet_packed) {
+      return AttentionPackedBitNetOutputForward(heads_out, prepared.w_o.module);
+    }
+    return PreparedLinearLikeForward(MergeHeadsForward(heads_out), prepared.w_o, "auto");
+  };
+
+  torch::Tensor kh_all = kh_new;
+  torch::Tensor vh_all = vh_new;
+  if (!cache.is_none()) {
+    const auto& native_cache = resolved_cache != nullptr ? *resolved_cache : ResolveNativeCache(cache);
+    NativeCacheAppendLayer(native_cache, layer_idx, kh_new, vh_new);
+    if (qh.size(2) == 1) {
+      auto paged_out = NativeCachePagedAttentionDecodeLayer(
+          native_cache,
+          layer_idx,
+          qh,
+          mask,
+          attention_scale);
+      if (paged_out.has_value()) {
+        return project_output(paged_out.value());
+      }
+    }
+    auto kv = NativeCacheReadLayerAll(native_cache, layer_idx);
+    kh_all = kv.first;
+    vh_all = kv.second;
+  }
+
+  auto out = prepared.use_bitnet_int8_attention_core
+      ? Int8AttentionFromFloatForward(
+            qh,
+            kh_all,
+            vh_all,
+            mask,
+            !mask.has_value(),
+            attention_scale,
+            c10::optional<torch::ScalarType>(qh.scalar_type()),
+            c10::nullopt,
+            c10::nullopt,
+            c10::nullopt)
+      : NativeAttentionForward(
+            qh,
+            kh_all,
+            vh_all,
+            mask,
+            !mask.has_value(),
+            attention_scale);
+  return project_output(out);
+}
+
+torch::Tensor ExecutePreparedMlp(
+    const PreparedMlpModule& prepared,
+    const torch::Tensor& x) {
+  auto hidden = PreparedLinearLikeForward(x, prepared.w_in, "auto");
+  if (prepared.gated) {
+    if (prepared.w_out.direct_bitnet) {
+      if (auto fused = TryBitNetGatedInt8LinearStateForward(hidden, prepared.activation, prepared.w_out.bitnet_state)) {
+        return fused.value();
+      }
+    }
+    hidden = ApplyGatedActivation(hidden, prepared.activation);
+  } else {
+    hidden = ApplyActivation(hidden, prepared.activation);
+  }
+  return PreparedLinearLikeForward(hidden, prepared.w_out, "auto");
+}
+
+c10::optional<torch::Tensor> TryPreparedNativeCausalModelForward(
+    const std::shared_ptr<PreparedNativeCausalModel>& prepared,
+    const torch::Tensor& input_ids,
+    const py::object& attention_mask,
+    const py::object& cache,
+    const py::object& position_ids_obj,
+    const py::object& cache_position_obj,
+    bool model_uses_attention_biases,
+    int64_t known_decode_position) {
+  if (prepared == nullptr) {
+    return c10::nullopt;
+  }
+  if (!SupportsNativeCausalRuntimeInputs(attention_mask, cache)) {
+    return c10::nullopt;
+  }
+
+  auto provided_attention_mask = OptionalTensorFromPyObject(attention_mask);
+  c10::optional<torch::Tensor> token_attention_mask = c10::nullopt;
+  c10::optional<torch::Tensor> explicit_attention_mask = c10::nullopt;
+  if (provided_attention_mask.has_value() && provided_attention_mask.value().defined()) {
+    if (IsTokenAttentionMaskTensor(provided_attention_mask.value(), input_ids.size(0), input_ids.size(1))) {
+      token_attention_mask = provided_attention_mask;
+    } else {
+      explicit_attention_mask = provided_attention_mask;
+    }
+  }
+  auto cache_position = OptionalTensorFromPyObject(cache_position_obj);
+  auto position_ids = OptionalTensorFromPyObject(position_ids_obj);
+  auto native_cache = ResolveNativeCache(cache);
+  c10::optional<int64_t> known_single_position = c10::nullopt;
+  if (!position_ids.has_value() &&
+      known_decode_position >= 0 &&
+      !cache.is_none() &&
+      input_ids.size(1) == 1 &&
+      !token_attention_mask.has_value() &&
+      !explicit_attention_mask.has_value() &&
+      !model_uses_attention_biases) {
+    known_single_position = known_decode_position;
+  }
+
+  auto x = known_single_position.has_value()
+      ? EmbeddingForwardUnchecked(prepared->embed_weight, input_ids, prepared->padding_idx)
+      : EmbeddingForward(prepared->embed_weight, input_ids, prepared->padding_idx);
+
+  if (!position_ids.has_value() && !known_single_position.has_value()) {
+    int64_t past_length = 0;
+    if (!cache.is_none() && !cache_position.has_value()) {
+      past_length = NativeCacheLayerLength(native_cache, 0);
+    }
+    position_ids = ResolvePositionIdsForward(
+        x.size(0),
+        x.size(1),
+        x,
+        token_attention_mask,
+        cache_position,
+        past_length);
+  }
+
+  c10::optional<torch::Tensor> mask = c10::nullopt;
+  if (explicit_attention_mask.has_value()) {
+    TORCH_CHECK(!prepared->blocks.empty(), "supported causal executor requires at least one block");
+    mask = PrepareExplicitAttentionMaskForHeads(
+        explicit_attention_mask.value(),
+        x.size(0),
+        prepared->blocks.front().attn.q_heads,
+        x.size(1),
+        explicit_attention_mask.value().size(-1));
+  } else if (
+      cache.is_none() || x.size(1) != 1 || token_attention_mask.has_value() ||
+      model_uses_attention_biases) {
+    mask = CreateCausalMaskForward(x, token_attention_mask, cache_position, position_ids);
+  }
+
+  int64_t layer_idx = 0;
+  for (const auto& block : prepared->blocks) {
+    const auto block_mask = model_uses_attention_biases
+        ? ApplySupportedAttentionBiases(block.block, x, mask, position_ids)
+        : mask;
+    if (block.kind == PreparedBlockKind::kParallel) {
+      auto y = ApplyNormModuleForward(x, block.n);
+      auto attn_out = ExecutePreparedAttention(block.attn, y, mask, cache, &native_cache, layer_idx, position_ids, known_single_position);
+      auto mlp_out = ExecutePreparedMlp(block.mlp, y);
+      x = ResidualAddForward(x, attn_out, block.residual_scale);
+      x = ResidualAddForward(x, mlp_out, block.residual_scale);
+      ++layer_idx;
+      continue;
+    }
+    if (block.norm_policy == "prenorm") {
+      auto attn_in = ApplyNormModuleForward(x, block.n1);
+      auto attn_out = ExecutePreparedAttention(
+          block.attn,
+          attn_in,
+          block_mask,
+          cache,
+          &native_cache,
+          layer_idx,
+          position_ids,
+          known_single_position);
+      auto add_norm = AddNormModuleForward(x, attn_out, block.n2, block.residual_scale);
+      x = add_norm[0];
+      auto mlp_out = ExecutePreparedMlp(block.mlp, add_norm[1]);
+      x = ResidualAddForward(x, mlp_out, block.residual_scale);
+    } else {
+      auto attn_out = ExecutePreparedAttention(
+          block.attn,
+          x,
+          block_mask,
+          cache,
+          &native_cache,
+          layer_idx,
+          position_ids,
+          known_single_position);
+      x = AddNormModuleForward(x, attn_out, block.n1, block.residual_scale)[1];
+      auto mlp_out = ExecutePreparedMlp(block.mlp, x);
+      x = AddNormModuleForward(x, mlp_out, block.n2, block.residual_scale)[1];
+    }
+    ++layer_idx;
+  }
+
+  x = ApplyNormModuleForward(x, prepared->norm);
+  return PreparedLinearLikeForward(x, prepared->lm_head, "auto");
+}
+
 torch::Tensor ExecuteSupportedAttention(
     const py::object& attn,
     const torch::Tensor& x,
@@ -4777,17 +7622,40 @@ torch::Tensor ExecuteSupportedAttention(
     const py::object& cache,
     int64_t layer_idx,
     const c10::optional<torch::Tensor>& position_ids) {
+  auto w_q = attn.attr("w_q");
+  auto w_k = attn.attr("w_k");
+  auto w_v = attn.attr("w_v");
+  auto w_o = attn.attr("w_o");
   const auto q_heads = PyIntAttr(attn, "n_heads", 0);
   const auto kv_heads = PyIntAttr(attn, "n_kv_heads", q_heads);
   const auto head_dim = PyIntAttr(attn, "head_dim", x.size(-1) / std::max<int64_t>(q_heads, 1));
+  BitNetModuleState q_state;
+  BitNetModuleState k_state;
+  BitNetModuleState v_state;
+  const bool direct_bitnet_qkv =
+      BitNetModuleDirectSupported(w_q, &q_state) &&
+      BitNetModuleDirectSupported(w_k, &k_state) &&
+      BitNetModuleDirectSupported(w_v, &v_state);
+  const bool use_bitnet_int8_attention_core =
+      direct_bitnet_qkv &&
+      BitNetStateUsesInt8PackedPath(q_state) &&
+      BitNetStateUsesInt8PackedPath(k_state) &&
+      BitNetStateUsesInt8PackedPath(v_state);
+  const bool use_packed_bitnet_qkv =
+      ModuleSupportsPackedBackend(w_q, "bitnet") &&
+      ModuleSupportsPackedBackend(w_k, "bitnet") &&
+      ModuleSupportsPackedBackend(w_v, "bitnet");
+  BitNetModuleState w_o_state;
+  const bool direct_bitnet_output = BitNetModuleDirectSupported(w_o, &w_o_state);
   std::vector<torch::Tensor> qkv;
-  if (AttentionQkvSupportsPackedBitNet(attn)) {
-    qkv = AttentionPackedBitNetQkvForward(x, attn, q_heads, kv_heads);
-  } else if (ModuleHasRuntimeLinear(attn.attr("w_q")) || ModuleHasRuntimeLinear(attn.attr("w_k")) ||
-             ModuleHasRuntimeLinear(attn.attr("w_v"))) {
-    auto q = PythonLinearModuleForward(x, attn.attr("w_q"), "auto");
-    auto k = PythonLinearModuleForward(x, attn.attr("w_k"), "auto");
-    auto v = PythonLinearModuleForward(x, attn.attr("w_v"), "auto");
+  if (use_packed_bitnet_qkv) {
+    qkv = direct_bitnet_qkv
+        ? AttentionPackedBitNetQkvForwardFromStates(x, q_state, k_state, v_state, q_heads, kv_heads)
+        : AttentionPackedBitNetQkvForward(x, attn, q_heads, kv_heads);
+  } else if (ModuleHasRuntimeLinear(w_q) || ModuleHasRuntimeLinear(w_k) || ModuleHasRuntimeLinear(w_v)) {
+    auto q = LinearLikeModuleForward(x, w_q, "auto");
+    auto k = LinearLikeModuleForward(x, w_k, "auto");
+    auto v = LinearLikeModuleForward(x, w_v, "auto");
     qkv = {
         SplitHeadsForward(q, q_heads),
         SplitHeadsForward(k, kv_heads),
@@ -4796,12 +7664,12 @@ torch::Tensor ExecuteSupportedAttention(
   } else {
     qkv = QkvHeadsProjectionForward(
         x,
-        TensorAttr(attn.attr("w_q"), "weight"),
-        TensorAttrOptional(attn.attr("w_q"), "bias"),
-        TensorAttr(attn.attr("w_k"), "weight"),
-        TensorAttrOptional(attn.attr("w_k"), "bias"),
-        TensorAttr(attn.attr("w_v"), "weight"),
-        TensorAttrOptional(attn.attr("w_v"), "bias"),
+        TensorAttr(w_q, "weight"),
+        TensorAttrOptional(w_q, "bias"),
+        TensorAttr(w_k, "weight"),
+        TensorAttrOptional(w_k, "bias"),
+        TensorAttr(w_v, "weight"),
+        TensorAttrOptional(w_v, "bias"),
         q_heads,
         kv_heads,
         "auto");
@@ -4809,6 +7677,8 @@ torch::Tensor ExecuteSupportedAttention(
   auto qh = qkv[0];
   auto kh_new = qkv[1];
   auto vh_new = qkv[2];
+  const auto attention_scale =
+      c10::optional<double>(PyFloatAttr(attn, "scaling", std::pow(static_cast<double>(head_dim), -0.5)));
 
   if (PyBoolAttr(attn, "use_rope", false)) {
     double base_theta = PyFloatAttr(attn, "rope_theta", 1e6);
@@ -4817,12 +7687,15 @@ torch::Tensor ExecuteSupportedAttention(
     if (scaling_type == "linear" && !scaling_factor_obj.is_none()) {
       base_theta *= py::cast<double>(scaling_factor_obj);
     }
-    auto cos_sin = ResolveRotaryEmbeddingForward(
+    auto cos_sin = ResolveAttentionRotaryEmbedding(
+        attn,
         x,
         head_dim,
         base_theta,
         PyFloatAttr(attn, "rope_attention_scaling", 1.0),
-        position_ids);
+        qh.scalar_type(),
+        position_ids,
+        c10::nullopt);
     auto rotated = ApplyRotaryForward(qh, kh_new, cos_sin[0], cos_sin[1]);
     qh = rotated[0];
     kh_new = rotated[1];
@@ -4838,18 +7711,21 @@ torch::Tensor ExecuteSupportedAttention(
           layer_idx,
           qh,
           mask,
-          c10::optional<double>(PyFloatAttr(attn, "scaling", std::pow(static_cast<double>(head_dim), -0.5))));
+          attention_scale);
       if (paged_out.has_value()) {
-        if (ModuleSupportsPackedBackend(attn.attr("w_o"), "bitnet")) {
-          return AttentionPackedBitNetOutputForward(paged_out.value(), attn.attr("w_o"));
+        if (direct_bitnet_output) {
+          return BitNetLinearStateForward(MergeHeadsForward(paged_out.value()), w_o_state);
         }
-        if (ModuleHasRuntimeLinear(attn.attr("w_o"))) {
-          return PythonLinearModuleForward(MergeHeadsForward(paged_out.value()), attn.attr("w_o"), "auto");
+        if (ModuleSupportsPackedBackend(w_o, "bitnet")) {
+          return AttentionPackedBitNetOutputForward(paged_out.value(), w_o);
+        }
+        if (ModuleHasRuntimeLinear(w_o)) {
+          return PythonLinearModuleForward(MergeHeadsForward(paged_out.value()), w_o, "auto");
         }
         return HeadOutputProjectionForward(
             paged_out.value(),
-            TensorAttr(attn.attr("w_o"), "weight"),
-            TensorAttrOptional(attn.attr("w_o"), "bias"),
+            TensorAttr(w_o, "weight"),
+            TensorAttrOptional(w_o, "bias"),
             "auto");
       }
     }
@@ -4858,50 +7734,66 @@ torch::Tensor ExecuteSupportedAttention(
     vh_all = kv.second;
   }
 
-  auto out = NativeAttentionForward(
-      qh,
-      kh_all,
-      vh_all,
-      mask,
-      !mask.has_value(),
-      c10::optional<double>(PyFloatAttr(attn, "scaling", std::pow(static_cast<double>(head_dim), -0.5))));
-  if (ModuleSupportsPackedBackend(attn.attr("w_o"), "bitnet")) {
-    return AttentionPackedBitNetOutputForward(out, attn.attr("w_o"));
+  auto out = use_bitnet_int8_attention_core
+      ? Int8AttentionFromFloatForward(
+            qh,
+            kh_all,
+            vh_all,
+            mask,
+            !mask.has_value(),
+            attention_scale,
+            c10::optional<torch::ScalarType>(qh.scalar_type()),
+            c10::nullopt,
+            c10::nullopt,
+            c10::nullopt)
+      : NativeAttentionForward(
+            qh,
+            kh_all,
+            vh_all,
+            mask,
+            !mask.has_value(),
+            attention_scale);
+  if (direct_bitnet_output) {
+    return BitNetLinearStateForward(MergeHeadsForward(out), w_o_state);
   }
-  if (ModuleHasRuntimeLinear(attn.attr("w_o"))) {
-    return PythonLinearModuleForward(MergeHeadsForward(out), attn.attr("w_o"), "auto");
+  if (ModuleSupportsPackedBackend(w_o, "bitnet")) {
+    return AttentionPackedBitNetOutputForward(out, w_o);
+  }
+  if (ModuleHasRuntimeLinear(w_o)) {
+    return PythonLinearModuleForward(MergeHeadsForward(out), w_o, "auto");
   }
   return HeadOutputProjectionForward(
       out,
-      TensorAttr(attn.attr("w_o"), "weight"),
-      TensorAttrOptional(attn.attr("w_o"), "bias"),
+      TensorAttr(w_o, "weight"),
+      TensorAttrOptional(w_o, "bias"),
       "auto");
 }
 
 torch::Tensor ExecuteSupportedMlp(const py::object& mlp, const torch::Tensor& x) {
   const auto activation = PyStringAttr(mlp, "activation_name", "gelu");
   const bool gated = PyBoolAttr(mlp, "gated", false);
-  const bool module_aware =
-      ModuleHasRuntimeLinear(mlp.attr("w_in")) || ModuleHasRuntimeLinear(mlp.attr("w_out"));
+  auto w_in = mlp.attr("w_in");
+  auto w_out = mlp.attr("w_out");
+  const bool module_aware = ModuleHasRuntimeLinear(w_in) || ModuleHasRuntimeLinear(w_out);
   if (!module_aware) {
     return MlpForward(
         x,
-        TensorAttr(mlp.attr("w_in"), "weight"),
-        TensorAttrOptional(mlp.attr("w_in"), "bias"),
-        TensorAttr(mlp.attr("w_out"), "weight"),
-        TensorAttrOptional(mlp.attr("w_out"), "bias"),
+        TensorAttr(w_in, "weight"),
+        TensorAttrOptional(w_in, "bias"),
+        TensorAttr(w_out, "weight"),
+        TensorAttrOptional(w_out, "bias"),
         activation,
         gated,
         "auto");
   }
 
-  auto hidden = LinearLikeModuleForward(x, mlp.attr("w_in"), "auto");
+  auto hidden = LinearLikeModuleForward(x, w_in, "auto");
   if (gated) {
     hidden = ApplyGatedActivation(hidden, activation);
   } else {
     hidden = ApplyActivation(hidden, activation);
   }
-  return LinearLikeModuleForward(hidden, mlp.attr("w_out"), "auto");
+  return LinearLikeModuleForward(hidden, w_out, "auto");
 }
 
 torch::Tensor ExecuteSupportedMoE(const py::object& moe, const torch::Tensor& x) {
@@ -4934,11 +7826,19 @@ c10::optional<torch::Tensor> TryNativeCausalModelForward(
     const py::object& attention_mask,
     const py::object& cache,
     const py::object& position_ids_obj,
-    const py::object& cache_position_obj) {
-  if (!IsSupportedNativeCausalModel(model, attention_mask, cache)) {
+    const py::object& cache_position_obj,
+    bool skip_model_support_check,
+    bool model_uses_attention_biases) {
+  if (skip_model_support_check) {
+    if (!SupportsNativeCausalRuntimeInputs(attention_mask, cache)) {
+      return c10::nullopt;
+    }
+  } else if (!IsSupportedNativeCausalModel(model, attention_mask, cache)) {
     return c10::nullopt;
   }
   auto embed = model.attr("embed");
+  auto norm = model.attr("norm");
+  auto lm_head = model.attr("lm_head");
   int64_t padding_idx = -1;
   auto padding_idx_obj = PyAttrOrNone(embed, "padding_idx");
   if (!padding_idx_obj.is_none()) {
@@ -4976,7 +7876,8 @@ c10::optional<torch::Tensor> TryNativeCausalModelForward(
   if (explicit_attention_mask.has_value()) {
     TORCH_CHECK(py::len(blocks) > 0, "supported causal executor requires at least one block");
     auto first_block = py::reinterpret_borrow<py::object>(blocks[py::int_(0)]);
-    const auto num_heads = PyIntAttr(first_block.attr("attn"), "n_heads", 0);
+    auto first_attn = first_block.attr("attn");
+    const auto num_heads = PyIntAttr(first_attn, "n_heads", 0);
     TORCH_CHECK(num_heads > 0, "supported causal executor requires attention heads");
     mask = PrepareExplicitAttentionMaskForHeads(
         explicit_attention_mask.value(),
@@ -4984,19 +7885,24 @@ c10::optional<torch::Tensor> TryNativeCausalModelForward(
         num_heads,
         x.size(1),
         explicit_attention_mask.value().size(-1));
-  } else {
+  } else if (
+      cache.is_none() || x.size(1) != 1 || token_attention_mask.has_value() ||
+      model_uses_attention_biases) {
     mask = CreateCausalMaskForward(x, token_attention_mask, cache_position, position_ids);
   }
   int64_t layer_idx = 0;
   for (auto block_handle : blocks) {
     py::object block = py::reinterpret_borrow<py::object>(block_handle);
     const auto block_type = PyTypeName(block);
+    auto attn = block.attr("attn");
     auto bc = block.attr("bc");
     const auto residual_scale = PyFloatAttr(bc, "residual_scale", 1.0);
     if (block_type == "ParallelTransformerBlock") {
-      auto y = ApplyNormModuleForward(x, block.attr("n"));
-      auto attn_out = ExecuteSupportedAttention(block.attr("attn"), y, mask, cache, layer_idx, position_ids);
-      auto mlp_out = ExecuteSupportedMlp(block.attr("mlp"), y);
+      auto n = block.attr("n");
+      auto mlp = block.attr("mlp");
+      auto y = ApplyNormModuleForward(x, n);
+      auto attn_out = ExecuteSupportedAttention(attn, y, mask, cache, layer_idx, position_ids);
+      auto mlp_out = ExecuteSupportedMlp(mlp, y);
       x = ResidualAddForward(x, attn_out, residual_scale);
       x = ResidualAddForward(x, mlp_out, residual_scale);
       ++layer_idx;
@@ -5005,24 +7911,28 @@ c10::optional<torch::Tensor> TryNativeCausalModelForward(
     const auto block_mask = ApplySupportedAttentionBiases(block, x, mask, position_ids);
     const auto norm_policy = PyStringAttr(bc, "norm_policy", "prenorm");
     const bool moe_block = block_type == "MoEBlock";
+    auto n1 = block.attr("n1");
+    auto n2 = block.attr("n2");
+    py::object mlp = moe_block ? py::object(py::none()) : block.attr("mlp");
+    py::object moe = moe_block ? block.attr("moe") : py::object(py::none());
     if (norm_policy == "prenorm") {
-      auto attn_in = ApplyNormModuleForward(x, block.attr("n1"));
-      auto attn_out = ExecuteSupportedAttention(block.attr("attn"), attn_in, block_mask, cache, layer_idx, position_ids);
-      auto add_norm = AddNormModuleForward(x, attn_out, block.attr("n2"), residual_scale);
+      auto attn_in = ApplyNormModuleForward(x, n1);
+      auto attn_out = ExecuteSupportedAttention(attn, attn_in, block_mask, cache, layer_idx, position_ids);
+      auto add_norm = AddNormModuleForward(x, attn_out, n2, residual_scale);
       x = add_norm[0];
-      auto mlp_out = moe_block ? ExecuteSupportedMoE(block.attr("moe"), add_norm[1]) : ExecuteSupportedMlp(block.attr("mlp"), add_norm[1]);
+      auto mlp_out = moe_block ? ExecuteSupportedMoE(moe, add_norm[1]) : ExecuteSupportedMlp(mlp, add_norm[1]);
       x = ResidualAddForward(x, mlp_out, residual_scale);
     } else {
-      auto attn_out = ExecuteSupportedAttention(block.attr("attn"), x, block_mask, cache, layer_idx, position_ids);
-      x = AddNormModuleForward(x, attn_out, block.attr("n1"), residual_scale)[1];
-      auto mlp_out = moe_block ? ExecuteSupportedMoE(block.attr("moe"), x) : ExecuteSupportedMlp(block.attr("mlp"), x);
-      x = AddNormModuleForward(x, mlp_out, block.attr("n2"), residual_scale)[1];
+      auto attn_out = ExecuteSupportedAttention(attn, x, block_mask, cache, layer_idx, position_ids);
+      x = AddNormModuleForward(x, attn_out, n1, residual_scale)[1];
+      auto mlp_out = moe_block ? ExecuteSupportedMoE(moe, x) : ExecuteSupportedMlp(mlp, x);
+      x = AddNormModuleForward(x, mlp_out, n2, residual_scale)[1];
     }
     ++layer_idx;
   }
 
-  x = ApplyNormModuleForward(x, model.attr("norm"));
-  return LinearLikeModuleForward(x, model.attr("lm_head"), "auto");
+  x = ApplyNormModuleForward(x, norm);
+  return LinearLikeModuleForward(x, lm_head, "auto");
 }
 
 std::string ResolveLinearBackendPy(const std::string& requested) {
@@ -5092,7 +8002,8 @@ PYBIND11_MODULE(_model_stack_native, m) {
       .def("v_pages", &PagedKvLayerState::VPages)
       .def("block_table", &PagedKvLayerState::BlockTable)
       .def("lengths", &PagedKvLayerState::Lengths)
-      .def("page_count", &PagedKvLayerState::PageCount);
+      .def("page_count", &PagedKvLayerState::PageCount)
+      .def("max_length", &PagedKvLayerState::MaxLength);
   py::class_<PagedKvCacheState, std::shared_ptr<PagedKvCacheState>>(m, "PagedKvCacheState")
       .def(py::init<int64_t, int64_t, int64_t, int64_t, int64_t, const torch::Tensor&>(),
            py::arg("batch"),
@@ -5203,6 +8114,10 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("no_repeat_ngram_mask_forward", &NoRepeatNgramMaskForward, py::arg("token_ids"), py::arg("vocab_size"),
         py::arg("n"));
   m.def("sample_next_token_forward", &SampleNextTokenForward, py::arg("logits"), py::arg("do_sample"));
+  m.def("speculative_accept_forward", &SpeculativeAcceptForward, py::arg("target_probs"), py::arg("draft_probs"),
+        py::arg("draft_token_ids"), py::arg("bonus_probs") = py::none(), py::arg("bonus_enabled") = py::none(),
+        py::arg("method") = "rejection_sampler", py::arg("posterior_threshold") = 0.09,
+        py::arg("posterior_alpha") = 0.3);
   m.def("beam_search_step_forward", &BeamSearchStepForward, py::arg("beams"), py::arg("logits"),
         py::arg("raw_scores"), py::arg("finished"), py::arg("lengths"), py::arg("beam_size"),
         py::arg("eos_id"), py::arg("pad_id"));
@@ -5221,11 +8136,104 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("gated_activation_forward", &ApplyGatedActivation, py::arg("x"), py::arg("activation") = "swiglu");
   m.def("linear_forward", &LinearForward, py::arg("x"), py::arg("weight"), py::arg("bias") = py::none(),
         py::arg("backend") = "auto");
-  m.def("int8_linear_forward", &Int8LinearForward, py::arg("qx"), py::arg("x_scale"), py::arg("qweight"),
-        py::arg("inv_scale"), py::arg("bias") = py::none(), py::arg("out_dtype") = py::none());
+  m.def("nf4_linear_forward", &Nf4LinearForward, py::arg("x"), py::arg("packed_weight"),
+        py::arg("weight_scale"), py::arg("bias") = py::none());
+  m.def("fp8_linear_forward", &Fp8LinearForward, py::arg("x"), py::arg("weight_fp8"),
+        py::arg("weight_scale"), py::arg("bias") = py::none(), py::arg("out_dtype") = py::none());
+  m.def(
+      "int8_linear_forward",
+      [](const torch::Tensor& qx,
+         const torch::Tensor& x_scale,
+         const torch::Tensor& qweight,
+         const torch::Tensor& inv_scale,
+         const c10::optional<torch::Tensor>& bias,
+         const c10::optional<torch::ScalarType>& out_dtype) {
+        return Int8LinearForward(qx, x_scale, qweight, inv_scale, bias, out_dtype);
+      },
+      py::arg("qx"),
+      py::arg("x_scale"),
+      py::arg("qweight"),
+      py::arg("inv_scale"),
+      py::arg("bias") = py::none(),
+      py::arg("out_dtype") = py::none());
+  m.def("int8_linear_from_float_forward", &Int8LinearFromFloatForward, py::arg("x"), py::arg("qweight"),
+        py::arg("inv_scale"), py::arg("bias") = py::none(), py::arg("provided_scale") = py::none(),
+        py::arg("out_dtype") = py::none());
   m.def("int8_attention_forward", &Int8AttentionForward, py::arg("q"), py::arg("q_scale"), py::arg("k"),
         py::arg("k_scale"), py::arg("v"), py::arg("v_scale"), py::arg("attn_mask") = py::none(),
         py::arg("is_causal") = false, py::arg("scale") = py::none(), py::arg("out_dtype") = py::none());
+  m.def("int8_attention_from_float_forward", &Int8AttentionFromFloatForward, py::arg("q"), py::arg("k"),
+        py::arg("v"), py::arg("attn_mask") = py::none(), py::arg("is_causal") = false,
+        py::arg("scale") = py::none(), py::arg("out_dtype") = py::none(),
+        py::arg("q_provided_scale") = py::none(), py::arg("k_provided_scale") = py::none(),
+        py::arg("v_provided_scale") = py::none());
+  m.def("bitnet_transform_input_forward", &BitNetTransformInputForward, py::arg("x"),
+        py::arg("spin_enabled") = false, py::arg("spin_signs") = py::none(), py::arg("pre_scale") = py::none(),
+        py::arg("act_quant_mode") = "none", py::arg("act_quant_method") = "absmax",
+        py::arg("act_quant_bits") = 8, py::arg("act_quant_percentile") = 0.999, py::arg("act_scale") = py::none());
+  m.def("bitnet_linear_from_float_forward", &BitNetLinearFromFloatForward, py::arg("x"),
+        py::arg("packed_weight"), py::arg("scale_values"), py::arg("layout_header"), py::arg("segment_offsets"),
+        py::arg("bias") = py::none(), py::arg("spin_enabled") = false, py::arg("spin_signs") = py::none(),
+        py::arg("pre_scale") = py::none(), py::arg("act_quant_mode") = "none",
+        py::arg("act_quant_method") = "absmax", py::arg("act_quant_bits") = 8,
+        py::arg("act_quant_percentile") = 0.999, py::arg("act_scale") = py::none(),
+        py::arg("out_dtype") = py::none());
+  m.def(
+      "bitnet_int8_linear_from_float_forward",
+      [](const torch::Tensor& x,
+         const torch::Tensor& qweight,
+         const torch::Tensor& inv_scale,
+         const c10::optional<torch::Tensor>& bias,
+         const c10::optional<torch::Tensor>& pre_scale,
+         const std::string& act_quant_mode,
+         const std::string& act_quant_method,
+         int64_t act_quant_bits,
+         double act_quant_percentile,
+         const c10::optional<torch::Tensor>& act_scale,
+         const c10::optional<torch::ScalarType>& out_dtype) {
+        return BitNetInt8LinearFromFloatForward(
+            x,
+            qweight,
+            inv_scale,
+            bias,
+            pre_scale,
+            act_quant_mode,
+            act_quant_method,
+            act_quant_bits,
+            act_quant_percentile,
+            act_scale,
+            out_dtype);
+      },
+      py::arg("x"),
+      py::arg("qweight"),
+      py::arg("inv_scale"),
+      py::arg("bias") = py::none(),
+      py::arg("pre_scale") = py::none(),
+      py::arg("act_quant_mode") = "dynamic_int8",
+      py::arg("act_quant_method") = "absmax",
+      py::arg("act_quant_bits") = 8,
+      py::arg("act_quant_percentile") = 0.999,
+      py::arg("act_scale") = py::none(),
+      py::arg("out_dtype") = py::none());
+  m.def(
+      "bitnet_int8_fused_qkv_packed_heads_projection_forward",
+      &BitNetInt8FusedQkvPackedHeadsProjectionForward,
+      py::arg("x"),
+      py::arg("qweight"),
+      py::arg("inv_scale"),
+      py::arg("packed_bias") = py::none(),
+      py::arg("pre_scale") = py::none(),
+      py::arg("act_quant_mode") = "dynamic_int8",
+      py::arg("act_quant_method") = "absmax",
+      py::arg("act_quant_bits") = 8,
+      py::arg("act_quant_percentile") = 0.999,
+      py::arg("act_scale") = py::none(),
+      py::arg("q_size"),
+      py::arg("k_size"),
+      py::arg("v_size"),
+      py::arg("q_heads"),
+      py::arg("kv_heads"),
+      py::arg("out_dtype") = py::none());
   m.def("bitnet_linear_forward", &BitNetLinearForward, py::arg("x"), py::arg("packed_weight"),
         py::arg("scale_values"), py::arg("layout_header"), py::arg("segment_offsets"),
         py::arg("bias") = py::none(), py::arg("out_dtype") = py::none(),
@@ -5256,6 +8264,10 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("v_packed_weight"), py::arg("v_scale_values"), py::arg("v_layout_header"),
         py::arg("v_segment_offsets"), py::arg("v_bias") = py::none(), py::arg("q_heads"),
         py::arg("kv_heads"), py::arg("out_dtype") = py::none());
+  m.def("bitnet_fused_qkv_packed_heads_projection_forward", &BitNetFusedQkvPackedHeadsProjectionForward,
+        py::arg("x"), py::arg("packed_weight"), py::arg("scale_values"), py::arg("layout_header"),
+        py::arg("segment_offsets"), py::arg("packed_bias") = py::none(), py::arg("q_size"), py::arg("k_size"),
+        py::arg("v_size"), py::arg("q_heads"), py::arg("kv_heads"));
   m.def("qkv_heads_projection_forward", &QkvHeadsProjectionForward, py::arg("x"), py::arg("q_weight"),
         py::arg("q_bias") = py::none(), py::arg("k_weight"), py::arg("k_bias") = py::none(),
         py::arg("v_weight"), py::arg("v_bias") = py::none(), py::arg("q_heads"), py::arg("kv_heads"),

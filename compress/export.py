@@ -12,7 +12,7 @@ from typing import Dict, Optional
 import torch
 
 from .lora import get_lora_state_dict, apply_lora_state_dict
-from .quantization import QuantizedLinearBitNet, QuantizedLinearFP8, QuantizedLinearInt4, QuantizedLinearInt8
+from .quantization import QuantizedLinearBitNet, QuantizedLinearFP8, QuantizedLinearInt4, QuantizedLinearInt8, QuantizedLinearNF4
 
 
 def build_delta(
@@ -66,6 +66,21 @@ def build_delta(
                     "type": "int4_pc_packed",
                     "qweight_packed": m.qweight_packed.detach().cpu(),
                     "inv_scale": m.inv_scale.detach().cpu(),
+                    "pre_scale": m.pre_scale.detach().cpu(),
+                    "act_scale": m.act_scale.detach().cpu(),
+                    "weight_opt": m.weight_opt,
+                    "act_quant_mode": m.act_quant_mode,
+                    "act_quant_bits": m.act_quant_bits,
+                    "act_quant_method": m.act_quant_method,
+                    "act_quant_percentile": m.act_quant_percentile,
+                    "spin_enabled": bool(int(m.spin_enabled_flag.item())),
+                    "spin_signs": m.spin_signs.detach().cpu(),
+                }
+            elif isinstance(m, QuantizedLinearNF4):
+                quant[name] = {
+                    "type": "nf4_codebook_packed",
+                    "qweight_packed": m.qweight_packed.detach().cpu(),
+                    "weight_scale": m.weight_scale.detach().cpu(),
                     "pre_scale": m.pre_scale.detach().cpu(),
                     "act_scale": m.act_scale.detach().cpu(),
                     "weight_opt": m.weight_opt,
@@ -194,6 +209,33 @@ def apply_delta(
                     if "qweight_packed" in info:
                         m.qweight_packed.copy_(info["qweight_packed"].to(m.qweight_packed.device))
                     m.inv_scale.copy_(info["inv_scale"].to(m.inv_scale.device))
+                    if "pre_scale" in info:
+                        m.pre_scale.copy_(info["pre_scale"].to(m.pre_scale.device))
+                    if "act_scale" in info:
+                        m.act_scale.copy_(info["act_scale"].to(m.act_scale.device))
+                    if "weight_opt" in info:
+                        m.weight_opt = str(info["weight_opt"])
+                    if "act_quant_mode" in info:
+                        m.act_quant_mode = str(info["act_quant_mode"])
+                    if "act_quant_bits" in info:
+                        m.act_quant_bits = int(info["act_quant_bits"])
+                    if "act_quant_method" in info:
+                        m.act_quant_method = str(info["act_quant_method"])
+                    if "act_quant_percentile" in info:
+                        m.act_quant_percentile = float(info["act_quant_percentile"])
+                    if "spin_signs" in info:
+                        m.spin_signs.copy_(info["spin_signs"].to(m.spin_signs.device))
+                    if "spin_enabled" in info:
+                        m.spin_enabled_flag.copy_(
+                            torch.tensor(1 if info["spin_enabled"] else 0, device=m.spin_enabled_flag.device, dtype=m.spin_enabled_flag.dtype)
+                        )
+                    m._invalidate_weight_cache()
+            elif isinstance(m, QuantizedLinearNF4):
+                if info.get("type") == "nf4_codebook_packed":
+                    if "qweight_packed" in info:
+                        m.qweight_packed.copy_(info["qweight_packed"].to(m.qweight_packed.device))
+                    if "weight_scale" in info:
+                        m.weight_scale.copy_(info["weight_scale"].to(m.weight_scale.device))
                     if "pre_scale" in info:
                         m.pre_scale.copy_(info["pre_scale"].to(m.pre_scale.device))
                     if "act_scale" in info:

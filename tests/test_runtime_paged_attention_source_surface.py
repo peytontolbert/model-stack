@@ -54,3 +54,21 @@ def test_native_runtime_exposes_paged_attention_decode_kernel_surface() -> None:
     assert "torch::Tensor CudaPagedAttentionDecodeForward(" in cuda_source
     assert "block_table_contig" in cuda_source
     assert '"model_stack_cuda_paged_attention_decode_forward"' in cuda_source
+
+
+def test_native_runtime_exposes_cuda_speculative_accept_kernel_surface() -> None:
+    native_source = _read("runtime/csrc/model_stack_native.cpp")
+    cuda_sampling_source = _read("runtime/csrc/backend/cuda_sampling.cu")
+    ops_source = _read("runtime/ops.py")
+
+    assert "torch::Tensor CudaSampleWithPoliciesForward(" in native_source
+    assert "CudaSpeculativeAcceptForward(" in native_source
+    assert 'm.def("speculative_accept_forward", &SpeculativeAcceptForward' in native_source
+    assert "speculative_accept_forward_kernel" in cuda_sampling_source
+    assert "CudaSpeculativeAcceptForward(" in cuda_sampling_source
+    assert "SpeculativeSampleSeed(" in cuda_sampling_source
+    assert "BlockArgmaxProbIndex(" in cuda_sampling_source
+    assert "BlockEntropy(" in cuda_sampling_source
+    assert "policy.row_reduce_threads" in cuda_sampling_source
+    assert "SampleResidualProbIndex(" in cuda_sampling_source
+    assert "module.speculative_accept_forward(" in ops_source

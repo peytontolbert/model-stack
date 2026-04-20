@@ -30,6 +30,12 @@ constexpr int kTensorCoreThreads = 32;
 constexpr int kTensorCoreTileM = 16;
 constexpr int kTensorCoreTileN = 16;
 constexpr int kTensorCoreTileK = 16;
+constexpr int kWgmmaAttentionThreads = 128;
+constexpr int kWgmmaAttentionScoreTileM = 64;
+constexpr int kWgmmaAttentionActiveTileM = 32;
+constexpr int kWgmmaAttentionTileN = 8;
+constexpr int kWgmmaAttentionTileK = 32;
+constexpr int kWgmmaAttentionLayoutNoSwizzle = 0;
 constexpr int kSm90PipelineStages = 2;
 constexpr int kDecodeMaxThreads = 256;
 constexpr int kDecodeTileN = 128;
@@ -85,12 +91,33 @@ bool Int8AttentionPersistentEnabled() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+bool Int8AttentionWgmmaDisabled() {
+  if (Int8AttentionOptimizedDisabled()) {
+    return true;
+  }
+  const char* env = std::getenv("MODEL_STACK_DISABLE_INT8_ATTENTION_WGMMA");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+bool Int8AttentionWgmmaEnabled() {
+  const char* env = std::getenv("MODEL_STACK_ENABLE_INT8_ATTENTION_WGMMA");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 int Int8AttentionPersistentWaves() {
   const char* env = std::getenv("MODEL_STACK_INT8_ATTENTION_PERSISTENT_WAVES");
   if (env == nullptr || env[0] == '\0') {
     return 2;
   }
   return std::max(1, static_cast<int>(std::strtol(env, nullptr, 10)));
+}
+
+int64_t Int8AttentionWgmmaMinWork() {
+  const char* env = std::getenv("MODEL_STACK_INT8_ATTENTION_WGMMA_MIN_WORK");
+  if (env == nullptr || env[0] == '\0') {
+    return 262144;
+  }
+  return std::max<int64_t>(1, std::strtoll(env, nullptr, 10));
 }
 
 int Int8AttentionSm90PipelineMinSeq() {
@@ -190,11 +217,70 @@ bool SupportsInt8AttentionPersistentPath(const torch::Tensor& q, const torch::Te
   return ShouldPreferInt8AttentionOptimizedPath(q, k);
 }
 
+bool SupportsInt8AttentionWgmmaPath(const torch::Tensor& q, const torch::Tensor& k) {
+  if (!t10::cuda::BuildRequestsSm90aExperimental()) {
+    return false;
+  }
+  if (!Int8AttentionWgmmaEnabled() || Int8AttentionWgmmaDisabled()) {
+    return false;
+  }
+  if (!t10::cuda::DeviceIsSm90OrLater(q)) {
+    return false;
+  }
+  if (q.size(2) <= 1) {
+    return false;
+  }
+  const auto head_dim = q.size(3);
+  if (head_dim < kWgmmaAttentionTileK || head_dim > 128 || (head_dim % kWgmmaAttentionTileK) != 0) {
+    return false;
+  }
+  if (k.size(2) < kWgmmaAttentionTileN) {
+    return false;
+  }
+  const int64_t work = q.size(2) * k.size(2) * head_dim;
+  return work >= Int8AttentionWgmmaMinWork() && ShouldPreferInt8AttentionOptimizedPath(q, k);
+}
+
 int64_t PersistentAttentionBlockCount(const torch::Tensor& q, int64_t total_blocks) {
   cudaDeviceProp prop{};
   C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, q.get_device()));
   const int64_t target = static_cast<int64_t>(prop.multiProcessorCount) * Int8AttentionPersistentWaves();
   return std::max<int64_t>(1, std::min<int64_t>(total_blocks, target));
+}
+
+template <int HeadDim, int TileN, int Threads>
+__device__ inline void async_copy_int8_attention_tile_generic(
+    int8_t* __restrict__ k_dst,
+    int8_t* __restrict__ v_dst,
+    const int8_t* __restrict__ k_src,
+    const int8_t* __restrict__ v_src,
+    int valid_k) {
+  const int lane = static_cast<int>(threadIdx.x);
+  const int total_bytes = valid_k * HeadDim;
+  for (int idx = lane; idx < TileN * HeadDim; idx += Threads) {
+    if (idx >= total_bytes) {
+      k_dst[idx] = static_cast<int8_t>(0);
+      v_dst[idx] = static_cast<int8_t>(0);
+    }
+  }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  constexpr int kCopyBytes = 16;
+  const int aligned = (total_bytes / kCopyBytes) * kCopyBytes;
+  for (int byte_offset = lane * kCopyBytes; byte_offset < aligned; byte_offset += Threads * kCopyBytes) {
+    __pipeline_memcpy_async(k_dst + byte_offset, k_src + byte_offset, kCopyBytes);
+    __pipeline_memcpy_async(v_dst + byte_offset, v_src + byte_offset, kCopyBytes);
+  }
+  for (int idx = aligned + lane; idx < total_bytes; idx += Threads) {
+    k_dst[idx] = k_src[idx];
+    v_dst[idx] = v_src[idx];
+  }
+  __pipeline_commit();
+#else
+  for (int idx = lane; idx < total_bytes; idx += Threads) {
+    k_dst[idx] = k_src[idx];
+    v_dst[idx] = v_src[idx];
+  }
+#endif
 }
 
 template <int HeadDim>
@@ -204,32 +290,8 @@ __device__ inline void async_copy_int8_attention_tile(
     const int8_t* __restrict__ k_src,
     const int8_t* __restrict__ v_src,
     int valid_k) {
-  const int lane = static_cast<int>(threadIdx.x);
-  const int total_bytes = valid_k * HeadDim;
-  for (int idx = lane; idx < kTensorCoreTileN * HeadDim; idx += kTensorCoreThreads) {
-    if (idx >= total_bytes) {
-      k_dst[idx] = static_cast<int8_t>(0);
-      v_dst[idx] = static_cast<int8_t>(0);
-    }
-  }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  constexpr int kCopyBytes = 16;
-  const int aligned = (total_bytes / kCopyBytes) * kCopyBytes;
-  for (int byte_offset = lane * kCopyBytes; byte_offset < aligned; byte_offset += kTensorCoreThreads * kCopyBytes) {
-    __pipeline_memcpy_async(k_dst + byte_offset, k_src + byte_offset, kCopyBytes);
-    __pipeline_memcpy_async(v_dst + byte_offset, v_src + byte_offset, kCopyBytes);
-  }
-  for (int idx = aligned + lane; idx < total_bytes; idx += kTensorCoreThreads) {
-    k_dst[idx] = k_src[idx];
-    v_dst[idx] = v_src[idx];
-  }
-  __pipeline_commit();
-#else
-  for (int idx = lane; idx < total_bytes; idx += kTensorCoreThreads) {
-    k_dst[idx] = k_src[idx];
-    v_dst[idx] = v_src[idx];
-  }
-#endif
+  async_copy_int8_attention_tile_generic<HeadDim, kTensorCoreTileN, kTensorCoreThreads>(
+      k_dst, v_dst, k_src, v_src, valid_k);
 }
 
 bool SupportsInt8AttentionDecodeSpecializedPath(
@@ -612,6 +674,421 @@ __device__ inline void compute_int8_score_tile_tensorcore(
   wmma::store_matrix_sync(score_tile, acc_frag, kTensorCoreTileN, wmma::mem_row_major);
 }
 
+template <int HeadDim>
+__device__ inline void compute_int8_score_tile_wgmma(
+    const uint8_t* q_tile_rebased,
+    const int8_t* k_tile_kmajor,
+    const int* k_rebias_correction,
+    int* score_tile,
+    int valid_q,
+    int valid_k) {
+  static_assert((HeadDim % kWgmmaAttentionTileK) == 0, "WGMMA attention head_dim must be a multiple of 32");
+  const int tid = static_cast<int>(threadIdx.x);
+  const int lane = tid & (kWarpSize - 1);
+  const int warp = tid / kWarpSize;
+
+  int accum[4] = {0, 0, 0, 0};
+  #pragma unroll
+  for (int idx = 0; idx < 4; ++idx) {
+    t10::cuda::WgmmaFenceOperand(accum[idx]);
+  }
+  t10::cuda::WgmmaFenceSyncAligned();
+
+  for (int chunk = 0; chunk < HeadDim; chunk += kWgmmaAttentionTileK) {
+    t10::cuda::AsyncProxyFenceSharedCta();
+    const auto desc_a = static_cast<uint64_t>(t10::cuda::MakeWgmmaSmemDesc(
+        q_tile_rebased + chunk,
+        kWgmmaAttentionLayoutNoSwizzle,
+        0,
+        HeadDim * static_cast<int>(sizeof(uint8_t))));
+    const auto desc_b = static_cast<uint64_t>(t10::cuda::MakeWgmmaSmemDesc(
+        k_tile_kmajor + chunk * kWgmmaAttentionTileN,
+        kWgmmaAttentionLayoutNoSwizzle,
+        0,
+        kWgmmaAttentionTileN * static_cast<int>(sizeof(int8_t))));
+    t10::cuda::WgmmaM64N8K32S32U8S8(desc_a, desc_b, accum);
+    t10::cuda::WgmmaCommitGroupSyncAligned();
+    t10::cuda::WgmmaWaitGroupSyncAligned<0>();
+    __syncthreads();
+  }
+
+  const int local_row = warp * 16 + (lane & 15);
+  const int local_col_base = (lane >> 4) * 4;
+  if (local_row >= valid_q || local_row >= kWgmmaAttentionActiveTileM) {
+    return;
+  }
+
+  #pragma unroll
+  for (int idx = 0; idx < 4; ++idx) {
+    const int local_col = local_col_base + idx;
+    if (local_col >= valid_k || local_col >= kWgmmaAttentionTileN) {
+      continue;
+    }
+    score_tile[local_row * kWgmmaAttentionTileN + local_col] = accum[idx] - k_rebias_correction[local_col];
+  }
+}
+
+template <typename scalar_t, int HeadDim, bool HasBoolMask, bool HasAdditiveMask, bool IsCausal, bool UseBulkAsync>
+__global__ __launch_bounds__(kWgmmaAttentionThreads, 1) void int8_attention_forward_sm90a_wgmma_kernel(
+    const int8_t* __restrict__ q,
+    const float* __restrict__ q_scale,
+    const int8_t* __restrict__ k,
+    const float* __restrict__ k_scale,
+    const int8_t* __restrict__ v,
+    const float* __restrict__ v_scale,
+    const bool* __restrict__ bool_mask,
+    const float* __restrict__ additive_mask,
+    scalar_t* __restrict__ out,
+    int64_t batch_size,
+    int64_t q_heads,
+    int64_t kv_heads,
+    int64_t tgt_len,
+    int64_t src_len,
+    float scale_value) {
+  const int tid = static_cast<int>(threadIdx.x);
+  const int64_t tiles_per_head = DivUpInt64(tgt_len, kWgmmaAttentionActiveTileM);
+  const int64_t total_blocks = batch_size * q_heads * tiles_per_head;
+
+  __shared__ __align__(16) uint8_t q_tile[kWgmmaAttentionScoreTileM * HeadDim];
+  __shared__ __align__(16) int8_t k_tile_row_major[kSm90PipelineStages][kWgmmaAttentionTileN * HeadDim];
+  __shared__ __align__(16) int8_t k_tile_kmajor[kSm90PipelineStages][HeadDim * kWgmmaAttentionTileN];
+  __shared__ __align__(16) int8_t v_tile[kSm90PipelineStages][kWgmmaAttentionTileN * HeadDim];
+  __shared__ float q_row_scale[kWgmmaAttentionActiveTileM];
+  __shared__ float k_row_scale[kSm90PipelineStages][kWgmmaAttentionTileN];
+  __shared__ float v_row_scale[kSm90PipelineStages][kWgmmaAttentionTileN];
+  __shared__ int k_rebias_correction[kSm90PipelineStages][kWgmmaAttentionTileN];
+  __shared__ float row_max[kWgmmaAttentionActiveTileM];
+  __shared__ float row_sum[kWgmmaAttentionActiveTileM];
+  __shared__ float row_rescale[kWgmmaAttentionActiveTileM];
+  __shared__ int score_tile[kWgmmaAttentionActiveTileM * kWgmmaAttentionTileN];
+  __shared__ float weight_tile[kWgmmaAttentionActiveTileM * kWgmmaAttentionTileN];
+  __shared__ float out_accum[kWgmmaAttentionActiveTileM * HeadDim];
+  #pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ block_barrier_t k_copy_bar[kSm90PipelineStages];
+  #pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ block_barrier_t v_copy_bar[kSm90PipelineStages];
+
+  block_barrier_t::arrival_token k_tokens[kSm90PipelineStages];
+  block_barrier_t::arrival_token v_tokens[kSm90PipelineStages];
+  bool stage_pending[kSm90PipelineStages] = {false, false};
+
+  for (int64_t logical_block = static_cast<int64_t>(blockIdx.x);
+       logical_block < total_blocks;
+       logical_block += static_cast<int64_t>(gridDim.x)) {
+    const int64_t tile_idx = logical_block % tiles_per_head;
+    const int64_t tmp = logical_block / tiles_per_head;
+    const int64_t head_idx = tmp % q_heads;
+    const int64_t batch_idx = tmp / q_heads;
+    const int64_t q_tile_start = tile_idx * kWgmmaAttentionActiveTileM;
+    const int valid_q = static_cast<int>(
+        (tgt_len - q_tile_start) < kWgmmaAttentionActiveTileM ? (tgt_len - q_tile_start) : kWgmmaAttentionActiveTileM);
+    if (valid_q <= 0) {
+      continue;
+    }
+
+    const int64_t head_repeat = q_heads / kv_heads;
+    const int64_t kv_head_idx = head_idx / head_repeat;
+
+    if constexpr (UseBulkAsync) {
+      if (tid < kSm90PipelineStages) {
+        init(&k_copy_bar[tid], static_cast<ptrdiff_t>(kWgmmaAttentionThreads));
+        init(&v_copy_bar[tid], static_cast<ptrdiff_t>(kWgmmaAttentionThreads));
+      }
+      if (tid == 0) {
+        t10::cuda::Sm90FenceProxyAsyncSharedCta();
+      }
+      __syncthreads();
+    }
+
+    for (int idx = tid; idx < kWgmmaAttentionScoreTileM * HeadDim; idx += kWgmmaAttentionThreads) {
+      const int row = idx / HeadDim;
+      const int d = idx % HeadDim;
+      if (row < valid_q) {
+        const int64_t q_idx = q_tile_start + row;
+        const int64_t q_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * HeadDim;
+        q_tile[idx] = static_cast<uint8_t>(static_cast<int>(q[q_base + d]) + 128);
+      } else {
+        q_tile[idx] = 0;
+      }
+    }
+    for (int row = tid; row < kWgmmaAttentionActiveTileM; row += kWgmmaAttentionThreads) {
+      if (row < valid_q) {
+        const int64_t q_idx = q_tile_start + row;
+        q_row_scale[row] = q_scale[((batch_idx * q_heads) + head_idx) * tgt_len + q_idx];
+        row_max[row] = -std::numeric_limits<float>::infinity();
+        row_sum[row] = 0.0f;
+        row_rescale[row] = 0.0f;
+      } else {
+        q_row_scale[row] = 0.0f;
+        row_max[row] = -std::numeric_limits<float>::infinity();
+        row_sum[row] = 0.0f;
+        row_rescale[row] = 0.0f;
+      }
+    }
+    for (int idx = tid; idx < kWgmmaAttentionActiveTileM * HeadDim; idx += kWgmmaAttentionThreads) {
+      out_accum[idx] = 0.0f;
+    }
+    __syncthreads();
+
+    const int first_valid_k = static_cast<int>(src_len < kWgmmaAttentionTileN ? src_len : kWgmmaAttentionTileN);
+    const int first_copy_bytes = first_valid_k * HeadDim;
+    if constexpr (UseBulkAsync) {
+      if (tid == 0 && first_copy_bytes > 0) {
+        const int64_t first_base = (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim;
+        t10::cuda::Sm90CpAsyncBulkGlobalToShared(
+            k_tile_row_major[0],
+            k + first_base,
+            static_cast<uint32_t>(first_copy_bytes),
+            k_copy_bar[0]);
+        t10::cuda::Sm90CpAsyncBulkGlobalToShared(
+            v_tile[0],
+            v + first_base,
+            static_cast<uint32_t>(first_copy_bytes),
+            v_copy_bar[0]);
+        k_tokens[0] = t10::cuda::Sm90BarrierArriveTx(k_copy_bar[0], 1, static_cast<uint32_t>(first_copy_bytes));
+        v_tokens[0] = t10::cuda::Sm90BarrierArriveTx(v_copy_bar[0], 1, static_cast<uint32_t>(first_copy_bytes));
+      } else {
+        k_tokens[0] = k_copy_bar[0].arrive();
+        v_tokens[0] = v_copy_bar[0].arrive();
+      }
+      stage_pending[0] = true;
+    } else {
+      async_copy_int8_attention_tile_generic<HeadDim, kWgmmaAttentionTileN, kWgmmaAttentionThreads>(
+          k_tile_row_major[0],
+          v_tile[0],
+          k + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
+          v + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
+          first_valid_k);
+    }
+    for (int col = tid; col < kWgmmaAttentionTileN; col += kWgmmaAttentionThreads) {
+      if (col < first_valid_k) {
+        const int64_t scale_idx = (((batch_idx * kv_heads) + kv_head_idx) * src_len) + col;
+        k_row_scale[0][col] = k_scale[scale_idx];
+        v_row_scale[0][col] = v_scale[scale_idx];
+      } else {
+        k_row_scale[0][col] = 0.0f;
+        v_row_scale[0][col] = 0.0f;
+      }
+    }
+    if constexpr (UseBulkAsync) {
+      __syncthreads();
+    } else {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      __pipeline_wait_prior(0);
+#endif
+    }
+    __syncthreads();
+
+    for (int64_t s_tile_start = 0; s_tile_start < src_len; s_tile_start += kWgmmaAttentionTileN) {
+      const int current_stage = static_cast<int>((s_tile_start / kWgmmaAttentionTileN) % kSm90PipelineStages);
+      const int next_stage = (current_stage + 1) % kSm90PipelineStages;
+      const int valid_k = static_cast<int>(
+          (src_len - s_tile_start) < kWgmmaAttentionTileN ? (src_len - s_tile_start) : kWgmmaAttentionTileN);
+      const int64_t next_s_tile_start = s_tile_start + kWgmmaAttentionTileN;
+
+      if constexpr (UseBulkAsync) {
+        if (stage_pending[current_stage]) {
+          k_copy_bar[current_stage].wait(std::move(k_tokens[current_stage]));
+          v_copy_bar[current_stage].wait(std::move(v_tokens[current_stage]));
+          stage_pending[current_stage] = false;
+        }
+        __syncthreads();
+      }
+
+      if (next_s_tile_start < src_len) {
+        const int next_valid_k = static_cast<int>(
+            (src_len - next_s_tile_start) < kWgmmaAttentionTileN ? (src_len - next_s_tile_start) : kWgmmaAttentionTileN);
+        const int64_t next_base = ((((batch_idx * kv_heads) + kv_head_idx) * src_len) + next_s_tile_start) * HeadDim;
+        if constexpr (UseBulkAsync) {
+          const int next_copy_bytes = next_valid_k * HeadDim;
+          if (tid == 0 && next_copy_bytes > 0) {
+            t10::cuda::Sm90CpAsyncBulkGlobalToShared(
+                k_tile_row_major[next_stage],
+                k + next_base,
+                static_cast<uint32_t>(next_copy_bytes),
+                k_copy_bar[next_stage]);
+            t10::cuda::Sm90CpAsyncBulkGlobalToShared(
+                v_tile[next_stage],
+                v + next_base,
+                static_cast<uint32_t>(next_copy_bytes),
+                v_copy_bar[next_stage]);
+            k_tokens[next_stage] =
+                t10::cuda::Sm90BarrierArriveTx(k_copy_bar[next_stage], 1, static_cast<uint32_t>(next_copy_bytes));
+            v_tokens[next_stage] =
+                t10::cuda::Sm90BarrierArriveTx(v_copy_bar[next_stage], 1, static_cast<uint32_t>(next_copy_bytes));
+          } else {
+            k_tokens[next_stage] = k_copy_bar[next_stage].arrive();
+            v_tokens[next_stage] = v_copy_bar[next_stage].arrive();
+          }
+          stage_pending[next_stage] = true;
+        } else {
+          async_copy_int8_attention_tile_generic<HeadDim, kWgmmaAttentionTileN, kWgmmaAttentionThreads>(
+              k_tile_row_major[next_stage],
+              v_tile[next_stage],
+              k + next_base,
+              v + next_base,
+              next_valid_k);
+        }
+        for (int col = tid; col < kWgmmaAttentionTileN; col += kWgmmaAttentionThreads) {
+          if (col < next_valid_k) {
+            const int64_t scale_idx = (((batch_idx * kv_heads) + kv_head_idx) * src_len) + next_s_tile_start + col;
+            k_row_scale[next_stage][col] = k_scale[scale_idx];
+            v_row_scale[next_stage][col] = v_scale[scale_idx];
+          } else {
+            k_row_scale[next_stage][col] = 0.0f;
+            v_row_scale[next_stage][col] = 0.0f;
+          }
+        }
+      }
+
+      for (int idx = tid; idx < HeadDim * kWgmmaAttentionTileN; idx += kWgmmaAttentionThreads) {
+        const int d = idx / kWgmmaAttentionTileN;
+        const int col = idx % kWgmmaAttentionTileN;
+        k_tile_kmajor[current_stage][idx] =
+            col < valid_k ? k_tile_row_major[current_stage][col * HeadDim + d] : static_cast<int8_t>(0);
+      }
+      for (int col = tid; col < kWgmmaAttentionTileN; col += kWgmmaAttentionThreads) {
+        int sum = 0;
+        if (col < valid_k) {
+          for (int d = 0; d < HeadDim; ++d) {
+            sum += static_cast<int>(k_tile_kmajor[current_stage][d * kWgmmaAttentionTileN + col]);
+          }
+        }
+        k_rebias_correction[current_stage][col] = sum * 128;
+      }
+      __syncthreads();
+
+      compute_int8_score_tile_wgmma<HeadDim>(
+          q_tile,
+          k_tile_kmajor[current_stage],
+          k_rebias_correction[current_stage],
+          score_tile,
+          valid_q,
+          valid_k);
+      __syncthreads();
+
+      for (int row = tid; row < valid_q; row += kWgmmaAttentionThreads) {
+        const float prev_row_max = row_max[row];
+        const float prev_row_sum = row_sum[row];
+        float tile_max = -std::numeric_limits<float>::infinity();
+        const int64_t q_idx = q_tile_start + row;
+        const int64_t mask_row_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * src_len;
+
+        #pragma unroll
+        for (int col = 0; col < kWgmmaAttentionTileN; ++col) {
+          if (col >= valid_k) {
+            break;
+          }
+          const int64_t kv_idx = s_tile_start + col;
+          if constexpr (IsCausal) {
+            if (tgt_len > 1 && kv_idx > q_idx) {
+              continue;
+            }
+          }
+          if constexpr (HasBoolMask) {
+            if (bool_mask[mask_row_base + kv_idx]) {
+              continue;
+            }
+          }
+          float score =
+              static_cast<float>(score_tile[row * kWgmmaAttentionTileN + col]) *
+              q_row_scale[row] *
+              k_row_scale[current_stage][col] *
+              scale_value;
+          if constexpr (HasAdditiveMask) {
+            score += additive_mask[mask_row_base + kv_idx];
+          }
+          if (!::isfinite(score)) {
+            continue;
+          }
+          tile_max = fmaxf(tile_max, score);
+        }
+
+        const float new_row_max = fmaxf(prev_row_max, tile_max);
+        float prev_scale = 0.0f;
+        if (::isfinite(prev_row_max) && ::isfinite(new_row_max)) {
+          prev_scale = expf(prev_row_max - new_row_max);
+        }
+        float tile_sum = 0.0f;
+        #pragma unroll
+        for (int col = 0; col < kWgmmaAttentionTileN; ++col) {
+          float weight = 0.0f;
+          if (col < valid_k) {
+            const int64_t kv_idx = s_tile_start + col;
+            bool allowed = true;
+            if constexpr (IsCausal) {
+              if (tgt_len > 1 && kv_idx > q_idx) {
+                allowed = false;
+              }
+            }
+            if constexpr (HasBoolMask) {
+              if (bool_mask[mask_row_base + kv_idx]) {
+                allowed = false;
+              }
+            }
+            if (allowed) {
+              float score =
+                  static_cast<float>(score_tile[row * kWgmmaAttentionTileN + col]) *
+                  q_row_scale[row] *
+                  k_row_scale[current_stage][col] *
+                  scale_value;
+              if constexpr (HasAdditiveMask) {
+                score += additive_mask[mask_row_base + kv_idx];
+              }
+              if (::isfinite(score) && ::isfinite(new_row_max)) {
+                weight = expf(score - new_row_max);
+              }
+            }
+          }
+          weight_tile[row * kWgmmaAttentionTileN + col] = weight;
+          tile_sum += weight;
+        }
+
+        row_max[row] = new_row_max;
+        row_sum[row] = prev_row_sum * prev_scale + tile_sum;
+        row_rescale[row] = prev_scale;
+      }
+      __syncthreads();
+
+      for (int idx = tid; idx < valid_q * HeadDim; idx += kWgmmaAttentionThreads) {
+        const int row = idx / HeadDim;
+        const int d = idx % HeadDim;
+        float accum = out_accum[idx] * row_rescale[row];
+        #pragma unroll
+        for (int col = 0; col < kWgmmaAttentionTileN; ++col) {
+          if (col >= valid_k) {
+            break;
+          }
+          const float weight = weight_tile[row * kWgmmaAttentionTileN + col];
+          if (weight != 0.0f) {
+            accum += weight * (static_cast<float>(v_tile[current_stage][col * HeadDim + d]) * v_row_scale[current_stage][col]);
+          }
+        }
+        out_accum[idx] = accum;
+      }
+      if constexpr (!UseBulkAsync) {
+        if (next_s_tile_start < src_len) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+          __pipeline_wait_prior(0);
+#endif
+        }
+      }
+      __syncthreads();
+    }
+
+    for (int idx = tid; idx < valid_q * HeadDim; idx += kWgmmaAttentionThreads) {
+      const int row = idx / HeadDim;
+      const int d = idx % HeadDim;
+      const float denom = fmaxf(row_sum[row], 1e-8f);
+      const float value = out_accum[idx] / denom;
+      const int64_t q_idx = q_tile_start + row;
+      const int64_t out_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * HeadDim;
+      out[out_base + d] = static_cast<scalar_t>(value);
+    }
+    __syncthreads();
+  }
+}
+
 template <typename scalar_t, int HeadDim, bool HasBoolMask, bool HasAdditiveMask, bool IsCausal>
 __global__ void int8_attention_forward_tensorcore_kernel(
     const int8_t* __restrict__ q,
@@ -631,24 +1108,7 @@ __global__ void int8_attention_forward_tensorcore_kernel(
     float scale_value) {
   const int lane = static_cast<int>(threadIdx.x);
   const int64_t tiles_per_head = DivUpInt64(tgt_len, kTensorCoreTileM);
-  const int64_t block = static_cast<int64_t>(blockIdx.x);
-  const int64_t tile_idx = block % tiles_per_head;
-  const int64_t tmp = block / tiles_per_head;
-  const int64_t head_idx = tmp % q_heads;
-  const int64_t batch_idx = tmp / q_heads;
-  if (batch_idx >= batch_size) {
-    return;
-  }
-
-  const int64_t q_tile_start = tile_idx * kTensorCoreTileM;
-  const int valid_q = static_cast<int>(
-      (tgt_len - q_tile_start) < kTensorCoreTileM ? (tgt_len - q_tile_start) : kTensorCoreTileM);
-  if (valid_q <= 0) {
-    return;
-  }
-
-  const int64_t head_repeat = q_heads / kv_heads;
-  const int64_t kv_head_idx = head_idx / head_repeat;
+  const int64_t total_blocks = batch_size * q_heads * tiles_per_head;
 
   __shared__ int8_t q_tile[kTensorCoreTileM * HeadDim];
   __shared__ int8_t k_tile_col_major[kTensorCoreTileN * HeadDim];
@@ -663,178 +1123,197 @@ __global__ void int8_attention_forward_tensorcore_kernel(
   __shared__ float weight_tile[kTensorCoreTileM * kTensorCoreTileN];
   __shared__ float out_accum[kTensorCoreTileM * HeadDim];
 
-  for (int idx = lane; idx < kTensorCoreTileM * HeadDim; idx += kTensorCoreThreads) {
-    const int row = idx / HeadDim;
-    const int d = idx % HeadDim;
-    if (row < valid_q) {
-      const int64_t q_idx = q_tile_start + row;
-      const int64_t q_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * HeadDim;
-      q_tile[idx] = q[q_base + d];
-      out_accum[idx] = 0.0f;
-    } else {
-      q_tile[idx] = 0;
-      out_accum[idx] = 0.0f;
+  for (int64_t logical_block = static_cast<int64_t>(blockIdx.x);
+       logical_block < total_blocks;
+       logical_block += static_cast<int64_t>(gridDim.x)) {
+    const int64_t tile_idx = logical_block % tiles_per_head;
+    const int64_t tmp = logical_block / tiles_per_head;
+    const int64_t head_idx = tmp % q_heads;
+    const int64_t batch_idx = tmp / q_heads;
+    const int64_t q_tile_start = tile_idx * kTensorCoreTileM;
+    const int valid_q = static_cast<int>(
+        (tgt_len - q_tile_start) < kTensorCoreTileM ? (tgt_len - q_tile_start) : kTensorCoreTileM);
+    if (valid_q <= 0) {
+      continue;
     }
-  }
-  if (lane < kTensorCoreTileM) {
-    if (lane < valid_q) {
-      const int64_t q_idx = q_tile_start + lane;
-      q_row_scale[lane] = q_scale[((batch_idx * q_heads) + head_idx) * tgt_len + q_idx];
-      row_max[lane] = -std::numeric_limits<float>::infinity();
-      row_sum[lane] = 0.0f;
-      row_rescale[lane] = 0.0f;
-    } else {
-      q_row_scale[lane] = 0.0f;
-      row_max[lane] = -std::numeric_limits<float>::infinity();
-      row_sum[lane] = 0.0f;
-      row_rescale[lane] = 0.0f;
-    }
-  }
-  __syncthreads();
 
-  for (int64_t s_tile_start = 0; s_tile_start < src_len; s_tile_start += kTensorCoreTileN) {
-    const int valid_k = static_cast<int>(
-        (src_len - s_tile_start) < kTensorCoreTileN ? (src_len - s_tile_start) : kTensorCoreTileN);
+    const int64_t head_repeat = q_heads / kv_heads;
+    const int64_t kv_head_idx = head_idx / head_repeat;
 
-    for (int idx = lane; idx < kTensorCoreTileN * HeadDim; idx += kTensorCoreThreads) {
-      const int col = idx / HeadDim;
+    for (int idx = lane; idx < kTensorCoreTileM * HeadDim; idx += kTensorCoreThreads) {
+      const int row = idx / HeadDim;
       const int d = idx % HeadDim;
-      if (col < valid_k) {
-        const int64_t kv_idx = s_tile_start + col;
-        const int64_t kv_base = (((batch_idx * kv_heads) + kv_head_idx) * src_len + kv_idx) * HeadDim;
-        k_tile_col_major[col * HeadDim + d] = k[kv_base + d];
-        v_tile[col * HeadDim + d] = v[kv_base + d];
+      if (row < valid_q) {
+        const int64_t q_idx = q_tile_start + row;
+        const int64_t q_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * HeadDim;
+        q_tile[idx] = q[q_base + d];
+        out_accum[idx] = 0.0f;
       } else {
-        k_tile_col_major[col * HeadDim + d] = 0;
-        v_tile[col * HeadDim + d] = 0;
+        q_tile[idx] = 0;
+        out_accum[idx] = 0.0f;
       }
     }
-    if (lane < kTensorCoreTileN) {
-      if (lane < valid_k) {
-        const int64_t kv_idx = s_tile_start + lane;
-        const int64_t scale_idx = (((batch_idx * kv_heads) + kv_head_idx) * src_len) + kv_idx;
-        k_row_scale[lane] = k_scale[scale_idx];
-        v_row_scale[lane] = v_scale[scale_idx];
+    if (lane < kTensorCoreTileM) {
+      if (lane < valid_q) {
+        const int64_t q_idx = q_tile_start + lane;
+        q_row_scale[lane] = q_scale[((batch_idx * q_heads) + head_idx) * tgt_len + q_idx];
+        row_max[lane] = -std::numeric_limits<float>::infinity();
+        row_sum[lane] = 0.0f;
+        row_rescale[lane] = 0.0f;
       } else {
-        k_row_scale[lane] = 0.0f;
-        v_row_scale[lane] = 0.0f;
+        q_row_scale[lane] = 0.0f;
+        row_max[lane] = -std::numeric_limits<float>::infinity();
+        row_sum[lane] = 0.0f;
+        row_rescale[lane] = 0.0f;
       }
     }
     __syncthreads();
 
-    compute_int8_score_tile_tensorcore<HeadDim>(q_tile, k_tile_col_major, score_tile);
-    __syncthreads();
+    for (int64_t s_tile_start = 0; s_tile_start < src_len; s_tile_start += kTensorCoreTileN) {
+      const int valid_k = static_cast<int>(
+          (src_len - s_tile_start) < kTensorCoreTileN ? (src_len - s_tile_start) : kTensorCoreTileN);
 
-    if (lane < kTensorCoreTileM && lane < valid_q) {
-      const float prev_row_max = row_max[lane];
-      const float prev_row_sum = row_sum[lane];
-      float tile_max = -std::numeric_limits<float>::infinity();
-      const int64_t q_idx = q_tile_start + lane;
-      const int64_t mask_row_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * src_len;
-
-      #pragma unroll
-      for (int col = 0; col < kTensorCoreTileN; ++col) {
-        if (col >= valid_k) {
-          break;
-        }
-        const int64_t kv_idx = s_tile_start + col;
-        if constexpr (IsCausal) {
-          if (tgt_len > 1 && kv_idx > q_idx) {
-            continue;
-          }
-        }
-        if constexpr (HasBoolMask) {
-          if (bool_mask[mask_row_base + kv_idx]) {
-            continue;
-          }
-        }
-        float score =
-            static_cast<float>(score_tile[lane * kTensorCoreTileN + col]) *
-            q_row_scale[lane] *
-            k_row_scale[col] *
-            scale_value;
-        if constexpr (HasAdditiveMask) {
-          score += additive_mask[mask_row_base + kv_idx];
-        }
-        if (!::isfinite(score)) {
-          continue;
-        }
-        tile_max = fmaxf(tile_max, score);
-      }
-
-      const float new_row_max = fmaxf(prev_row_max, tile_max);
-      float prev_scale = 0.0f;
-      if (::isfinite(prev_row_max) && ::isfinite(new_row_max)) {
-        prev_scale = expf(prev_row_max - new_row_max);
-      }
-      float tile_sum = 0.0f;
-      #pragma unroll
-      for (int col = 0; col < kTensorCoreTileN; ++col) {
-        float weight = 0.0f;
+      for (int idx = lane; idx < kTensorCoreTileN * HeadDim; idx += kTensorCoreThreads) {
+        const int col = idx / HeadDim;
+        const int d = idx % HeadDim;
         if (col < valid_k) {
           const int64_t kv_idx = s_tile_start + col;
-          bool allowed = true;
+          const int64_t kv_base = (((batch_idx * kv_heads) + kv_head_idx) * src_len + kv_idx) * HeadDim;
+          k_tile_col_major[col * HeadDim + d] = k[kv_base + d];
+          v_tile[col * HeadDim + d] = v[kv_base + d];
+        } else {
+          k_tile_col_major[col * HeadDim + d] = 0;
+          v_tile[col * HeadDim + d] = 0;
+        }
+      }
+      if (lane < kTensorCoreTileN) {
+        if (lane < valid_k) {
+          const int64_t kv_idx = s_tile_start + lane;
+          const int64_t scale_idx = (((batch_idx * kv_heads) + kv_head_idx) * src_len) + kv_idx;
+          k_row_scale[lane] = k_scale[scale_idx];
+          v_row_scale[lane] = v_scale[scale_idx];
+        } else {
+          k_row_scale[lane] = 0.0f;
+          v_row_scale[lane] = 0.0f;
+        }
+      }
+      __syncthreads();
+
+      compute_int8_score_tile_tensorcore<HeadDim>(q_tile, k_tile_col_major, score_tile);
+      __syncthreads();
+
+      if (lane < kTensorCoreTileM && lane < valid_q) {
+        const float prev_row_max = row_max[lane];
+        const float prev_row_sum = row_sum[lane];
+        float tile_max = -std::numeric_limits<float>::infinity();
+        const int64_t q_idx = q_tile_start + lane;
+        const int64_t mask_row_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * src_len;
+
+        #pragma unroll
+        for (int col = 0; col < kTensorCoreTileN; ++col) {
+          if (col >= valid_k) {
+            break;
+          }
+          const int64_t kv_idx = s_tile_start + col;
           if constexpr (IsCausal) {
             if (tgt_len > 1 && kv_idx > q_idx) {
-              allowed = false;
+              continue;
             }
           }
           if constexpr (HasBoolMask) {
             if (bool_mask[mask_row_base + kv_idx]) {
-              allowed = false;
+              continue;
             }
           }
-          if (allowed) {
-            float score =
-                static_cast<float>(score_tile[lane * kTensorCoreTileN + col]) *
-                q_row_scale[lane] *
-                k_row_scale[col] *
-                scale_value;
-            if constexpr (HasAdditiveMask) {
-              score += additive_mask[mask_row_base + kv_idx];
+          float score =
+              static_cast<float>(score_tile[lane * kTensorCoreTileN + col]) *
+              q_row_scale[lane] *
+              k_row_scale[col] *
+              scale_value;
+          if constexpr (HasAdditiveMask) {
+            score += additive_mask[mask_row_base + kv_idx];
+          }
+          if (!::isfinite(score)) {
+            continue;
+          }
+          tile_max = fmaxf(tile_max, score);
+        }
+
+        const float new_row_max = fmaxf(prev_row_max, tile_max);
+        float prev_scale = 0.0f;
+        if (::isfinite(prev_row_max) && ::isfinite(new_row_max)) {
+          prev_scale = expf(prev_row_max - new_row_max);
+        }
+        float tile_sum = 0.0f;
+        #pragma unroll
+        for (int col = 0; col < kTensorCoreTileN; ++col) {
+          float weight = 0.0f;
+          if (col < valid_k) {
+            const int64_t kv_idx = s_tile_start + col;
+            bool allowed = true;
+            if constexpr (IsCausal) {
+              if (tgt_len > 1 && kv_idx > q_idx) {
+                allowed = false;
+              }
             }
-            if (::isfinite(score) && ::isfinite(new_row_max)) {
-              weight = expf(score - new_row_max);
+            if constexpr (HasBoolMask) {
+              if (bool_mask[mask_row_base + kv_idx]) {
+                allowed = false;
+              }
             }
+            if (allowed) {
+              float score =
+                  static_cast<float>(score_tile[lane * kTensorCoreTileN + col]) *
+                  q_row_scale[lane] *
+                  k_row_scale[col] *
+                  scale_value;
+              if constexpr (HasAdditiveMask) {
+                score += additive_mask[mask_row_base + kv_idx];
+              }
+              if (::isfinite(score) && ::isfinite(new_row_max)) {
+                weight = expf(score - new_row_max);
+              }
+            }
+          }
+          weight_tile[lane * kTensorCoreTileN + col] = weight;
+          tile_sum += weight;
+        }
+
+        row_max[lane] = new_row_max;
+        row_sum[lane] = prev_row_sum * prev_scale + tile_sum;
+        row_rescale[lane] = prev_scale;
+      }
+      __syncthreads();
+
+      for (int idx = lane; idx < valid_q * HeadDim; idx += kTensorCoreThreads) {
+        const int row = idx / HeadDim;
+        const int d = idx % HeadDim;
+        float accum = out_accum[idx] * row_rescale[row];
+        #pragma unroll
+        for (int col = 0; col < kTensorCoreTileN; ++col) {
+          if (col >= valid_k) {
+            break;
+          }
+          const float weight = weight_tile[row * kTensorCoreTileN + col];
+          if (weight != 0.0f) {
+            accum += weight * (static_cast<float>(v_tile[col * HeadDim + d]) * v_row_scale[col]);
           }
         }
-        weight_tile[lane * kTensorCoreTileN + col] = weight;
-        tile_sum += weight;
+        out_accum[idx] = accum;
       }
-
-      row_max[lane] = new_row_max;
-      row_sum[lane] = prev_row_sum * prev_scale + tile_sum;
-      row_rescale[lane] = prev_scale;
+      __syncthreads();
     }
-    __syncthreads();
 
     for (int idx = lane; idx < valid_q * HeadDim; idx += kTensorCoreThreads) {
       const int row = idx / HeadDim;
       const int d = idx % HeadDim;
-      float accum = out_accum[idx] * row_rescale[row];
-      #pragma unroll
-      for (int col = 0; col < kTensorCoreTileN; ++col) {
-        if (col >= valid_k) {
-          break;
-        }
-        const float weight = weight_tile[row * kTensorCoreTileN + col];
-        if (weight != 0.0f) {
-          accum += weight * (static_cast<float>(v_tile[col * HeadDim + d]) * v_row_scale[col]);
-        }
-      }
-      out_accum[idx] = accum;
+      const float denom = fmaxf(row_sum[row], 1e-8f);
+      const float value = out_accum[idx] / denom;
+      const int64_t q_idx = q_tile_start + row;
+      const int64_t out_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * HeadDim;
+      out[out_base + d] = static_cast<scalar_t>(value);
     }
     __syncthreads();
-  }
-
-  for (int idx = lane; idx < valid_q * HeadDim; idx += kTensorCoreThreads) {
-    const int row = idx / HeadDim;
-    const int d = idx % HeadDim;
-    const float denom = fmaxf(row_sum[row], 1e-8f);
-    const float value = out_accum[idx] / denom;
-    const int64_t q_idx = q_tile_start + row;
-    const int64_t out_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * HeadDim;
-    out[out_base + d] = static_cast<scalar_t>(value);
   }
 }
 
@@ -857,24 +1336,7 @@ __global__ void int8_attention_forward_sm90_pipeline_kernel(
     float scale_value) {
   const int lane = static_cast<int>(threadIdx.x);
   const int64_t tiles_per_head = DivUpInt64(tgt_len, kTensorCoreTileM);
-  const int64_t block = static_cast<int64_t>(blockIdx.x);
-  const int64_t tile_idx = block % tiles_per_head;
-  const int64_t tmp = block / tiles_per_head;
-  const int64_t head_idx = tmp % q_heads;
-  const int64_t batch_idx = tmp / q_heads;
-  if (batch_idx >= batch_size) {
-    return;
-  }
-
-  const int64_t q_tile_start = tile_idx * kTensorCoreTileM;
-  const int valid_q = static_cast<int>(
-      (tgt_len - q_tile_start) < kTensorCoreTileM ? (tgt_len - q_tile_start) : kTensorCoreTileM);
-  if (valid_q <= 0) {
-    return;
-  }
-
-  const int64_t head_repeat = q_heads / kv_heads;
-  const int64_t kv_head_idx = head_idx / head_repeat;
+  const int64_t total_blocks = batch_size * q_heads * tiles_per_head;
 
   __shared__ alignas(16) int8_t q_tile[kTensorCoreTileM * HeadDim];
   __shared__ alignas(16) int8_t k_tile_col_major[kSm90PipelineStages][kTensorCoreTileN * HeadDim];
@@ -897,276 +1359,297 @@ __global__ void int8_attention_forward_sm90_pipeline_kernel(
   block_barrier_t::arrival_token v_tokens[kSm90PipelineStages];
   bool stage_pending[kSm90PipelineStages] = {false, false};
 
-  if constexpr (UseBulkAsync) {
-    if (lane < kSm90PipelineStages) {
-      init(&k_copy_bar[lane], static_cast<ptrdiff_t>(kTensorCoreThreads));
-      init(&v_copy_bar[lane], static_cast<ptrdiff_t>(kTensorCoreThreads));
+  for (int64_t logical_block = static_cast<int64_t>(blockIdx.x);
+       logical_block < total_blocks;
+       logical_block += static_cast<int64_t>(gridDim.x)) {
+    const int64_t tile_idx = logical_block % tiles_per_head;
+    const int64_t tmp = logical_block / tiles_per_head;
+    const int64_t head_idx = tmp % q_heads;
+    const int64_t batch_idx = tmp / q_heads;
+    const int64_t q_tile_start = tile_idx * kTensorCoreTileM;
+    const int valid_q = static_cast<int>(
+        (tgt_len - q_tile_start) < kTensorCoreTileM ? (tgt_len - q_tile_start) : kTensorCoreTileM);
+    if (valid_q <= 0) {
+      continue;
     }
-    if (lane == 0) {
-      t10::cuda::Sm90FenceProxyAsyncSharedCta();
-    }
-    __syncthreads();
-  }
 
-  for (int idx = lane; idx < kTensorCoreTileM * HeadDim; idx += kTensorCoreThreads) {
-    const int row = idx / HeadDim;
-    const int d = idx % HeadDim;
-    if (row < valid_q) {
-      const int64_t q_idx = q_tile_start + row;
-      const int64_t q_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * HeadDim;
-      q_tile[idx] = q[q_base + d];
-      out_accum[idx] = 0.0f;
-    } else {
-      q_tile[idx] = 0;
-      out_accum[idx] = 0.0f;
-    }
-  }
-  if (lane < kTensorCoreTileM) {
-    if (lane < valid_q) {
-      const int64_t q_idx = q_tile_start + lane;
-      q_row_scale[lane] = q_scale[((batch_idx * q_heads) + head_idx) * tgt_len + q_idx];
-      row_max[lane] = -std::numeric_limits<float>::infinity();
-      row_sum[lane] = 0.0f;
-      row_rescale[lane] = 0.0f;
-    } else {
-      q_row_scale[lane] = 0.0f;
-      row_max[lane] = -std::numeric_limits<float>::infinity();
-      row_sum[lane] = 0.0f;
-      row_rescale[lane] = 0.0f;
-    }
-  }
-  __syncthreads();
-
-  const int first_valid_k = static_cast<int>(src_len < kTensorCoreTileN ? src_len : kTensorCoreTileN);
-  const int first_copy_bytes = first_valid_k * HeadDim;
-  if constexpr (UseBulkAsync) {
-    if (lane == 0 && first_copy_bytes > 0) {
-      t10::cuda::Sm90CpAsyncBulkGlobalToShared(
-          k_tile_col_major[0],
-          k + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
-          static_cast<uint32_t>(first_copy_bytes),
-          k_copy_bar[0]);
-      t10::cuda::Sm90CpAsyncBulkGlobalToShared(
-          v_tile[0],
-          v + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
-          static_cast<uint32_t>(first_copy_bytes),
-          v_copy_bar[0]);
-      k_tokens[0] = t10::cuda::Sm90BarrierArriveTx(k_copy_bar[0], 1, static_cast<uint32_t>(first_copy_bytes));
-      v_tokens[0] = t10::cuda::Sm90BarrierArriveTx(v_copy_bar[0], 1, static_cast<uint32_t>(first_copy_bytes));
-    } else {
-      k_tokens[0] = k_copy_bar[0].arrive();
-      v_tokens[0] = v_copy_bar[0].arrive();
-    }
-    stage_pending[0] = true;
-  } else {
-    async_copy_int8_attention_tile<HeadDim>(
-        k_tile_col_major[0],
-        v_tile[0],
-        k + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
-        v + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
-        first_valid_k);
-  }
-  if (lane < kTensorCoreTileN) {
-    if (lane < first_valid_k) {
-      const int64_t scale_idx = (((batch_idx * kv_heads) + kv_head_idx) * src_len) + lane;
-      k_row_scale[0][lane] = k_scale[scale_idx];
-      v_row_scale[0][lane] = v_scale[scale_idx];
-    } else {
-      k_row_scale[0][lane] = 0.0f;
-      v_row_scale[0][lane] = 0.0f;
-    }
-  }
-  if constexpr (UseBulkAsync) {
-    __syncthreads();
-  } else {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    __pipeline_wait_prior(0);
-#endif
-  }
-  __syncthreads();
-
-  for (int64_t s_tile_start = 0; s_tile_start < src_len; s_tile_start += kTensorCoreTileN) {
-    const int current_stage = static_cast<int>((s_tile_start / kTensorCoreTileN) % kSm90PipelineStages);
-    const int next_stage = (current_stage + 1) % kSm90PipelineStages;
-    const int valid_k = static_cast<int>(
-        (src_len - s_tile_start) < kTensorCoreTileN ? (src_len - s_tile_start) : kTensorCoreTileN);
-    const int64_t next_s_tile_start = s_tile_start + kTensorCoreTileN;
+    const int64_t head_repeat = q_heads / kv_heads;
+    const int64_t kv_head_idx = head_idx / head_repeat;
 
     if constexpr (UseBulkAsync) {
-      if (stage_pending[current_stage]) {
-        k_copy_bar[current_stage].wait(std::move(k_tokens[current_stage]));
-        v_copy_bar[current_stage].wait(std::move(v_tokens[current_stage]));
-        stage_pending[current_stage] = false;
+      if (lane < kSm90PipelineStages) {
+        init(&k_copy_bar[lane], static_cast<ptrdiff_t>(kTensorCoreThreads));
+        init(&v_copy_bar[lane], static_cast<ptrdiff_t>(kTensorCoreThreads));
+      }
+      if (lane == 0) {
+        t10::cuda::Sm90FenceProxyAsyncSharedCta();
       }
       __syncthreads();
     }
 
-    if (next_s_tile_start < src_len) {
-      const int next_valid_k = static_cast<int>(
-          (src_len - next_s_tile_start) < kTensorCoreTileN ? (src_len - next_s_tile_start) : kTensorCoreTileN);
-      const int64_t next_base = ((((batch_idx * kv_heads) + kv_head_idx) * src_len) + next_s_tile_start) * HeadDim;
-      if constexpr (UseBulkAsync) {
-        const int next_copy_bytes = next_valid_k * HeadDim;
-        if (lane == 0 && next_copy_bytes > 0) {
-          t10::cuda::Sm90CpAsyncBulkGlobalToShared(
-              k_tile_col_major[next_stage],
-              k + next_base,
-              static_cast<uint32_t>(next_copy_bytes),
-              k_copy_bar[next_stage]);
-          t10::cuda::Sm90CpAsyncBulkGlobalToShared(
-              v_tile[next_stage],
-              v + next_base,
-              static_cast<uint32_t>(next_copy_bytes),
-              v_copy_bar[next_stage]);
-          k_tokens[next_stage] =
-              t10::cuda::Sm90BarrierArriveTx(k_copy_bar[next_stage], 1, static_cast<uint32_t>(next_copy_bytes));
-          v_tokens[next_stage] =
-              t10::cuda::Sm90BarrierArriveTx(v_copy_bar[next_stage], 1, static_cast<uint32_t>(next_copy_bytes));
-        } else {
-          k_tokens[next_stage] = k_copy_bar[next_stage].arrive();
-          v_tokens[next_stage] = v_copy_bar[next_stage].arrive();
-        }
-        stage_pending[next_stage] = true;
+    for (int idx = lane; idx < kTensorCoreTileM * HeadDim; idx += kTensorCoreThreads) {
+      const int row = idx / HeadDim;
+      const int d = idx % HeadDim;
+      if (row < valid_q) {
+        const int64_t q_idx = q_tile_start + row;
+        const int64_t q_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * HeadDim;
+        q_tile[idx] = q[q_base + d];
+        out_accum[idx] = 0.0f;
       } else {
-        async_copy_int8_attention_tile<HeadDim>(
-            k_tile_col_major[next_stage],
-            v_tile[next_stage],
-            k + next_base,
-            v + next_base,
-            next_valid_k);
-      }
-      if (lane < kTensorCoreTileN) {
-        if (lane < next_valid_k) {
-          const int64_t scale_idx = (((batch_idx * kv_heads) + kv_head_idx) * src_len) + next_s_tile_start + lane;
-          k_row_scale[next_stage][lane] = k_scale[scale_idx];
-          v_row_scale[next_stage][lane] = v_scale[scale_idx];
-        } else {
-          k_row_scale[next_stage][lane] = 0.0f;
-          v_row_scale[next_stage][lane] = 0.0f;
-        }
+        q_tile[idx] = 0;
+        out_accum[idx] = 0.0f;
       }
     }
-
-    compute_int8_score_tile_tensorcore<HeadDim>(q_tile, k_tile_col_major[current_stage], score_tile);
+    if (lane < kTensorCoreTileM) {
+      if (lane < valid_q) {
+        const int64_t q_idx = q_tile_start + lane;
+        q_row_scale[lane] = q_scale[((batch_idx * q_heads) + head_idx) * tgt_len + q_idx];
+        row_max[lane] = -std::numeric_limits<float>::infinity();
+        row_sum[lane] = 0.0f;
+        row_rescale[lane] = 0.0f;
+      } else {
+        q_row_scale[lane] = 0.0f;
+        row_max[lane] = -std::numeric_limits<float>::infinity();
+        row_sum[lane] = 0.0f;
+        row_rescale[lane] = 0.0f;
+      }
+    }
     __syncthreads();
 
-    if (lane < kTensorCoreTileM && lane < valid_q) {
-      const float prev_row_max = row_max[lane];
-      const float prev_row_sum = row_sum[lane];
-      float tile_max = -std::numeric_limits<float>::infinity();
-      const int64_t q_idx = q_tile_start + lane;
-      const int64_t mask_row_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * src_len;
+    const int first_valid_k = static_cast<int>(src_len < kTensorCoreTileN ? src_len : kTensorCoreTileN);
+    const int first_copy_bytes = first_valid_k * HeadDim;
+    if constexpr (UseBulkAsync) {
+      if (lane == 0 && first_copy_bytes > 0) {
+        t10::cuda::Sm90CpAsyncBulkGlobalToShared(
+            k_tile_col_major[0],
+            k + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
+            static_cast<uint32_t>(first_copy_bytes),
+            k_copy_bar[0]);
+        t10::cuda::Sm90CpAsyncBulkGlobalToShared(
+            v_tile[0],
+            v + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
+            static_cast<uint32_t>(first_copy_bytes),
+            v_copy_bar[0]);
+        k_tokens[0] = t10::cuda::Sm90BarrierArriveTx(k_copy_bar[0], 1, static_cast<uint32_t>(first_copy_bytes));
+        v_tokens[0] = t10::cuda::Sm90BarrierArriveTx(v_copy_bar[0], 1, static_cast<uint32_t>(first_copy_bytes));
+      } else {
+        k_tokens[0] = k_copy_bar[0].arrive();
+        v_tokens[0] = v_copy_bar[0].arrive();
+      }
+      stage_pending[0] = true;
+    } else {
+      async_copy_int8_attention_tile<HeadDim>(
+          k_tile_col_major[0],
+          v_tile[0],
+          k + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
+          v + (((batch_idx * kv_heads) + kv_head_idx) * src_len) * HeadDim,
+          first_valid_k);
+    }
+    if (lane < kTensorCoreTileN) {
+      if (lane < first_valid_k) {
+        const int64_t scale_idx = (((batch_idx * kv_heads) + kv_head_idx) * src_len) + lane;
+        k_row_scale[0][lane] = k_scale[scale_idx];
+        v_row_scale[0][lane] = v_scale[scale_idx];
+      } else {
+        k_row_scale[0][lane] = 0.0f;
+        v_row_scale[0][lane] = 0.0f;
+      }
+    }
+    if constexpr (UseBulkAsync) {
+      __syncthreads();
+    } else {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      __pipeline_wait_prior(0);
+#endif
+    }
+    __syncthreads();
 
-      #pragma unroll
-      for (int col = 0; col < kTensorCoreTileN; ++col) {
-        if (col >= valid_k) {
-          break;
+    for (int64_t s_tile_start = 0; s_tile_start < src_len; s_tile_start += kTensorCoreTileN) {
+      const int current_stage = static_cast<int>((s_tile_start / kTensorCoreTileN) % kSm90PipelineStages);
+      const int next_stage = (current_stage + 1) % kSm90PipelineStages;
+      const int valid_k = static_cast<int>(
+          (src_len - s_tile_start) < kTensorCoreTileN ? (src_len - s_tile_start) : kTensorCoreTileN);
+      const int64_t next_s_tile_start = s_tile_start + kTensorCoreTileN;
+
+      if constexpr (UseBulkAsync) {
+        if (stage_pending[current_stage]) {
+          k_copy_bar[current_stage].wait(std::move(k_tokens[current_stage]));
+          v_copy_bar[current_stage].wait(std::move(v_tokens[current_stage]));
+          stage_pending[current_stage] = false;
         }
-        const int64_t kv_idx = s_tile_start + col;
-        if constexpr (IsCausal) {
-          if (tgt_len > 1 && kv_idx > q_idx) {
-            continue;
-          }
-        }
-        if constexpr (HasBoolMask) {
-          if (bool_mask[mask_row_base + kv_idx]) {
-            continue;
-          }
-        }
-        float score =
-            static_cast<float>(score_tile[lane * kTensorCoreTileN + col]) *
-            q_row_scale[lane] *
-            k_row_scale[current_stage][col] *
-            scale_value;
-        if constexpr (HasAdditiveMask) {
-          score += additive_mask[mask_row_base + kv_idx];
-        }
-        if (!::isfinite(score)) {
-          continue;
-        }
-        tile_max = fmaxf(tile_max, score);
+        __syncthreads();
       }
 
-      const float new_row_max = fmaxf(prev_row_max, tile_max);
-      float prev_scale = 0.0f;
-      if (::isfinite(prev_row_max) && ::isfinite(new_row_max)) {
-        prev_scale = expf(prev_row_max - new_row_max);
+      if (next_s_tile_start < src_len) {
+        const int next_valid_k = static_cast<int>(
+            (src_len - next_s_tile_start) < kTensorCoreTileN ? (src_len - next_s_tile_start) : kTensorCoreTileN);
+        const int64_t next_base = ((((batch_idx * kv_heads) + kv_head_idx) * src_len) + next_s_tile_start) * HeadDim;
+        if constexpr (UseBulkAsync) {
+          const int next_copy_bytes = next_valid_k * HeadDim;
+          if (lane == 0 && next_copy_bytes > 0) {
+            t10::cuda::Sm90CpAsyncBulkGlobalToShared(
+                k_tile_col_major[next_stage],
+                k + next_base,
+                static_cast<uint32_t>(next_copy_bytes),
+                k_copy_bar[next_stage]);
+            t10::cuda::Sm90CpAsyncBulkGlobalToShared(
+                v_tile[next_stage],
+                v + next_base,
+                static_cast<uint32_t>(next_copy_bytes),
+                v_copy_bar[next_stage]);
+            k_tokens[next_stage] = t10::cuda::Sm90BarrierArriveTx(
+                k_copy_bar[next_stage], 1, static_cast<uint32_t>(next_copy_bytes));
+            v_tokens[next_stage] = t10::cuda::Sm90BarrierArriveTx(
+                v_copy_bar[next_stage], 1, static_cast<uint32_t>(next_copy_bytes));
+          } else {
+            k_tokens[next_stage] = k_copy_bar[next_stage].arrive();
+            v_tokens[next_stage] = v_copy_bar[next_stage].arrive();
+          }
+          stage_pending[next_stage] = true;
+        } else {
+          async_copy_int8_attention_tile<HeadDim>(
+              k_tile_col_major[next_stage],
+              v_tile[next_stage],
+              k + next_base,
+              v + next_base,
+              next_valid_k);
+        }
+        if (lane < kTensorCoreTileN) {
+          if (lane < next_valid_k) {
+            const int64_t scale_idx =
+                (((batch_idx * kv_heads) + kv_head_idx) * src_len) + next_s_tile_start + lane;
+            k_row_scale[next_stage][lane] = k_scale[scale_idx];
+            v_row_scale[next_stage][lane] = v_scale[scale_idx];
+          } else {
+            k_row_scale[next_stage][lane] = 0.0f;
+            v_row_scale[next_stage][lane] = 0.0f;
+          }
+        }
       }
-      float tile_sum = 0.0f;
-      #pragma unroll
-      for (int col = 0; col < kTensorCoreTileN; ++col) {
-        float weight = 0.0f;
-        if (col < valid_k) {
+
+      compute_int8_score_tile_tensorcore<HeadDim>(q_tile, k_tile_col_major[current_stage], score_tile);
+      __syncthreads();
+
+      if (lane < kTensorCoreTileM && lane < valid_q) {
+        const float prev_row_max = row_max[lane];
+        const float prev_row_sum = row_sum[lane];
+        float tile_max = -std::numeric_limits<float>::infinity();
+        const int64_t q_idx = q_tile_start + lane;
+        const int64_t mask_row_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * src_len;
+
+        #pragma unroll
+        for (int col = 0; col < kTensorCoreTileN; ++col) {
+          if (col >= valid_k) {
+            break;
+          }
           const int64_t kv_idx = s_tile_start + col;
-          bool allowed = true;
           if constexpr (IsCausal) {
             if (tgt_len > 1 && kv_idx > q_idx) {
-              allowed = false;
+              continue;
             }
           }
           if constexpr (HasBoolMask) {
             if (bool_mask[mask_row_base + kv_idx]) {
-              allowed = false;
+              continue;
             }
           }
-          if (allowed) {
-            float score =
-                static_cast<float>(score_tile[lane * kTensorCoreTileN + col]) *
-                q_row_scale[lane] *
-                k_row_scale[current_stage][col] *
-                scale_value;
-            if constexpr (HasAdditiveMask) {
-              score += additive_mask[mask_row_base + kv_idx];
+          float score =
+              static_cast<float>(score_tile[lane * kTensorCoreTileN + col]) *
+              q_row_scale[lane] *
+              k_row_scale[current_stage][col] *
+              scale_value;
+          if constexpr (HasAdditiveMask) {
+            score += additive_mask[mask_row_base + kv_idx];
+          }
+          if (!::isfinite(score)) {
+            continue;
+          }
+          tile_max = fmaxf(tile_max, score);
+        }
+
+        const float new_row_max = fmaxf(prev_row_max, tile_max);
+        float prev_scale = 0.0f;
+        if (::isfinite(prev_row_max) && ::isfinite(new_row_max)) {
+          prev_scale = expf(prev_row_max - new_row_max);
+        }
+        float tile_sum = 0.0f;
+        #pragma unroll
+        for (int col = 0; col < kTensorCoreTileN; ++col) {
+          float weight = 0.0f;
+          if (col < valid_k) {
+            const int64_t kv_idx = s_tile_start + col;
+            bool allowed = true;
+            if constexpr (IsCausal) {
+              if (tgt_len > 1 && kv_idx > q_idx) {
+                allowed = false;
+              }
             }
-            if (::isfinite(score) && ::isfinite(new_row_max)) {
-              weight = expf(score - new_row_max);
+            if constexpr (HasBoolMask) {
+              if (bool_mask[mask_row_base + kv_idx]) {
+                allowed = false;
+              }
             }
+            if (allowed) {
+              float score =
+                  static_cast<float>(score_tile[lane * kTensorCoreTileN + col]) *
+                  q_row_scale[lane] *
+                  k_row_scale[current_stage][col] *
+                  scale_value;
+              if constexpr (HasAdditiveMask) {
+                score += additive_mask[mask_row_base + kv_idx];
+              }
+              if (::isfinite(score) && ::isfinite(new_row_max)) {
+                weight = expf(score - new_row_max);
+              }
+            }
+          }
+          weight_tile[lane * kTensorCoreTileN + col] = weight;
+          tile_sum += weight;
+        }
+
+        row_max[lane] = new_row_max;
+        row_sum[lane] = prev_row_sum * prev_scale + tile_sum;
+        row_rescale[lane] = prev_scale;
+      }
+      __syncthreads();
+
+      for (int idx = lane; idx < valid_q * HeadDim; idx += kTensorCoreThreads) {
+        const int row = idx / HeadDim;
+        const int d = idx % HeadDim;
+        float accum = out_accum[idx] * row_rescale[row];
+        #pragma unroll
+        for (int col = 0; col < kTensorCoreTileN; ++col) {
+          if (col >= valid_k) {
+            break;
+          }
+          const float weight = weight_tile[row * kTensorCoreTileN + col];
+          if (weight != 0.0f) {
+            accum += weight *
+                (static_cast<float>(v_tile[current_stage][col * HeadDim + d]) * v_row_scale[current_stage][col]);
           }
         }
-        weight_tile[lane * kTensorCoreTileN + col] = weight;
-        tile_sum += weight;
+        out_accum[idx] = accum;
       }
-
-      row_max[lane] = new_row_max;
-      row_sum[lane] = prev_row_sum * prev_scale + tile_sum;
-      row_rescale[lane] = prev_scale;
+      if constexpr (!UseBulkAsync) {
+        if (next_s_tile_start < src_len) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+          __pipeline_wait_prior(0);
+#endif
+        }
+      }
+      __syncthreads();
     }
-    __syncthreads();
 
     for (int idx = lane; idx < valid_q * HeadDim; idx += kTensorCoreThreads) {
       const int row = idx / HeadDim;
       const int d = idx % HeadDim;
-      float accum = out_accum[idx] * row_rescale[row];
-      #pragma unroll
-      for (int col = 0; col < kTensorCoreTileN; ++col) {
-        if (col >= valid_k) {
-          break;
-        }
-        const float weight = weight_tile[row * kTensorCoreTileN + col];
-        if (weight != 0.0f) {
-          accum += weight * (static_cast<float>(v_tile[current_stage][col * HeadDim + d]) * v_row_scale[current_stage][col]);
-        }
-      }
-      out_accum[idx] = accum;
-    }
-    if constexpr (!UseBulkAsync) {
-      if (next_s_tile_start < src_len) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-        __pipeline_wait_prior(0);
-#endif
-      }
+      const float denom = fmaxf(row_sum[row], 1e-8f);
+      const float value = out_accum[idx] / denom;
+      const int64_t q_idx = q_tile_start + row;
+      const int64_t out_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * HeadDim;
+      out[out_base + d] = static_cast<scalar_t>(value);
     }
     __syncthreads();
-  }
-
-  for (int idx = lane; idx < valid_q * HeadDim; idx += kTensorCoreThreads) {
-    const int row = idx / HeadDim;
-    const int d = idx % HeadDim;
-    const float denom = fmaxf(row_sum[row], 1e-8f);
-    const float value = out_accum[idx] / denom;
-    const int64_t q_idx = q_tile_start + row;
-    const int64_t out_base = (((batch_idx * q_heads) + head_idx) * tgt_len + q_idx) * HeadDim;
-    out[out_base + d] = static_cast<scalar_t>(value);
   }
 }
 
@@ -1300,6 +1783,176 @@ inline bool launch_int8_attention_decode_if_supported(
   }
 }
 
+template <typename scalar_t, int HeadDim, bool HasBoolMask, bool HasAdditiveMask, bool IsCausal, bool UseBulkAsync>
+inline void launch_int8_attention_sm90a_wgmma_specialized(
+    const torch::Tensor& q_contig,
+    const torch::Tensor& q_scale_contig,
+    const torch::Tensor& k_contig,
+    const torch::Tensor& k_scale_contig,
+    const torch::Tensor& v_contig,
+    const torch::Tensor& v_scale_contig,
+    const bool* bool_mask_ptr,
+    const float* additive_mask_ptr,
+    const torch::Tensor& out,
+    float scale_value,
+    cudaStream_t stream) {
+  const int64_t tiles_per_head = DivUpInt64(q_contig.size(2), kWgmmaAttentionActiveTileM);
+  const int64_t total_blocks = q_contig.size(0) * q_contig.size(1) * tiles_per_head;
+  const int64_t launch_blocks = SupportsInt8AttentionPersistentPath(q_contig, k_contig)
+      ? PersistentAttentionBlockCount(q_contig, total_blocks)
+      : total_blocks;
+  const dim3 blocks(static_cast<unsigned int>(launch_blocks));
+  const dim3 threads(kWgmmaAttentionThreads);
+  int8_attention_forward_sm90a_wgmma_kernel<scalar_t, HeadDim, HasBoolMask, HasAdditiveMask, IsCausal, UseBulkAsync>
+      <<<blocks, threads, 0, stream>>>(
+          q_contig.data_ptr<int8_t>(),
+          q_scale_contig.data_ptr<float>(),
+          k_contig.data_ptr<int8_t>(),
+          k_scale_contig.data_ptr<float>(),
+          v_contig.data_ptr<int8_t>(),
+          v_scale_contig.data_ptr<float>(),
+          bool_mask_ptr,
+          additive_mask_ptr,
+          out.data_ptr<scalar_t>(),
+          q_contig.size(0),
+          q_contig.size(1),
+          k_contig.size(1),
+          q_contig.size(2),
+          k_contig.size(2),
+          scale_value);
+}
+
+template <typename scalar_t, int HeadDim>
+inline void launch_int8_attention_sm90a_wgmma(
+    const torch::Tensor& q_contig,
+    const torch::Tensor& q_scale_contig,
+    const torch::Tensor& k_contig,
+    const torch::Tensor& k_scale_contig,
+    const torch::Tensor& v_contig,
+    const torch::Tensor& v_scale_contig,
+    const bool* bool_mask_ptr,
+    const float* additive_mask_ptr,
+    const torch::Tensor& out,
+    bool has_bool_mask,
+    bool has_additive_mask,
+    bool is_causal,
+    bool use_bulk_async,
+    float scale_value,
+    cudaStream_t stream) {
+  if (has_bool_mask) {
+    if (is_causal) {
+      if (use_bulk_async) {
+        launch_int8_attention_sm90a_wgmma_specialized<scalar_t, HeadDim, true, false, true, true>(
+            q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+            additive_mask_ptr, out, scale_value, stream);
+      } else {
+        launch_int8_attention_sm90a_wgmma_specialized<scalar_t, HeadDim, true, false, true, false>(
+            q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+            additive_mask_ptr, out, scale_value, stream);
+      }
+      return;
+    }
+    if (use_bulk_async) {
+      launch_int8_attention_sm90a_wgmma_specialized<scalar_t, HeadDim, true, false, false, true>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, scale_value, stream);
+    } else {
+      launch_int8_attention_sm90a_wgmma_specialized<scalar_t, HeadDim, true, false, false, false>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, scale_value, stream);
+    }
+    return;
+  }
+  if (has_additive_mask) {
+    if (is_causal) {
+      if (use_bulk_async) {
+        launch_int8_attention_sm90a_wgmma_specialized<scalar_t, HeadDim, false, true, true, true>(
+            q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+            additive_mask_ptr, out, scale_value, stream);
+      } else {
+        launch_int8_attention_sm90a_wgmma_specialized<scalar_t, HeadDim, false, true, true, false>(
+            q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+            additive_mask_ptr, out, scale_value, stream);
+      }
+      return;
+    }
+    if (use_bulk_async) {
+      launch_int8_attention_sm90a_wgmma_specialized<scalar_t, HeadDim, false, true, false, true>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, scale_value, stream);
+    } else {
+      launch_int8_attention_sm90a_wgmma_specialized<scalar_t, HeadDim, false, true, false, false>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, scale_value, stream);
+    }
+    return;
+  }
+  if (is_causal) {
+    if (use_bulk_async) {
+      launch_int8_attention_sm90a_wgmma_specialized<scalar_t, HeadDim, false, false, true, true>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, scale_value, stream);
+    } else {
+      launch_int8_attention_sm90a_wgmma_specialized<scalar_t, HeadDim, false, false, true, false>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, scale_value, stream);
+    }
+    return;
+  }
+  if (use_bulk_async) {
+    launch_int8_attention_sm90a_wgmma_specialized<scalar_t, HeadDim, false, false, false, true>(
+        q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+        additive_mask_ptr, out, scale_value, stream);
+  } else {
+    launch_int8_attention_sm90a_wgmma_specialized<scalar_t, HeadDim, false, false, false, false>(
+        q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+        additive_mask_ptr, out, scale_value, stream);
+  }
+}
+
+template <typename scalar_t>
+inline bool launch_int8_attention_sm90a_wgmma_if_supported(
+    const torch::Tensor& q_contig,
+    const torch::Tensor& q_scale_contig,
+    const torch::Tensor& k_contig,
+    const torch::Tensor& k_scale_contig,
+    const torch::Tensor& v_contig,
+    const torch::Tensor& v_scale_contig,
+    const bool* bool_mask_ptr,
+    const float* additive_mask_ptr,
+    const torch::Tensor& out,
+    bool has_bool_mask,
+    bool has_additive_mask,
+    bool is_causal,
+    bool use_bulk_async,
+    float scale_value,
+    cudaStream_t stream) {
+  switch (q_contig.size(3)) {
+    case 32:
+      launch_int8_attention_sm90a_wgmma<scalar_t, 32>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, use_bulk_async, scale_value, stream);
+      return true;
+    case 64:
+      launch_int8_attention_sm90a_wgmma<scalar_t, 64>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, use_bulk_async, scale_value, stream);
+      return true;
+    case 96:
+      launch_int8_attention_sm90a_wgmma<scalar_t, 96>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, use_bulk_async, scale_value, stream);
+      return true;
+    case 128:
+      launch_int8_attention_sm90a_wgmma<scalar_t, 128>(
+          q_contig, q_scale_contig, k_contig, k_scale_contig, v_contig, v_scale_contig, bool_mask_ptr,
+          additive_mask_ptr, out, has_bool_mask, has_additive_mask, is_causal, use_bulk_async, scale_value, stream);
+      return true;
+    default:
+      return false;
+  }
+}
+
 template <typename scalar_t, int HeadDim, bool HasBoolMask, bool HasAdditiveMask, bool IsCausal>
 inline void launch_int8_attention_tensorcore_specialized(
     const torch::Tensor& q_contig,
@@ -1314,7 +1967,11 @@ inline void launch_int8_attention_tensorcore_specialized(
     float scale_value,
     cudaStream_t stream) {
   const int64_t tiles_per_head = DivUpInt64(q_contig.size(2), kTensorCoreTileM);
-  const dim3 blocks(static_cast<unsigned int>(q_contig.size(0) * q_contig.size(1) * tiles_per_head));
+  const int64_t total_blocks = q_contig.size(0) * q_contig.size(1) * tiles_per_head;
+  const int64_t launch_blocks = SupportsInt8AttentionPersistentPath(q_contig, k_contig)
+      ? PersistentAttentionBlockCount(q_contig, total_blocks)
+      : total_blocks;
+  const dim3 blocks(static_cast<unsigned int>(launch_blocks));
   const dim3 threads(kTensorCoreThreads);
   int8_attention_forward_tensorcore_kernel<scalar_t, HeadDim, HasBoolMask, HasAdditiveMask, IsCausal>
       <<<blocks, threads, 0, stream>>>(
@@ -1457,7 +2114,11 @@ inline void launch_int8_attention_sm90_pipeline_specialized(
     float scale_value,
     cudaStream_t stream) {
   const int64_t tiles_per_head = DivUpInt64(q_contig.size(2), kTensorCoreTileM);
-  const dim3 blocks(static_cast<unsigned int>(q_contig.size(0) * q_contig.size(1) * tiles_per_head));
+  const int64_t total_blocks = q_contig.size(0) * q_contig.size(1) * tiles_per_head;
+  const int64_t launch_blocks = SupportsInt8AttentionPersistentPath(q_contig, k_contig)
+      ? PersistentAttentionBlockCount(q_contig, total_blocks)
+      : total_blocks;
+  const dim3 blocks(static_cast<unsigned int>(launch_blocks));
   const dim3 threads(kTensorCoreThreads);
   int8_attention_forward_sm90_pipeline_kernel<scalar_t, HeadDim, HasBoolMask, HasAdditiveMask, IsCausal, UseBulkAsync>
       <<<blocks, threads, 0, stream>>>(
@@ -1829,11 +2490,14 @@ torch::Tensor CudaInt8AttentionForward(
   const bool prefer_optimized = ShouldPreferInt8AttentionOptimizedPath(q_contig, k_contig);
   const bool prefer_decode_specialized =
       SupportsInt8AttentionDecodeSpecializedPath(q_contig, has_bool_mask, has_additive_mask);
+  const bool prefer_wgmma =
+      !prefer_decode_specialized && prefer_optimized && SupportsInt8AttentionWgmmaPath(q_contig, k_contig);
   const bool prefer_tensorcore = prefer_optimized && SupportsInt8AttentionTensorCorePath(q_contig);
   const bool prefer_sm90_pipeline =
-      !prefer_decode_specialized && prefer_tensorcore && SupportsInt8AttentionSm90PipelinePath(q_contig, k_contig);
+      !prefer_decode_specialized && !prefer_wgmma && prefer_tensorcore &&
+      SupportsInt8AttentionSm90PipelinePath(q_contig, k_contig);
   const bool prefer_sm90_bulk_async =
-      prefer_sm90_pipeline && SupportsInt8AttentionSm90BulkAsyncPath(q_contig, k_contig);
+      (prefer_wgmma || prefer_sm90_pipeline) && SupportsInt8AttentionSm90BulkAsyncPath(q_contig, k_contig);
 
   switch (output_dtype) {
     case torch::kFloat32: {
@@ -1849,8 +2513,28 @@ torch::Tensor CudaInt8AttentionForward(
               out,
               stream.stream(),
               scale_value);
+      const bool launched_wgmma =
+          !launched_decode &&
+          prefer_wgmma &&
+          launch_int8_attention_sm90a_wgmma_if_supported<float>(
+              q_contig,
+              q_scale_contig,
+              k_contig,
+              k_scale_contig,
+              v_contig,
+              v_scale_contig,
+              bool_mask_ptr,
+              additive_mask_ptr,
+              out,
+              has_bool_mask,
+              has_additive_mask,
+              is_causal,
+              prefer_sm90_bulk_async,
+              scale_value,
+              stream.stream());
       const bool launched_sm90_pipeline =
           !launched_decode &&
+          !launched_wgmma &&
           prefer_sm90_pipeline &&
           launch_int8_attention_sm90_pipeline_if_supported<float>(
               q_contig,
@@ -1870,6 +2554,7 @@ torch::Tensor CudaInt8AttentionForward(
               stream.stream());
       const bool launched_tensorcore =
           !launched_decode &&
+          !launched_wgmma &&
           !launched_sm90_pipeline &&
           prefer_tensorcore &&
           launch_int8_attention_tensorcore_if_supported<float>(
@@ -1887,7 +2572,7 @@ torch::Tensor CudaInt8AttentionForward(
               is_causal,
               scale_value,
               stream.stream());
-      if (!launched_decode && !launched_sm90_pipeline && !launched_tensorcore) {
+      if (!launched_decode && !launched_wgmma && !launched_sm90_pipeline && !launched_tensorcore) {
         launch_int8_attention_generic<float>(
             q_contig,
             q_scale_contig,
@@ -1919,8 +2604,28 @@ torch::Tensor CudaInt8AttentionForward(
               out,
               stream.stream(),
               scale_value);
+      const bool launched_wgmma =
+          !launched_decode &&
+          prefer_wgmma &&
+          launch_int8_attention_sm90a_wgmma_if_supported<at::Half>(
+              q_contig,
+              q_scale_contig,
+              k_contig,
+              k_scale_contig,
+              v_contig,
+              v_scale_contig,
+              bool_mask_ptr,
+              additive_mask_ptr,
+              out,
+              has_bool_mask,
+              has_additive_mask,
+              is_causal,
+              prefer_sm90_bulk_async,
+              scale_value,
+              stream.stream());
       const bool launched_sm90_pipeline =
           !launched_decode &&
+          !launched_wgmma &&
           prefer_sm90_pipeline &&
           launch_int8_attention_sm90_pipeline_if_supported<at::Half>(
               q_contig,
@@ -1940,6 +2645,7 @@ torch::Tensor CudaInt8AttentionForward(
               stream.stream());
       const bool launched_tensorcore =
           !launched_decode &&
+          !launched_wgmma &&
           !launched_sm90_pipeline &&
           prefer_tensorcore &&
           launch_int8_attention_tensorcore_if_supported<at::Half>(
@@ -1957,7 +2663,7 @@ torch::Tensor CudaInt8AttentionForward(
               is_causal,
               scale_value,
               stream.stream());
-      if (!launched_decode && !launched_sm90_pipeline && !launched_tensorcore) {
+      if (!launched_decode && !launched_wgmma && !launched_sm90_pipeline && !launched_tensorcore) {
         launch_int8_attention_generic<at::Half>(
             q_contig,
             q_scale_contig,
@@ -1989,8 +2695,28 @@ torch::Tensor CudaInt8AttentionForward(
               out,
               stream.stream(),
               scale_value);
+      const bool launched_wgmma =
+          !launched_decode &&
+          prefer_wgmma &&
+          launch_int8_attention_sm90a_wgmma_if_supported<at::BFloat16>(
+              q_contig,
+              q_scale_contig,
+              k_contig,
+              k_scale_contig,
+              v_contig,
+              v_scale_contig,
+              bool_mask_ptr,
+              additive_mask_ptr,
+              out,
+              has_bool_mask,
+              has_additive_mask,
+              is_causal,
+              prefer_sm90_bulk_async,
+              scale_value,
+              stream.stream());
       const bool launched_sm90_pipeline =
           !launched_decode &&
+          !launched_wgmma &&
           prefer_sm90_pipeline &&
           launch_int8_attention_sm90_pipeline_if_supported<at::BFloat16>(
               q_contig,
@@ -2010,6 +2736,7 @@ torch::Tensor CudaInt8AttentionForward(
               stream.stream());
       const bool launched_tensorcore =
           !launched_decode &&
+          !launched_wgmma &&
           !launched_sm90_pipeline &&
           prefer_tensorcore &&
           launch_int8_attention_tensorcore_if_supported<at::BFloat16>(
@@ -2027,7 +2754,7 @@ torch::Tensor CudaInt8AttentionForward(
               is_causal,
               scale_value,
               stream.stream());
-      if (!launched_decode && !launched_sm90_pipeline && !launched_tensorcore) {
+      if (!launched_decode && !launched_wgmma && !launched_sm90_pipeline && !launched_tensorcore) {
         launch_int8_attention_generic<at::BFloat16>(
             q_contig,
             q_scale_contig,

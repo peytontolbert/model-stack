@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import compress.quantization as quant_mod
+import runtime.generation as runtime_generation_mod
 import runtime.native as runtime_native_mod
 import runtime.ops as runtime_ops_mod
 from runtime.causal import CausalLM
@@ -52,14 +53,24 @@ def _convert_model_to_bitnet(model: CausalLM) -> list[quant_mod.QuantizedLinearB
     return modules
 
 
-def _run_native_bitnet_session_without_python_runtime_ops(monkeypatch, model: CausalLM) -> torch.Tensor:
+def _disable_python_runtime_ops(monkeypatch) -> None:
     def boom(*args, **kwargs):
         del args, kwargs
         raise AssertionError("direct native BitNet executor should not call Python runtime.ops helpers")
 
     monkeypatch.setattr(runtime_ops_mod, "qkv_packed_spec_heads_projection", boom)
+    monkeypatch.setattr(runtime_ops_mod, "resolve_packed_qkv_module_spec", boom)
+    monkeypatch.setattr(runtime_ops_mod, "head_output_packed_projection", boom)
+    monkeypatch.setattr(runtime_ops_mod, "resolve_packed_linear_module_spec", boom)
     monkeypatch.setattr(runtime_ops_mod, "mlp_module", boom)
     monkeypatch.setattr(runtime_ops_mod, "linear_module", boom)
+
+
+def _run_native_bitnet_session_without_python_runtime_ops(
+    monkeypatch,
+    model: CausalLM,
+) -> torch.Tensor:
+    _disable_python_runtime_ops(monkeypatch)
 
     seq = torch.randint(0, model.cfg.vocab_size, (2, 3))
     session = runtime_native_mod.create_native_model_session(model, seq)
@@ -73,6 +84,20 @@ def _run_native_bitnet_session_without_python_runtime_ops(monkeypatch, model: Ca
             if "direct native BitNet executor should not call Python runtime.ops helpers" in str(exc):
                 pytest.skip("loaded native extension not rebuilt with direct BitNet executor")
             raise
+
+
+def _run_native_bitnet_session(model: CausalLM) -> torch.Tensor:
+    seq = torch.randint(0, model.cfg.vocab_size, (2, 3))
+    session = runtime_native_mod.create_native_model_session(model, seq)
+    if session is None or getattr(session, "native_executor_kind", "python") != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+    with torch.no_grad():
+        return session.full_next_logits()
+
+
+def _create_session(model: CausalLM) -> tuple[object | None, torch.Tensor]:
+    seq = torch.randint(0, model.cfg.vocab_size, (2, 3))
+    return runtime_native_mod.create_native_model_session(model, seq), seq
 
 
 @pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
@@ -104,7 +129,7 @@ def test_native_causal_executor_direct_bitnet_supports_spin_prescale_and_static_
 
 
 @pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
-def test_native_causal_executor_direct_bitnet_supports_percentile_and_mse_activation_calibration(monkeypatch):
+def test_native_model_session_runs_bitnet_w2a8_calibrated_models_on_native_executor(monkeypatch):
     model = CausalLM(_cfg(), block_variant="llama", tie_weights=False)
     model.eval()
     for idx, module in enumerate(_convert_model_to_bitnet(model)):
@@ -123,7 +148,7 @@ def test_native_causal_executor_direct_bitnet_supports_percentile_and_mse_activa
 
 
 @pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
-def test_native_causal_executor_direct_bitnet_supports_sub8_activation_quant_bits(monkeypatch):
+def test_native_model_session_runs_bitnet_w2a8_sub8_models_on_native_executor(monkeypatch):
     model = CausalLM(_cfg(), block_variant="llama", tie_weights=False)
     model.eval()
     for idx, module in enumerate(_convert_model_to_bitnet(model)):
@@ -135,3 +160,111 @@ def test_native_causal_executor_direct_bitnet_supports_sub8_activation_quant_bit
 
     logits = _run_native_bitnet_session_without_python_runtime_ops(monkeypatch, model)
     assert logits.shape == (2, model.cfg.vocab_size)
+
+
+@pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
+def test_native_causal_executor_direct_bitnet_ignores_irrelevant_act_metadata_for_fused_qkv(monkeypatch):
+    model = CausalLM(_cfg(), block_variant="llama", tie_weights=False)
+    model.eval()
+    modules = _convert_model_to_bitnet(model)
+    block = model.blocks[0]
+
+    block.attn.w_q.act_quant_mode = "none"
+    block.attn.w_q.act_quant_method = "absmax"
+    block.attn.w_q.act_quant_percentile = 0.999
+
+    block.attn.w_k.act_quant_mode = "none"
+    block.attn.w_k.act_quant_method = "mse"
+    block.attn.w_k.act_quant_percentile = 0.75
+
+    block.attn.w_v.act_quant_mode = "none"
+    block.attn.w_v.act_quant_method = "percentile"
+    block.attn.w_v.act_quant_percentile = 0.5
+
+    for module in modules:
+        module.act_quant_bits = 8
+
+    logits = _run_native_bitnet_session_without_python_runtime_ops(monkeypatch, model)
+    assert logits.shape == (2, model.cfg.vocab_size)
+
+
+@pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
+def test_runtime_generation_session_native_executor_supports_bitnet_w2a8_cached_decode(monkeypatch):
+    model = CausalLM(_cfg(), block_variant="llama", tie_weights=False)
+    model.eval()
+    for idx, module in enumerate(_convert_model_to_bitnet(model)):
+        module.act_quant_mode = "dynamic_int8" if idx % 2 == 0 else "static_int8"
+        module.act_quant_method = "percentile" if idx % 2 == 0 else "mse"
+        module.act_quant_bits = 4 if idx % 2 == 0 else 6
+        module.act_quant_percentile = 0.92
+        module.act_scale.fill_(0.15)
+
+    session = runtime_generation_mod.RuntimeGenerationSession.from_model(
+        model,
+        torch.tensor([[1, 2]], dtype=torch.long),
+        cache_pagesize=16,
+        cache_backend="native-paged",
+    )
+    if not session.uses_native_session or session.native_executor_kind != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    _disable_python_runtime_ops(monkeypatch)
+
+    def boom(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("python model forward should not be called")
+
+    model.forward = boom
+
+    prefill = session.prefill_next_logits()
+    assert prefill is not None
+    assert prefill.shape == (1, model.cfg.vocab_size)
+
+    session.append(torch.argmax(prefill, dim=-1, keepdim=True))
+    decode = session.decode_next_logits()
+    assert decode is not None
+    assert decode.shape == (1, model.cfg.vocab_size)
+    rope_cos = getattr(model.blocks[0].attn, "_rope_cos", None)
+    rope_sin = getattr(model.blocks[0].attn, "_rope_sin", None)
+    assert isinstance(rope_cos, torch.Tensor)
+    assert isinstance(rope_sin, torch.Tensor)
+
+
+@pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
+def test_runtime_generation_session_native_bitnet_w2a8_cached_decode_with_alibi(monkeypatch):
+    model = CausalLM(_cfg(), block_variant="gpt", tie_weights=False, use_alibi=True)
+    model.eval()
+    for idx, module in enumerate(_convert_model_to_bitnet(model)):
+        module.act_quant_mode = "dynamic_int8" if idx % 2 == 0 else "static_int8"
+        module.act_quant_method = "percentile" if idx % 2 == 0 else "mse"
+        module.act_quant_bits = 4 if idx % 2 == 0 else 6
+        module.act_quant_percentile = 0.92
+        module.act_scale.fill_(0.15)
+
+    seq = torch.tensor([[1, 2]], dtype=torch.long)
+    native_session = runtime_generation_mod.RuntimeGenerationSession.from_model(
+        model,
+        seq,
+        cache_pagesize=16,
+        cache_backend="native-paged",
+    )
+    if not native_session.uses_native_session or native_session.native_executor_kind != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    _disable_python_runtime_ops(monkeypatch)
+
+    def boom(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("python model forward should not be called")
+
+    model.forward = boom
+
+    native_prefill = native_session.prefill_next_logits()
+    assert native_prefill is not None
+
+    next_id = torch.argmax(native_prefill, dim=-1, keepdim=True)
+    native_session.append(next_id)
+
+    native_decode = native_session.decode_next_logits()
+    assert native_decode is not None
+    assert native_decode.shape == (1, model.cfg.vocab_size)

@@ -9,9 +9,8 @@ import torch.nn as nn
 from runtime.attention import _read_backend_from_env_or_file, scaled_dot_product_attention, select_attention_backend
 from runtime.hardware import prefer_hopper_library_attention
 from runtime.attention_interfaces import Attention, KVCache
-from runtime.native import resolve_linear_backend
-from runtime.quant import int8_matmul_qkv as runtime_int8_matmul_qkv
-from runtime.quant import quantize_activation_int8_rowwise as runtime_quantize_activation_int8_rowwise
+from runtime.native import has_native_op, native_module, resolve_linear_backend
+from runtime.quant import int8_attention as runtime_int8_attention
 from runtime.ops import (
     attention as runtime_attention,
     apply_rotary as runtime_apply_rotary,
@@ -146,32 +145,34 @@ class EagerAttention(nn.Module):
         is_causal: bool,
         scale: float,
     ) -> torch.Tensor:
-        qq, q_scale = runtime_quantize_activation_int8_rowwise(q)
-        kq, k_scale = runtime_quantize_activation_int8_rowwise(k)
-        vq, v_scale = runtime_quantize_activation_int8_rowwise(v)
-        return runtime_int8_matmul_qkv(
-            qq,
-            kq,
-            vq,
-            q_scale,
-            k_scale,
-            v_scale,
-            attn_mask,
+        return runtime_int8_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
             is_causal=is_causal,
             scale=scale,
             out_dtype=q.dtype,
         )
 
-    def _packed_backend(self, x: torch.Tensor) -> str | None:
+    def _select_packed_backend(
+        self,
+        x: torch.Tensor,
+        projections: tuple[nn.Module, ...],
+        *,
+        prefer_runtime_linear_for_bitnet: bool = False,
+    ) -> str | None:
         if self.training or (not getattr(x, "is_cuda", False)):
             return None
         preferred_backend = resolve_linear_backend("auto")
 
         def _supports_backend(candidate: str) -> bool:
-            for projection in (self.w_q, self.w_k, self.w_v, self.w_o):
+            for projection in projections:
                 runtime_linear = getattr(projection, "runtime_linear", None)
                 supports_packed_backend = getattr(projection, "runtime_supports_packed_backend", None)
                 if callable(runtime_linear):
+                    if candidate == "bitnet" and prefer_runtime_linear_for_bitnet:
+                        return False
                     if not callable(supports_packed_backend):
                         return False
                     if not bool(supports_packed_backend(candidate)):
@@ -195,6 +196,12 @@ class EagerAttention(nn.Module):
             if _supports_backend(candidate):
                 return candidate
         return None
+
+    def _packed_backend(self, x: torch.Tensor) -> str | None:
+        return self._select_packed_backend(x, (self.w_q, self.w_k, self.w_v))
+
+    def _packed_output_backend(self, x: torch.Tensor) -> str | None:
+        return self._select_packed_backend(x, (self.w_o,))
 
     def _ensure_packed_qkv(self, backend: str, reference: torch.Tensor):
         signature = (
@@ -270,6 +277,18 @@ class EagerAttention(nn.Module):
         B, T, D = x.shape
         device, dtype = x.device, x.dtype
         packed_backend = self._packed_backend(x)
+        shared_int8_signature = None
+        prefer_cuda_fused_int8_runtime_linear = False
+        if k is None and v is None:
+            shared_int8_signature = self._shared_int8_qkv_input_signature()
+            if shared_int8_signature is not None and getattr(x, "is_cuda", False):
+                module = native_module()
+                prefer_cuda_fused_int8_runtime_linear = bool(
+                    all(callable(getattr(projection, "runtime_linear", None)) for projection in (self.w_q, self.w_k, self.w_v))
+                    and has_native_op("int8_linear_from_float")
+                    and module is not None
+                    and hasattr(module, "int8_linear_from_float_forward")
+                )
 
         if k is None and v is None:
             if packed_backend is not None:
@@ -281,7 +300,7 @@ class EagerAttention(nn.Module):
                     kv_heads=self.n_kv_heads,
                     backend=packed_backend,
                 )
-            elif self._shared_int8_qkv_input_signature() is not None:
+            elif shared_int8_signature is not None and not prefer_cuda_fused_int8_runtime_linear:
                 qh, kh_new, vh_new = self._shared_int8_qkv_projection(x)
             elif self._uses_module_runtime_linear():
                 q_lin = runtime_linear_module(x, self.w_q)
@@ -482,9 +501,10 @@ class EagerAttention(nn.Module):
         if cache is not None and T > 0 and not appended_to_cache:
             cache.append(kh_new, vh_new)
 
-        if packed_backend is not None:
-            packed_o_spec = self._ensure_packed_output(packed_backend, out)
-            return runtime_head_output_packed_projection(out, packed_o_spec, backend=packed_backend)
+        packed_output_backend = self._packed_output_backend(out)
+        if packed_output_backend is not None:
+            packed_o_spec = self._ensure_packed_output(packed_output_backend, out)
+            return runtime_head_output_packed_projection(out, packed_o_spec, backend=packed_output_backend)
         runtime_linear = getattr(self.w_o, "runtime_linear", None)
         if callable(runtime_linear):
             return runtime_linear_module(runtime_merge_heads(out), self.w_o)

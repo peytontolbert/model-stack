@@ -10,8 +10,10 @@
 #include <thrust/sort.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -22,6 +24,9 @@ constexpr int kSmallRowThreads = 64;
 constexpr int kMediumRowThreads = 128;
 constexpr int kBeamSearchThreads = 128;
 constexpr int kMaxBeamSearchBeamSize = 32;
+constexpr int kSpeculativeAcceptStrict = 0;
+constexpr int kSpeculativeAcceptRejectionSampler = 1;
+constexpr int kSpeculativeAcceptTypical = 2;
 
 struct SamplingLaunchPolicy {
   int elementwise_threads;
@@ -49,6 +54,304 @@ __device__ inline float Uniform01FromSeed(uint64_t seed) {
   const uint64_t mixed = SplitMix64(seed);
   const uint32_t mantissa = static_cast<uint32_t>((mixed >> 40) & 0xFFFFFFu);
   return (static_cast<float>(mantissa) + 0.5f) * (1.0f / 16777216.0f);
+}
+
+__device__ inline uint64_t SpeculativeSampleSeed(
+    int64_t row,
+    int64_t step,
+    uint64_t salt) {
+  return static_cast<uint64_t>(clock64()) ^
+         (static_cast<uint64_t>(row + 1) * 0x9E3779B97F4A7C15ull) ^
+         (static_cast<uint64_t>(step + 1) * 0xBF58476D1CE4E5B9ull) ^
+         salt;
+}
+
+template <int Threads>
+__device__ inline int64_t BlockArgmaxProbIndex(
+    const float* probs,
+    int64_t vocab_size,
+    float* shared_values,
+    int64_t* shared_indices) {
+  float best_value = -std::numeric_limits<float>::infinity();
+  int64_t best_index = 0;
+  for (int64_t idx = threadIdx.x; idx < vocab_size; idx += Threads) {
+    const float value = probs[idx];
+    if (value > best_value || (value == best_value && idx < best_index)) {
+      best_value = value;
+      best_index = idx;
+    }
+  }
+
+  shared_values[threadIdx.x] = best_value;
+  shared_indices[threadIdx.x] = best_index;
+  __syncthreads();
+
+  for (int stride = Threads / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+      const float other_value = shared_values[threadIdx.x + stride];
+      const int64_t other_index = shared_indices[threadIdx.x + stride];
+      const float current_value = shared_values[threadIdx.x];
+      const int64_t current_index = shared_indices[threadIdx.x];
+      if (other_value > current_value ||
+          (other_value == current_value && other_index < current_index)) {
+        shared_values[threadIdx.x] = other_value;
+        shared_indices[threadIdx.x] = other_index;
+      }
+    }
+    __syncthreads();
+  }
+
+  return shared_indices[0];
+}
+
+template <int Threads>
+__device__ inline double BlockEntropy(
+    const float* probs,
+    int64_t vocab_size,
+    double* shared_sums) {
+  double entropy = 0.0;
+  for (int64_t idx = threadIdx.x; idx < vocab_size; idx += Threads) {
+    const float value = fmaxf(probs[idx], 0.0f);
+    entropy -= static_cast<double>(value) * static_cast<double>(logf(value + 1.0e-5f));
+  }
+  shared_sums[threadIdx.x] = entropy;
+  __syncthreads();
+
+  for (int stride = Threads / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+      shared_sums[threadIdx.x] += shared_sums[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  return shared_sums[0];
+}
+
+__device__ inline int64_t ArgmaxProbIndex(
+    const float* probs,
+    int64_t vocab_size) {
+  float best_value = -std::numeric_limits<float>::infinity();
+  int64_t best_index = 0;
+  for (int64_t idx = 0; idx < vocab_size; ++idx) {
+    const float value = probs[idx];
+    if (value > best_value || (value == best_value && idx < best_index)) {
+      best_value = value;
+      best_index = idx;
+    }
+  }
+  return best_index;
+}
+
+__device__ inline int64_t SamplePositiveProbIndex(
+    const float* probs,
+    int64_t vocab_size,
+    uint64_t seed) {
+  double total = 0.0;
+  int64_t fallback = ArgmaxProbIndex(probs, vocab_size);
+  int64_t last_positive = fallback;
+  for (int64_t idx = 0; idx < vocab_size; ++idx) {
+    const float value = fmaxf(probs[idx], 0.0f);
+    if (value > 0.0f) {
+      last_positive = idx;
+    }
+    total += static_cast<double>(value);
+  }
+  if (total <= 1e-8) {
+    return fallback;
+  }
+  const double threshold = static_cast<double>(Uniform01FromSeed(seed)) * total;
+  double cumulative = 0.0;
+  for (int64_t idx = 0; idx < vocab_size; ++idx) {
+    const float value = fmaxf(probs[idx], 0.0f);
+    if (value <= 0.0f) {
+      continue;
+    }
+    cumulative += static_cast<double>(value);
+    if (cumulative >= threshold) {
+      return idx;
+    }
+  }
+  return last_positive;
+}
+
+__device__ inline int64_t SampleResidualProbIndex(
+    const float* target_probs,
+    const float* draft_probs,
+    int64_t vocab_size,
+    uint64_t seed) {
+  double total = 0.0;
+  for (int64_t idx = 0; idx < vocab_size; ++idx) {
+    total += static_cast<double>(fmaxf(target_probs[idx] - draft_probs[idx], 0.0f));
+  }
+  if (total <= 1e-8) {
+    return SamplePositiveProbIndex(target_probs, vocab_size, seed);
+  }
+  const double threshold = static_cast<double>(Uniform01FromSeed(seed)) * total;
+  double cumulative = 0.0;
+  int64_t last_positive = ArgmaxProbIndex(target_probs, vocab_size);
+  for (int64_t idx = 0; idx < vocab_size; ++idx) {
+    const float value = fmaxf(target_probs[idx] - draft_probs[idx], 0.0f);
+    if (value <= 0.0f) {
+      continue;
+    }
+    last_positive = idx;
+    cumulative += static_cast<double>(value);
+    if (cumulative >= threshold) {
+      return idx;
+    }
+  }
+  return last_positive;
+}
+
+template <int Threads>
+__global__ void speculative_accept_forward_kernel(
+    const float* __restrict__ target_probs,
+    const float* __restrict__ draft_probs,
+    const int64_t* __restrict__ draft_token_ids,
+    const float* __restrict__ bonus_probs,
+    const bool* __restrict__ bonus_enabled,
+    int64_t* __restrict__ out_tokens,
+    int64_t* __restrict__ out_lengths,
+    int64_t* __restrict__ accepted_counts,
+    int64_t batch_size,
+    int64_t draft_len,
+    int64_t vocab_size,
+    int method_code,
+    float posterior_threshold,
+    float posterior_alpha) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  if (row >= batch_size) {
+    return;
+  }
+
+  __shared__ float shared_values[Threads];
+  __shared__ int64_t shared_indices[Threads];
+  __shared__ double shared_sums[Threads];
+  __shared__ int64_t shared_candidate;
+  __shared__ int64_t shared_emitted;
+  __shared__ int64_t shared_accepted;
+  __shared__ int shared_stop;
+
+  const int64_t out_base = row * (draft_len + 1);
+  const int64_t token_base = row * draft_len;
+  if (threadIdx.x == 0) {
+    shared_emitted = 0;
+    shared_accepted = 0;
+    shared_stop = 0;
+  }
+  __syncthreads();
+
+  for (int64_t step = 0; step < draft_len; ++step) {
+    if (threadIdx.x == 0) {
+      shared_candidate = draft_token_ids[token_base + step];
+      shared_stop = 0;
+    }
+    __syncthreads();
+
+    const int64_t candidate = shared_candidate;
+    const float* target_row = target_probs + ((row * draft_len + step) * vocab_size);
+    if (method_code == kSpeculativeAcceptStrict) {
+      const int64_t expected =
+          BlockArgmaxProbIndex<Threads>(target_row, vocab_size, shared_values, shared_indices);
+      if (threadIdx.x == 0) {
+        if (candidate == expected) {
+          out_tokens[out_base + shared_emitted] = candidate;
+          shared_emitted += 1;
+          shared_accepted += 1;
+        } else {
+          out_tokens[out_base + shared_emitted] = expected;
+          shared_emitted += 1;
+          shared_stop = 1;
+        }
+      }
+      __syncthreads();
+      if (shared_stop != 0) {
+        break;
+      }
+      continue;
+    }
+    if (method_code == kSpeculativeAcceptTypical) {
+      const double entropy = BlockEntropy<Threads>(target_row, vocab_size, shared_sums);
+      if (threadIdx.x == 0) {
+        float candidate_prob = 0.0f;
+        if (candidate >= 0 && candidate < vocab_size) {
+          candidate_prob = target_row[candidate];
+        }
+        const float threshold =
+            fminf(posterior_threshold, expf(static_cast<float>(-entropy)) * posterior_alpha);
+        if (candidate_prob > threshold) {
+          out_tokens[out_base + shared_emitted] = candidate;
+          shared_emitted += 1;
+          shared_accepted += 1;
+        } else {
+          out_tokens[out_base + shared_emitted] = SamplePositiveProbIndex(
+              target_row,
+              vocab_size,
+              SpeculativeSampleSeed(row, step, 0xA5A5A5A5ull));
+          shared_emitted += 1;
+          shared_stop = 1;
+        }
+      }
+      __syncthreads();
+      if (shared_stop != 0) {
+        break;
+      }
+      continue;
+    }
+
+    if (threadIdx.x == 0) {
+      const float* draft_row = draft_probs + ((row * draft_len + step) * vocab_size);
+      float px = 0.0f;
+      float qx = 0.0f;
+      if (candidate >= 0 && candidate < vocab_size) {
+        px = target_row[candidate];
+        qx = draft_row[candidate];
+      }
+      const float accept_prob = qx <= 1e-12f ? 1.0f : fminf(px / qx, 1.0f);
+      if (Uniform01FromSeed(SpeculativeSampleSeed(row, step, 0x13579BDFull)) <= accept_prob) {
+        out_tokens[out_base + shared_emitted] = candidate;
+        shared_emitted += 1;
+        shared_accepted += 1;
+      } else {
+        out_tokens[out_base + shared_emitted] = SampleResidualProbIndex(
+            target_row,
+            draft_row,
+            vocab_size,
+            SpeculativeSampleSeed(row, step, 0x2468ACE0ull));
+        shared_emitted += 1;
+        shared_stop = 1;
+      }
+    }
+    __syncthreads();
+    if (shared_stop != 0) {
+      break;
+    }
+  }
+
+  const bool emit_bonus =
+      shared_accepted == draft_len && bonus_probs != nullptr && (bonus_enabled == nullptr || bonus_enabled[row]);
+  if (emit_bonus && method_code == kSpeculativeAcceptStrict) {
+    const float* bonus_row = bonus_probs + (row * vocab_size);
+    const int64_t expected =
+        BlockArgmaxProbIndex<Threads>(bonus_row, vocab_size, shared_values, shared_indices);
+    if (threadIdx.x == 0) {
+      out_tokens[out_base + shared_emitted] = expected;
+      shared_emitted += 1;
+    }
+  } else if (emit_bonus && threadIdx.x == 0) {
+    const float* bonus_row = bonus_probs + (row * vocab_size);
+    out_tokens[out_base + shared_emitted] = SamplePositiveProbIndex(
+        bonus_row,
+        vocab_size,
+        SpeculativeSampleSeed(row, draft_len, 0x11223344ull));
+    shared_emitted += 1;
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    out_lengths[row] = shared_emitted;
+    accepted_counts[row] = shared_accepted;
+  }
 }
 
 template <typename scalar_t>
@@ -1966,6 +2269,137 @@ torch::Tensor CudaMultinomialSampleForward(const torch::Tensor& logits) {
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return next_token;
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> CudaSpeculativeAcceptForward(
+    const torch::Tensor& target_probs,
+    const torch::Tensor& draft_probs,
+    const torch::Tensor& draft_token_ids,
+    const c10::optional<torch::Tensor>& bonus_probs,
+    const c10::optional<torch::Tensor>& bonus_enabled,
+    const std::string& method,
+    double posterior_threshold,
+    double posterior_alpha) {
+  TORCH_CHECK(target_probs.is_cuda() && draft_probs.is_cuda() && draft_token_ids.is_cuda(),
+              "CudaSpeculativeAcceptForward: target_probs, draft_probs, and draft_token_ids must be CUDA tensors");
+  TORCH_CHECK(target_probs.dim() == 3, "CudaSpeculativeAcceptForward: target_probs must be rank-3 (B, K, V)");
+  TORCH_CHECK(draft_probs.dim() == 3, "CudaSpeculativeAcceptForward: draft_probs must be rank-3 (B, K, V)");
+  TORCH_CHECK(draft_token_ids.dim() == 2, "CudaSpeculativeAcceptForward: draft_token_ids must be rank-2 (B, K)");
+  TORCH_CHECK(target_probs.sizes() == draft_probs.sizes(),
+              "CudaSpeculativeAcceptForward: target_probs and draft_probs shape mismatch");
+  TORCH_CHECK(target_probs.size(0) == draft_token_ids.size(0) && target_probs.size(1) == draft_token_ids.size(1),
+              "CudaSpeculativeAcceptForward: draft token shape mismatch");
+
+  c10::cuda::CUDAGuard device_guard{target_probs.device()};
+
+  auto target_probs_contig = target_probs.to(torch::kFloat32).contiguous();
+  auto draft_probs_contig = draft_probs.to(torch::kFloat32).contiguous();
+  auto draft_token_ids_contig = NormalizeTokenIdsLongContiguous(draft_token_ids);
+  torch::Tensor bonus_probs_contig;
+  if (bonus_probs.has_value() && bonus_probs.value().defined()) {
+    TORCH_CHECK(bonus_probs.value().is_cuda(), "CudaSpeculativeAcceptForward: bonus_probs must be a CUDA tensor");
+    TORCH_CHECK(bonus_probs.value().dim() == 2, "CudaSpeculativeAcceptForward: bonus_probs must be rank-2 (B, V)");
+    TORCH_CHECK(bonus_probs.value().size(0) == target_probs.size(0) && bonus_probs.value().size(1) == target_probs.size(2),
+                "CudaSpeculativeAcceptForward: bonus_probs shape mismatch");
+    bonus_probs_contig = bonus_probs.value().to(torch::kFloat32).contiguous();
+  }
+  torch::Tensor bonus_enabled_contig;
+  if (bonus_enabled.has_value() && bonus_enabled.value().defined()) {
+    TORCH_CHECK(bonus_enabled.value().is_cuda(), "CudaSpeculativeAcceptForward: bonus_enabled must be a CUDA tensor");
+    TORCH_CHECK(bonus_enabled.value().numel() == target_probs.size(0),
+                "CudaSpeculativeAcceptForward: bonus_enabled must have one flag per batch row");
+    bonus_enabled_contig = bonus_enabled.value().to(torch::kBool).contiguous().view({-1});
+  }
+
+  int method_code = kSpeculativeAcceptRejectionSampler;
+  std::string method_name = method;
+  std::transform(method_name.begin(), method_name.end(), method_name.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  if (method_name.empty() || method_name == "rejection_sampler" || method_name == "probabilistic" || method_name == "rejection") {
+    method_code = kSpeculativeAcceptRejectionSampler;
+  } else if (method_name == "strict") {
+    method_code = kSpeculativeAcceptStrict;
+  } else if (method_name == "typical_acceptance_sampler" || method_name == "typical") {
+    method_code = kSpeculativeAcceptTypical;
+  } else {
+    TORCH_CHECK(false, "CudaSpeculativeAcceptForward: unsupported method ", method);
+  }
+
+  const auto batch_size = target_probs_contig.size(0);
+  const auto draft_len = target_probs_contig.size(1);
+  const auto vocab_size = target_probs_contig.size(2);
+  auto out_tokens = torch::full(
+      {batch_size, draft_len + 1},
+      -1,
+      torch::TensorOptions().dtype(torch::kLong).device(target_probs.device()));
+  auto out_lengths = torch::zeros(
+      {batch_size},
+      torch::TensorOptions().dtype(torch::kLong).device(target_probs.device()));
+  auto accepted_counts = torch::zeros(
+      {batch_size},
+      torch::TensorOptions().dtype(torch::kLong).device(target_probs.device()));
+  if (batch_size == 0) {
+    return std::make_tuple(out_tokens, out_lengths, accepted_counts);
+  }
+
+  const auto policy = SelectSamplingLaunchPolicy(vocab_size);
+  auto stream = c10::cuda::getCurrentCUDAStream(target_probs.get_device());
+  switch (policy.row_reduce_threads) {
+    case kSmallRowThreads:
+      speculative_accept_forward_kernel<kSmallRowThreads><<<static_cast<unsigned int>(batch_size), kSmallRowThreads, 0, stream.stream()>>>(
+          target_probs_contig.data_ptr<float>(),
+          draft_probs_contig.data_ptr<float>(),
+          draft_token_ids_contig.data_ptr<int64_t>(),
+          bonus_probs_contig.defined() ? bonus_probs_contig.data_ptr<float>() : nullptr,
+          bonus_enabled_contig.defined() ? bonus_enabled_contig.data_ptr<bool>() : nullptr,
+          out_tokens.data_ptr<int64_t>(),
+          out_lengths.data_ptr<int64_t>(),
+          accepted_counts.data_ptr<int64_t>(),
+          batch_size,
+          draft_len,
+          vocab_size,
+          method_code,
+          static_cast<float>(posterior_threshold),
+          static_cast<float>(posterior_alpha));
+      break;
+    case kMediumRowThreads:
+      speculative_accept_forward_kernel<kMediumRowThreads><<<static_cast<unsigned int>(batch_size), kMediumRowThreads, 0, stream.stream()>>>(
+          target_probs_contig.data_ptr<float>(),
+          draft_probs_contig.data_ptr<float>(),
+          draft_token_ids_contig.data_ptr<int64_t>(),
+          bonus_probs_contig.defined() ? bonus_probs_contig.data_ptr<float>() : nullptr,
+          bonus_enabled_contig.defined() ? bonus_enabled_contig.data_ptr<bool>() : nullptr,
+          out_tokens.data_ptr<int64_t>(),
+          out_lengths.data_ptr<int64_t>(),
+          accepted_counts.data_ptr<int64_t>(),
+          batch_size,
+          draft_len,
+          vocab_size,
+          method_code,
+          static_cast<float>(posterior_threshold),
+          static_cast<float>(posterior_alpha));
+      break;
+    default:
+      speculative_accept_forward_kernel<kThreads><<<static_cast<unsigned int>(batch_size), kThreads, 0, stream.stream()>>>(
+          target_probs_contig.data_ptr<float>(),
+          draft_probs_contig.data_ptr<float>(),
+          draft_token_ids_contig.data_ptr<int64_t>(),
+          bonus_probs_contig.defined() ? bonus_probs_contig.data_ptr<float>() : nullptr,
+          bonus_enabled_contig.defined() ? bonus_enabled_contig.data_ptr<bool>() : nullptr,
+          out_tokens.data_ptr<int64_t>(),
+          out_lengths.data_ptr<int64_t>(),
+          accepted_counts.data_ptr<int64_t>(),
+          batch_size,
+          draft_len,
+          vocab_size,
+          method_code,
+          static_cast<float>(posterior_threshold),
+          static_cast<float>(posterior_alpha));
+      break;
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return std::make_tuple(out_tokens, out_lengths, accepted_counts);
 }
 
 

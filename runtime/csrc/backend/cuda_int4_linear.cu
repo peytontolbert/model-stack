@@ -30,8 +30,15 @@ constexpr int kImmaTileN = 8;
 constexpr int kImmaTileK = 32;
 
 bool Int4ImmaEnabled() {
-  const char* env = std::getenv("MODEL_STACK_ENABLE_INT4_IMMA_ACT_QUANT");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
+  const char* disable_env = std::getenv("MODEL_STACK_DISABLE_INT4_IMMA_ACT_QUANT");
+  if (disable_env != nullptr && disable_env[0] != '\0' && disable_env[0] != '0') {
+    return false;
+  }
+  const char* enable_env = std::getenv("MODEL_STACK_ENABLE_INT4_IMMA_ACT_QUANT");
+  if (enable_env != nullptr && enable_env[0] != '\0' && enable_env[0] != '0') {
+    return true;
+  }
+  return true;
 }
 
 int64_t Int4ImmaMinOps() {

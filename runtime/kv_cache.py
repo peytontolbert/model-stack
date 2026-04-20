@@ -154,6 +154,16 @@ class PagedKVCache(RuntimeKVCacheMixin):
             return self._native_layers[layer_idx].lengths()
         return self.lengths[layer_idx]
 
+    def layer_max_length(self, layer_idx: int) -> int:
+        if self._native_cache is not None:
+            return int(self._native_cache.max_length(layer_idx))
+        if self._native_layers is not None:
+            layer = self._native_layers[layer_idx]
+            if hasattr(layer, "max_length"):
+                return int(layer.max_length())
+        lengths = self.layer_lengths(layer_idx)
+        return int(lengths.max().item()) if lengths.numel() > 0 else 0
+
     def layer_page_count(self, layer_idx: int) -> int:
         if self._native_cache is not None:
             return int(self._native_cache.page_count(layer_idx))
@@ -440,6 +450,9 @@ class ContiguousKVCache(RuntimeKVCacheMixin):
     def layer_lengths(self, layer_idx: int) -> torch.Tensor:
         return torch.tensor(self.lengths[layer_idx], dtype=torch.long, device=self.device)
 
+    def layer_max_length(self, layer_idx: int) -> int:
+        return max(self.lengths[layer_idx], default=0)
+
     def _allocate(self, capacity: int) -> torch.Tensor:
         return torch.empty(
             self.n_kv_heads,
@@ -687,6 +700,159 @@ def reorder_kv_cache_rows_(cache, row_ids: torch.Tensor):
     return clone_kv_cache_rows(cache, row_ids)
 
 
+def concat_kv_caches(caches: list[object | None]):
+    from runtime.cache import KVCacheSpec, create_kv_cache
+
+    live = [cache for cache in caches if cache is not None]
+    if not live:
+        return None
+
+    first = live[0]
+    backend = getattr(first, "backend", "auto")
+    n_layers = int(getattr(first, "n_layers"))
+    n_kv_heads = int(getattr(first, "n_kv_heads"))
+    head_dim = int(getattr(first, "head_dim"))
+    pagesize = int(getattr(first, "pagesize"))
+    dtype = first.dtype
+    device = torch.device(first.device)
+
+    total_batch = 0
+    for cache in live:
+        if (
+            int(getattr(cache, "n_layers")) != n_layers
+            or int(getattr(cache, "n_kv_heads")) != n_kv_heads
+            or int(getattr(cache, "head_dim")) != head_dim
+            or int(getattr(cache, "pagesize")) != pagesize
+            or cache.dtype != dtype
+            or torch.device(cache.device) != device
+        ):
+            raise ValueError("concat_kv_caches requires all caches to share the same spec")
+        total_batch += int(getattr(cache, "batch"))
+
+    next_cache = create_kv_cache(
+        KVCacheSpec(
+            batch=int(total_batch),
+            n_layers=n_layers,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            pagesize=pagesize,
+            dtype=dtype,
+            device=device,
+            backend=backend,
+        )
+    )
+    if total_batch == 0:
+        return next_cache
+
+    row_offset = 0
+    for cache in live:
+        cache_batch = int(getattr(cache, "batch"))
+        if cache_batch <= 0:
+            continue
+        target_rows = torch.arange(
+            row_offset,
+            row_offset + cache_batch,
+            device=device,
+            dtype=torch.long,
+        )
+        for layer_idx in range(n_layers):
+            lengths = cache.layer_lengths(layer_idx).to(device=device, dtype=torch.long)
+            max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+            if max_len <= 0:
+                continue
+            if hasattr(cache, "read_batch"):
+                source_rows = torch.arange(cache_batch, device=device, dtype=torch.long)
+                k, v = cache.read_batch(layer_idx, 0, max_len, block_ids=source_rows)
+            else:
+                raise ValueError("concat_kv_caches requires a cache implementation with read_batch support")
+            unique_lengths = sorted(
+                {
+                    int(length)
+                    for length in lengths.detach().to(torch.long).cpu().tolist()
+                    if int(length) > 0
+                }
+            )
+            for length in unique_lengths:
+                rows = torch.nonzero(lengths == int(length), as_tuple=False).view(-1)
+                if rows.numel() == 0:
+                    continue
+                next_cache.append_batch(
+                    layer_idx,
+                    k.index_select(0, rows).slice(2, 0, int(length)).contiguous(),
+                    v.index_select(0, rows).slice(2, 0, int(length)).contiguous(),
+                    block_ids=target_rows.index_select(0, rows),
+                )
+        row_offset += cache_batch
+    return next_cache
+
+
+def split_kv_cache_rows(cache, row_sizes: list[int]):
+    if cache is None:
+        return [None for _ in row_sizes]
+    out = []
+    row_offset = 0
+    device = torch.device(cache.device)
+    for size in row_sizes:
+        count = int(size)
+        row_ids = torch.arange(row_offset, row_offset + count, device=device, dtype=torch.long)
+        out.append(clone_kv_cache_rows(cache, row_ids))
+        row_offset += count
+    if row_offset != int(getattr(cache, "batch")):
+        raise ValueError("split_kv_cache_rows row_sizes must sum to the cache batch size")
+    return out
+
+
+def truncate_kv_cache_prefix(cache, max_tokens: int):
+    from runtime.cache import KVCacheSpec, create_kv_cache
+
+    if cache is None:
+        return None
+
+    keep = max(int(max_tokens), 0)
+    spec = KVCacheSpec(
+        batch=int(getattr(cache, "batch")),
+        n_layers=int(getattr(cache, "n_layers")),
+        n_kv_heads=int(getattr(cache, "n_kv_heads")),
+        head_dim=int(getattr(cache, "head_dim")),
+        pagesize=int(getattr(cache, "pagesize")),
+        dtype=cache.dtype,
+        device=torch.device(cache.device),
+        backend=getattr(cache, "backend", "auto"),
+    )
+    next_cache = create_kv_cache(spec)
+    if keep <= 0 or int(spec.batch) <= 0:
+        return next_cache
+
+    source_rows = torch.arange(int(spec.batch), device=spec.device, dtype=torch.long)
+    for layer_idx in range(int(spec.n_layers)):
+        lengths = cache.layer_lengths(layer_idx).to(device=spec.device, dtype=torch.long).clamp_(min=0, max=keep)
+        max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+        if max_len <= 0:
+            continue
+        if hasattr(cache, "read_batch"):
+            k, v = cache.read_batch(layer_idx, 0, max_len, block_ids=source_rows)
+        else:
+            raise ValueError("truncate_kv_cache_prefix requires a cache implementation with read_batch support")
+        unique_lengths = sorted(
+            {
+                int(length)
+                for length in lengths.detach().to(torch.long).cpu().tolist()
+                if int(length) > 0
+            }
+        )
+        for length in unique_lengths:
+            rows = torch.nonzero(lengths == int(length), as_tuple=False).view(-1)
+            if rows.numel() == 0:
+                continue
+            next_cache.append_batch(
+                layer_idx,
+                k.index_select(0, rows)[:, :, : int(length), :].contiguous(),
+                v.index_select(0, rows)[:, :, : int(length), :].contiguous(),
+                block_ids=source_rows.index_select(0, rows),
+            )
+    return next_cache
+
+
 def kv_cache_append(cache: PagedKVCache, layer_idx: int, k_chunk: torch.Tensor, v_chunk: torch.Tensor, block_ids: Optional[torch.Tensor] = None):
     if hasattr(cache, "append_batch"):
         cache.append_batch(layer_idx, k_chunk, v_chunk, block_ids=block_ids)
@@ -754,7 +920,10 @@ __all__ = [
     "ContiguousKVCache",
     "PagedKVCache",
     "clone_kv_cache_rows",
+    "concat_kv_caches",
     "reorder_kv_cache_rows_",
+    "split_kv_cache_rows",
+    "truncate_kv_cache_prefix",
     "init_kv_cache",
     "kv_cache_append",
     "paged_attention_decode",

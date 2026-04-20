@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include <cuda_runtime.h>
+#include <sm_61_intrinsics.h>
 
 #include <tuple>
 #include <algorithm>
@@ -62,6 +63,113 @@ inline int DeviceMultiProcessorCount(const torch::Tensor& reference) {
 
 inline bool SupportsScaleGranularity(const LayoutInfo& layout) {
   return layout.scale_granularity == 0 || layout.scale_granularity == 1 || layout.scale_granularity == 2;
+}
+
+inline int BitNetQuantMax(int64_t bits) {
+  return (static_cast<int>(1) << (static_cast<int>(bits) - 1)) - 1;
+}
+
+template <typename scalar_t>
+__device__ inline float BitNetInputValueAfterPreScaleDevice(
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ pre_scale,
+    int64_t index,
+    int64_t col) {
+  float value = static_cast<float>(x[index]);
+  if (pre_scale != nullptr) {
+    value /= static_cast<float>(pre_scale[col]);
+    value = static_cast<float>(static_cast<scalar_t>(value));
+  }
+  return value;
+}
+
+__device__ inline float ResolveInputScaleDevice(
+    int64_t row,
+    const float* __restrict__ input_scale,
+    int64_t input_scale_rows) {
+  return fmaxf(input_scale[input_scale_rows == 1 ? 0 : row], 1.0e-8f);
+}
+
+__device__ inline int8_t BitNetQuantizeStaticInputCodeDevice(
+    float value,
+    float scale,
+    int qmax) {
+  const float scaled = value / scale;
+  const float rounded = nearbyintf(scaled);
+  const float clamped = fminf(static_cast<float>(qmax), fmaxf(-static_cast<float>(qmax), rounded));
+  return static_cast<int8_t>(clamped);
+}
+
+template <typename scalar_t>
+__device__ inline scalar_t BitNetFakeQuantizedStaticInputValueDevice(
+    float value,
+    float scale,
+    int qmax) {
+  const float code = static_cast<float>(BitNetQuantizeStaticInputCodeDevice(value, scale, qmax));
+  return static_cast<scalar_t>(code * scale);
+}
+
+template <typename scalar_t>
+__device__ inline int8_t BitNetQuantizeStaticInputCodeDevice(
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ pre_scale,
+    const float* __restrict__ input_scale,
+    int64_t input_scale_rows,
+    int qmax,
+    int64_t row,
+    int64_t col,
+    int64_t index) {
+  const float value = BitNetInputValueAfterPreScaleDevice(x, pre_scale, index, col);
+  const float scale = ResolveInputScaleDevice(row, input_scale, input_scale_rows);
+  return BitNetQuantizeStaticInputCodeDevice(value, scale, qmax);
+}
+
+template <typename scalar_t>
+__device__ inline scalar_t BitNetFakeQuantizedStaticInputValueDevice(
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ pre_scale,
+    const float* __restrict__ input_scale,
+    int64_t input_scale_rows,
+    int qmax,
+    int64_t row,
+    int64_t col,
+    int64_t index) {
+  const float scale = ResolveInputScaleDevice(row, input_scale, input_scale_rows);
+  const float code = static_cast<float>(
+      BitNetQuantizeStaticInputCodeDevice(
+          x,
+          pre_scale,
+          input_scale,
+          input_scale_rows,
+          qmax,
+          row,
+          col,
+          index));
+  return static_cast<scalar_t>(code * scale);
+}
+
+__device__ inline int32_t BitNetPackInt8x4Device(const int8_t* __restrict__ values) {
+  return static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint8_t>(values[0])) |
+                              (static_cast<uint32_t>(static_cast<uint8_t>(values[1])) << 8) |
+                              (static_cast<uint32_t>(static_cast<uint8_t>(values[2])) << 16) |
+                              (static_cast<uint32_t>(static_cast<uint8_t>(values[3])) << 24));
+}
+
+__device__ inline int BitNetDotInt8Chunk4Device(
+    const int8_t* __restrict__ lhs,
+    const int8_t* __restrict__ rhs,
+    int acc) {
+  const int32_t lhs_packed = BitNetPackInt8x4Device(lhs);
+  const int32_t rhs_packed = BitNetPackInt8x4Device(rhs);
+#if __CUDA_ARCH__ >= 610
+  return __dp4a(lhs_packed, rhs_packed, acc);
+#else
+  acc += static_cast<int>(lhs[0]) * static_cast<int>(rhs[0]);
+  acc += static_cast<int>(lhs[1]) * static_cast<int>(rhs[1]);
+  acc += static_cast<int>(lhs[2]) * static_cast<int>(rhs[2]);
+  acc += static_cast<int>(lhs[3]) * static_cast<int>(rhs[3]);
+  return acc;
+#endif
 }
 
 inline bool BitNetPersistentDecodeDisabled() {
@@ -148,6 +256,55 @@ __device__ inline int DecodeSignedTernaryCode(uint8_t packed_value, int64_t in_i
   return code == 0 ? -1 : (code == 2 ? 1 : 0);
 }
 
+__device__ inline int32_t DecodeSignedTernaryPackInt8x4Device(uint8_t packed_value, int valid_values = 4) {
+  int8_t values[4] = {0, 0, 0, 0};
+  #pragma unroll
+  for (int offset = 0; offset < 4; ++offset) {
+    if (offset >= valid_values) {
+      break;
+    }
+    values[offset] = static_cast<int8_t>(DecodeSignedTernaryCode(packed_value, offset));
+  }
+  return BitNetPackInt8x4Device(values);
+}
+
+__device__ inline int BitNetDotPackedInt8Chunk4Device(
+    int32_t lhs_packed,
+    int32_t rhs_packed,
+    int acc) {
+#if __CUDA_ARCH__ >= 610
+  return __dp4a(lhs_packed, rhs_packed, acc);
+#else
+  union PackedInt8x4 {
+    int32_t packed;
+    int8_t values[4];
+  };
+  PackedInt8x4 lhs{lhs_packed};
+  PackedInt8x4 rhs{rhs_packed};
+  acc += static_cast<int>(lhs.values[0]) * static_cast<int>(rhs.values[0]);
+  acc += static_cast<int>(lhs.values[1]) * static_cast<int>(rhs.values[1]);
+  acc += static_cast<int>(lhs.values[2]) * static_cast<int>(rhs.values[2]);
+  acc += static_cast<int>(lhs.values[3]) * static_cast<int>(rhs.values[3]);
+  return acc;
+#endif
+}
+
+template <typename scalar_t>
+__device__ inline float BitNetDotFloatPackedTernaryChunk4Device(
+    const scalar_t* __restrict__ lhs,
+    uint8_t packed_value,
+    int valid_values,
+    float acc) {
+  #pragma unroll
+  for (int offset = 0; offset < 4; ++offset) {
+    if (offset >= valid_values) {
+      break;
+    }
+    acc += static_cast<float>(lhs[offset]) * static_cast<float>(DecodeSignedTernaryCode(packed_value, offset));
+  }
+  return acc;
+}
+
 __device__ inline float ResolveRowScaleDevice(
     int64_t out_idx,
     const float* scale_values,
@@ -181,6 +338,19 @@ void LaunchBitNetDecodeKernel(
     const LayoutInfo& layout,
     const Plan& plan);
 
+void LaunchBitNetDecodeKernelStaticInput(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const torch::Tensor& input_scale,
+    int64_t act_quant_bits,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& segment_offsets,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan);
+
 void LaunchBitNetPrefillKernel(
     torch::Tensor& out_2d,
     const torch::Tensor& x_2d,
@@ -191,9 +361,35 @@ void LaunchBitNetPrefillKernel(
     const LayoutInfo& layout,
     const Plan& plan);
 
+void LaunchBitNetPrefillKernelStaticInput(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const torch::Tensor& input_scale,
+    int64_t act_quant_bits,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& segment_offsets,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan);
+
 void LaunchBitNetPrefillSplitKKernel(
     torch::Tensor& out_2d,
     const torch::Tensor& x_2d,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& segment_offsets,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan);
+
+void LaunchBitNetPrefillSplitKKernelStaticInput(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const torch::Tensor& input_scale,
+    int64_t act_quant_bits,
     const torch::Tensor& packed_weight,
     const torch::Tensor& scale_values,
     const torch::Tensor& segment_offsets,
@@ -213,6 +409,43 @@ torch::Tensor CudaBitNetLinearForward(
     const c10::optional<torch::Tensor>& bias,
     const c10::optional<torch::ScalarType>& out_dtype);
 
+torch::Tensor CudaBitNetLinearFromFloatForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& layout_header,
+    const torch::Tensor& segment_offsets,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    const c10::optional<torch::Tensor>& act_scale,
+    const c10::optional<torch::ScalarType>& out_dtype);
+
+torch::Tensor CudaBitNetTransformInputForward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    const c10::optional<torch::Tensor>& act_scale);
+
+torch::Tensor CudaBitNetCalibrateInputScaleForward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& pre_scale,
+    int64_t act_quant_bits);
+
+std::tuple<torch::Tensor, torch::Tensor> CudaBitNetQuantizeGatedActivationInt8CodesForward(
+    const torch::Tensor& x,
+    const std::string& activation,
+    const c10::optional<torch::Tensor>& pre_scale,
+    const std::string& act_quant_mode,
+    const std::string& act_quant_method,
+    int64_t act_quant_bits,
+    const c10::optional<torch::Tensor>& act_scale);
+
 bool HasCudaBitNetLinearKernel();
+bool HasCudaBitNetInputFrontendKernel();
 
 }  // namespace t10::bitnet

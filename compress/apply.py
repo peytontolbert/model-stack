@@ -11,6 +11,7 @@ from .quantization import (
     QuantizedLinearFP8,
     QuantizedLinearInt4,
     QuantizedLinearInt8,
+    QuantizedLinearNF4,
 )
 
 
@@ -32,7 +33,7 @@ def apply_compression(
     }
 
     quant: {
-      "scheme": str = "int8",  # one of: int8, bitnet, int4, fp8
+      "scheme": str = "int8",  # one of: int8, bitnet, int4, nf4, fp8
       "include": Iterable[str] | None,
       "exclude": Iterable[str] | None,
       "calibration": str = "absmax",  # QuantizedLinearInt8.from_float argument
@@ -113,5 +114,6 @@ __all__ = [
     "QuantizedLinearInt8",
     "QuantizedLinearBitNet",
     "QuantizedLinearInt4",
+    "QuantizedLinearNF4",
     "QuantizedLinearFP8",
 ]

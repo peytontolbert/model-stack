@@ -68,6 +68,9 @@ inline LayoutInfo ParseLayoutHeader(const torch::Tensor& layout_header) {
                   info.padded_in_features >= info.logical_in_features,
               "bitnet padded dimensions must be at least the logical dimensions");
   TORCH_CHECK(info.segment_count > 0, "bitnet segment_count must be positive");
+  TORCH_CHECK(info.interleave_mode == 1,
+              "Unsupported bitnet interleave_mode: ",
+              info.interleave_mode);
   return info;
 }
 
@@ -86,6 +89,30 @@ inline void ValidateSegmentOffsets(
   for (int64_t idx = 1; idx < offsets_cpu.size(0); ++idx) {
     TORCH_CHECK(acc[idx] >= acc[idx - 1], "bitnet segment_offsets must be non-decreasing");
   }
+}
+
+inline void ValidateScaleValues(
+    const torch::Tensor& scale_values,
+    const LayoutInfo& layout) {
+  TORCH_CHECK(scale_values.defined(), "bitnet scale_values must be defined");
+  TORCH_CHECK(scale_values.dim() == 1, "bitnet scale_values must be rank-1");
+  if (layout.scale_granularity == 0) {
+    TORCH_CHECK(scale_values.numel() >= 1, "bitnet per-matrix scaling requires at least one value");
+    return;
+  }
+  if (layout.scale_granularity == 1) {
+    TORCH_CHECK(scale_values.numel() == layout.segment_count, "bitnet per-segment scaling size mismatch");
+    return;
+  }
+  if (layout.scale_granularity == 2) {
+    TORCH_CHECK(layout.scale_group_size > 0,
+                "bitnet per-output-group scaling requires a positive scale_group_size");
+    const int64_t expected_groups =
+        (layout.logical_out_features + layout.scale_group_size - 1) / layout.scale_group_size;
+    TORCH_CHECK(scale_values.numel() == expected_groups, "bitnet per-output-group scaling size mismatch");
+    return;
+  }
+  TORCH_CHECK(false, "Unsupported bitnet scale granularity: ", layout.scale_granularity);
 }
 
 inline float ResolveRowScale(

@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -273,6 +274,7 @@ def test_eager_attention_prefers_library_backend_on_hopper(monkeypatch):
     attn.w_v = BitNetPackedProjection()
     attn.w_o = BitNetPackedProjection()
     assert attn._packed_backend(FakeRef()) == "bitnet"
+    assert attn._packed_output_backend(FakeRef()) == "bitnet"
 
 
 def test_eager_attention_bitnet_wrappers_use_module_runtime_projections(monkeypatch):
@@ -317,12 +319,13 @@ def test_eager_attention_bitnet_wrappers_use_packed_spec_path_when_enabled(monke
     attn = EagerAttention(_build_cfg(), use_rope=False)
     attn.eval()
     monkeypatch.setattr(attn, "_packed_backend", lambda x: "bitnet")
+    monkeypatch.setattr(attn, "_packed_output_backend", lambda x: None)
     monkeypatch.setattr(eager_mod, "runtime_attention", lambda q, k, v, attn_mask=None, is_causal=False, scale=None: torch.zeros_like(q))
     orig_has_native_op = runtime_ops_mod.has_native_op
     monkeypatch.setattr(
         runtime_ops_mod,
         "has_native_op",
-        lambda name: False if name == "bitnet_qkv_packed_heads_projection" else orig_has_native_op(name),
+        lambda name: False if name == "bitnet_fused_qkv_packed_heads_projection" else orig_has_native_op(name),
     )
 
     calls = []
@@ -345,56 +348,43 @@ def test_eager_attention_bitnet_wrappers_use_packed_spec_path_when_enabled(monke
         y = attn(x, None, None, None)
 
     assert y.shape == x.shape
-    assert len(calls) == 4
-    assert calls[0] == ((2, 3, attn.d_model), attn.n_heads * attn.head_dim)
-    assert calls[1] == ((2, 3, attn.d_model), attn.n_kv_heads * attn.head_dim)
-    assert calls[2] == ((2, 3, attn.d_model), attn.n_kv_heads * attn.head_dim)
-    assert calls[3] == ((2, 3, attn.d_model), attn.d_model)
+    assert len(calls) == 1
+    assert calls[0] == ((2, 3, attn.d_model), attn.n_heads * attn.head_dim + 2 * attn.n_kv_heads * attn.head_dim)
 
 
 def test_eager_attention_bitnet_wrappers_use_native_packed_qkv_when_available(monkeypatch):
     attn = EagerAttention(_build_cfg(), use_rope=False)
     attn.eval()
     monkeypatch.setattr(attn, "_packed_backend", lambda x: "bitnet")
+    monkeypatch.setattr(attn, "_packed_output_backend", lambda x: None)
     monkeypatch.setattr(eager_mod, "runtime_attention", lambda q, k, v, attn_mask=None, is_causal=False, scale=None: torch.zeros_like(q))
 
     native_calls = {"qkv": 0}
     output_calls = []
 
     class FakeNativeModule:
-        def bitnet_qkv_packed_heads_projection_forward(
+        def bitnet_fused_qkv_packed_heads_projection_forward(
             self,
-            q_x,
-            q_packed_weight,
-            q_scale_values,
-            q_layout_header,
-            q_segment_offsets,
-            q_bias,
-            k_x,
-            k_packed_weight,
-            k_scale_values,
-            k_layout_header,
-            k_segment_offsets,
-            k_bias,
-            v_x,
-            v_packed_weight,
-            v_scale_values,
-            v_layout_header,
-            v_segment_offsets,
-            v_bias,
+            x,
+            packed_weight,
+            scale_values,
+            layout_header,
+            segment_offsets,
+            packed_bias,
+            q_size,
+            k_size,
+            v_size,
             q_heads,
             kv_heads,
         ):
-            del q_packed_weight, q_scale_values, q_segment_offsets, q_bias
-            del k_packed_weight, k_scale_values, k_segment_offsets, k_bias
-            del v_packed_weight, v_scale_values, v_segment_offsets, v_bias
+            del packed_weight, scale_values, segment_offsets, packed_bias, layout_header
             native_calls["qkv"] += 1
-            q_width = int(q_layout_header[3].item()) // int(q_heads)
-            kv_width = int(k_layout_header[3].item()) // int(kv_heads)
+            q_width = int(q_size) // int(q_heads)
+            kv_width = int(k_size) // int(kv_heads)
             return (
-                torch.full((q_x.shape[0], int(q_heads), q_x.shape[1], q_width), 1.0, dtype=q_x.dtype, device=q_x.device),
-                torch.full((k_x.shape[0], int(kv_heads), k_x.shape[1], kv_width), 2.0, dtype=k_x.dtype, device=k_x.device),
-                torch.full((v_x.shape[0], int(kv_heads), v_x.shape[1], kv_width), 3.0, dtype=v_x.dtype, device=v_x.device),
+                torch.full((x.shape[0], int(q_heads), x.shape[1], q_width), 1.0, dtype=x.dtype, device=x.device),
+                torch.full((x.shape[0], int(kv_heads), x.shape[1], kv_width), 2.0, dtype=x.dtype, device=x.device),
+                torch.full((x.shape[0], int(kv_heads), x.shape[1], int(v_size) // int(kv_heads)), 3.0, dtype=x.dtype, device=x.device),
             )
 
     def fake_runtime_bitnet_linear(x, packed_weight, scale_values, layout_header, segment_offsets, bias=None):
@@ -403,7 +393,7 @@ def test_eager_attention_bitnet_wrappers_use_native_packed_qkv_when_available(mo
         output_calls.append((tuple(x.shape), out_features))
         return torch.full(x.shape[:-1] + (out_features,), 4.0, dtype=x.dtype, device=x.device)
 
-    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: name == "bitnet_qkv_packed_heads_projection")
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: name == "bitnet_fused_qkv_packed_heads_projection")
     monkeypatch.setattr(runtime_ops_mod, "native_module", lambda: FakeNativeModule())
     monkeypatch.setattr(runtime_quant_mod, "bitnet_linear", fake_runtime_bitnet_linear)
 
@@ -418,7 +408,220 @@ def test_eager_attention_bitnet_wrappers_use_native_packed_qkv_when_available(mo
 
     assert y.shape == x.shape
     assert native_calls["qkv"] == 1
-    assert output_calls == [((2, 3, attn.d_model), attn.d_model)]
+    assert output_calls == []
+
+
+def test_eager_attention_bitnet_w2a8_packed_backend_uses_fused_int8_qkv_and_int8_attention(monkeypatch):
+    attn = EagerAttention(_build_cfg(), use_rope=False)
+    attn.eval()
+    monkeypatch.setattr(attn, "_packed_backend", lambda x: "bitnet")
+    monkeypatch.setattr(attn, "_packed_output_backend", lambda x: "bitnet")
+
+    def fail_runtime_attention(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("BitNet W2A8 attention should use the int8 attention core")
+
+    calls = {"resolve_qkv": [], "packed_qkv": [], "resolve_o": [], "packed_o": 0, "runtime_linear": [], "int8_attention": 0}
+
+    def fake_int8_attention(q, k, v, attn_mask=None, *, is_causal=False, scale=None, out_dtype=None, q_scale=None, k_scale=None, v_scale=None):
+        del attn_mask, is_causal, scale, q_scale, k_scale, v_scale
+        calls["int8_attention"] += 1
+        dtype = torch.float32 if out_dtype is None else out_dtype
+        return torch.zeros_like(v, dtype=dtype)
+
+    def fake_resolve_packed_qkv_module_spec(q_module, k_module, v_module, *, backend=None, reference=None, dtype=None, device=None):
+        del q_module, k_module, v_module, dtype, device
+        calls["resolve_qkv"].append((backend, None if reference is None else tuple(reference.shape)))
+        return {
+            "format": "bitnet_qkv_fused_int8",
+            "backend": "bitnet",
+            "qweight": torch.zeros(
+                attn.n_heads * attn.head_dim + 2 * (attn.n_kv_heads * attn.head_dim),
+                attn.d_model,
+                dtype=torch.int8,
+            ),
+            "inv_scale": torch.ones(
+                attn.n_heads * attn.head_dim + 2 * (attn.n_kv_heads * attn.head_dim),
+                dtype=torch.float32,
+            ),
+            "packed_bias": None,
+            "q_size": attn.n_heads * attn.head_dim,
+            "k_size": attn.n_kv_heads * attn.head_dim,
+            "v_size": attn.n_kv_heads * attn.head_dim,
+            "spin_enabled": False,
+            "spin_signs": attn.w_q.spin_signs,
+            "pre_scale": attn.w_q.pre_scale,
+            "act_quant_mode": "dynamic_int8",
+            "act_quant_method": "absmax",
+            "act_quant_bits": 6,
+            "act_quant_percentile": 0.999,
+            "act_scale": attn.w_q.act_scale,
+        }
+
+    def fake_qkv_packed_spec_heads_projection(x, spec, *, q_heads, kv_heads, backend=None):
+        calls["packed_qkv"].append((str(spec.get("format")), backend, tuple(x.shape), q_heads, kv_heads))
+        return (
+            torch.zeros((x.shape[0], q_heads, x.shape[1], attn.head_dim), dtype=x.dtype, device=x.device),
+            torch.zeros((x.shape[0], kv_heads, x.shape[1], attn.head_dim), dtype=x.dtype, device=x.device),
+            torch.zeros((x.shape[0], kv_heads, x.shape[1], attn.head_dim), dtype=x.dtype, device=x.device),
+        )
+
+    def fake_resolve_packed_linear_module_spec(module, *, backend=None, reference=None, dtype=None, device=None):
+        del module, dtype, device
+        calls["resolve_o"].append((backend, None if reference is None else tuple(reference.shape)))
+        return {
+            "format": "bitnet_w2a8_int8",
+            "backend": "bitnet",
+            "qweight": torch.zeros(attn.d_model, attn.n_heads * attn.head_dim, dtype=torch.int8),
+            "inv_scale": torch.ones(attn.d_model, dtype=torch.float32),
+            "bias": None,
+            "spin_enabled": False,
+            "spin_signs": attn.w_o.spin_signs,
+            "pre_scale": attn.w_o.pre_scale,
+            "act_quant_mode": "dynamic_int8",
+            "act_quant_method": "absmax",
+            "act_quant_bits": 6,
+            "act_quant_percentile": 0.999,
+            "act_scale": attn.w_o.act_scale,
+        }
+
+    def fake_head_output_packed_projection(x, spec, *, backend=None):
+        calls["packed_o"] += 1
+        assert str(spec.get("format")) == "bitnet_w2a8_int8"
+        assert backend == "bitnet"
+        return torch.zeros((x.shape[0], x.shape[2], attn.d_model), dtype=x.dtype, device=x.device)
+
+    def fake_runtime_linear_module(x, module, *, backend=None):
+        del backend
+        assert module is attn.w_o
+        calls["runtime_linear"].append(tuple(x.shape))
+        return torch.zeros((x.shape[0], x.shape[1], attn.d_model), dtype=x.dtype, device=x.device)
+
+    monkeypatch.setattr(eager_mod, "runtime_resolve_packed_qkv_module_spec", fake_resolve_packed_qkv_module_spec)
+    monkeypatch.setattr(eager_mod, "runtime_qkv_packed_spec_heads_projection", fake_qkv_packed_spec_heads_projection)
+    monkeypatch.setattr(eager_mod, "runtime_resolve_packed_linear_module_spec", fake_resolve_packed_linear_module_spec)
+    monkeypatch.setattr(eager_mod, "runtime_head_output_packed_projection", fake_head_output_packed_projection)
+    monkeypatch.setattr(eager_mod, "runtime_linear_module", fake_runtime_linear_module)
+    monkeypatch.setattr(eager_mod, "runtime_attention", fail_runtime_attention)
+    monkeypatch.setattr(eager_mod, "runtime_int8_attention", fake_int8_attention)
+
+    attn.w_q = quant_mod.QuantizedLinearBitNet(attn.d_model, attn.n_heads * attn.head_dim, bias=True).from_float(
+        attn.w_q,
+        activation_quant="dynamic_int8",
+        activation_quant_bits=6,
+    )
+    attn.w_k = quant_mod.QuantizedLinearBitNet(attn.d_model, attn.n_kv_heads * attn.head_dim, bias=True).from_float(
+        attn.w_k,
+        activation_quant="dynamic_int8",
+        activation_quant_bits=6,
+    )
+    attn.w_v = quant_mod.QuantizedLinearBitNet(attn.d_model, attn.n_kv_heads * attn.head_dim, bias=True).from_float(
+        attn.w_v,
+        activation_quant="dynamic_int8",
+        activation_quant_bits=6,
+    )
+    attn.w_o = quant_mod.QuantizedLinearBitNet(attn.n_heads * attn.head_dim, attn.d_model, bias=True).from_float(
+        attn.w_o,
+        activation_quant="dynamic_int8",
+        activation_quant_bits=6,
+    )
+    monkeypatch.setattr(
+        attn,
+        "_shared_int8_qkv_projection",
+        lambda x: (_ for _ in ()).throw(AssertionError("packed BitNet W2A8 path should not use shared qkv projection")),
+    )
+
+    x = torch.randn(2, 3, attn.d_model)
+    with torch.no_grad():
+        y = attn(x, None, None, None)
+
+    assert y.shape == x.shape
+    assert calls["resolve_qkv"] == [("bitnet", (2, 3, attn.d_model))]
+    assert calls["packed_qkv"] == [("bitnet_qkv_fused_int8", "bitnet", (2, 3, attn.d_model), attn.n_heads, attn.n_kv_heads)]
+    assert calls["resolve_o"] == [("bitnet", (2, attn.n_heads, 3, attn.head_dim))]
+    assert calls["packed_o"] == 1
+    assert calls["runtime_linear"] == []
+    assert calls["int8_attention"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for single-token BitNet W2A8 decode path")
+def test_eager_attention_bitnet_w2a8_single_token_prefers_packed_qkv_over_runtime_linear(monkeypatch):
+    attn = EagerAttention(_build_cfg(), use_rope=False).to(device="cuda")
+    attn.eval()
+    monkeypatch.setattr(attn, "_packed_backend", lambda x: "bitnet")
+    monkeypatch.setattr(attn, "_packed_output_backend", lambda x: None)
+    monkeypatch.setattr(eager_mod, "has_native_op", lambda name: name == "int8_linear_from_float")
+    monkeypatch.setattr(
+        eager_mod,
+        "native_module",
+        lambda: type("FakeNativeModule", (), {"int8_linear_from_float_forward": object()})(),
+    )
+    monkeypatch.setattr(eager_mod, "runtime_attention", lambda q, k, v, attn_mask=None, is_causal=False, scale=None: torch.zeros_like(v))
+
+    calls = {"resolve": [], "packed": [], "runtime_linear": []}
+
+    def fake_resolve_packed_qkv(q_module, k_module, v_module, *, backend=None, reference=None, dtype=None, device=None):
+        del dtype, device
+        calls["resolve"].append((q_module, k_module, v_module, backend, tuple(reference.shape)))
+        return {
+            "format": "bitnet_qkv_fused_int8",
+            "backend": "bitnet",
+            "q_size": attn.n_heads * attn.head_dim,
+            "k_size": attn.n_kv_heads * attn.head_dim,
+            "v_size": attn.n_kv_heads * attn.head_dim,
+        }
+
+    def fake_packed_qkv(x, spec, *, q_heads, kv_heads, backend=None):
+        calls["packed"].append((tuple(x.shape), spec["format"], q_heads, kv_heads, backend))
+        q = torch.zeros((x.shape[0], attn.n_heads, x.shape[1], attn.head_dim), dtype=x.dtype, device=x.device)
+        k = torch.zeros((x.shape[0], attn.n_kv_heads, x.shape[1], attn.head_dim), dtype=x.dtype, device=x.device)
+        v = torch.zeros((x.shape[0], attn.n_kv_heads, x.shape[1], attn.head_dim), dtype=x.dtype, device=x.device)
+        return q, k, v
+
+    def fake_runtime_linear_module(x, module, *, backend=None):
+        calls["runtime_linear"].append((module, tuple(x.shape), backend))
+        out_features = module.out_features
+        return torch.zeros((*x.shape[:-1], out_features), dtype=x.dtype, device=x.device)
+
+    monkeypatch.setattr(eager_mod, "runtime_resolve_packed_qkv_module_spec", fake_resolve_packed_qkv)
+    monkeypatch.setattr(eager_mod, "runtime_qkv_packed_spec_heads_projection", fake_packed_qkv)
+    monkeypatch.setattr(eager_mod, "runtime_linear_module", fake_runtime_linear_module)
+
+    attn.w_q = quant_mod.QuantizedLinearBitNet(attn.d_model, attn.n_heads * attn.head_dim, bias=True).from_float(
+        attn.w_q,
+        activation_quant="dynamic_int8",
+        activation_quant_bits=6,
+    )
+    attn.w_k = quant_mod.QuantizedLinearBitNet(attn.d_model, attn.n_kv_heads * attn.head_dim, bias=True).from_float(
+        attn.w_k,
+        activation_quant="dynamic_int8",
+        activation_quant_bits=6,
+    )
+    attn.w_v = quant_mod.QuantizedLinearBitNet(attn.d_model, attn.n_kv_heads * attn.head_dim, bias=True).from_float(
+        attn.w_v,
+        activation_quant="dynamic_int8",
+        activation_quant_bits=6,
+    )
+    attn.w_o = quant_mod.QuantizedLinearBitNet(attn.n_heads * attn.head_dim, attn.d_model, bias=True).from_float(
+        attn.w_o,
+        activation_quant="dynamic_int8",
+        activation_quant_bits=6,
+    )
+
+    x = torch.randn(2, 1, attn.d_model, device="cuda")
+    with torch.no_grad():
+        y = attn(x, None, None, None)
+
+    assert y.shape == x.shape
+    assert calls["resolve"] == [
+        (attn.w_q, attn.w_k, attn.w_v, "bitnet", (2, 1, attn.d_model)),
+    ]
+    assert calls["packed"] == [
+        ((2, 1, attn.d_model), "bitnet_qkv_fused_int8", attn.n_heads, attn.n_kv_heads, "bitnet"),
+    ]
+    assert calls["runtime_linear"] == [
+        (attn.w_o, (2, 1, attn.n_heads * attn.head_dim), None),
+    ]
 
 
 def test_eager_attention_int8_wrappers_share_qkv_input_quantization(monkeypatch):
@@ -442,12 +645,11 @@ def test_eager_attention_int8_wrappers_share_qkv_input_quantization(monkeypatch)
         return torch.full((*qx.shape[:-1], qweight.shape[0]), float(len(calls["project"])), dtype=dtype, device=qx.device)
 
     monkeypatch.setattr(quant_mod, "runtime_quantize_activation_int8_rowwise", fake_quantize_activation_int8_rowwise)
-    monkeypatch.setattr(eager_mod, "runtime_quantize_activation_int8_rowwise", fake_quantize_activation_int8_rowwise)
     monkeypatch.setattr(quant_mod, "runtime_int8_linear_from_quantized_activation", fake_int8_linear_from_quantized_activation)
     monkeypatch.setattr(
         eager_mod,
-        "runtime_int8_matmul_qkv",
-        lambda q, k, v, *args, **kwargs: torch.zeros_like(v, dtype=torch.float32),
+        "runtime_int8_attention",
+        lambda q, k, v, **kwargs: torch.zeros_like(v, dtype=torch.float32),
     )
 
     attn.w_q = quant_mod.QuantizedLinearInt8(attn.d_model, attn.n_heads * attn.head_dim, bias=True).from_float(
@@ -472,44 +674,176 @@ def test_eager_attention_int8_wrappers_share_qkv_input_quantization(monkeypatch)
         y = attn(x, None, None, None)
 
     assert y.shape == x.shape
-    assert len(calls["quantize"]) >= 2
-    assert len(calls["project"]) == 4
+    assert len(calls["quantize"]) == 1
+    assert len(calls["project"]) == 3
     assert calls["project"][0][0] == calls["project"][1][0] == calls["project"][2][0]
     assert calls["project"][0][1] == attn.n_heads * attn.head_dim
     assert calls["project"][1][1] == attn.n_kv_heads * attn.head_dim
     assert calls["project"][2][1] == attn.n_kv_heads * attn.head_dim
-    assert calls["project"][3][1] == attn.d_model
+
+
+def test_eager_attention_int8_wrappers_share_qkv_input_quantization_when_irrelevant_metadata_differs(monkeypatch):
+    monkeypatch.setattr(
+        eager_mod,
+        "runtime_attention",
+        lambda q, k, v, attn_mask=None, is_causal=False, scale=None: torch.zeros_like(q),
+    )
+
+    def fake_quantize_activation_int8_rowwise(x, *, scale=None, method="absmax", percentile=0.999, eps=1e-8):
+        del scale, method, percentile, eps
+        rows = x.reshape(-1, x.shape[-1]).shape[0]
+        qx = torch.ones_like(x, dtype=torch.int8)
+        fake_quantize_activation_int8_rowwise.calls.append(int(qx.data_ptr()))
+        return qx, torch.full((rows,), 0.25, dtype=torch.float32, device=x.device)
+
+    fake_quantize_activation_int8_rowwise.calls = []
+
+    def fake_int8_linear_from_quantized_activation(qx, x_scale, qweight, inv_scale, bias=None, *, out_dtype=None):
+        del x_scale, inv_scale, bias
+        fake_int8_linear_from_quantized_activation.calls.append((int(qx.data_ptr()), int(qweight.shape[0]), out_dtype))
+        dtype = torch.float32 if out_dtype is None else out_dtype
+        return torch.full((*qx.shape[:-1], qweight.shape[0]), float(len(fake_int8_linear_from_quantized_activation.calls)), dtype=dtype, device=qx.device)
+
+    fake_int8_linear_from_quantized_activation.calls = []
+
+    monkeypatch.setattr(quant_mod, "runtime_quantize_activation_int8_rowwise", fake_quantize_activation_int8_rowwise)
+    monkeypatch.setattr(quant_mod, "runtime_int8_linear_from_quantized_activation", fake_int8_linear_from_quantized_activation)
+    monkeypatch.setattr(
+        eager_mod,
+        "runtime_int8_attention",
+        lambda q, k, v, **kwargs: torch.zeros_like(v, dtype=torch.float32),
+    )
+
+    def _run_case(mode: str) -> None:
+        fake_quantize_activation_int8_rowwise.calls.clear()
+        fake_int8_linear_from_quantized_activation.calls.clear()
+
+        attn = EagerAttention(_build_cfg(), use_rope=False)
+        attn.eval()
+        attn.w_q = quant_mod.QuantizedLinearInt8(attn.d_model, attn.n_heads * attn.head_dim, bias=True).from_float(
+            attn.w_q,
+            activation_quant=mode,
+        )
+        attn.w_k = quant_mod.QuantizedLinearInt8(attn.d_model, attn.n_kv_heads * attn.head_dim, bias=True).from_float(
+            attn.w_k,
+            activation_quant=mode,
+        )
+        attn.w_v = quant_mod.QuantizedLinearInt8(attn.d_model, attn.n_kv_heads * attn.head_dim, bias=True).from_float(
+            attn.w_v,
+            activation_quant=mode,
+        )
+        attn.w_o = quant_mod.QuantizedLinearInt8(attn.n_heads * attn.head_dim, attn.d_model, bias=True).from_float(
+            attn.w_o,
+            activation_quant=mode,
+        )
+        if mode == "dynamic_int8":
+            attn.w_q.act_scale.fill_(0.125)
+            attn.w_k.act_scale.fill_(0.25)
+            attn.w_v.act_scale.fill_(0.5)
+        else:
+            for projection in (attn.w_q, attn.w_k, attn.w_v):
+                projection.act_scale.fill_(0.125)
+            attn.w_q.act_quant_method = "absmax"
+            attn.w_k.act_quant_method = "percentile"
+            attn.w_v.act_quant_method = "mse"
+            attn.w_q.act_quant_percentile = 0.999
+            attn.w_k.act_quant_percentile = 0.95
+            attn.w_v.act_quant_percentile = 0.9
+
+        x = torch.randn(2, 3, attn.d_model)
+        with torch.no_grad():
+            y = attn(x, None, None, None)
+
+        assert y.shape == x.shape
+        assert len(fake_quantize_activation_int8_rowwise.calls) == 1
+        assert len(fake_int8_linear_from_quantized_activation.calls) == 3
+        assert (
+            fake_int8_linear_from_quantized_activation.calls[0][0]
+            == fake_int8_linear_from_quantized_activation.calls[1][0]
+            == fake_int8_linear_from_quantized_activation.calls[2][0]
+        )
+
+    _run_case("dynamic_int8")
+    _run_case("static_int8")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused int8 attention dispatch")
+def test_eager_attention_prefers_cuda_int8_runtime_linear_over_shared_qkv_quantization(monkeypatch):
+    attn = EagerAttention(_build_cfg(), use_rope=False).to(device="cuda", dtype=torch.float16)
+    attn.eval()
+
+    monkeypatch.setattr(
+        eager_mod,
+        "runtime_int8_attention",
+        lambda q, k, v, **kwargs: torch.zeros_like(v, dtype=torch.float16),
+    )
+    monkeypatch.setattr(eager_mod, "runtime_head_output_projection", _stub_output_projection)
+
+    def fail_quantize_activation_int8_rowwise(x, *, scale=None, method="absmax", percentile=0.999, eps=1e-8):
+        del x, scale, method, percentile, eps
+        raise AssertionError("shared int8 qkv quantization path should not run on CUDA when the fused frontend is available")
+
+    calls = {"runtime_linear": 0}
+
+    def fake_runtime_int8_linear(x, qweight, inv_scale, bias=None, *, act_scale=None, act_method="absmax", act_percentile=0.999):
+        del qweight, inv_scale, bias, act_scale, act_method, act_percentile
+        calls["runtime_linear"] += 1
+        return torch.zeros((*x.shape[:-1], attn.n_heads * attn.head_dim), dtype=x.dtype, device=x.device)
+
+    class FakeNativeModule:
+        int8_linear_from_float_forward = object()
+
+    monkeypatch.setattr(quant_mod, "runtime_quantize_activation_int8_rowwise", fail_quantize_activation_int8_rowwise)
+    monkeypatch.setattr(quant_mod, "runtime_int8_linear", fake_runtime_int8_linear)
+    monkeypatch.setattr(eager_mod, "has_native_op", lambda name: name == "int8_linear_from_float")
+    monkeypatch.setattr(eager_mod, "native_module", lambda: FakeNativeModule())
+
+    attn.w_q = quant_mod.QuantizedLinearInt8(attn.d_model, attn.n_heads * attn.head_dim, bias=True).from_float(
+        attn.w_q,
+        activation_quant="dynamic_int8",
+    ).to(device="cuda")
+    attn.w_k = quant_mod.QuantizedLinearInt8(attn.d_model, attn.n_kv_heads * attn.head_dim, bias=True).from_float(
+        attn.w_k,
+        activation_quant="dynamic_int8",
+    ).to(device="cuda")
+    attn.w_v = quant_mod.QuantizedLinearInt8(attn.d_model, attn.n_kv_heads * attn.head_dim, bias=True).from_float(
+        attn.w_v,
+        activation_quant="dynamic_int8",
+    ).to(device="cuda")
+    attn.w_q.act_scale.fill_(0.125)
+    attn.w_k.act_scale.fill_(0.25)
+    attn.w_v.act_scale.fill_(0.5)
+
+    x = torch.randn(2, 3, attn.d_model, device="cuda", dtype=torch.float16)
+    with torch.no_grad():
+        y = attn(x, None, None, None)
+
+    assert y.shape == x.shape
+    assert calls["runtime_linear"] == 3
 
 
 def test_eager_attention_int8_wrappers_use_int8_attention_core(monkeypatch):
     attn = EagerAttention(_build_cfg(), use_rope=False)
     attn.eval()
 
-    calls = {"quantize": 0, "int8_attention": 0}
+    calls = {"int8_attention": 0}
 
     def fail_runtime_attention(*args, **kwargs):
         del args, kwargs
         raise AssertionError("float runtime attention path should not run for int8 attention-core path")
 
-    def fake_quantize_activation_int8_rowwise(x, *, scale=None, method="absmax", percentile=0.999, eps=1e-8):
-        del scale, method, percentile, eps
-        calls["quantize"] += 1
-        rows = x.reshape(-1, x.shape[-1]).shape[0]
-        return torch.ones_like(x, dtype=torch.int8), torch.full((rows,), 0.25, dtype=torch.float32, device=x.device)
-
-    def fake_int8_matmul_qkv(q, k, v, q_scales, k_scales, v_scales, attn_mask=None, *, is_causal=False, scale=None, out_dtype=None):
-        del q_scales, k_scales, v_scales, attn_mask, scale
+    def fake_int8_attention(q, k, v, attn_mask=None, *, is_causal=False, scale=None, out_dtype=None, q_scale=None, k_scale=None, v_scale=None):
+        del attn_mask, scale, q_scale, k_scale, v_scale
         calls["int8_attention"] += 1
-        assert q.dtype == torch.int8
-        assert k.dtype == torch.int8
-        assert v.dtype == torch.int8
+        assert q.dtype == torch.float32
+        assert k.dtype == torch.float32
+        assert v.dtype == torch.float32
         assert is_causal is True
         dtype = torch.float32 if out_dtype is None else out_dtype
         return torch.zeros(q.shape, dtype=dtype, device=q.device)
 
     monkeypatch.setattr(eager_mod, "runtime_attention", fail_runtime_attention)
-    monkeypatch.setattr(eager_mod, "runtime_quantize_activation_int8_rowwise", fake_quantize_activation_int8_rowwise)
-    monkeypatch.setattr(eager_mod, "runtime_int8_matmul_qkv", fake_int8_matmul_qkv)
+    monkeypatch.setattr(eager_mod, "runtime_int8_attention", fake_int8_attention)
 
     attn.w_q = quant_mod.QuantizedLinearInt8(attn.d_model, attn.n_heads * attn.head_dim, bias=True).from_float(
         attn.w_q,
@@ -533,7 +867,6 @@ def test_eager_attention_int8_wrappers_use_int8_attention_core(monkeypatch):
         y = attn(x, None, None, None)
 
     assert y.shape == x.shape
-    assert calls["quantize"] == 3
     assert calls["int8_attention"] == 1
 
 
@@ -541,33 +874,26 @@ def test_eager_attention_int8_wrappers_use_int8_attention_core_with_mask(monkeyp
     attn = EagerAttention(_build_cfg(), use_rope=False)
     attn.eval()
 
-    calls = {"quantize": 0, "int8_attention": 0, "mask_shape": None, "is_causal": None}
+    calls = {"int8_attention": 0, "mask_shape": None, "is_causal": None}
 
     def fail_runtime_attention(*args, **kwargs):
         del args, kwargs
         raise AssertionError("float runtime attention path should not run for masked int8 attention-core path")
 
-    def fake_quantize_activation_int8_rowwise(x, *, scale=None, method="absmax", percentile=0.999, eps=1e-8):
-        del scale, method, percentile, eps
-        calls["quantize"] += 1
-        rows = x.reshape(-1, x.shape[-1]).shape[0]
-        return torch.ones_like(x, dtype=torch.int8), torch.full((rows,), 0.25, dtype=torch.float32, device=x.device)
-
-    def fake_int8_matmul_qkv(q, k, v, q_scales, k_scales, v_scales, attn_mask=None, *, is_causal=False, scale=None, out_dtype=None):
-        del q_scales, k_scales, v_scales, scale
+    def fake_int8_attention(q, k, v, attn_mask=None, *, is_causal=False, scale=None, out_dtype=None, q_scale=None, k_scale=None, v_scale=None):
+        del scale, q_scale, k_scale, v_scale
         calls["int8_attention"] += 1
         calls["mask_shape"] = None if attn_mask is None else tuple(attn_mask.shape)
         calls["is_causal"] = is_causal
-        assert q.dtype == torch.int8
-        assert k.dtype == torch.int8
-        assert v.dtype == torch.int8
+        assert q.dtype == torch.float32
+        assert k.dtype == torch.float32
+        assert v.dtype == torch.float32
         assert attn_mask is not None
         dtype = torch.float32 if out_dtype is None else out_dtype
         return torch.zeros(q.shape, dtype=dtype, device=q.device)
 
     monkeypatch.setattr(eager_mod, "runtime_attention", fail_runtime_attention)
-    monkeypatch.setattr(eager_mod, "runtime_quantize_activation_int8_rowwise", fake_quantize_activation_int8_rowwise)
-    monkeypatch.setattr(eager_mod, "runtime_int8_matmul_qkv", fake_int8_matmul_qkv)
+    monkeypatch.setattr(eager_mod, "runtime_int8_attention", fake_int8_attention)
 
     attn.w_q = quant_mod.QuantizedLinearInt8(attn.d_model, attn.n_heads * attn.head_dim, bias=True).from_float(
         attn.w_q,
@@ -593,7 +919,6 @@ def test_eager_attention_int8_wrappers_use_int8_attention_core_with_mask(monkeyp
         y = attn(x, None, None, mask)
 
     assert y.shape == x.shape
-    assert calls["quantize"] == 3
     assert calls["int8_attention"] == 1
     assert calls["mask_shape"] == (2, attn.n_heads, 3, 3)
     assert calls["is_causal"] is False

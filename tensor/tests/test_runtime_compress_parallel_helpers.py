@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
 import compress.export as delta_mod
@@ -135,23 +136,40 @@ def test_quantized_int4_linear_uses_runtime_int4_linear(monkeypatch):
     assert layer.runtime_supports_packed_backend("cublaslt") is False
 
 
+def test_quantized_nf4_linear_uses_runtime_nf4_linear(monkeypatch):
+    seen = {}
+
+    def fake_runtime_nf4_linear(x, weight_packed, weight_scale, bias=None):
+        seen["x"] = tuple(x.shape)
+        seen["packed_weight"] = tuple(weight_packed.shape)
+        seen["weight_scale"] = tuple(weight_scale.shape)
+        seen["bias"] = bias is not None
+        return torch.full((*x.shape[:-1], weight_scale.shape[0]), 4.5, dtype=x.dtype)
+
+    monkeypatch.setattr(quant_mod, "runtime_nf4_linear", fake_runtime_nf4_linear)
+
+    layer = quant_mod.QuantizedLinearNF4(4, 3, bias=True)
+    x = torch.randn(2, 4)
+    out = layer(x)
+
+    assert out.shape == (2, 3)
+    assert torch.all(out == 4.5)
+    assert seen == {"x": (2, 4), "packed_weight": (3, 2), "weight_scale": (3,), "bias": True}
+    assert layer.runtime_supports_packed_backend("cublaslt") is False
+
+
 def test_quantized_int8_awq_and_static_activation_quant_precondition_runtime_input(monkeypatch):
     seen = {}
 
-    def fake_runtime_quantize_activation_int8_rowwise(x, *, scale=None, method="absmax", percentile=0.999, eps=1e-8):
-        del method, percentile, eps
+    def fake_runtime_int8_linear(x, qweight, inv_scale, bias=None, *, act_scale=None, act_method="absmax", act_percentile=0.999):
+        del qweight, inv_scale, bias
         seen["x"] = x.clone()
-        seen["act_scale"] = scale.clone() if isinstance(scale, torch.Tensor) else scale
-        rows = x.reshape(-1, x.shape[-1]).shape[0]
-        return torch.ones_like(x, dtype=torch.int8), torch.full((rows,), 0.25, dtype=torch.float32, device=x.device)
+        seen["act_scale"] = act_scale.clone() if isinstance(act_scale, torch.Tensor) else act_scale
+        seen["act_method"] = act_method
+        seen["act_percentile"] = act_percentile
+        return torch.full((*x.shape[:-1], 3), 8.0, dtype=x.dtype, device=x.device)
 
-    def fake_runtime_int8_linear_from_quantized_activation(qx, row_scale, qweight, inv_scale, bias=None, *, out_dtype=None):
-        del row_scale, qweight, inv_scale, bias
-        dtype = torch.float32 if out_dtype is None else out_dtype
-        return torch.full((*qx.shape[:-1], 3), 8.0, dtype=dtype, device=qx.device)
-
-    monkeypatch.setattr(quant_mod, "runtime_quantize_activation_int8_rowwise", fake_runtime_quantize_activation_int8_rowwise)
-    monkeypatch.setattr(quant_mod, "runtime_int8_linear_from_quantized_activation", fake_runtime_int8_linear_from_quantized_activation)
+    monkeypatch.setattr(quant_mod, "runtime_int8_linear", fake_runtime_int8_linear)
 
     layer = quant_mod.QuantizedLinearInt8(4, 3, bias=False)
     linear = torch.nn.Linear(4, 3, bias=False)
@@ -171,6 +189,8 @@ def test_quantized_int8_awq_and_static_activation_quant_precondition_runtime_inp
     assert torch.all(out == 8.0)
     assert torch.allclose(seen["x"], quant_mod._apply_pre_scale_to_input(x, layer.pre_scale))
     assert torch.allclose(seen["act_scale"], layer.act_scale)
+    assert seen["act_method"] == "absmax"
+    assert seen["act_percentile"] == 0.999
     assert layer.weight_opt == "awq"
     assert layer.act_quant_mode == "static_int8"
     assert float(layer.act_scale.item()) > 0.0
@@ -227,6 +247,171 @@ def test_quantized_bitnet_linear_uses_runtime_bitnet_linear(monkeypatch):
     assert layer.runtime_supports_packed_backend("cublaslt") is False
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native BitNet input transform dispatch")
+def test_bitnet_transform_input_uses_native_helper_when_available(monkeypatch):
+    seen = {}
+
+    class FakeNativeModule:
+        def bitnet_transform_input_forward(
+            self,
+            x,
+            spin_enabled,
+            spin_signs,
+            pre_scale,
+            act_quant_mode,
+            act_quant_method,
+            act_quant_bits,
+            act_quant_percentile,
+            act_scale,
+        ):
+            seen["x_shape"] = tuple(x.shape)
+            seen["spin_enabled"] = bool(spin_enabled)
+            seen["spin_signs_shape"] = None if spin_signs is None else tuple(spin_signs.shape)
+            seen["pre_scale_shape"] = None if pre_scale is None else tuple(pre_scale.shape)
+            seen["act_quant_mode"] = act_quant_mode
+            seen["act_quant_method"] = act_quant_method
+            seen["act_quant_bits"] = int(act_quant_bits)
+            seen["act_quant_percentile"] = float(act_quant_percentile)
+            seen["act_scale_shape"] = None if act_scale is None else tuple(act_scale.shape)
+            return x + 3.0
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: name == "bitnet_transform_input")
+    monkeypatch.setattr(runtime_ops_mod, "native_module", lambda: FakeNativeModule())
+
+    x = torch.randn(2, 4, device="cuda", dtype=torch.float16)
+    out = runtime_ops_mod.bitnet_transform_input(
+        x,
+        spin_enabled=True,
+        spin_signs=torch.ones(4),
+        pre_scale=torch.full((4,), 0.5),
+        act_quant_mode="static_int8",
+        act_scale=torch.full((1,), 0.25),
+        act_quant_bits=6,
+        act_quant_method="percentile",
+        act_quant_percentile=0.95,
+    )
+
+    assert torch.allclose(out, x + 3.0)
+    assert seen == {
+        "x_shape": (2, 4),
+        "spin_enabled": True,
+        "spin_signs_shape": (4,),
+        "pre_scale_shape": (4,),
+        "act_quant_mode": "static_int8",
+        "act_quant_method": "percentile",
+        "act_quant_bits": 6,
+        "act_quant_percentile": 0.95,
+        "act_scale_shape": (1,),
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native BitNet input transform dispatch")
+def test_bitnet_transform_input_native_matches_python_fallback(monkeypatch):
+    if not runtime_ops_mod.has_native_op("bitnet_transform_input"):
+        pytest.skip("native BitNet input transform op unavailable")
+
+    x = torch.randn(4, 16, 64, device="cuda", dtype=torch.float16)
+    spin_signs = torch.where(torch.arange(64, device="cuda") % 2 == 0, 1.0, -1.0).to(dtype=torch.float32)
+    pre_scale = torch.linspace(0.75, 1.25, 64, device="cuda", dtype=torch.float32)
+    act_scale = torch.tensor(0.125, device="cuda", dtype=torch.float32)
+
+    native = runtime_ops_mod.bitnet_transform_input(
+        x,
+        spin_enabled=True,
+        spin_signs=spin_signs,
+        pre_scale=pre_scale,
+        act_quant_mode="static_int8",
+        act_scale=act_scale,
+        act_quant_bits=8,
+        act_quant_method="absmax",
+        act_quant_percentile=0.999,
+    )
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: False)
+    fallback = runtime_ops_mod.bitnet_transform_input(
+        x,
+        spin_enabled=True,
+        spin_signs=spin_signs,
+        pre_scale=pre_scale,
+        act_quant_mode="static_int8",
+        act_scale=act_scale,
+        act_quant_bits=8,
+        act_quant_method="absmax",
+        act_quant_percentile=0.999,
+    )
+
+    assert torch.equal(native, fallback)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native BitNet input transform dispatch")
+def test_bitnet_transform_input_native_nospin_matches_python_fallback(monkeypatch):
+    if not runtime_ops_mod.has_native_op("bitnet_transform_input"):
+        pytest.skip("native BitNet input transform op unavailable")
+
+    x = torch.randn(4, 16, 64, device="cuda", dtype=torch.float16)
+    pre_scale = torch.linspace(0.75, 1.25, 64, device="cuda", dtype=torch.float32)
+    act_scale = torch.tensor(0.125, device="cuda", dtype=torch.float32)
+
+    native = runtime_ops_mod.bitnet_transform_input(
+        x,
+        spin_enabled=False,
+        pre_scale=pre_scale,
+        act_quant_mode="static_int8",
+        act_scale=act_scale,
+        act_quant_bits=6,
+        act_quant_method="absmax",
+        act_quant_percentile=0.999,
+    )
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: False)
+    fallback = runtime_ops_mod.bitnet_transform_input(
+        x,
+        spin_enabled=False,
+        pre_scale=pre_scale,
+        act_quant_mode="static_int8",
+        act_scale=act_scale,
+        act_quant_bits=6,
+        act_quant_method="absmax",
+        act_quant_percentile=0.999,
+    )
+
+    assert torch.equal(native, fallback)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native BitNet input transform dispatch")
+def test_bitnet_transform_input_dynamic_native_matches_python_fallback(monkeypatch):
+    if not runtime_ops_mod.has_native_op("bitnet_transform_input"):
+        pytest.skip("native BitNet input transform op unavailable")
+
+    x = torch.randn(4, 16, 64, device="cuda", dtype=torch.float16)
+    pre_scale = torch.linspace(0.75, 1.25, 64, device="cuda", dtype=torch.float32)
+
+    native = runtime_ops_mod.bitnet_transform_input(
+        x,
+        spin_enabled=False,
+        pre_scale=pre_scale,
+        act_quant_mode="dynamic_int8",
+        act_scale=None,
+        act_quant_bits=6,
+        act_quant_method="absmax",
+        act_quant_percentile=0.999,
+    )
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: False)
+    fallback = runtime_ops_mod.bitnet_transform_input(
+        x,
+        spin_enabled=False,
+        pre_scale=pre_scale,
+        act_quant_mode="dynamic_int8",
+        act_scale=None,
+        act_quant_bits=6,
+        act_quant_method="absmax",
+        act_quant_percentile=0.999,
+    )
+
+    assert torch.equal(native, fallback)
+
+
 def test_quantized_bitnet_linear_exposes_packed_linear_spec():
     layer = quant_mod.QuantizedLinearBitNet(4, 3, bias=True)
     layer.from_float(torch.nn.Linear(4, 3, bias=True))
@@ -258,6 +443,227 @@ def test_quantized_bitnet_linear_exposes_packed_linear_spec():
     assert torch.equal(spec["act_scale"], layer.act_scale.cpu())
 
 
+def test_packed_bitnet_linear_spec_supports_percentile_and_mse_activation_quantization(monkeypatch):
+    seen = {}
+
+    def fake_runtime_int8_linear_from_quantized_activation(qx, row_scale, qweight, inv_scale, bias=None, *, out_dtype=None):
+        del inv_scale, bias
+        seen.setdefault("qxs", []).append(qx.clone())
+        seen.setdefault("row_scales", []).append(row_scale.clone())
+        dtype = torch.float32 if out_dtype is None else out_dtype
+        return torch.full((*qx.shape[:-1], qweight.shape[0]), 2.0, dtype=dtype, device=qx.device)
+
+    monkeypatch.setattr(runtime_quant_mod, "int8_linear_from_quantized_activation", fake_runtime_int8_linear_from_quantized_activation)
+    monkeypatch.setattr(runtime_ops_mod, "native_module", lambda: None)
+
+    x = torch.tensor([[1.0, -2.0, 0.5, 3.0], [0.25, -0.75, 1.5, -1.0]], dtype=torch.float32)
+    layer = quant_mod.QuantizedLinearBitNet(4, 3, bias=True).from_float(torch.nn.Linear(4, 3, bias=True))
+
+    layer.act_quant_mode = "dynamic_int8"
+    layer.act_quant_method = "percentile"
+    layer.act_quant_bits = 6
+    layer.act_quant_percentile = 0.9
+    percentile_spec = layer.runtime_packed_linear_spec(backend="bitnet", dtype=torch.float32, device="cpu")
+    runtime_ops_mod.linear_from_packed_spec(x, percentile_spec, backend="bitnet")
+
+    expected_percentile_scale = quant_mod.calibrate_activation_scale(x, method="percentile", bits=6, p=0.9)
+    expected_percentile_qx = torch.round(x / expected_percentile_scale).clamp_(-31.0, 31.0).to(torch.int8)
+    assert torch.equal(seen["qxs"][0], expected_percentile_qx)
+    assert torch.allclose(seen["row_scales"][0], expected_percentile_scale.reshape(1).expand(x.shape[0]))
+
+    layer.act_quant_mode = "static_int8"
+    layer.act_quant_method = "mse"
+    layer.act_quant_bits = 5
+    layer.act_scale.fill_(0.125)
+    mse_spec = layer.runtime_packed_linear_spec(backend="bitnet", dtype=torch.float32, device="cpu")
+    runtime_ops_mod.linear_from_packed_spec(x, mse_spec, backend="bitnet")
+
+    expected_mse_qx = torch.round(x / layer.act_scale).clamp_(-15.0, 15.0).to(torch.int8)
+    assert torch.equal(seen["qxs"][1], expected_mse_qx)
+    assert torch.allclose(seen["row_scales"][1], layer.act_scale.reshape(1).expand(x.shape[0]))
+
+
+def test_packed_bitnet_int8_linear_spec_prefers_native_from_float_helper(monkeypatch):
+    seen = {}
+
+    class FakeNativeModule:
+        def bitnet_int8_linear_from_float_forward(
+            self,
+            x,
+            qweight,
+            inv_scale,
+            bias,
+            pre_scale,
+            act_quant_mode,
+            act_quant_method,
+            act_quant_bits,
+            act_quant_percentile,
+            act_scale,
+            out_dtype,
+        ):
+            del inv_scale, bias, act_scale
+            seen["x"] = x.clone()
+            seen["qweight_shape"] = tuple(qweight.shape)
+            seen["pre_scale"] = None if pre_scale is None else pre_scale.clone()
+            seen["act_quant_mode"] = act_quant_mode
+            seen["act_quant_method"] = act_quant_method
+            seen["act_quant_bits"] = act_quant_bits
+            seen["act_quant_percentile"] = act_quant_percentile
+            seen["out_dtype"] = out_dtype
+            dtype = torch.float32 if out_dtype is None else out_dtype
+            return torch.full((*x.shape[:-1], qweight.shape[0]), 4.0, dtype=dtype, device=x.device)
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: name == "bitnet_int8_linear_from_float")
+    monkeypatch.setattr(runtime_ops_mod, "native_module", lambda: FakeNativeModule())
+    monkeypatch.setattr(
+        runtime_quant_mod,
+        "int8_linear_from_quantized_activation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("native packed BitNet int8 helper should bypass Python quantized linear")),
+    )
+
+    layer = quant_mod.QuantizedLinearBitNet(4, 3, bias=True).from_float(
+        torch.nn.Linear(4, 3, bias=True),
+        activation_quant="dynamic_int8",
+        activation_quant_bits=6,
+        activation_quant_method="percentile",
+        activation_quant_percentile=0.9,
+    )
+    spec = layer.runtime_packed_linear_spec(backend="bitnet", dtype=torch.float32, device="cpu")
+    x = torch.randn(2, 4, dtype=torch.float32)
+    out = runtime_ops_mod.linear_from_packed_spec(x, spec, backend="bitnet")
+
+    assert out.shape == (2, 3)
+    assert torch.all(out == 4.0)
+    assert seen["qweight_shape"] == (3, 4)
+    assert torch.equal(seen["x"], x)
+    assert seen["pre_scale"] is None
+    assert seen["act_quant_mode"] == "dynamic_int8"
+    assert seen["act_quant_method"] == "percentile"
+    assert seen["act_quant_bits"] == 6
+    assert seen["act_quant_percentile"] == 0.9
+    assert seen["out_dtype"] == torch.float32
+
+
+def test_quantized_bitnet_int8_packed_linear_spec_omits_inactive_transform_tensors():
+    layer = quant_mod.QuantizedLinearBitNet(4, 3, bias=True).from_float(torch.nn.Linear(4, 3, bias=True))
+    layer.act_quant_mode = "dynamic_int8"
+    layer.act_quant_bits = 6
+
+    spec = layer.runtime_packed_linear_spec(backend="bitnet", dtype=torch.float16, device="cpu")
+
+    assert spec["format"] == "bitnet_w2a8_int8"
+    assert spec["spin_enabled"] is False
+    assert spec["spin_signs"] is None
+    assert spec["pre_scale"] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native BitNet input transform dispatch")
+def test_packed_bitnet_linear_spec_uses_native_bitnet_transform_input_when_available(monkeypatch):
+    seen = {}
+
+    class FakeNativeModule:
+        def bitnet_transform_input_forward(
+            self,
+            x,
+            spin_enabled,
+            spin_signs,
+            pre_scale,
+            act_quant_mode,
+            act_quant_method,
+            act_quant_bits,
+            act_quant_percentile,
+            act_scale,
+        ):
+            del spin_enabled, spin_signs, pre_scale, act_quant_mode, act_quant_method, act_quant_bits, act_quant_percentile, act_scale
+            return x + 1.5
+
+    def fake_runtime_bitnet_linear(x, packed_weight, scale_values, layout_header, segment_offsets, bias=None):
+        del packed_weight, scale_values, layout_header, segment_offsets, bias
+        seen["x"] = x.clone()
+        return torch.full((*x.shape[:-1], 3), 2.0, dtype=x.dtype, device=x.device)
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: name == "bitnet_transform_input")
+    monkeypatch.setattr(runtime_ops_mod, "native_module", lambda: FakeNativeModule())
+    monkeypatch.setattr(runtime_quant_mod, "bitnet_linear", fake_runtime_bitnet_linear)
+
+    layer = quant_mod.QuantizedLinearBitNet(4, 3, bias=True).from_float(torch.nn.Linear(4, 3, bias=True))
+    spec = layer.runtime_packed_linear_spec(backend="bitnet", dtype=torch.float16, device="cuda")
+    x = torch.randn(2, 4, device="cuda", dtype=torch.float16)
+    out = runtime_ops_mod.linear_from_packed_spec(x, spec, backend="bitnet")
+
+    assert out.shape == (2, 3)
+    assert torch.all(out == 2.0)
+    assert torch.allclose(seen["x"], x + 1.5)
+
+
+def test_quantized_bitnet_runtime_linear_prefers_bitnet_int8_from_float_helper_for_nospin_w2a8(monkeypatch):
+    seen = {}
+
+    def fake_runtime_bitnet_int8_linear_from_float(
+        x,
+        qweight,
+        inv_scale,
+        bias=None,
+        *,
+        pre_scale=None,
+        act_quant_mode="dynamic_int8",
+        act_scale=None,
+        act_quant_bits=8,
+        act_quant_method="absmax",
+        act_quant_percentile=0.999,
+    ):
+        seen["x"] = x.clone()
+        seen["qweight_shape"] = tuple(qweight.shape)
+        seen["inv_scale_shape"] = tuple(inv_scale.shape)
+        seen["bias"] = None if bias is None else bias.clone()
+        seen["pre_scale"] = None if pre_scale is None else pre_scale.clone()
+        seen["act_quant_mode"] = act_quant_mode
+        seen["act_scale"] = act_scale
+        seen["act_quant_bits"] = act_quant_bits
+        seen["act_quant_method"] = act_quant_method
+        seen["act_quant_percentile"] = act_quant_percentile
+        return torch.full((*x.shape[:-1], 3), 7.0, dtype=x.dtype, device=x.device)
+
+    monkeypatch.setattr(quant_mod, "runtime_bitnet_int8_linear_from_float", fake_runtime_bitnet_int8_linear_from_float)
+    monkeypatch.setattr(
+        quant_mod,
+        "runtime_bitnet_transform_input",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("split BitNet path should not run for no-spin W2A8")),
+    )
+    monkeypatch.setattr(
+        quant_mod,
+        "runtime_bitnet_linear_from_float",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("BitNet from-float path should not run for no-spin W2A8")),
+    )
+    monkeypatch.setattr(
+        quant_mod,
+        "runtime_int8_linear_from_quantized_activation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("split quantized int8 linear path should not run for no-spin W2A8")),
+    )
+
+    layer = quant_mod.QuantizedLinearBitNet(4, 3, bias=True).from_float(torch.nn.Linear(4, 3, bias=True))
+    layer.act_quant_mode = "dynamic_int8"
+    layer.act_quant_bits = 6
+    layer.act_quant_method = "mse"
+    layer.act_quant_percentile = 0.95
+    x = torch.randn(2, 4)
+
+    out = layer.runtime_linear(x)
+
+    assert out.shape == (2, 3)
+    assert torch.all(out == 7.0)
+    assert torch.allclose(seen["x"], x)
+    assert seen["qweight_shape"] == (3, 4)
+    assert seen["inv_scale_shape"] == (3,)
+    assert seen["bias"].shape == (3,)
+    assert seen["pre_scale"] is None
+    assert seen["act_quant_mode"] == "dynamic_int8"
+    assert seen["act_scale"] is None
+    assert seen["act_quant_bits"] == 6
+    assert seen["act_quant_method"] == "mse"
+    assert seen["act_quant_percentile"] == 0.95
+
+
 def test_quantized_bitnet_packed_linear_signature_tracks_activation_percentile():
     layer = quant_mod.QuantizedLinearBitNet(4, 3, bias=True)
     layer.from_float(torch.nn.Linear(4, 3, bias=True))
@@ -274,6 +680,41 @@ def test_quantized_bitnet_packed_linear_signature_tracks_activation_percentile()
     assert sig_a != sig_b
 
 
+def test_quantized_int8_shared_input_signature_ignores_irrelevant_activation_metadata():
+    layer = quant_mod.QuantizedLinearInt8(4, 3, bias=True)
+    layer.from_float(torch.nn.Linear(4, 3, bias=True))
+    layer.act_quant_bits = 8
+
+    layer.act_quant_mode = "dynamic_int8"
+    layer.act_quant_method = "absmax"
+    layer.act_quant_percentile = 0.999
+    layer.act_scale.fill_(0.25)
+    dynamic_sig_a = layer.runtime_shared_int8_input_signature()
+
+    layer.act_scale.fill_(0.5)
+    dynamic_sig_b = layer.runtime_shared_int8_input_signature()
+    assert dynamic_sig_a == dynamic_sig_b
+
+    layer.act_quant_method = "percentile"
+    dynamic_sig_c = layer.runtime_shared_int8_input_signature()
+    assert dynamic_sig_a != dynamic_sig_c
+
+    layer.act_quant_mode = "static_int8"
+    layer.act_quant_method = "absmax"
+    layer.act_quant_percentile = 0.999
+    layer.act_scale.fill_(0.125)
+    static_sig_a = layer.runtime_shared_int8_input_signature()
+
+    layer.act_quant_method = "mse"
+    layer.act_quant_percentile = 0.95
+    static_sig_b = layer.runtime_shared_int8_input_signature()
+    assert static_sig_a == static_sig_b
+
+    layer.act_scale.fill_(0.25)
+    static_sig_c = layer.runtime_shared_int8_input_signature()
+    assert static_sig_a != static_sig_c
+
+
 def test_resolve_packed_linear_module_spec_uses_backend_specific_payload():
     bitnet = quant_mod.QuantizedLinearBitNet(4, 3, bias=True)
     bitnet.from_float(torch.nn.Linear(4, 3, bias=True))
@@ -286,8 +727,10 @@ def test_resolve_packed_linear_module_spec_uses_backend_specific_payload():
         backend="bitnet",
         reference=torch.randn(2, 4, dtype=torch.float16),
     )
-    assert bitnet_spec["format"] == "bitnet_w2a8"
+    assert bitnet_spec["format"] == "bitnet_w2a8_int8"
     assert bitnet_spec["backend"] == "bitnet"
+    assert tuple(bitnet_spec["qweight"].shape) == (3, 4)
+    assert tuple(bitnet_spec["inv_scale"].shape) == (3,)
     assert bitnet_spec["bias"] is not None and bitnet_spec["bias"].dtype == torch.float16
     assert bitnet_spec["act_quant_method"] == "percentile"
     assert bitnet_spec["act_quant_bits"] == 5
@@ -303,6 +746,147 @@ def test_resolve_packed_linear_module_spec_uses_backend_specific_payload():
     assert dense_spec["backend"] == "cublaslt"
     assert tuple(dense_spec["packed_weight"].shape) == tuple(dense.weight.shape)
     assert dense_spec["bias"] is not None and tuple(dense_spec["bias"].shape) == tuple(dense.bias.shape)
+
+
+def test_quantized_bitnet_percentile_weight_calibration_changes_packed_layout():
+    linear = torch.nn.Linear(4, 3, bias=False)
+    with torch.no_grad():
+        linear.weight.copy_(
+            torch.tensor(
+                [
+                    [100.0, 0.2, 0.2, 0.2],
+                    [0.5, 0.4, 0.3, 0.2],
+                    [0.1, 0.1, 0.1, 0.1],
+                ],
+                dtype=torch.float32,
+            )
+        )
+
+    absmax_layer = quant_mod.QuantizedLinearBitNet(4, 3, bias=False).from_float(linear, calibration="absmax")
+    percentile_layer = quant_mod.QuantizedLinearBitNet(4, 3, bias=False).from_float(
+        linear,
+        calibration="percentile",
+        percentile=0.5,
+    )
+
+    assert int(absmax_layer.layout_header[7].item()) == 0
+    assert tuple(absmax_layer.scale_values.shape) == (1,)
+    assert int(percentile_layer.layout_header[7].item()) == 2
+    assert int(percentile_layer.layout_header[8].item()) == 1
+    assert tuple(percentile_layer.scale_values.shape) == (3,)
+    assert not torch.equal(absmax_layer.scale_values.cpu(), percentile_layer.scale_values.cpu())
+
+
+def test_public_pack_bitnet_weight_accepts_explicit_metadata_overrides():
+    weight = torch.tensor(
+        [
+            [0.8, -0.2, 0.1, -0.4],
+            [0.3, 1.6, -0.9, 0.2],
+        ],
+        dtype=torch.float32,
+    )
+    scale_values = torch.tensor([0.5, 1.0], dtype=torch.float32)
+    layout_header = torch.tensor([1, 16, 32, 2, 4, 16, 32, 2, 1, 1, 80, 1, 0], dtype=torch.int32)
+    segment_offsets = torch.tensor([0, 2], dtype=torch.int32)
+
+    packed_weight, packed_scales, packed_header, packed_offsets = runtime_ops_mod.pack_bitnet_weight(
+        weight,
+        scale_values=scale_values,
+        layout_header=layout_header,
+        segment_offsets=segment_offsets,
+    )
+
+    assert torch.equal(packed_scales.cpu(), scale_values)
+    assert torch.equal(packed_header.cpu(), layout_header)
+    assert torch.equal(packed_offsets.cpu(), segment_offsets)
+    dequant = quant_mod._dequantize_bitnet_weight(
+        packed_weight,
+        packed_scales,
+        packed_header,
+        packed_offsets,
+        dtype=torch.float32,
+    )
+    expected = torch.tensor(
+        [
+            [0.5, 0.0, 0.0, -0.5],
+            [0.0, 1.0, -1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    assert torch.allclose(dequant, expected)
+
+
+def test_public_pack_bitnet_weight_supports_percentile_calibration():
+    weight = torch.tensor(
+        [
+            [100.0, 0.2, 0.2, 0.2],
+            [0.5, 0.4, 0.3, 0.2],
+            [0.1, 0.1, 0.1, 0.1],
+        ],
+        dtype=torch.float32,
+    )
+    packed_weight, scale_values, layout_header, segment_offsets = runtime_ops_mod.pack_bitnet_weight(
+        weight,
+        calibration="percentile",
+        percentile=0.5,
+    )
+
+    assert tuple(packed_weight.shape) == (16, 8)
+    assert tuple(scale_values.shape) == (3,)
+    assert int(layout_header[7].item()) == 2
+    assert int(layout_header[8].item()) == 1
+    assert torch.equal(segment_offsets.cpu(), torch.tensor([0, 3], dtype=torch.int32))
+
+
+def test_quantized_bitnet_gptq_delegates_to_public_pack_helper(monkeypatch):
+    seen = {}
+
+    def fake_pack_bitnet_weight(
+        weight,
+        scale_values=None,
+        layout_header=None,
+        segment_offsets=None,
+        *,
+        calibration="absmax",
+        percentile=0.999,
+        weight_opt="none",
+        calibration_inputs=None,
+    ):
+        del scale_values, layout_header, segment_offsets
+        seen["weight"] = tuple(weight.shape)
+        seen["calibration"] = calibration
+        seen["percentile"] = percentile
+        seen["weight_opt"] = weight_opt
+        seen["inputs"] = None if calibration_inputs is None else tuple(calibration_inputs.shape)
+        return (
+            torch.ones((16, 8), dtype=torch.uint8),
+            torch.ones((3,), dtype=torch.float32),
+            torch.tensor([1, 16, 32, 3, 4, 16, 32, 2, 1, 1, 80, 1, 0], dtype=torch.int32),
+            torch.tensor([0, 3], dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(quant_mod, "runtime_pack_bitnet_weight", fake_pack_bitnet_weight)
+
+    layer = quant_mod.QuantizedLinearBitNet(4, 3, bias=True)
+    linear = torch.nn.Linear(4, 3, bias=True)
+    layer.from_float(
+        linear,
+        calibration_inputs=torch.randn(8, 4),
+        weight_opt="gptq",
+        calibration="percentile",
+        percentile=0.9,
+    )
+
+    assert seen == {
+        "weight": (3, 4),
+        "calibration": "percentile",
+        "percentile": 0.9,
+        "weight_opt": "gptq",
+        "inputs": (8, 4),
+    }
+    assert int(layer.layout_header[7].item()) == 2
+    assert int(layer.layout_header[8].item()) == 1
+    assert tuple(layer.scale_values.shape) == (3,)
 
 
 def test_resolve_packed_qkv_module_spec_uses_dense_and_bitnet_payloads():
@@ -335,14 +919,358 @@ def test_resolve_packed_qkv_module_spec_uses_dense_and_bitnet_payloads():
         backend="bitnet",
         reference=reference,
     )
-    assert bitnet_spec["format"] == "bitnet_qkv"
+    assert bitnet_spec["format"] == "bitnet_qkv_fused"
     assert bitnet_spec["backend"] == "bitnet"
     assert bitnet_spec["q_size"] == 3
     assert bitnet_spec["k_size"] == 5
     assert bitnet_spec["v_size"] == 7
+    assert tuple(bitnet_spec["packed_weight"].shape) == (16, 8)
+    assert tuple(bitnet_spec["scale_values"].shape) == (15,)
+    assert tuple(bitnet_spec["layout_header"].shape) == (13,)
+    assert tuple(bitnet_spec["segment_offsets"].shape) == (2,)
+    assert bitnet_spec["packed_bias"] is not None and tuple(bitnet_spec["packed_bias"].shape) == (15,)
+
+
+def test_resolve_packed_qkv_module_spec_falls_back_to_unfused_bitnet_when_input_transforms_differ():
+    reference = torch.randn(2, 4, dtype=torch.float16)
+
+    q_bitnet = quant_mod.QuantizedLinearBitNet(4, 3, bias=True).from_float(torch.nn.Linear(4, 3, bias=True))
+    k_bitnet = quant_mod.QuantizedLinearBitNet(4, 5, bias=True).from_float(torch.nn.Linear(4, 5, bias=True))
+    v_bitnet = quant_mod.QuantizedLinearBitNet(4, 7, bias=True).from_float(torch.nn.Linear(4, 7, bias=True))
+    k_bitnet.pre_scale.fill_(2.0)
+
+    bitnet_spec = runtime_ops_mod.resolve_packed_qkv_module_spec(
+        q_bitnet,
+        k_bitnet,
+        v_bitnet,
+        backend="bitnet",
+        reference=reference,
+    )
+
+    assert bitnet_spec["format"] == "bitnet_qkv"
     assert bitnet_spec["q_spec"]["format"] == "bitnet_w2a8"
     assert bitnet_spec["k_spec"]["format"] == "bitnet_w2a8"
     assert bitnet_spec["v_spec"]["format"] == "bitnet_w2a8"
+
+
+def test_resolve_packed_qkv_module_spec_keeps_fused_bitnet_when_none_mode_metadata_differs():
+    reference = torch.randn(2, 4, dtype=torch.float16)
+
+    q_bitnet = quant_mod.QuantizedLinearBitNet(4, 3, bias=True).from_float(torch.nn.Linear(4, 3, bias=True))
+    k_bitnet = quant_mod.QuantizedLinearBitNet(4, 5, bias=True).from_float(torch.nn.Linear(4, 5, bias=True))
+    v_bitnet = quant_mod.QuantizedLinearBitNet(4, 7, bias=True).from_float(torch.nn.Linear(4, 7, bias=True))
+    k_bitnet.act_quant_method = "mse"
+    v_bitnet.act_quant_percentile = 0.75
+
+    bitnet_spec = runtime_ops_mod.resolve_packed_qkv_module_spec(
+        q_bitnet,
+        k_bitnet,
+        v_bitnet,
+        backend="bitnet",
+        reference=reference,
+    )
+
+    assert bitnet_spec["format"] == "bitnet_qkv_fused"
+
+
+def test_resolve_packed_qkv_module_spec_keeps_fused_bitnet_when_dynamic_mode_act_scale_differs():
+    reference = torch.randn(2, 4, dtype=torch.float16)
+
+    q_bitnet = quant_mod.QuantizedLinearBitNet(4, 3, bias=True).from_float(torch.nn.Linear(4, 3, bias=True))
+    k_bitnet = quant_mod.QuantizedLinearBitNet(4, 5, bias=True).from_float(torch.nn.Linear(4, 5, bias=True))
+    v_bitnet = quant_mod.QuantizedLinearBitNet(4, 7, bias=True).from_float(torch.nn.Linear(4, 7, bias=True))
+    for module in (q_bitnet, k_bitnet, v_bitnet):
+        module.act_quant_mode = "dynamic_int8"
+        module.act_quant_method = "percentile"
+        module.act_quant_bits = 6
+        module.act_quant_percentile = 0.9
+    k_bitnet.act_scale.fill_(0.25)
+    v_bitnet.act_scale.fill_(0.5)
+
+    bitnet_spec = runtime_ops_mod.resolve_packed_qkv_module_spec(
+        q_bitnet,
+        k_bitnet,
+        v_bitnet,
+        backend="bitnet",
+        reference=reference,
+    )
+
+    assert bitnet_spec["format"] == "bitnet_qkv_fused_int8"
+    assert tuple(bitnet_spec["qweight"].shape) == (15, 4)
+    assert tuple(bitnet_spec["inv_scale"].shape) == (15,)
+
+
+def test_resolve_packed_qkv_module_spec_keeps_fused_bitnet_when_spin_disabled_buffers_differ():
+    reference = torch.randn(2, 4, dtype=torch.float16)
+
+    q_bitnet = quant_mod.QuantizedLinearBitNet(4, 3, bias=True).from_float(torch.nn.Linear(4, 3, bias=True))
+    k_bitnet = quant_mod.QuantizedLinearBitNet(4, 5, bias=True).from_float(torch.nn.Linear(4, 5, bias=True))
+    v_bitnet = quant_mod.QuantizedLinearBitNet(4, 7, bias=True).from_float(torch.nn.Linear(4, 7, bias=True))
+    for module in (q_bitnet, k_bitnet, v_bitnet):
+        module.act_quant_mode = "dynamic_int8"
+        module.act_quant_method = "absmax"
+        module.act_quant_bits = 6
+    k_bitnet.spin_signs.copy_(torch.tensor([1.0, -1.0, 1.0, -1.0]))
+    v_bitnet.spin_signs.copy_(torch.tensor([-1.0, -1.0, 1.0, 1.0]))
+
+    bitnet_spec = runtime_ops_mod.resolve_packed_qkv_module_spec(
+        q_bitnet,
+        k_bitnet,
+        v_bitnet,
+        backend="bitnet",
+        reference=reference,
+    )
+
+    assert bitnet_spec["format"] == "bitnet_qkv_fused_int8"
+    assert tuple(bitnet_spec["qweight"].shape) == (15, 4)
+    assert tuple(bitnet_spec["inv_scale"].shape) == (15,)
+
+
+def test_resolve_packed_qkv_module_spec_keeps_fused_bitnet_when_static_mode_calibration_metadata_differs():
+    reference = torch.randn(2, 4, dtype=torch.float16)
+
+    q_bitnet = quant_mod.QuantizedLinearBitNet(4, 3, bias=True).from_float(torch.nn.Linear(4, 3, bias=True))
+    k_bitnet = quant_mod.QuantizedLinearBitNet(4, 5, bias=True).from_float(torch.nn.Linear(4, 5, bias=True))
+    v_bitnet = quant_mod.QuantizedLinearBitNet(4, 7, bias=True).from_float(torch.nn.Linear(4, 7, bias=True))
+    for module in (q_bitnet, k_bitnet, v_bitnet):
+        module.act_quant_mode = "static_int8"
+        module.act_quant_bits = 5
+        module.act_scale.fill_(0.125)
+    k_bitnet.act_quant_method = "mse"
+    v_bitnet.act_quant_percentile = 0.8
+
+    bitnet_spec = runtime_ops_mod.resolve_packed_qkv_module_spec(
+        q_bitnet,
+        k_bitnet,
+        v_bitnet,
+        backend="bitnet",
+        reference=reference,
+    )
+
+    assert bitnet_spec["format"] == "bitnet_qkv_fused_int8"
+    assert tuple(bitnet_spec["qweight"].shape) == (15, 4)
+    assert tuple(bitnet_spec["inv_scale"].shape) == (15,)
+
+
+def test_bitnet_int8_qkv_packed_projection_shares_quantized_input(monkeypatch):
+    reference = torch.randn(2, 4, dtype=torch.float16)
+    q_bitnet = quant_mod.QuantizedLinearBitNet(4, 4, bias=True).from_float(torch.nn.Linear(4, 4, bias=True))
+    k_bitnet = quant_mod.QuantizedLinearBitNet(4, 4, bias=True).from_float(torch.nn.Linear(4, 4, bias=True))
+    v_bitnet = quant_mod.QuantizedLinearBitNet(4, 4, bias=True).from_float(torch.nn.Linear(4, 4, bias=True))
+    for module in (q_bitnet, k_bitnet, v_bitnet):
+        module.act_quant_mode = "dynamic_int8"
+        module.act_quant_method = "percentile"
+        module.act_quant_bits = 6
+        module.act_quant_percentile = 0.9
+
+    qkv_spec = runtime_ops_mod.resolve_packed_qkv_module_spec(
+        q_bitnet,
+        k_bitnet,
+        v_bitnet,
+        backend="bitnet",
+        reference=reference,
+    )
+
+    calls = []
+
+    def fake_runtime_int8_linear_from_quantized_activation(qx, row_scale, qweight, inv_scale, bias=None, *, out_dtype=None):
+        del row_scale, inv_scale, bias
+        calls.append((tuple(qx.shape), int(qweight.shape[0]), out_dtype))
+        dtype = torch.float32 if out_dtype is None else out_dtype
+        return torch.full((*qx.shape[:-1], qweight.shape[0]), 3.0, dtype=dtype, device=qx.device)
+
+    monkeypatch.setattr(runtime_quant_mod, "int8_linear_from_quantized_activation", fake_runtime_int8_linear_from_quantized_activation)
+    monkeypatch.setattr(runtime_ops_mod, "native_module", lambda: None)
+
+    qh, kh, vh = runtime_ops_mod.qkv_packed_spec_heads_projection(
+        torch.randn(2, 3, 4, dtype=torch.float16),
+        qkv_spec,
+        q_heads=2,
+        kv_heads=2,
+        backend="bitnet",
+    )
+
+    assert qkv_spec["format"] == "bitnet_qkv_fused_int8"
+    assert qh.shape == (2, 2, 3, 2)
+    assert kh.shape == (2, 2, 3, 2)
+    assert vh.shape == (2, 2, 3, 2)
+    assert calls == [((2, 3, 4), 12, torch.float16)]
+
+
+def test_bitnet_int8_qkv_packed_projection_prefers_native_from_float_helper(monkeypatch):
+    reference = torch.randn(2, 4, dtype=torch.float16)
+    q_bitnet = quant_mod.QuantizedLinearBitNet(4, 4, bias=True).from_float(torch.nn.Linear(4, 4, bias=True))
+    k_bitnet = quant_mod.QuantizedLinearBitNet(4, 4, bias=True).from_float(torch.nn.Linear(4, 4, bias=True))
+    v_bitnet = quant_mod.QuantizedLinearBitNet(4, 4, bias=True).from_float(torch.nn.Linear(4, 4, bias=True))
+    for module in (q_bitnet, k_bitnet, v_bitnet):
+        module.act_quant_mode = "dynamic_int8"
+        module.act_quant_method = "percentile"
+        module.act_quant_bits = 6
+        module.act_quant_percentile = 0.9
+
+    qkv_spec = runtime_ops_mod.resolve_packed_qkv_module_spec(
+        q_bitnet,
+        k_bitnet,
+        v_bitnet,
+        backend="bitnet",
+        reference=reference,
+    )
+
+    seen = {}
+
+    class FakeNativeModule:
+        def bitnet_int8_linear_from_float_forward(
+            self,
+            x,
+            qweight,
+            inv_scale,
+            bias,
+            pre_scale,
+            act_quant_mode,
+            act_quant_method,
+            act_quant_bits,
+            act_quant_percentile,
+            act_scale,
+            out_dtype,
+        ):
+            del inv_scale, bias, pre_scale, act_scale
+            seen["x_shape"] = tuple(x.shape)
+            seen["qweight_shape"] = tuple(qweight.shape)
+            seen["act_quant_mode"] = act_quant_mode
+            seen["act_quant_method"] = act_quant_method
+            seen["act_quant_bits"] = act_quant_bits
+            seen["act_quant_percentile"] = act_quant_percentile
+            dtype = torch.float32 if out_dtype is None else out_dtype
+            return torch.full((*x.shape[:-1], qweight.shape[0]), 5.0, dtype=dtype, device=x.device)
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: name == "bitnet_int8_linear_from_float")
+    monkeypatch.setattr(runtime_ops_mod, "native_module", lambda: FakeNativeModule())
+    monkeypatch.setattr(
+        runtime_quant_mod,
+        "int8_linear_from_quantized_activation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("native fused BitNet int8 helper should bypass Python quantized linear")),
+    )
+
+    qh, kh, vh = runtime_ops_mod.qkv_packed_spec_heads_projection(
+        torch.randn(2, 3, 4, dtype=torch.float16),
+        qkv_spec,
+        q_heads=2,
+        kv_heads=2,
+        backend="bitnet",
+    )
+
+    assert qkv_spec["format"] == "bitnet_qkv_fused_int8"
+    assert qh.shape == (2, 2, 3, 2)
+    assert kh.shape == (2, 2, 3, 2)
+    assert vh.shape == (2, 2, 3, 2)
+    assert seen["x_shape"] == (2, 3, 4)
+    assert seen["qweight_shape"] == (12, 4)
+    assert seen["act_quant_mode"] == "dynamic_int8"
+    assert seen["act_quant_method"] == "percentile"
+    assert seen["act_quant_bits"] == 6
+    assert seen["act_quant_percentile"] == 0.9
+
+
+def test_bitnet_int8_qkv_packed_projection_prefers_native_fused_helper(monkeypatch):
+    reference = torch.randn(2, 4, dtype=torch.float16)
+    q_bitnet = quant_mod.QuantizedLinearBitNet(4, 4, bias=True).from_float(torch.nn.Linear(4, 4, bias=True))
+    k_bitnet = quant_mod.QuantizedLinearBitNet(4, 4, bias=True).from_float(torch.nn.Linear(4, 4, bias=True))
+    v_bitnet = quant_mod.QuantizedLinearBitNet(4, 4, bias=True).from_float(torch.nn.Linear(4, 4, bias=True))
+    for module in (q_bitnet, k_bitnet, v_bitnet):
+        module.act_quant_mode = "dynamic_int8"
+        module.act_quant_method = "percentile"
+        module.act_quant_bits = 6
+        module.act_quant_percentile = 0.9
+
+    qkv_spec = runtime_ops_mod.resolve_packed_qkv_module_spec(
+        q_bitnet,
+        k_bitnet,
+        v_bitnet,
+        backend="bitnet",
+        reference=reference,
+    )
+
+    seen = {}
+
+    class FakeNativeModule:
+        def bitnet_int8_fused_qkv_packed_heads_projection_forward(
+            self,
+            x,
+            qweight,
+            inv_scale,
+            packed_bias,
+            pre_scale,
+            act_quant_mode,
+            act_quant_method,
+            act_quant_bits,
+            act_quant_percentile,
+            act_scale,
+            q_size,
+            k_size,
+            v_size,
+            q_heads,
+            kv_heads,
+            out_dtype,
+        ):
+            del inv_scale, packed_bias, pre_scale, act_scale
+            seen["x_shape"] = tuple(x.shape)
+            seen["qweight_shape"] = tuple(qweight.shape)
+            seen["act_quant_mode"] = act_quant_mode
+            seen["act_quant_method"] = act_quant_method
+            seen["act_quant_bits"] = act_quant_bits
+            seen["act_quant_percentile"] = act_quant_percentile
+            seen["q_size"] = q_size
+            seen["k_size"] = k_size
+            seen["v_size"] = v_size
+            seen["q_heads"] = q_heads
+            seen["kv_heads"] = kv_heads
+            dtype = torch.float32 if out_dtype is None else out_dtype
+            return (
+                torch.full((x.shape[0], q_heads, x.shape[1], q_size // q_heads), 7.0, dtype=dtype, device=x.device),
+                torch.full((x.shape[0], kv_heads, x.shape[1], k_size // kv_heads), 8.0, dtype=dtype, device=x.device),
+                torch.full((x.shape[0], kv_heads, x.shape[1], v_size // kv_heads), 9.0, dtype=dtype, device=x.device),
+            )
+
+    monkeypatch.setattr(
+        runtime_ops_mod,
+        "has_native_op",
+        lambda name: name == "bitnet_int8_fused_qkv_packed_heads_projection",
+    )
+    monkeypatch.setattr(runtime_ops_mod, "native_module", lambda: FakeNativeModule())
+    monkeypatch.setattr(
+        runtime_ops_mod,
+        "_bitnet_int8_linear_from_float_input",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("native fused BitNet int8 QKV helper should bypass fused Python linear helper")
+        ),
+    )
+
+    qh, kh, vh = runtime_ops_mod.qkv_packed_spec_heads_projection(
+        torch.randn(2, 3, 4, dtype=torch.float16),
+        qkv_spec,
+        q_heads=2,
+        kv_heads=2,
+        backend="bitnet",
+    )
+
+    assert qkv_spec["format"] == "bitnet_qkv_fused_int8"
+    assert qh.shape == (2, 2, 3, 2)
+    assert kh.shape == (2, 2, 3, 2)
+    assert vh.shape == (2, 2, 3, 2)
+    assert torch.all(qh == 7.0)
+    assert torch.all(kh == 8.0)
+    assert torch.all(vh == 9.0)
+    assert seen["x_shape"] == (2, 3, 4)
+    assert seen["qweight_shape"] == (12, 4)
+    assert seen["act_quant_mode"] == "dynamic_int8"
+    assert seen["act_quant_method"] == "percentile"
+    assert seen["act_quant_bits"] == 6
+    assert seen["act_quant_percentile"] == 0.9
+    assert seen["q_size"] == 4
+    assert seen["k_size"] == 4
+    assert seen["v_size"] == 4
+    assert seen["q_heads"] == 2
+    assert seen["kv_heads"] == 2
 
 
 def test_packed_bitnet_projection_helpers_execute_from_spec(monkeypatch):
@@ -355,6 +1283,7 @@ def test_packed_bitnet_projection_helpers_execute_from_spec(monkeypatch):
         return torch.full(x.shape[:-1] + (out_features,), float(len(calls)), dtype=x.dtype, device=x.device)
 
     monkeypatch.setattr(runtime_quant_mod, "bitnet_linear", fake_runtime_bitnet_linear)
+    monkeypatch.setattr(runtime_ops_mod, "native_module", lambda: None)
 
     q_bitnet = quant_mod.QuantizedLinearBitNet(4, 3, bias=True).from_float(torch.nn.Linear(4, 3, bias=True))
     k_bitnet = quant_mod.QuantizedLinearBitNet(4, 5, bias=True).from_float(torch.nn.Linear(4, 5, bias=True))
@@ -378,7 +1307,7 @@ def test_packed_bitnet_projection_helpers_execute_from_spec(monkeypatch):
     assert qh.shape == (2, 1, 3, 3)
     assert kh.shape == (2, 1, 3, 5)
     assert vh.shape == (2, 1, 3, 7)
-    assert calls[:3] == [((2, 3, 4), 3), ((2, 3, 4), 5), ((2, 3, 4), 7)]
+    assert calls[0] == ((2, 3, 4), 15)
 
     out_spec = runtime_ops_mod.resolve_packed_linear_module_spec(
         quant_mod.QuantizedLinearBitNet(7, 4, bias=True).from_float(torch.nn.Linear(7, 4, bias=True)),
@@ -391,7 +1320,7 @@ def test_packed_bitnet_projection_helpers_execute_from_spec(monkeypatch):
         backend="bitnet",
     )
     assert out.shape == (2, 3, 4)
-    assert calls[3] == ((2, 3, 7), 4)
+    assert calls[1] == ((2, 3, 7), 4)
 
 
 def test_bitnet_qkv_packed_projection_uses_native_helper_when_available(monkeypatch):
@@ -409,47 +1338,37 @@ def test_bitnet_qkv_packed_projection_uses_native_helper_when_available(monkeypa
     calls = {}
 
     class FakeNativeModule:
-        def bitnet_qkv_packed_heads_projection_forward(
+        def bitnet_fused_qkv_packed_heads_projection_forward(
             self,
-            q_x,
-            q_packed_weight,
-            q_scale_values,
-            q_layout_header,
-            q_segment_offsets,
-            q_bias,
-            k_x,
-            k_packed_weight,
-            k_scale_values,
-            k_layout_header,
-            k_segment_offsets,
-            k_bias,
-            v_x,
-            v_packed_weight,
-            v_scale_values,
-            v_layout_header,
-            v_segment_offsets,
-            v_bias,
+            x,
+            packed_weight,
+            scale_values,
+            layout_header,
+            segment_offsets,
+            packed_bias,
+            q_size,
+            k_size,
+            v_size,
             q_heads,
             kv_heads,
         ):
-            del q_packed_weight, q_scale_values, q_segment_offsets, q_bias
-            del k_packed_weight, k_scale_values, k_segment_offsets, k_bias
-            del v_packed_weight, v_scale_values, v_segment_offsets, v_bias
-            calls["q_x"] = tuple(q_x.shape)
-            calls["k_x"] = tuple(k_x.shape)
-            calls["v_x"] = tuple(v_x.shape)
+            del packed_weight, scale_values, segment_offsets, packed_bias
+            calls["x"] = tuple(x.shape)
+            calls["q_size"] = int(q_size)
+            calls["k_size"] = int(k_size)
+            calls["v_size"] = int(v_size)
             calls["q_heads"] = int(q_heads)
             calls["kv_heads"] = int(kv_heads)
-            q_width = int(q_layout_header[3].item()) // int(q_heads)
-            k_width = int(k_layout_header[3].item()) // int(kv_heads)
-            v_width = int(v_layout_header[3].item()) // int(kv_heads)
+            q_width = int(q_size) // int(q_heads)
+            k_width = int(k_size) // int(kv_heads)
+            v_width = int(v_size) // int(kv_heads)
             return (
-                torch.full((q_x.shape[0], int(q_heads), q_x.shape[1], q_width), 1.0, dtype=q_x.dtype),
-                torch.full((k_x.shape[0], int(kv_heads), k_x.shape[1], k_width), 2.0, dtype=k_x.dtype),
-                torch.full((v_x.shape[0], int(kv_heads), v_x.shape[1], v_width), 3.0, dtype=v_x.dtype),
+                torch.full((x.shape[0], int(q_heads), x.shape[1], q_width), 1.0, dtype=x.dtype),
+                torch.full((x.shape[0], int(kv_heads), x.shape[1], k_width), 2.0, dtype=x.dtype),
+                torch.full((x.shape[0], int(kv_heads), x.shape[1], v_width), 3.0, dtype=x.dtype),
             )
 
-    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: name == "bitnet_qkv_packed_heads_projection")
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: name == "bitnet_fused_qkv_packed_heads_projection")
     monkeypatch.setattr(runtime_ops_mod, "native_module", lambda: FakeNativeModule())
     monkeypatch.setattr(
         runtime_quant_mod,
@@ -470,9 +1389,10 @@ def test_bitnet_qkv_packed_projection_uses_native_helper_when_available(monkeypa
     assert kh.shape == (2, 2, 3, 2)
     assert vh.shape == (2, 2, 3, 2)
     assert calls == {
-        "q_x": (2, 3, 4),
-        "k_x": (2, 3, 4),
-        "v_x": (2, 3, 4),
+        "x": (2, 3, 4),
+        "q_size": 4,
+        "k_size": 4,
+        "v_size": 4,
         "q_heads": 2,
         "kv_heads": 2,
     }

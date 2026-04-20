@@ -134,3 +134,36 @@ def test_runtime_exporter_threads_awq_and_activation_quantization(monkeypatch, t
     assert seen["quant"]["activation_quant_method"] == "percentile"
     assert seen["quant"]["activation_quant_percentile"] == 0.995
     assert set(seen["quant"]["calibration_inputs"]) == {"layer.w_q"}
+
+
+def test_runtime_exporter_accepts_nf4_quantization(monkeypatch):
+    seen = {}
+
+    def fake_apply_compression(model, *, quant=None, lora=None):
+        del model, lora
+        seen["quant"] = quant
+        return {}
+
+    monkeypatch.setattr(runtime_exporter_mod, "apply_compression", fake_apply_compression)
+
+    runtime_exporter_mod._maybe_apply_quantization(
+        torch.nn.Linear(16, 8, bias=False),
+        type(
+            "ExportCfg",
+            (),
+            {
+                "quantize": "nf4",
+                "quant_spin": False,
+                "quant_spin_seed": 0,
+                "quant_weight_opt": "none",
+                "quant_activation_quant": None,
+                "quant_activation_quant_bits": 8,
+                "quant_activation_quant_method": "absmax",
+                "quant_activation_quant_percentile": 0.999,
+                "quant_calibration_inputs_path": None,
+            },
+        )(),
+    )
+
+    assert seen["quant"] is not None
+    assert seen["quant"]["scheme"] == "nf4"

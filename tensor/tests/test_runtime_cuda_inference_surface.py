@@ -22,6 +22,7 @@ def test_runtime_package_exports_cuda_inference_surface():
     assert runtime_pkg.resolve_generation_sampling_mode is runtime_generation_mod.resolve_generation_sampling_mode
     assert runtime_pkg.resolve_linear_backend is runtime_native_mod.resolve_linear_backend
     assert runtime_pkg.bitnet_linear is runtime_quant_mod.bitnet_linear
+    assert runtime_pkg.nf4_linear is runtime_quant_mod.nf4_linear
     assert runtime_pkg.int4_linear is runtime_quant_mod.int4_linear
     assert runtime_pkg.int8_linear is runtime_quant_mod.int8_linear
     assert runtime_pkg.native_module is runtime_native_mod.native_module

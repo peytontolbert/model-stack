@@ -7,7 +7,29 @@ from runtime.attention import select_attention_backend
 from runtime.hardware import prefer_hopper_library_attention
 from runtime.native import has_native_op, native_module
 from runtime.ops import attention as runtime_attention
+from runtime.ops import bitnet_transform_input as runtime_bitnet_transform_input
 from runtime.ops import linear as runtime_linear
+from tensor.numerics import mse_scale, percentile_scale
+
+
+_NF4_CODEBOOK_VALUES = (
+    -1.0,
+    -0.6961928009986877,
+    -0.5250730514526367,
+    -0.39491748809814453,
+    -0.28444138169288635,
+    -0.18477343022823334,
+    -0.09105003625154495,
+    0.0,
+    0.07958029955625534,
+    0.16093020141124725,
+    0.24611230194568634,
+    0.33791524171829224,
+    0.44070982933044434,
+    0.5626170039176941,
+    0.7229568362236023,
+    1.0,
+)
 
 
 def _should_use_eager_autograd_fallback(*tensors: torch.Tensor | None) -> bool:
@@ -56,6 +78,56 @@ def _dequantize_packed_int4_weight(
     qweight = _unpack_packed_int4(qweight_packed, original_last_dim=original_last_dim)
     scale = _broadcast_scale(inv_scale, qweight)
     return qweight.to(device=scale.device, dtype=torch.float32).mul(scale).to(dtype=dtype)
+
+
+def _nf4_codebook(*, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    return torch.tensor(_NF4_CODEBOOK_VALUES, device=device, dtype=dtype)
+
+
+def _pack_packed_uint4(qcodes: torch.Tensor) -> torch.Tensor:
+    if qcodes.dtype not in {torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64}:
+        raise TypeError("NF4 code tensor must use an integer dtype")
+    q = qcodes.to(dtype=torch.int16)
+    if bool(((q < 0) | (q > 15)).any()):
+        raise ValueError("NF4 codes must be in [0, 15]")
+    if q.size(-1) % 2 != 0:
+        pad = torch.zeros((*q.shape[:-1], 1), dtype=q.dtype, device=q.device)
+        q = torch.cat([q, pad], dim=-1)
+    low = q[..., 0::2]
+    high = q[..., 1::2]
+    return (low | (high << 4)).to(dtype=torch.uint8)
+
+
+def _unpack_packed_uint4(qweight_packed: torch.Tensor, *, original_last_dim: int) -> torch.Tensor:
+    if qweight_packed.dtype != torch.uint8:
+        raise TypeError("packed NF4 tensor must use uint8 storage")
+    packed = qweight_packed.to(dtype=torch.int16)
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    return torch.stack((low, high), dim=-1).flatten(-2)[..., :original_last_dim].to(dtype=torch.uint8)
+
+
+def _dequantize_nf4_codes(
+    qcodes: torch.Tensor,
+    scale: torch.Tensor | float,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    codebook = _nf4_codebook(device=qcodes.device, dtype=torch.float32)
+    decoded = codebook[qcodes.to(dtype=torch.long)]
+    scale_t = _broadcast_scale(scale, decoded)
+    return decoded.mul(scale_t).to(dtype=dtype)
+
+
+def _dequantize_packed_nf4_weight(
+    qweight_packed: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    original_last_dim: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    qcodes = _unpack_packed_uint4(qweight_packed, original_last_dim=original_last_dim)
+    return _dequantize_nf4_codes(qcodes, scale, dtype=dtype)
 
 
 _BITNET_LAYOUT_HEADER_LEN = 13
@@ -168,6 +240,8 @@ def _normalize_bitnet_layout_inputs(
         raise ValueError("BitNet logical dimensions must be positive")
     if meta["padded_out_features"] < meta["logical_out_features"] or meta["padded_in_features"] < meta["logical_in_features"]:
         raise ValueError("BitNet padded dimensions must be at least the logical dimensions")
+    if meta["interleave_mode"] != 1:
+        raise ValueError(f"Unsupported BitNet interleave_mode: {meta['interleave_mode']}")
     expected_cols = (meta["padded_in_features"] + 3) // 4
     if int(packed_cast.shape[0]) != meta["padded_out_features"] or int(packed_cast.shape[1]) != expected_cols:
         raise ValueError(
@@ -222,16 +296,20 @@ def per_channel_absmax(x: torch.Tensor, axis: int) -> torch.Tensor:
 
 
 def nf4_quantize(x: torch.Tensor, scale: torch.Tensor):
-    # Simplified placeholder quantization to 16 buckets (NF4-like).
-    q = torch.clamp((x / (scale + 1e-6)) * 7.0, -7.0, 7.0)
-    q = torch.round(q).to(torch.int8)
-    meta = scale
-    return q, meta
+    meta = scale if isinstance(scale, torch.Tensor) else torch.tensor(scale, device=x.device, dtype=torch.float32)
+    meta = meta.to(device=x.device, dtype=torch.float32)
+    scale_t = _broadcast_scale(meta, x).clamp_min(1e-8)
+    x_norm = x.to(device=scale_t.device, dtype=torch.float32).div(scale_t)
+    codebook = _nf4_codebook(device=x_norm.device, dtype=torch.float32)
+    x_norm = x_norm.clamp(min=float(codebook[0].item()), max=float(codebook[-1].item()))
+    distances = (x_norm.unsqueeze(-1) - codebook).abs()
+    qcodes = torch.argmin(distances, dim=-1).to(dtype=torch.uint8)
+    return qcodes, meta
 
 
 def nf4_dequantize(qx: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
     target_dtype = meta.dtype if meta.dtype.is_floating_point else torch.float32
-    return _dequantize_to_dtype(qx, meta / 7.0, dtype=target_dtype)
+    return _dequantize_nf4_codes(qx.to(dtype=torch.uint8), meta, dtype=target_dtype)
 
 
 def quantize_activation_int8_rowwise(
@@ -317,6 +395,45 @@ def _dequantize_int8_weight(
 ) -> torch.Tensor:
     scale = _broadcast_scale(inv_scale, qweight)
     return qweight.to(device=scale.device, dtype=torch.float32).mul(scale).to(dtype=dtype)
+
+
+def _coerce_optional_row_scale(
+    scale: torch.Tensor | float | None,
+    *,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if scale is None:
+        return None
+    scale_t = scale if isinstance(scale, torch.Tensor) else torch.tensor(scale, device=device, dtype=torch.float32)
+    return scale_t.to(device=device, dtype=torch.float32).reshape(-1).contiguous()
+
+
+def _bitnet_quant_max(bits: int) -> int:
+    if bits < 2:
+        raise ValueError("bits must be >= 2")
+    return (1 << (bits - 1)) - 1
+
+
+def _calibrate_bitnet_activation_scale(
+    x: torch.Tensor,
+    *,
+    method: str,
+    bits: int,
+    percentile: float,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    qmax = float(_bitnet_quant_max(bits))
+    x_float = x.detach().float()
+    method_name = str(method).strip().lower()
+    if method_name == "absmax":
+        clip = x_float.abs().amax()
+    elif method_name == "percentile":
+        clip = percentile_scale(x_float, p=float(percentile))
+    elif method_name == "mse":
+        clip = mse_scale(x_float)
+    else:
+        raise ValueError(f"Unknown BitNet activation calibration method: {method}")
+    return (clip.clamp_min(eps) / qmax).to(device=x.device, dtype=torch.float32)
 
 
 def int8_linear_from_quantized_activation(
@@ -417,9 +534,9 @@ def int8_matmul_qkv(
                 scale,
                 compute_dtype,
             )
-    qf = _dequantize_to_dtype(q_cast, q_scales_raw, dtype=compute_dtype)
-    kf = _dequantize_to_dtype(k_cast, k_scales_raw, dtype=compute_dtype)
-    vf = _dequantize_to_dtype(v_cast, v_scales_raw, dtype=compute_dtype)
+    qf = _dequantize_int8_activation(q_cast, q_scales_raw.reshape(-1), dtype=compute_dtype)
+    kf = _dequantize_int8_activation(k_cast, k_scales_raw.reshape(-1), dtype=compute_dtype)
+    vf = _dequantize_int8_activation(v_cast, v_scales_raw.reshape(-1), dtype=compute_dtype)
     backend = None
     if prefer_library:
         backend = select_attention_backend(
@@ -444,6 +561,65 @@ def int8_matmul_qkv(
     )
 
 
+def int8_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    *,
+    is_causal: bool = False,
+    scale: float | None = None,
+    out_dtype: torch.dtype | None = None,
+    q_scale: torch.Tensor | float | None = None,
+    k_scale: torch.Tensor | float | None = None,
+    v_scale: torch.Tensor | float | None = None,
+) -> torch.Tensor:
+    compute_dtype = out_dtype if out_dtype is not None else (q.dtype if q.dtype.is_floating_point else torch.float32)
+    target_device = q.device
+    q_cast = q.to(device=target_device, dtype=compute_dtype)
+    k_cast = k.to(device=target_device, dtype=compute_dtype)
+    v_cast = v.to(device=target_device, dtype=compute_dtype)
+    attn_mask_cast = None if attn_mask is None else attn_mask.to(device=target_device)
+    q_scale_cast = _coerce_optional_row_scale(q_scale, device=target_device)
+    k_scale_cast = _coerce_optional_row_scale(k_scale, device=target_device)
+    v_scale_cast = _coerce_optional_row_scale(v_scale, device=target_device)
+    if q_cast.is_cuda and not _should_use_eager_autograd_fallback(q_cast, k_cast, v_cast):
+        module = native_module()
+        if (
+            has_native_op("int8_attention_from_float")
+            and module is not None
+            and hasattr(module, "int8_attention_from_float_forward")
+        ):
+            return module.int8_attention_from_float_forward(
+                q_cast,
+                k_cast,
+                v_cast,
+                attn_mask_cast,
+                bool(is_causal),
+                scale,
+                compute_dtype,
+                q_scale_cast,
+                k_scale_cast,
+                v_scale_cast,
+            )
+
+    qq, q_scale_row = quantize_activation_int8_rowwise(q_cast, scale=q_scale_cast)
+    kk, k_scale_row = quantize_activation_int8_rowwise(k_cast, scale=k_scale_cast)
+    vv, v_scale_row = quantize_activation_int8_rowwise(v_cast, scale=v_scale_cast)
+    return int8_matmul_qkv(
+        qq,
+        kk,
+        vv,
+        q_scale_row,
+        k_scale_row,
+        v_scale_row,
+        attn_mask_cast,
+        is_causal=is_causal,
+        scale=scale,
+        out_dtype=compute_dtype,
+    )
+
+
 def int8_linear(
     x: torch.Tensor,
     qweight: torch.Tensor,
@@ -457,27 +633,127 @@ def int8_linear(
     compute_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
     target_device = qweight.device
     x_cast = x.to(device=target_device, dtype=compute_dtype)
+    bias_cast = None if bias is None else bias.to(device=target_device, dtype=compute_dtype)
     if _should_use_eager_autograd_fallback(x_cast, bias):
-        bias_cast = None if bias is None else bias.to(device=target_device, dtype=compute_dtype)
         weight = _dequantize_int8_weight(
             qweight.to(device=target_device, dtype=torch.int8),
             inv_scale.to(device=target_device, dtype=torch.float32),
             dtype=compute_dtype,
         )
         return runtime_linear(x_cast, weight, bias_cast)
+    act_scale_cast = _coerce_optional_row_scale(act_scale, device=target_device)
+    if x_cast.is_cuda:
+        module = native_module()
+        if (
+            has_native_op("int8_linear_from_float")
+            and module is not None
+            and hasattr(module, "int8_linear_from_float_forward")
+        ):
+            return module.int8_linear_from_float_forward(
+                x_cast,
+                qweight.to(device=target_device, dtype=torch.int8).contiguous(),
+                inv_scale.to(device=target_device, dtype=torch.float32).contiguous(),
+                bias_cast,
+                act_scale_cast,
+                compute_dtype,
+            )
 
     qx_cast, row_scale = quantize_activation_int8_rowwise(
         x_cast,
-        scale=act_scale,
+        scale=act_scale_cast,
         method=act_method,
         percentile=act_percentile,
     )
-    bias_cast = None if bias is None else bias.to(device=target_device, dtype=compute_dtype)
     return int8_linear_from_quantized_activation(
         qx_cast,
         row_scale,
         qweight,
         inv_scale,
+        bias_cast,
+        out_dtype=compute_dtype,
+    )
+
+
+def bitnet_int8_linear_from_float(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    inv_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    pre_scale: torch.Tensor | None = None,
+    act_quant_mode: str = "dynamic_int8",
+    act_scale: torch.Tensor | float | None = None,
+    act_quant_bits: int = 8,
+    act_quant_method: str = "absmax",
+    act_quant_percentile: float = 0.999,
+) -> torch.Tensor:
+    compute_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
+    target_device = qweight.device
+    x_cast = x.to(device=target_device, dtype=compute_dtype)
+    qweight_cast = qweight.to(device=target_device, dtype=torch.int8).contiguous()
+    inv_scale_cast = inv_scale.to(device=target_device, dtype=torch.float32).contiguous()
+    bias_cast = None if bias is None else bias.to(device=target_device, dtype=compute_dtype)
+    pre_scale_cast = None
+    if pre_scale is not None:
+        pre_scale_cast = pre_scale.to(device=target_device, dtype=compute_dtype).reshape(-1).contiguous()
+    act_scale_cast = _coerce_optional_row_scale(act_scale, device=target_device)
+
+    if not _should_use_eager_autograd_fallback(x_cast, bias_cast):
+        if x_cast.is_cuda:
+            module = native_module()
+            if (
+                has_native_op("bitnet_int8_linear_from_float")
+                and module is not None
+                and hasattr(module, "bitnet_int8_linear_from_float_forward")
+            ):
+                return module.bitnet_int8_linear_from_float_forward(
+                    x_cast,
+                    qweight_cast,
+                    inv_scale_cast,
+                    bias_cast,
+                    pre_scale_cast,
+                    str(act_quant_mode),
+                    str(act_quant_method),
+                    int(act_quant_bits),
+                    float(act_quant_percentile),
+                    act_scale_cast,
+                    compute_dtype,
+                )
+
+    x_local = x_cast
+    if pre_scale_cast is not None:
+        x_local = x_local / pre_scale_cast.view(*([1] * (x_local.ndim - 1)), -1)
+
+    flat = x_local.reshape(-1, x_local.shape[-1])
+    rows = int(flat.shape[0])
+    mode_name = str(act_quant_mode).strip().lower()
+    if mode_name == "dynamic_int8":
+        row_scale = _calibrate_bitnet_activation_scale(
+            x_local,
+            method=act_quant_method,
+            bits=int(act_quant_bits),
+            percentile=float(act_quant_percentile),
+        ).reshape(1).expand(rows).contiguous()
+    elif mode_name == "static_int8":
+        if act_scale_cast is None:
+            raise ValueError("BitNet static_int8 requires act_scale")
+        if act_scale_cast.numel() == 1:
+            row_scale = act_scale_cast.expand(rows).contiguous()
+        elif act_scale_cast.numel() == rows:
+            row_scale = act_scale_cast.contiguous()
+        else:
+            raise ValueError("BitNet static_int8 act_scale must have 1 or rows elements")
+        row_scale = row_scale.clamp_min_(1e-8)
+    else:
+        raise ValueError("BitNet int8 from-float requires act_quant_mode in {dynamic_int8, static_int8}")
+
+    qmax = float(_bitnet_quant_max(int(act_quant_bits)))
+    qx_cast = torch.round(flat.float() / row_scale.unsqueeze(-1)).clamp_(-qmax, qmax).to(dtype=torch.int8).view_as(x_local)
+    return int8_linear_from_quantized_activation(
+        qx_cast,
+        row_scale,
+        qweight_cast,
+        inv_scale_cast,
         bias_cast,
         out_dtype=compute_dtype,
     )
@@ -493,9 +769,58 @@ def fp8_linear(
     amax_tracker.update(weight_fp8)
     compute_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
     target_device = weight_fp8.device
-    weight = _dequantize_to_dtype(weight_fp8, float(scale), dtype=compute_dtype)
+    x_cast = x.to(device=target_device, dtype=compute_dtype)
     bias_cast = None if bias is None else bias.to(device=target_device, dtype=compute_dtype)
-    return runtime_linear(x.to(device=target_device, dtype=compute_dtype), weight, bias_cast)
+    if x_cast.is_cuda and not _should_use_eager_autograd_fallback(x_cast, bias_cast):
+        module = native_module()
+        if (
+            has_native_op("fp8_linear")
+            and module is not None
+            and hasattr(module, "fp8_linear_forward")
+        ):
+            return module.fp8_linear_forward(
+                x_cast,
+                weight_fp8.to(device=target_device).contiguous(),
+                float(scale),
+                bias_cast,
+                compute_dtype,
+            )
+    weight = _dequantize_to_dtype(weight_fp8, float(scale), dtype=compute_dtype)
+    return runtime_linear(x_cast, weight, bias_cast)
+
+
+def nf4_linear(
+    x: torch.Tensor,
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    compute_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
+    target_device = weight_packed.device
+    x_cast = x.to(device=target_device, dtype=compute_dtype)
+    packed_cast = weight_packed.to(device=target_device, dtype=torch.uint8)
+    scale_cast = weight_scale.to(device=target_device, dtype=torch.float32)
+    bias_cast = None if bias is None else bias.to(device=target_device, dtype=compute_dtype)
+    if packed_cast.is_cuda and not _should_use_eager_autograd_fallback(x_cast, bias_cast):
+        module = native_module()
+        if (
+            has_native_op("nf4_linear")
+            and module is not None
+            and hasattr(module, "nf4_linear_forward")
+        ):
+            return module.nf4_linear_forward(
+                x_cast,
+                packed_cast.contiguous(),
+                scale_cast.contiguous(),
+                bias_cast,
+            )
+    weight = _dequantize_packed_nf4_weight(
+        packed_cast,
+        scale_cast,
+        original_last_dim=int(x_cast.shape[-1]),
+        dtype=compute_dtype,
+    )
+    return runtime_linear(x_cast, weight, bias_cast)
 
 
 def int4_linear(
@@ -577,15 +902,109 @@ def bitnet_linear(
     return runtime_linear(x_cast, weight, bias_cast)
 
 
+def bitnet_linear_from_float(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    scale_values: torch.Tensor,
+    layout_header: torch.Tensor,
+    segment_offsets: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    spin_enabled: bool = False,
+    spin_signs: torch.Tensor | None = None,
+    pre_scale: torch.Tensor | None = None,
+    act_quant_mode: str = "none",
+    act_scale: torch.Tensor | float | None = None,
+    act_quant_bits: int = 8,
+    act_quant_method: str = "absmax",
+    act_quant_percentile: float = 0.999,
+) -> torch.Tensor:
+    compute_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
+    target_device = packed_weight.device
+    x_cast = x.to(device=target_device, dtype=compute_dtype)
+    packed_cast, scales_cast, header_cast, offsets_cast, meta = _normalize_bitnet_layout_inputs(
+        packed_weight,
+        scale_values,
+        layout_header,
+        segment_offsets,
+        target_device=target_device,
+    )
+    if int(x_cast.shape[-1]) != meta["logical_in_features"]:
+        raise ValueError(
+            "BitNet input feature mismatch: "
+            f"expected {meta['logical_in_features']}, got {int(x_cast.shape[-1])}"
+        )
+    bias_cast = None if bias is None else bias.to(device=target_device, dtype=compute_dtype)
+    if bias_cast is not None and int(bias_cast.shape[0]) != meta["logical_out_features"]:
+        raise ValueError(
+            "BitNet bias size mismatch: "
+            f"expected {meta['logical_out_features']}, got {int(bias_cast.shape[0])}"
+        )
+    spin_signs_cast = None
+    if spin_signs is not None:
+        spin_signs_cast = spin_signs.to(device=target_device, dtype=torch.float32).reshape(-1).contiguous()
+    pre_scale_cast = None
+    if pre_scale is not None:
+        pre_scale_cast = pre_scale.to(device=target_device, dtype=compute_dtype).reshape(-1).contiguous()
+    act_scale_cast = _coerce_optional_row_scale(act_scale, device=target_device)
+    if x_cast.is_cuda and not _should_use_eager_autograd_fallback(x_cast, bias_cast):
+        module = native_module()
+        if (
+            has_native_op("bitnet_linear_from_float")
+            and module is not None
+            and hasattr(module, "bitnet_linear_from_float_forward")
+        ):
+            return module.bitnet_linear_from_float_forward(
+                x_cast,
+                packed_cast,
+                scales_cast,
+                header_cast,
+                offsets_cast,
+                bias_cast,
+                bool(spin_enabled),
+                spin_signs_cast,
+                pre_scale_cast,
+                str(act_quant_mode),
+                str(act_quant_method),
+                int(act_quant_bits),
+                float(act_quant_percentile),
+                act_scale_cast,
+                None,
+            )
+
+    x_local = runtime_bitnet_transform_input(
+        x_cast,
+        spin_enabled=bool(spin_enabled),
+        spin_signs=spin_signs_cast,
+        pre_scale=pre_scale_cast,
+        act_quant_mode=str(act_quant_mode),
+        act_scale=act_scale_cast,
+        act_quant_bits=int(act_quant_bits),
+        act_quant_method=str(act_quant_method),
+        act_quant_percentile=float(act_quant_percentile),
+    )
+    return bitnet_linear(
+        x_local,
+        packed_cast,
+        scales_cast,
+        header_cast,
+        offsets_cast,
+        bias_cast,
+    )
+
+
 __all__ = [
     "per_channel_absmax",
     "nf4_quantize",
     "nf4_dequantize",
     "quantize_activation_int8_rowwise",
+    "int8_attention",
     "int8_matmul_qkv",
     "int8_linear_from_quantized_activation",
     "int8_linear",
     "bitnet_linear",
+    "bitnet_linear_from_float",
     "fp8_linear",
+    "nf4_linear",
     "int4_linear",
 ]

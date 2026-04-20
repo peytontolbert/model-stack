@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <memory>
 #include <vector>
 
 namespace {
@@ -56,6 +57,158 @@ bool IsSupportedInt8LinearOutDtype(torch::ScalarType dtype) {
 bool Int8CublasLtDisabled() {
   const char* env = std::getenv("MODEL_STACK_DISABLE_INT8_LINEAR_CUBLASLT");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+struct CachedInt8AccumMatmulPlan {
+  int device_index = -1;
+  int64_t m = 0;
+  int64_t n = 0;
+  int64_t k = 0;
+  size_t workspace_size = 0;
+  cublasLtMatmulDesc_t op_desc = nullptr;
+  cublasLtMatrixLayout_t a_desc = nullptr;
+  cublasLtMatrixLayout_t b_desc = nullptr;
+  cublasLtMatrixLayout_t c_desc = nullptr;
+  cublasLtMatmulHeuristicResult_t heuristic{};
+
+  ~CachedInt8AccumMatmulPlan() {
+    if (c_desc != nullptr) {
+      cublasLtMatrixLayoutDestroy(c_desc);
+    }
+    if (b_desc != nullptr) {
+      cublasLtMatrixLayoutDestroy(b_desc);
+    }
+    if (a_desc != nullptr) {
+      cublasLtMatrixLayoutDestroy(a_desc);
+    }
+    if (op_desc != nullptr) {
+      cublasLtMatmulDescDestroy(op_desc);
+    }
+  }
+
+  bool Matches(int device, int64_t m_value, int64_t n_value, int64_t k_value, size_t workspace_value) const {
+    return device_index == device && m == m_value && n == n_value && k == k_value && workspace_size == workspace_value;
+  }
+};
+
+struct CachedInt8AccumScratch {
+  int device_index = -1;
+  std::uintptr_t stream_key = 0;
+  int64_t m = 0;
+  int64_t n = 0;
+  torch::Tensor accum;
+
+  bool Matches(int device, std::uintptr_t stream, int64_t m_value, int64_t n_value) const {
+    return device_index == device && stream_key == stream && m == m_value && n == n_value && accum.defined();
+  }
+};
+
+CachedInt8AccumMatmulPlan* GetOrCreateCachedInt8AccumMatmulPlan(
+    cublasLtHandle_t handle,
+    int device_index,
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    size_t workspace_size) {
+  thread_local std::vector<std::unique_ptr<CachedInt8AccumMatmulPlan>> plans;
+  for (auto& plan_ptr : plans) {
+    if (plan_ptr != nullptr && plan_ptr->Matches(device_index, m, n, k, workspace_size)) {
+      return plan_ptr.get();
+    }
+  }
+
+  auto plan = std::make_unique<CachedInt8AccumMatmulPlan>();
+  plan->device_index = device_index;
+  plan->m = m;
+  plan->n = n;
+  plan->k = k;
+  plan->workspace_size = workspace_size;
+
+  const auto scale_type = CUDA_R_32I;
+  const auto data_type = CUDA_R_8I;
+  const auto accum_type = CUDA_R_32I;
+  const auto compute_type = CUBLAS_COMPUTE_32I;
+  cublasOperation_t trans_a = CUBLAS_OP_T;
+  cublasOperation_t trans_b = CUBLAS_OP_N;
+
+  auto reset_plan = [&]() {
+    plan.reset();
+    return static_cast<CachedInt8AccumMatmulPlan*>(nullptr);
+  };
+
+  if (cublasLtMatmulDescCreate(&plan->op_desc, compute_type, scale_type) != CUBLAS_STATUS_SUCCESS) {
+    return reset_plan();
+  }
+  if (cublasLtMatmulDescSetAttribute(plan->op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)) !=
+          CUBLAS_STATUS_SUCCESS ||
+      cublasLtMatmulDescSetAttribute(plan->op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)) !=
+          CUBLAS_STATUS_SUCCESS ||
+      cublasLtMatrixLayoutCreate(&plan->a_desc, data_type, k, n, k) != CUBLAS_STATUS_SUCCESS ||
+      cublasLtMatrixLayoutCreate(&plan->b_desc, data_type, k, m, k) != CUBLAS_STATUS_SUCCESS ||
+      cublasLtMatrixLayoutCreate(&plan->c_desc, accum_type, n, m, n) != CUBLAS_STATUS_SUCCESS) {
+    return reset_plan();
+  }
+
+  cublasLtMatmulPreference_t preference = nullptr;
+  const bool preference_ok =
+      cublasLtMatmulPreferenceCreate(&preference) == CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatmulPreferenceSetAttribute(
+          preference,
+          CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+          &workspace_size,
+          sizeof(workspace_size)) == CUBLAS_STATUS_SUCCESS;
+  if (!preference_ok) {
+    if (preference != nullptr) {
+      cublasLtMatmulPreferenceDestroy(preference);
+    }
+    return reset_plan();
+  }
+
+  int returned_results = 0;
+  const auto heuristic_status = cublasLtMatmulAlgoGetHeuristic(
+      handle,
+      plan->op_desc,
+      plan->a_desc,
+      plan->b_desc,
+      plan->c_desc,
+      plan->c_desc,
+      preference,
+      1,
+      &plan->heuristic,
+      &returned_results);
+  cublasLtMatmulPreferenceDestroy(preference);
+  if (heuristic_status != CUBLAS_STATUS_SUCCESS || returned_results == 0) {
+    return reset_plan();
+  }
+
+  auto* out = plan.get();
+  plans.push_back(std::move(plan));
+  return out;
+}
+
+torch::Tensor GetOrCreateCachedInt8AccumScratch(
+    const torch::Tensor& reference,
+    int64_t m,
+    int64_t n,
+    cudaStream_t stream) {
+  thread_local std::vector<std::unique_ptr<CachedInt8AccumScratch>> scratch_cache;
+  const auto device_index = reference.get_device();
+  const auto stream_key = reinterpret_cast<std::uintptr_t>(stream);
+  for (auto& entry : scratch_cache) {
+    if (entry != nullptr && entry->Matches(device_index, stream_key, m, n)) {
+      return entry->accum;
+    }
+  }
+
+  auto entry = std::make_unique<CachedInt8AccumScratch>();
+  entry->device_index = device_index;
+  entry->stream_key = stream_key;
+  entry->m = m;
+  entry->n = n;
+  entry->accum = torch::empty({m, n}, reference.options().dtype(torch::kInt32));
+  auto out = entry->accum;
+  scratch_cache.push_back(std::move(entry));
+  return out;
 }
 
 cudaDataType_t ToCudaDataType(torch::ScalarType dtype) {
@@ -206,6 +359,31 @@ __global__ void int8_linear_rescale_epilogue_kernel(
   out[idx] = static_cast<scalar_t>(value);
 }
 
+template <typename scalar_t, int ColsPerThread>
+__global__ void int8_linear_row1_rescale_epilogue_kernel(
+    const int32_t* __restrict__ accum,
+    const float* __restrict__ x_scale,
+    const float* __restrict__ inv_scale,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ out,
+    int64_t out_features) {
+  const float row_scale = x_scale[0];
+  const int64_t col0 =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * ColsPerThread;
+  #pragma unroll
+  for (int idx = 0; idx < ColsPerThread; ++idx) {
+    const int64_t col = col0 + idx;
+    if (col >= out_features) {
+      return;
+    }
+    float value = static_cast<float>(accum[col]) * row_scale * inv_scale[col];
+    if (bias != nullptr) {
+      value += static_cast<float>(bias[col]);
+    }
+    out[col] = static_cast<scalar_t>(value);
+  }
+}
+
 torch::Tensor RunCublasLtInt8LinearAccum(
     const torch::Tensor& qx_2d,
     const torch::Tensor& qweight) {
@@ -213,103 +391,38 @@ torch::Tensor RunCublasLtInt8LinearAccum(
   const auto k = qx_2d.size(1);
   const auto n = qweight.size(0);
 
-  auto out = torch::empty({m, n}, qx_2d.options().dtype(torch::kInt32));
   auto stream = c10::cuda::getCurrentCUDAStream(qx_2d.get_device());
+  auto out = m == 1
+      ? GetOrCreateCachedInt8AccumScratch(qx_2d, m, n, stream.stream())
+      : torch::empty({m, n}, qx_2d.options().dtype(torch::kInt32));
   auto handle = at::cuda::getCurrentCUDABlasLtHandle();
   auto workspace = at::cuda::getCUDABlasLtWorkspace();
   auto workspace_size = at::cuda::getCUDABlasLtWorkspaceSize();
-
-  cublasLtMatmulDesc_t op_desc = nullptr;
-  cublasLtMatrixLayout_t a_desc = nullptr;
-  cublasLtMatrixLayout_t b_desc = nullptr;
-  cublasLtMatrixLayout_t c_desc = nullptr;
-  cublasLtMatmulPreference_t preference = nullptr;
-
-  const auto scale_type = CUDA_R_32I;
-  const auto data_type = CUDA_R_8I;
-  const auto accum_type = CUDA_R_32I;
   const auto compute_type = CUBLAS_COMPUTE_32I;
   const int32_t alpha = 1;
   const int32_t beta = 0;
-  cublasOperation_t trans_a = CUBLAS_OP_T;
-  cublasOperation_t trans_b = CUBLAS_OP_N;
-
-  auto cleanup = [&]() {
-    if (preference != nullptr) {
-      cublasLtMatmulPreferenceDestroy(preference);
-    }
-    if (c_desc != nullptr) {
-      cublasLtMatrixLayoutDestroy(c_desc);
-    }
-    if (b_desc != nullptr) {
-      cublasLtMatrixLayoutDestroy(b_desc);
-    }
-    if (a_desc != nullptr) {
-      cublasLtMatrixLayoutDestroy(a_desc);
-    }
-    if (op_desc != nullptr) {
-      cublasLtMatmulDescDestroy(op_desc);
-    }
-  };
-
-  const auto create_status = cublasLtMatmulDescCreate(&op_desc, compute_type, scale_type);
-  if (create_status != CUBLAS_STATUS_SUCCESS) {
-    cleanup();
-    return torch::Tensor();
-  }
-  if (cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)) !=
-          CUBLAS_STATUS_SUCCESS ||
-      cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)) !=
-          CUBLAS_STATUS_SUCCESS ||
-      cublasLtMatrixLayoutCreate(&a_desc, data_type, k, n, k) != CUBLAS_STATUS_SUCCESS ||
-      cublasLtMatrixLayoutCreate(&b_desc, data_type, k, m, k) != CUBLAS_STATUS_SUCCESS ||
-      cublasLtMatrixLayoutCreate(&c_desc, accum_type, n, m, n) != CUBLAS_STATUS_SUCCESS ||
-      cublasLtMatmulPreferenceCreate(&preference) != CUBLAS_STATUS_SUCCESS ||
-      cublasLtMatmulPreferenceSetAttribute(
-          preference,
-          CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-          &workspace_size,
-          sizeof(workspace_size)) != CUBLAS_STATUS_SUCCESS) {
-    cleanup();
-    return torch::Tensor();
-  }
-
-  cublasLtMatmulHeuristicResult_t heuristic{};
-  int returned_results = 0;
-  const auto heuristic_status = cublasLtMatmulAlgoGetHeuristic(
-      handle,
-      op_desc,
-      a_desc,
-      b_desc,
-      c_desc,
-      c_desc,
-      preference,
-      1,
-      &heuristic,
-      &returned_results);
-  if (heuristic_status != CUBLAS_STATUS_SUCCESS || returned_results == 0) {
-    cleanup();
+  auto* plan = GetOrCreateCachedInt8AccumMatmulPlan(handle, qx_2d.get_device(), m, n, k, workspace_size);
+  if (plan == nullptr) {
     return torch::Tensor();
   }
 
   const auto matmul_status = cublasLtMatmul(
       handle,
-      op_desc,
+      plan->op_desc,
       &alpha,
       qweight.data_ptr(),
-      a_desc,
+      plan->a_desc,
       qx_2d.data_ptr(),
-      b_desc,
+      plan->b_desc,
       &beta,
       out.data_ptr(),
-      c_desc,
+      plan->c_desc,
       out.data_ptr(),
-      c_desc,
-      &heuristic.algo,
+      plan->c_desc,
+      &plan->heuristic.algo,
       workspace,
       workspace_size,
       stream.stream());
-  cleanup();
   if (matmul_status != CUBLAS_STATUS_SUCCESS) {
     return torch::Tensor();
   }
@@ -381,9 +494,6 @@ torch::Tensor CublasLtInt8LinearForward(
     bias_cast = bias.value().to(qx_contig.device(), output_dtype).contiguous();
   }
   auto stream = c10::cuda::getCurrentCUDAStream(qx.get_device());
-  constexpr int kThreads = 256;
-  const dim3 threads(kThreads);
-  const dim3 blocks(static_cast<unsigned int>((rows * out_features + kThreads - 1) / kThreads));
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
@@ -394,14 +504,37 @@ torch::Tensor CublasLtInt8LinearForward(
         if (bias_cast.has_value() && bias_cast.value().defined()) {
           bias_ptr = bias_cast.value().data_ptr<scalar_t>();
         }
-        int8_linear_rescale_epilogue_kernel<scalar_t><<<blocks, threads, 0, stream.stream()>>>(
-            accum.data_ptr<int32_t>(),
-            x_scale_contig.data_ptr<float>(),
-            inv_scale_contig.data_ptr<float>(),
-            bias_ptr,
-            out.data_ptr<scalar_t>(),
-            rows,
-            out_features);
+        if (rows == 1) {
+          constexpr int kRow1Threads = 128;
+          constexpr int kRow1ColsPerThread = 4;
+          const dim3 threads(kRow1Threads);
+          const dim3 blocks(static_cast<unsigned int>(
+              (out_features + (kRow1Threads * kRow1ColsPerThread) - 1) /
+              (kRow1Threads * kRow1ColsPerThread)));
+          int8_linear_row1_rescale_epilogue_kernel<scalar_t, kRow1ColsPerThread><<<
+              blocks,
+              threads,
+              0,
+              stream.stream()>>>(
+              accum.data_ptr<int32_t>(),
+              x_scale_contig.data_ptr<float>(),
+              inv_scale_contig.data_ptr<float>(),
+              bias_ptr,
+              out.data_ptr<scalar_t>(),
+              out_features);
+        } else {
+          constexpr int kThreads = 256;
+          const dim3 threads(kThreads);
+          const dim3 blocks(static_cast<unsigned int>((rows * out_features + kThreads - 1) / kThreads));
+          int8_linear_rescale_epilogue_kernel<scalar_t><<<blocks, threads, 0, stream.stream()>>>(
+              accum.data_ptr<int32_t>(),
+              x_scale_contig.data_ptr<float>(),
+              inv_scale_contig.data_ptr<float>(),
+              bias_ptr,
+              out.data_ptr<scalar_t>(),
+              rows,
+              out_features);
+        }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 

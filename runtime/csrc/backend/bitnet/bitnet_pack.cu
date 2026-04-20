@@ -106,7 +106,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> CudaPackB
   const int64_t total = padded_out * packed_cols;
   const dim3 blocks(static_cast<unsigned int>((total + kPackThreads - 1) / kPackThreads));
   const dim3 threads(kPackThreads);
-  auto stream = c10::cuda::getDefaultCUDAStream(weight.device().index());
+  auto stream = c10::cuda::getCurrentCUDAStream(weight.device().index());
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf,

@@ -14,6 +14,7 @@ def generate(
     model,
     input_ids: torch.Tensor,
     *,
+    draft_model=None,
     cache=None,
     attention_mask: Optional[torch.Tensor] = None,
     config: Optional[GenerationConfig] = None,
@@ -29,4 +30,5 @@ def generate(
         config=cfg,
         sampler=sampler,
         cache_backend=cache_backend,
+        draft_model=draft_model,
     )
