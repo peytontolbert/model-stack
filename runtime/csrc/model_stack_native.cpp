@@ -273,6 +273,19 @@ torch::Tensor CudaBitNetLinearForward(
     const torch::Tensor& segment_offsets,
     const c10::optional<torch::Tensor>& bias,
     const c10::optional<torch::ScalarType>& out_dtype);
+torch::Tensor CudaBitNetLinearForwardComputePacked(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& layout_header,
+    const torch::Tensor& segment_offsets,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
+    const torch::Tensor& decode_nz_masks,
+    const torch::Tensor& decode_sign_masks,
+    const torch::Tensor& decode_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::ScalarType>& out_dtype);
 torch::Tensor CudaBitNetTransformInputForward(
     const torch::Tensor& x,
     const c10::optional<torch::Tensor>& pre_scale,
@@ -5006,6 +5019,13 @@ struct BitNetModuleState {
   torch::Tensor scale_values;
   torch::Tensor layout_header;
   torch::Tensor segment_offsets;
+  torch::Tensor compute_packed_words;
+  torch::Tensor compute_row_scales;
+  int64_t compute_tile_n = 0;
+  torch::Tensor decode_nz_masks;
+  torch::Tensor decode_sign_masks;
+  torch::Tensor decode_row_scales;
+  int64_t decode_tile_n = 0;
   torch::Tensor qweight;
   torch::Tensor inv_scale;
   c10::optional<torch::Tensor> bias = c10::nullopt;
@@ -5077,6 +5097,58 @@ bool TryLoadBitNetModuleState(const py::object& module, BitNetModuleState* state
     out.act_quant_bits = PyIntAttr(module, "act_quant_bits", 8);
     if (py::hasattr(module, "act_scale")) {
       out.act_scale = TensorAttr(module, "act_scale");
+    }
+    const bool use_compute_packed =
+        !out.spin_enabled && !pre_scale_active && NormalizeBackendName(out.act_quant_mode) == "none";
+    if (use_compute_packed) {
+      auto cached_compute_words = PyAttrOrNone(module, "_cached_compute_backend_words");
+      auto cached_compute_row_scales = PyAttrOrNone(module, "_cached_compute_backend_row_scales");
+      if (!cached_compute_words.is_none() && !cached_compute_row_scales.is_none()) {
+        auto compute_words = py::cast<torch::Tensor>(cached_compute_words);
+        auto compute_row_scales = py::cast<torch::Tensor>(cached_compute_row_scales);
+        if (compute_words.defined() && compute_row_scales.defined() &&
+            compute_words.device() == compute_row_scales.device()) {
+          out.compute_packed_words = compute_words;
+          out.compute_row_scales = compute_row_scales;
+        }
+      }
+      if ((!out.compute_packed_words.defined() || !out.compute_row_scales.defined()) &&
+          PyCallableAttr(module, "_compute_backend_weight")) {
+        auto compute_backend = py::cast<py::tuple>(module.attr("_compute_backend_weight")("device"_a = out.packed_weight.device()));
+        out.compute_packed_words = py::cast<torch::Tensor>(compute_backend[0]);
+        out.compute_row_scales = py::cast<torch::Tensor>(compute_backend[1]);
+      }
+      if (out.compute_row_scales.defined() && out.compute_row_scales.dim() == 2) {
+        out.compute_tile_n = out.compute_row_scales.size(1);
+      }
+
+      auto cached_decode_nz_masks = PyAttrOrNone(module, "_cached_decode_backend_nz_masks");
+      auto cached_decode_sign_masks = PyAttrOrNone(module, "_cached_decode_backend_sign_masks");
+      auto cached_decode_row_scales = PyAttrOrNone(module, "_cached_decode_backend_row_scales");
+      if (!cached_decode_nz_masks.is_none() && !cached_decode_sign_masks.is_none() && !cached_decode_row_scales.is_none()) {
+        auto decode_nz_masks = py::cast<torch::Tensor>(cached_decode_nz_masks);
+        auto decode_sign_masks = py::cast<torch::Tensor>(cached_decode_sign_masks);
+        auto decode_row_scales = py::cast<torch::Tensor>(cached_decode_row_scales);
+        if (decode_nz_masks.defined() && decode_sign_masks.defined() && decode_row_scales.defined() &&
+            decode_nz_masks.device() == decode_sign_masks.device() &&
+            decode_nz_masks.device() == decode_row_scales.device()) {
+          out.decode_nz_masks = decode_nz_masks;
+          out.decode_sign_masks = decode_sign_masks;
+          out.decode_row_scales = decode_row_scales;
+        }
+      }
+      const auto backend_device =
+          out.compute_packed_words.defined() ? out.compute_packed_words.device() : out.packed_weight.device();
+      if ((!out.decode_nz_masks.defined() || !out.decode_sign_masks.defined() || !out.decode_row_scales.defined()) &&
+          PyCallableAttr(module, "_decode_backend_weight")) {
+        auto decode_backend = py::cast<py::tuple>(module.attr("_decode_backend_weight")("device"_a = backend_device));
+        out.decode_nz_masks = py::cast<torch::Tensor>(decode_backend[0]);
+        out.decode_sign_masks = py::cast<torch::Tensor>(decode_backend[1]);
+        out.decode_row_scales = py::cast<torch::Tensor>(decode_backend[2]);
+      }
+      if (out.decode_row_scales.defined() && out.decode_row_scales.dim() == 2) {
+        out.decode_tile_n = out.decode_row_scales.size(1);
+      }
     }
     if (PyCallableAttr(module, "_uses_int8_packed_backend") &&
         py::cast<bool>(module.attr("_uses_int8_packed_backend")())) {
@@ -5787,6 +5859,38 @@ torch::Tensor ExpandBitNetRowScales(const BitNetModuleState& state) {
   TORCH_CHECK(false, "Unsupported BitNet scale granularity for fused QKV state: ", scale_granularity);
 }
 
+torch::Tensor FlattenComputePackedBitNetRows(const torch::Tensor& compute_packed_words, int64_t logical_rows) {
+  TORCH_CHECK(compute_packed_words.dim() == 3, "compute-packed BitNet rows must be rank-3");
+  auto row_major = compute_packed_words.permute({0, 2, 1}).contiguous().view({-1, compute_packed_words.size(1)});
+  return row_major.slice(0, 0, logical_rows).contiguous();
+}
+
+torch::Tensor FlattenComputePackedBitNetScales(const torch::Tensor& compute_row_scales, int64_t logical_rows) {
+  TORCH_CHECK(compute_row_scales.dim() == 2, "compute-packed BitNet row scales must be rank-2");
+  auto flat = compute_row_scales.contiguous().view({-1});
+  return flat.slice(0, 0, logical_rows).contiguous();
+}
+
+torch::Tensor FlattenDecodePackedBitNetRows(const torch::Tensor& decode_masks, int64_t logical_rows) {
+  TORCH_CHECK(decode_masks.dim() == 3, "decode-packed BitNet masks must be rank-3");
+  auto row_major = decode_masks.permute({0, 2, 1}).contiguous().view({-1, decode_masks.size(1)});
+  return row_major.slice(0, 0, logical_rows).contiguous();
+}
+
+std::vector<torch::Tensor> SplitProjectedBitNetQkv(
+    const torch::Tensor& projected,
+    int64_t q_size,
+    int64_t k_size,
+    int64_t v_size,
+    int64_t q_heads,
+    int64_t kv_heads) {
+  return {
+      SplitHeadsForward(projected.slice(-1, 0, q_size), q_heads),
+      SplitHeadsForward(projected.slice(-1, q_size, q_size + k_size), kv_heads),
+      SplitHeadsForward(projected.slice(-1, q_size + k_size, q_size + k_size + v_size), kv_heads),
+  };
+}
+
 bool TryFuseBitNetQkvStates(
     const BitNetModuleState& q_state,
     const BitNetModuleState& k_state,
@@ -6011,6 +6115,124 @@ bool TryFuseBitNetQkvStates(
   if (q_state.inv_scale.defined() && k_state.inv_scale.defined() && v_state.inv_scale.defined()) {
     out.inv_scale = torch::cat({q_state.inv_scale, k_state.inv_scale, v_state.inv_scale}, 0).contiguous();
   }
+  if (q_state.compute_packed_words.defined() && k_state.compute_packed_words.defined() && v_state.compute_packed_words.defined() &&
+      q_state.compute_row_scales.defined() && k_state.compute_row_scales.defined() && v_state.compute_row_scales.defined()) {
+    if (q_state.compute_packed_words.dim() == 3 &&
+        k_state.compute_packed_words.dim() == 3 &&
+        v_state.compute_packed_words.dim() == 3 &&
+        q_state.compute_row_scales.dim() == 2 &&
+        k_state.compute_row_scales.dim() == 2 &&
+        v_state.compute_row_scales.dim() == 2) {
+      const auto compute_tile_n = q_state.compute_packed_words.size(2);
+      const auto compute_word_cols = q_state.compute_packed_words.size(1);
+      if (compute_tile_n <= 0) {
+        // Ignore invalid cached compute-packed metadata and fall back to the public packed path.
+      } else if (
+        k_state.compute_packed_words.size(1) == compute_word_cols &&
+        v_state.compute_packed_words.size(1) == compute_word_cols &&
+        k_state.compute_packed_words.size(2) == compute_tile_n &&
+        v_state.compute_packed_words.size(2) == compute_tile_n &&
+        q_state.compute_row_scales.size(1) == compute_tile_n &&
+        k_state.compute_row_scales.size(1) == compute_tile_n &&
+        v_state.compute_row_scales.size(1) == compute_tile_n) {
+      auto fused_rows = torch::cat({
+          FlattenComputePackedBitNetRows(q_state.compute_packed_words, q_size),
+          FlattenComputePackedBitNetRows(k_state.compute_packed_words, k_size),
+          FlattenComputePackedBitNetRows(v_state.compute_packed_words, v_size),
+      }, 0).contiguous();
+      auto fused_row_scales = torch::cat({
+          FlattenComputePackedBitNetScales(q_state.compute_row_scales, q_size),
+          FlattenComputePackedBitNetScales(k_state.compute_row_scales, k_size),
+          FlattenComputePackedBitNetScales(v_state.compute_row_scales, v_size),
+      }, 0).contiguous();
+      const auto padded_compute_rows = ((logical_out + compute_tile_n - 1) / compute_tile_n) * compute_tile_n;
+      if (padded_compute_rows > logical_out) {
+        fused_rows = torch::cat({
+            fused_rows,
+            torch::full(
+                {padded_compute_rows - logical_out, compute_word_cols},
+                static_cast<int32_t>(0x55555555u),
+                torch::TensorOptions().device(fused_rows.device()).dtype(torch::kInt32)),
+        }, 0).contiguous();
+        fused_row_scales = torch::cat({
+            fused_row_scales,
+            torch::zeros(
+                {padded_compute_rows - logical_out},
+                torch::TensorOptions().device(fused_row_scales.device()).dtype(torch::kFloat32)),
+        }, 0).contiguous();
+      }
+      out.compute_packed_words = fused_rows.view({-1, compute_tile_n, compute_word_cols}).permute({0, 2, 1}).contiguous();
+      out.compute_row_scales = fused_row_scales.view({-1, compute_tile_n}).contiguous();
+      out.compute_tile_n = compute_tile_n;
+      }
+    }
+  }
+  if (q_state.decode_nz_masks.defined() && k_state.decode_nz_masks.defined() && v_state.decode_nz_masks.defined() &&
+      q_state.decode_sign_masks.defined() && k_state.decode_sign_masks.defined() && v_state.decode_sign_masks.defined() &&
+      q_state.decode_row_scales.defined() && k_state.decode_row_scales.defined() && v_state.decode_row_scales.defined()) {
+    if (q_state.decode_nz_masks.dim() == 3 &&
+        k_state.decode_nz_masks.dim() == 3 &&
+        v_state.decode_nz_masks.dim() == 3 &&
+        q_state.decode_sign_masks.dim() == 3 &&
+        k_state.decode_sign_masks.dim() == 3 &&
+        v_state.decode_sign_masks.dim() == 3 &&
+        q_state.decode_row_scales.dim() == 2 &&
+        k_state.decode_row_scales.dim() == 2 &&
+        v_state.decode_row_scales.dim() == 2) {
+      const auto decode_tile_n = q_state.decode_nz_masks.size(2);
+      const auto decode_chunk_cols = q_state.decode_nz_masks.size(1);
+      if (decode_tile_n <= 0) {
+        // Ignore invalid cached decode-packed metadata and fall back to the compute-packed path.
+      } else if (
+        k_state.decode_nz_masks.size(1) == decode_chunk_cols &&
+        v_state.decode_nz_masks.size(1) == decode_chunk_cols &&
+        k_state.decode_nz_masks.size(2) == decode_tile_n &&
+        v_state.decode_nz_masks.size(2) == decode_tile_n &&
+        q_state.decode_sign_masks.size(1) == decode_chunk_cols &&
+        k_state.decode_sign_masks.size(1) == decode_chunk_cols &&
+        v_state.decode_sign_masks.size(1) == decode_chunk_cols &&
+        q_state.decode_sign_masks.size(2) == decode_tile_n &&
+        k_state.decode_sign_masks.size(2) == decode_tile_n &&
+        v_state.decode_sign_masks.size(2) == decode_tile_n &&
+        q_state.decode_row_scales.size(1) == decode_tile_n &&
+        k_state.decode_row_scales.size(1) == decode_tile_n &&
+        v_state.decode_row_scales.size(1) == decode_tile_n) {
+      auto fused_nz_masks = torch::cat({
+          FlattenDecodePackedBitNetRows(q_state.decode_nz_masks, q_size),
+          FlattenDecodePackedBitNetRows(k_state.decode_nz_masks, k_size),
+          FlattenDecodePackedBitNetRows(v_state.decode_nz_masks, v_size),
+      }, 0).contiguous();
+      auto fused_sign_masks = torch::cat({
+          FlattenDecodePackedBitNetRows(q_state.decode_sign_masks, q_size),
+          FlattenDecodePackedBitNetRows(k_state.decode_sign_masks, k_size),
+          FlattenDecodePackedBitNetRows(v_state.decode_sign_masks, v_size),
+      }, 0).contiguous();
+      auto fused_row_scales = torch::cat({
+          FlattenComputePackedBitNetScales(q_state.decode_row_scales, q_size),
+          FlattenComputePackedBitNetScales(k_state.decode_row_scales, k_size),
+          FlattenComputePackedBitNetScales(v_state.decode_row_scales, v_size),
+      }, 0).contiguous();
+      const auto padded_decode_rows = ((logical_out + decode_tile_n - 1) / decode_tile_n) * decode_tile_n;
+      if (padded_decode_rows > logical_out) {
+        auto pad_rows = torch::zeros(
+            {padded_decode_rows - logical_out, decode_chunk_cols},
+            torch::TensorOptions().device(fused_nz_masks.device()).dtype(torch::kInt32));
+        fused_nz_masks = torch::cat({fused_nz_masks, pad_rows}, 0).contiguous();
+        fused_sign_masks = torch::cat({fused_sign_masks, pad_rows.clone()}, 0).contiguous();
+        fused_row_scales = torch::cat({
+            fused_row_scales,
+            torch::zeros(
+                {padded_decode_rows - logical_out},
+                torch::TensorOptions().device(fused_row_scales.device()).dtype(torch::kFloat32)),
+        }, 0).contiguous();
+      }
+      out.decode_nz_masks = fused_nz_masks.view({-1, decode_tile_n, decode_chunk_cols}).permute({0, 2, 1}).contiguous();
+      out.decode_sign_masks = fused_sign_masks.view({-1, decode_tile_n, decode_chunk_cols}).permute({0, 2, 1}).contiguous();
+      out.decode_row_scales = fused_row_scales.view({-1, decode_tile_n}).contiguous();
+      out.decode_tile_n = decode_tile_n;
+      }
+    }
+  }
   *fused_state = std::move(out);
   *q_size_out = q_size;
   *k_size_out = k_size;
@@ -6049,6 +6271,25 @@ torch::Tensor BitNetLinearStateForward(
         state.act_scale.defined() ? c10::optional<torch::Tensor>(state.act_scale) : c10::nullopt,
         resolved_out_dtype);
   }
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && !state.spin_enabled && !state.pre_scale.defined() &&
+      NormalizeBackendName(state.act_quant_mode) == "none" &&
+      state.compute_packed_words.defined() && state.compute_row_scales.defined()) {
+    return t10::bitnet::CudaBitNetLinearForwardComputePacked(
+        x,
+        state.packed_weight,
+        state.scale_values,
+        state.layout_header,
+        state.segment_offsets,
+        state.compute_packed_words,
+        state.compute_row_scales,
+        state.decode_nz_masks,
+        state.decode_sign_masks,
+        state.decode_row_scales,
+        state.bias,
+        resolved_out_dtype);
+  }
+#endif
   return BitNetLinearFromFloatForward(
       x,
       state.packed_weight,
@@ -6204,6 +6445,10 @@ std::vector<torch::Tensor> AttentionPackedBitNetQkvForwardFromStates(
   int64_t k_size = 0;
   int64_t v_size = 0;
   if (TryFuseBitNetQkvStates(q_state, k_state, v_state, &fused_state, &q_size, &k_size, &v_size)) {
+    if (fused_state.compute_packed_words.defined() && fused_state.compute_row_scales.defined()) {
+      auto projected = BitNetLinearStateForward(x, fused_state);
+      return SplitProjectedBitNetQkv(projected, q_size, k_size, v_size, q_heads, kv_heads);
+    }
     auto x_local = BitNetTransformInputFromState(x, fused_state);
     return BitNetFusedQkvPackedHeadsProjectionForward(
         x_local,
@@ -7362,18 +7607,30 @@ torch::Tensor ExecutePreparedAttention(
               prepared.kv_heads,
               c10::optional<torch::ScalarType>(x.scalar_type()));
         } else {
-          qkv = BitNetFusedQkvPackedHeadsProjectionForward(
-              x,
-              prepared.fused_bitnet_qkv_state.packed_weight,
-              prepared.fused_bitnet_qkv_state.scale_values,
-              prepared.fused_bitnet_qkv_state.layout_header,
-              prepared.fused_bitnet_qkv_state.segment_offsets,
-              prepared.fused_bitnet_qkv_state.bias,
-              prepared.fused_q_size,
-              prepared.fused_k_size,
-              prepared.fused_v_size,
-              prepared.q_heads,
-              prepared.kv_heads);
+          if (prepared.fused_bitnet_qkv_state.compute_packed_words.defined() &&
+              prepared.fused_bitnet_qkv_state.compute_row_scales.defined()) {
+            auto projected = BitNetLinearStateForward(x, prepared.fused_bitnet_qkv_state);
+            qkv = SplitProjectedBitNetQkv(
+                projected,
+                prepared.fused_q_size,
+                prepared.fused_k_size,
+                prepared.fused_v_size,
+                prepared.q_heads,
+                prepared.kv_heads);
+          } else {
+            qkv = BitNetFusedQkvPackedHeadsProjectionForward(
+                x,
+                prepared.fused_bitnet_qkv_state.packed_weight,
+                prepared.fused_bitnet_qkv_state.scale_values,
+                prepared.fused_bitnet_qkv_state.layout_header,
+                prepared.fused_bitnet_qkv_state.segment_offsets,
+                prepared.fused_bitnet_qkv_state.bias,
+                prepared.fused_q_size,
+                prepared.fused_k_size,
+                prepared.fused_v_size,
+                prepared.q_heads,
+                prepared.kv_heads);
+          }
         }
       } else {
         qkv = AttentionPackedBitNetQkvForwardFromStates(

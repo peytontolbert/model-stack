@@ -26,8 +26,9 @@ __global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet
   constexpr int TileCols = kPrefillThreadsX * ColsPerThread;
   constexpr int Threads = kPrefillThreadsX * kPrefillThreadsY;
   constexpr int PackedTileK = (TileK + 3) / 4;
+  constexpr int PackedTileKWords = (PackedTileK + 3) / 4;
   __shared__ scalar_t x_tile[kPrefillTileRows][TileK];
-  __shared__ uint8_t w_tile_packed[TileCols][PackedTileK];
+  __shared__ uint32_t w_tile_words[TileCols][PackedTileKWords];
   __shared__ float row_scales[TileCols];
 
   const int local_col = static_cast<int>(threadIdx.x);
@@ -62,17 +63,18 @@ __global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet
               ? x[global_row * layout.logical_in_features + global_k]
               : static_cast<scalar_t>(0);
     }
-    for (int index = thread_linear; index < TileCols * PackedTileK; index += Threads) {
-      const int tile_col = index / PackedTileK;
-      const int packed_k = index % PackedTileK;
-      const int tile_k0 = packed_k * 4;
+    for (int index = thread_linear; index < TileCols * PackedTileKWords; index += Threads) {
+      const int tile_col = index / PackedTileKWords;
+      const int word_idx = index % PackedTileKWords;
+      const int tile_k0 = word_idx * 16;
       const int64_t global_col = static_cast<int64_t>(blockIdx.x) * TileCols + tile_col;
       const int64_t global_k0 = k0 + tile_k0;
-      uint8_t packed_value = static_cast<uint8_t>(0x55);
+      uint32_t packed_word = 0;
       if (global_col < layout.logical_out_features && global_k0 < layout.logical_in_features) {
-        packed_value = packed_weight[global_col * packed_cols + (global_k0 >> 2)];
+        const uint8_t* weight_row = packed_weight + (global_col * packed_cols) + (k0 >> 2);
+        packed_word = LoadPackedTernaryWord16Device(weight_row, word_idx);
       }
-      w_tile_packed[tile_col][packed_k] = packed_value;
+      w_tile_words[tile_col][word_idx] = packed_word;
     }
     __syncthreads();
 
@@ -86,17 +88,134 @@ __global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet
         }
         float acc = accum[idx];
         #pragma unroll
-        for (int packed_k = 0; packed_k < PackedTileK; ++packed_k) {
-          const int tile_k0 = packed_k * 4;
+        for (int word_idx = 0; word_idx < PackedTileKWords; ++word_idx) {
+          const int tile_k0 = word_idx * 16;
           const int64_t global_k0 = k0 + tile_k0;
           if (global_k0 >= layout.logical_in_features) {
             break;
           }
           const int valid_values = static_cast<int>(
-              (layout.logical_in_features - global_k0) >= 4 ? 4 : (layout.logical_in_features - global_k0));
-          acc = BitNetDotFloatPackedTernaryChunk4Device(
+              (layout.logical_in_features - global_k0) >= 16 ? 16 : (layout.logical_in_features - global_k0));
+          acc = BitNetDotFloatPackedTernaryWord16Device(
               &x_tile[local_row][tile_k0],
-              w_tile_packed[tile_col][packed_k],
+              w_tile_words[tile_col][word_idx],
+              valid_values,
+              acc);
+        }
+        accum[idx] = acc;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (row >= rows) {
+    return;
+  }
+  #pragma unroll
+  for (int idx = 0; idx < ColsPerThread; ++idx) {
+    const int64_t global_col = col0 + idx * kPrefillThreadsX;
+    if (global_col >= layout.logical_out_features) {
+      continue;
+    }
+    const int tile_col = local_col + idx * kPrefillThreadsX;
+    float value = accum[idx] * row_scales[tile_col];
+    if (bias != nullptr) {
+      value += static_cast<float>(bias[global_col]);
+    }
+    out[row * layout.logical_out_features + global_col] = CastOutput<scalar_t>(value);
+  }
+}
+
+template <typename scalar_t, int TileK, int ColsPerThread>
+__global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet_linear_prefill_tiled_compute_packed_kernel(
+    const scalar_t* __restrict__ x,
+    const int32_t* __restrict__ compute_packed_words,
+    const float* __restrict__ compute_row_scales,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ out,
+    LayoutInfo layout,
+    int64_t rows,
+    int64_t compute_word_cols,
+    int64_t compute_tile_n) {
+  constexpr int TileCols = kPrefillThreadsX * ColsPerThread;
+  constexpr int Threads = kPrefillThreadsX * kPrefillThreadsY;
+  constexpr int PackedTileKWords = (TileK + 15) / 16;
+  __shared__ scalar_t x_tile[kPrefillTileRows][TileK];
+  __shared__ uint32_t w_tile_words[TileCols][PackedTileKWords];
+  __shared__ float row_scales[TileCols];
+
+  const int local_col = static_cast<int>(threadIdx.x);
+  const int local_row = static_cast<int>(threadIdx.y);
+  const int thread_linear = local_row * kPrefillThreadsX + local_col;
+  const int64_t row = static_cast<int64_t>(blockIdx.y) * kPrefillTileRows + local_row;
+  const int64_t col0 = static_cast<int64_t>(blockIdx.x) * TileCols + local_col;
+
+  float accum[ColsPerThread];
+  #pragma unroll
+  for (int idx = 0; idx < ColsPerThread; ++idx) {
+    accum[idx] = 0.0f;
+  }
+
+  for (int idx = thread_linear; idx < TileCols; idx += Threads) {
+    const int64_t global_col = static_cast<int64_t>(blockIdx.x) * TileCols + idx;
+    row_scales[idx] =
+        global_col < layout.logical_out_features
+            ? ResolveComputePackedRowScaleDevice(global_col, compute_row_scales, compute_tile_n)
+            : 0.0f;
+  }
+  __syncthreads();
+
+  for (int64_t k0 = 0; k0 < layout.logical_in_features; k0 += TileK) {
+    for (int index = thread_linear; index < kPrefillTileRows * TileK; index += Threads) {
+      const int tile_row = index / TileK;
+      const int tile_k = index % TileK;
+      const int64_t global_row = static_cast<int64_t>(blockIdx.y) * kPrefillTileRows + tile_row;
+      const int64_t global_k = k0 + tile_k;
+      x_tile[tile_row][tile_k] =
+          (global_row < rows && global_k < layout.logical_in_features)
+              ? x[global_row * layout.logical_in_features + global_k]
+              : static_cast<scalar_t>(0);
+    }
+    for (int index = thread_linear; index < TileCols * PackedTileKWords; index += Threads) {
+      const int tile_col = index / PackedTileKWords;
+      const int word_idx = index % PackedTileKWords;
+      const int tile_k0 = word_idx * 16;
+      const int64_t global_col = static_cast<int64_t>(blockIdx.x) * TileCols + tile_col;
+      const int64_t global_k0 = k0 + tile_k0;
+      uint32_t packed_word = 0;
+      if (global_col < layout.logical_out_features && global_k0 < layout.logical_in_features) {
+        packed_word = LoadComputePackedTernaryWord16Device(
+            compute_packed_words,
+            compute_word_cols,
+            compute_tile_n,
+            global_col,
+            global_k0 >> 4);
+      }
+      w_tile_words[tile_col][word_idx] = packed_word;
+    }
+    __syncthreads();
+
+    if (row < rows) {
+      #pragma unroll
+      for (int idx = 0; idx < ColsPerThread; ++idx) {
+        const int tile_col = local_col + idx * kPrefillThreadsX;
+        const int64_t global_col = static_cast<int64_t>(blockIdx.x) * TileCols + tile_col;
+        if (global_col >= layout.logical_out_features) {
+          continue;
+        }
+        float acc = accum[idx];
+        #pragma unroll
+        for (int word_idx = 0; word_idx < PackedTileKWords; ++word_idx) {
+          const int tile_k0 = word_idx * 16;
+          const int64_t global_k0 = k0 + tile_k0;
+          if (global_k0 >= layout.logical_in_features) {
+            break;
+          }
+          const int valid_values = static_cast<int>(
+              (layout.logical_in_features - global_k0) >= 16 ? 16 : (layout.logical_in_features - global_k0));
+          acc = BitNetDotFloatPackedTernaryWord16Device(
+              &x_tile[local_row][tile_k0],
+              w_tile_words[tile_col][word_idx],
               valid_values,
               acc);
         }
@@ -263,6 +382,129 @@ __global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet
 }
 
 template <typename scalar_t, int TileK, int ColsPerThread>
+__global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet_linear_prefill_splitk_compute_packed_kernel(
+    const scalar_t* __restrict__ x,
+    const int32_t* __restrict__ compute_packed_words,
+    const float* __restrict__ compute_row_scales,
+    float* __restrict__ workspace,
+    LayoutInfo layout,
+    int64_t rows,
+    int64_t compute_word_cols,
+    int64_t compute_tile_n) {
+  constexpr int TileCols = kPrefillThreadsX * ColsPerThread;
+  constexpr int Threads = kPrefillThreadsX * kPrefillThreadsY;
+  constexpr int PackedTileKWords = (TileK + 15) / 16;
+  __shared__ scalar_t x_tile[kPrefillTileRows][TileK];
+  __shared__ uint32_t w_tile_words[TileCols][PackedTileKWords];
+  __shared__ float row_scales[TileCols];
+
+  const int local_col = static_cast<int>(threadIdx.x);
+  const int local_row = static_cast<int>(threadIdx.y);
+  const int thread_linear = local_row * kPrefillThreadsX + local_col;
+  const int64_t row = static_cast<int64_t>(blockIdx.y) * kPrefillTileRows + local_row;
+  const int64_t col0 = static_cast<int64_t>(blockIdx.x) * TileCols + local_col;
+
+  const int split_k_slices = gridDim.z;
+  const int64_t workspace_slice_stride = rows * layout.logical_out_features;
+  const int64_t workspace_base = static_cast<int64_t>(blockIdx.z) * workspace_slice_stride;
+  const int64_t slice_span = ((layout.logical_in_features + split_k_slices - 1) / split_k_slices + TileK - 1) / TileK * TileK;
+  const int64_t slice_begin_raw = static_cast<int64_t>(blockIdx.z) * slice_span;
+  const int64_t slice_begin = slice_begin_raw < layout.logical_in_features ? slice_begin_raw : layout.logical_in_features;
+  const int64_t slice_end_raw = slice_begin + slice_span;
+  const int64_t slice_end = slice_end_raw < layout.logical_in_features ? slice_end_raw : layout.logical_in_features;
+
+  float accum[ColsPerThread];
+  #pragma unroll
+  for (int idx = 0; idx < ColsPerThread; ++idx) {
+    accum[idx] = 0.0f;
+  }
+
+  for (int idx = thread_linear; idx < TileCols; idx += Threads) {
+    const int64_t global_col = static_cast<int64_t>(blockIdx.x) * TileCols + idx;
+    row_scales[idx] =
+        global_col < layout.logical_out_features
+            ? ResolveComputePackedRowScaleDevice(global_col, compute_row_scales, compute_tile_n)
+            : 0.0f;
+  }
+  __syncthreads();
+
+  for (int64_t k0 = slice_begin; k0 < slice_end; k0 += TileK) {
+    for (int index = thread_linear; index < kPrefillTileRows * TileK; index += Threads) {
+      const int tile_row = index / TileK;
+      const int tile_k = index % TileK;
+      const int64_t global_row = static_cast<int64_t>(blockIdx.y) * kPrefillTileRows + tile_row;
+      const int64_t global_k = k0 + tile_k;
+      x_tile[tile_row][tile_k] =
+          (global_row < rows && global_k < slice_end && global_k < layout.logical_in_features)
+              ? x[global_row * layout.logical_in_features + global_k]
+              : static_cast<scalar_t>(0);
+    }
+    for (int index = thread_linear; index < TileCols * PackedTileKWords; index += Threads) {
+      const int tile_col = index / PackedTileKWords;
+      const int word_idx = index % PackedTileKWords;
+      const int tile_k0 = word_idx * 16;
+      const int64_t global_col = static_cast<int64_t>(blockIdx.x) * TileCols + tile_col;
+      const int64_t global_k0 = k0 + tile_k0;
+      uint32_t packed_word = 0;
+      if (global_col < layout.logical_out_features && global_k0 < slice_end && global_k0 < layout.logical_in_features) {
+        packed_word = LoadComputePackedTernaryWord16Device(
+            compute_packed_words,
+            compute_word_cols,
+            compute_tile_n,
+            global_col,
+            global_k0 >> 4);
+      }
+      w_tile_words[tile_col][word_idx] = packed_word;
+    }
+    __syncthreads();
+
+    if (row < rows) {
+      #pragma unroll
+      for (int idx = 0; idx < ColsPerThread; ++idx) {
+        const int tile_col = local_col + idx * kPrefillThreadsX;
+        const int64_t global_col = static_cast<int64_t>(blockIdx.x) * TileCols + tile_col;
+        if (global_col >= layout.logical_out_features) {
+          continue;
+        }
+        float acc = accum[idx];
+        #pragma unroll
+        for (int word_idx = 0; word_idx < PackedTileKWords; ++word_idx) {
+          const int tile_k0 = word_idx * 16;
+          const int64_t global_k0 = k0 + tile_k0;
+          if (global_k0 >= slice_end || global_k0 >= layout.logical_in_features) {
+            break;
+          }
+          const int64_t slice_limit = slice_end < layout.logical_in_features ? slice_end : layout.logical_in_features;
+          const int valid_values = static_cast<int>(
+              (slice_limit - global_k0) >= 16 ? 16 : (slice_limit - global_k0));
+          acc = BitNetDotFloatPackedTernaryWord16Device(
+              &x_tile[local_row][tile_k0],
+              w_tile_words[tile_col][word_idx],
+              valid_values,
+              acc);
+        }
+        accum[idx] = acc;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (row >= rows) {
+    return;
+  }
+  #pragma unroll
+  for (int idx = 0; idx < ColsPerThread; ++idx) {
+    const int64_t global_col = col0 + idx * kPrefillThreadsX;
+    if (global_col >= layout.logical_out_features) {
+      continue;
+    }
+    const int tile_col = local_col + idx * kPrefillThreadsX;
+    workspace[workspace_base + row * layout.logical_out_features + global_col] =
+        accum[idx] * row_scales[tile_col];
+  }
+}
+
+template <typename scalar_t, int TileK, int ColsPerThread>
 __global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet_linear_prefill_splitk_kernel(
     const scalar_t* __restrict__ x,
     const uint8_t* __restrict__ packed_weight,
@@ -275,8 +517,9 @@ __global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet
   constexpr int TileCols = kPrefillThreadsX * ColsPerThread;
   constexpr int Threads = kPrefillThreadsX * kPrefillThreadsY;
   constexpr int PackedTileK = (TileK + 3) / 4;
+  constexpr int PackedTileKWords = (PackedTileK + 3) / 4;
   __shared__ scalar_t x_tile[kPrefillTileRows][TileK];
-  __shared__ uint8_t w_tile_packed[TileCols][PackedTileK];
+  __shared__ uint32_t w_tile_words[TileCols][PackedTileKWords];
   __shared__ float row_scales[TileCols];
 
   const int local_col = static_cast<int>(threadIdx.x);
@@ -286,6 +529,8 @@ __global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet
   const int64_t col0 = static_cast<int64_t>(blockIdx.x) * TileCols + local_col;
 
   const int split_k_slices = gridDim.z;
+  const int64_t workspace_slice_stride = rows * layout.logical_out_features;
+  const int64_t workspace_base = static_cast<int64_t>(blockIdx.z) * workspace_slice_stride;
   const int64_t slice_span = ((layout.logical_in_features + split_k_slices - 1) / split_k_slices + TileK - 1) / TileK * TileK;
   const int64_t slice_begin_raw = static_cast<int64_t>(blockIdx.z) * slice_span;
   const int64_t slice_begin = slice_begin_raw < layout.logical_in_features ? slice_begin_raw : layout.logical_in_features;
@@ -318,17 +563,18 @@ __global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet
               ? x[global_row * layout.logical_in_features + global_k]
               : static_cast<scalar_t>(0);
     }
-    for (int index = thread_linear; index < TileCols * PackedTileK; index += Threads) {
-      const int tile_col = index / PackedTileK;
-      const int packed_k = index % PackedTileK;
-      const int tile_k0 = packed_k * 4;
+    for (int index = thread_linear; index < TileCols * PackedTileKWords; index += Threads) {
+      const int tile_col = index / PackedTileKWords;
+      const int word_idx = index % PackedTileKWords;
+      const int tile_k0 = word_idx * 16;
       const int64_t global_col = static_cast<int64_t>(blockIdx.x) * TileCols + tile_col;
       const int64_t global_k0 = k0 + tile_k0;
-      uint8_t packed_value = static_cast<uint8_t>(0x55);
+      uint32_t packed_word = 0;
       if (global_col < layout.logical_out_features && global_k0 < slice_end && global_k0 < layout.logical_in_features) {
-        packed_value = packed_weight[global_col * packed_cols + (global_k0 >> 2)];
+        const uint8_t* weight_row = packed_weight + (global_col * packed_cols) + (k0 >> 2);
+        packed_word = LoadPackedTernaryWord16Device(weight_row, word_idx);
       }
-      w_tile_packed[tile_col][packed_k] = packed_value;
+      w_tile_words[tile_col][word_idx] = packed_word;
     }
     __syncthreads();
 
@@ -342,18 +588,18 @@ __global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet
         }
         float acc = accum[idx];
         #pragma unroll
-        for (int packed_k = 0; packed_k < PackedTileK; ++packed_k) {
-          const int tile_k0 = packed_k * 4;
+        for (int word_idx = 0; word_idx < PackedTileKWords; ++word_idx) {
+          const int tile_k0 = word_idx * 16;
           const int64_t global_k0 = k0 + tile_k0;
           if (global_k0 >= slice_end || global_k0 >= layout.logical_in_features) {
             break;
           }
           const int64_t slice_limit = slice_end < layout.logical_in_features ? slice_end : layout.logical_in_features;
           const int valid_values = static_cast<int>(
-              (slice_limit - global_k0) >= 4 ? 4 : (slice_limit - global_k0));
-          acc = BitNetDotFloatPackedTernaryChunk4Device(
+              (slice_limit - global_k0) >= 16 ? 16 : (slice_limit - global_k0));
+          acc = BitNetDotFloatPackedTernaryWord16Device(
               &x_tile[local_row][tile_k0],
-              w_tile_packed[tile_col][packed_k],
+              w_tile_words[tile_col][word_idx],
               valid_values,
               acc);
         }
@@ -373,9 +619,8 @@ __global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet
       continue;
     }
     const int tile_col = local_col + idx * kPrefillThreadsX;
-    atomicAdd(
-        workspace + (row * layout.logical_out_features + global_col),
-        accum[idx] * row_scales[tile_col]);
+    workspace[workspace_base + row * layout.logical_out_features + global_col] =
+        accum[idx] * row_scales[tile_col];
   }
 }
 
@@ -408,6 +653,8 @@ __global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet
   const int64_t col0 = static_cast<int64_t>(blockIdx.x) * TileCols + local_col;
 
   const int split_k_slices = gridDim.z;
+  const int64_t workspace_slice_stride = rows * layout.logical_out_features;
+  const int64_t workspace_base = static_cast<int64_t>(blockIdx.z) * workspace_slice_stride;
   const int64_t slice_span = ((layout.logical_in_features + split_k_slices - 1) / split_k_slices + TileK - 1) / TileK * TileK;
   const int64_t slice_begin_raw = static_cast<int64_t>(blockIdx.z) * slice_span;
   const int64_t slice_begin = slice_begin_raw < layout.logical_in_features ? slice_begin_raw : layout.logical_in_features;
@@ -517,9 +764,8 @@ __global__ __launch_bounds__(kPrefillThreadsX * kPrefillThreadsY, 2) void bitnet
       continue;
     }
     const int tile_col = local_col + idx * kPrefillThreadsX;
-    atomicAdd(
-        workspace + (row * layout.logical_out_features + global_col),
-        static_cast<float>(accum[idx]) * input_scales[local_row] * row_scales[tile_col]);
+    workspace[workspace_base + row * layout.logical_out_features + global_col] =
+        static_cast<float>(accum[idx]) * input_scales[local_row] * row_scales[tile_col];
   }
 }
 
@@ -529,14 +775,18 @@ __global__ void bitnet_linear_splitk_finalize_kernel(
     const scalar_t* __restrict__ bias,
     scalar_t* __restrict__ out,
     LayoutInfo layout,
-    int64_t rows) {
+    int64_t rows,
+    int split_k_slices) {
   const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t total = rows * layout.logical_out_features;
   if (idx >= total) {
     return;
   }
   const int64_t col = idx % layout.logical_out_features;
-  float value = workspace[idx];
+  float value = 0.0f;
+  for (int slice_idx = 0; slice_idx < split_k_slices; ++slice_idx) {
+    value += workspace[static_cast<int64_t>(slice_idx) * total + idx];
+  }
   if (bias != nullptr) {
     value += static_cast<float>(bias[col]);
   }
@@ -612,6 +862,73 @@ void LaunchBitNetPrefillKernel(
                   layout,
                   rows,
                   packed_weight.size(1));
+        }
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void LaunchBitNetPrefillKernelComputePacked(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan) {
+  c10::cuda::CUDAGuard device_guard(x_2d.device());
+  auto stream = c10::cuda::getCurrentCUDAStream(x_2d.device().index());
+  const auto rows = x_2d.size(0);
+  const auto out_features = layout.logical_out_features;
+  const auto in_features = layout.logical_in_features;
+
+  if (!UseTiledPrefillKernel(rows, out_features, in_features)) {
+    LaunchBitNetDecodeKernelComputePacked(out_2d, x_2d, compute_packed_words, compute_row_scales, bias, layout, plan);
+    return;
+  }
+
+  const dim3 threads(kPrefillThreadsX, kPrefillThreadsY);
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      x_2d.scalar_type(),
+      "bitnet_linear_prefill_compute_packed_cuda",
+      [&] {
+        const scalar_t* bias_ptr = nullptr;
+        if (bias.has_value() && bias.value().defined()) {
+          bias_ptr = bias.value().data_ptr<scalar_t>();
+        }
+        if (plan.tile_k >= kPrefillSm80TileK && plan.cols_per_thread >= kPrefillSm80ColsPerThread) {
+          const dim3 blocks(
+              static_cast<unsigned int>((out_features + (kPrefillThreadsX * kPrefillSm80ColsPerThread) - 1) /
+                                        (kPrefillThreadsX * kPrefillSm80ColsPerThread)),
+              static_cast<unsigned int>((rows + kPrefillTileRows - 1) / kPrefillTileRows));
+          bitnet_linear_prefill_tiled_compute_packed_kernel<scalar_t, kPrefillSm80TileK, kPrefillSm80ColsPerThread>
+              <<<blocks, threads, 0, stream.stream()>>>(
+                  x_2d.data_ptr<scalar_t>(),
+                  compute_packed_words.data_ptr<int32_t>(),
+                  compute_row_scales.data_ptr<float>(),
+                  bias_ptr,
+                  out_2d.data_ptr<scalar_t>(),
+                  layout,
+                  rows,
+                  compute_packed_words.size(1),
+                  compute_packed_words.size(2));
+        } else {
+          const dim3 blocks(
+              static_cast<unsigned int>((out_features + kPrefillThreadsX - 1) / kPrefillThreadsX),
+              static_cast<unsigned int>((rows + kPrefillTileRows - 1) / kPrefillTileRows));
+          bitnet_linear_prefill_tiled_compute_packed_kernel<scalar_t, kPrefillGenericTileK, 1>
+              <<<blocks, threads, 0, stream.stream()>>>(
+                  x_2d.data_ptr<scalar_t>(),
+                  compute_packed_words.data_ptr<int32_t>(),
+                  compute_row_scales.data_ptr<float>(),
+                  bias_ptr,
+                  out_2d.data_ptr<scalar_t>(),
+                  layout,
+                  rows,
+                  compute_packed_words.size(1),
+                  compute_packed_words.size(2));
         }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -725,13 +1042,16 @@ void LaunchBitNetPrefillSplitKKernel(
   const auto rows = x_2d.size(0);
   const auto out_features = layout.logical_out_features;
   const auto total = rows * out_features;
-  auto workspace = torch::zeros({rows, out_features}, torch::TensorOptions().device(x_2d.device()).dtype(torch::kFloat32));
+  const auto split_k_slices = std::max(1, plan.split_k_slices);
+  auto workspace = torch::empty(
+      {split_k_slices, rows, out_features},
+      torch::TensorOptions().device(x_2d.device()).dtype(torch::kFloat32));
 
   const dim3 threads(kPrefillThreadsX, kPrefillThreadsY);
   const dim3 blocks(
       static_cast<unsigned int>((out_features + plan.outputs_per_block - 1) / plan.outputs_per_block),
       static_cast<unsigned int>((rows + kPrefillTileRows - 1) / kPrefillTileRows),
-      static_cast<unsigned int>(std::max(1, plan.split_k_slices)));
+      static_cast<unsigned int>(split_k_slices));
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf,
@@ -775,7 +1095,80 @@ void LaunchBitNetPrefillSplitKKernel(
             bias_ptr,
             out_2d.data_ptr<scalar_t>(),
             layout,
-            rows);
+            rows,
+            split_k_slices);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void LaunchBitNetPrefillSplitKKernelComputePacked(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan) {
+  c10::cuda::CUDAGuard device_guard(x_2d.device());
+  auto stream = c10::cuda::getCurrentCUDAStream(x_2d.device().index());
+  const auto rows = x_2d.size(0);
+  const auto out_features = layout.logical_out_features;
+  const auto total = rows * out_features;
+  const auto split_k_slices = std::max(1, plan.split_k_slices);
+  auto workspace = torch::empty(
+      {split_k_slices, rows, out_features},
+      torch::TensorOptions().device(x_2d.device()).dtype(torch::kFloat32));
+
+  const dim3 threads(kPrefillThreadsX, kPrefillThreadsY);
+  const dim3 blocks(
+      static_cast<unsigned int>((out_features + plan.outputs_per_block - 1) / plan.outputs_per_block),
+      static_cast<unsigned int>((rows + kPrefillTileRows - 1) / kPrefillTileRows),
+      static_cast<unsigned int>(split_k_slices));
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      x_2d.scalar_type(),
+      "bitnet_linear_prefill_splitk_compute_packed_cuda",
+      [&] {
+        const scalar_t* bias_ptr = nullptr;
+        if (bias.has_value() && bias.value().defined()) {
+          bias_ptr = bias.value().data_ptr<scalar_t>();
+        }
+        if (plan.tile_k >= kPrefillSm80TileK && plan.cols_per_thread >= kPrefillSm80ColsPerThread) {
+          bitnet_linear_prefill_splitk_compute_packed_kernel<scalar_t, kPrefillSm80TileK, kPrefillSm80ColsPerThread>
+              <<<blocks, threads, 0, stream.stream()>>>(
+                  x_2d.data_ptr<scalar_t>(),
+                  compute_packed_words.data_ptr<int32_t>(),
+                  compute_row_scales.data_ptr<float>(),
+                  workspace.data_ptr<float>(),
+                  layout,
+                  rows,
+                  compute_packed_words.size(1),
+                  compute_packed_words.size(2));
+        } else {
+          bitnet_linear_prefill_splitk_compute_packed_kernel<scalar_t, kPrefillGenericTileK, 1>
+              <<<blocks, threads, 0, stream.stream()>>>(
+                  x_2d.data_ptr<scalar_t>(),
+                  compute_packed_words.data_ptr<int32_t>(),
+                  compute_row_scales.data_ptr<float>(),
+                  workspace.data_ptr<float>(),
+                  layout,
+                  rows,
+                  compute_packed_words.size(1),
+                  compute_packed_words.size(2));
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        const dim3 finalize_blocks(static_cast<unsigned int>((total + kDecodeThreads - 1) / kDecodeThreads));
+        const dim3 finalize_threads(kDecodeThreads);
+        bitnet_linear_splitk_finalize_kernel<scalar_t><<<finalize_blocks, finalize_threads, 0, stream.stream()>>>(
+            workspace.data_ptr<float>(),
+            bias_ptr,
+            out_2d.data_ptr<scalar_t>(),
+            layout,
+            rows,
+            split_k_slices);
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -797,13 +1190,16 @@ void LaunchBitNetPrefillSplitKKernelStaticInput(
   const auto rows = x_2d.size(0);
   const auto out_features = layout.logical_out_features;
   const auto total = rows * out_features;
-  auto workspace = torch::zeros({rows, out_features}, torch::TensorOptions().device(x_2d.device()).dtype(torch::kFloat32));
+  const auto split_k_slices = std::max(1, plan.split_k_slices);
+  auto workspace = torch::empty(
+      {split_k_slices, rows, out_features},
+      torch::TensorOptions().device(x_2d.device()).dtype(torch::kFloat32));
 
   const dim3 threads(kPrefillThreadsX, kPrefillThreadsY);
   const dim3 blocks(
       static_cast<unsigned int>((out_features + plan.outputs_per_block - 1) / plan.outputs_per_block),
       static_cast<unsigned int>((rows + kPrefillTileRows - 1) / kPrefillTileRows),
-      static_cast<unsigned int>(std::max(1, plan.split_k_slices)));
+      static_cast<unsigned int>(split_k_slices));
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf,
@@ -859,7 +1255,8 @@ void LaunchBitNetPrefillSplitKKernelStaticInput(
             bias_ptr,
             out_2d.data_ptr<scalar_t>(),
             layout,
-            rows);
+            rows,
+            split_k_slices);
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

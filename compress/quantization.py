@@ -278,6 +278,149 @@ def _dequantize_bitnet_weight(
     return unpacked.to(dtype=torch.float32).mul(row_scales.unsqueeze(-1)).to(dtype=dtype)
 
 
+_BITNET_COMPUTE_TILE_N = 128
+_BITNET_DECODE_TILE_N = 128
+_BITNET_DECODE_CHUNK_K = 32
+
+
+def _pack_bitnet_compute_weight(
+    packed_weight: torch.Tensor,
+    scale_values: torch.Tensor,
+    layout_header: torch.Tensor,
+    segment_offsets: torch.Tensor,
+    *,
+    tile_n: int = _BITNET_COMPUTE_TILE_N,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if packed_weight.ndim != 2:
+        raise ValueError("BitNet packed_weight must be rank-2")
+    if tile_n <= 0:
+        raise ValueError("BitNet compute tile_n must be positive")
+    rows = int(packed_weight.shape[0])
+    packed_cols = int(packed_weight.shape[1])
+    word_cols = (packed_cols + 3) // 4
+    pad_cols = word_cols * 4 - packed_cols
+    if pad_cols > 0:
+        pad_value = torch.full(
+            (rows, pad_cols),
+            0x55,
+            device=packed_weight.device,
+            dtype=torch.uint8,
+        )
+        packed_bytes = torch.cat((packed_weight, pad_value), dim=1)
+    else:
+        packed_bytes = packed_weight
+    packed_bytes_i64 = packed_bytes.reshape(rows, word_cols, 4).to(dtype=torch.int64)
+    packed_words = (
+        packed_bytes_i64[..., 0]
+        | (packed_bytes_i64[..., 1] << 8)
+        | (packed_bytes_i64[..., 2] << 16)
+        | (packed_bytes_i64[..., 3] << 24)
+    ).to(dtype=torch.int32)
+    padded_rows = ((rows + tile_n - 1) // tile_n) * tile_n
+    if padded_rows > rows:
+        pad_rows = torch.full(
+            (padded_rows - rows, word_cols),
+            int(0x55555555),
+            device=packed_words.device,
+            dtype=torch.int32,
+        )
+        packed_words = torch.cat((packed_words, pad_rows), dim=0)
+    packed_words = packed_words.view(padded_rows // tile_n, tile_n, word_cols).permute(0, 2, 1).contiguous()
+
+    row_scales = _bitnet_row_scales(scale_values, layout_header, segment_offsets)
+    if padded_rows > int(row_scales.shape[0]):
+        row_scales = torch.cat(
+            (
+                row_scales,
+                torch.zeros(
+                    padded_rows - int(row_scales.shape[0]),
+                    device=row_scales.device,
+                    dtype=torch.float32,
+                ),
+            ),
+            dim=0,
+        )
+    row_scales = row_scales.view(padded_rows // tile_n, tile_n).contiguous()
+    return packed_words, row_scales
+
+
+def _pack_bitnet_decode_backend_weight(
+    packed_weight: torch.Tensor,
+    scale_values: torch.Tensor,
+    layout_header: torch.Tensor,
+    segment_offsets: torch.Tensor,
+    *,
+    tile_n: int = _BITNET_DECODE_TILE_N,
+    chunk_k: int = _BITNET_DECODE_CHUNK_K,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if packed_weight.ndim != 2:
+        raise ValueError("BitNet packed_weight must be rank-2")
+    if tile_n <= 0:
+        raise ValueError("BitNet decode tile_n must be positive")
+    if chunk_k <= 0 or chunk_k > 32:
+        raise ValueError("BitNet decode chunk_k must be in [1, 32]")
+    if chunk_k != 32:
+        raise ValueError("BitNet decode backend currently requires chunk_k == 32")
+
+    logical_out = int(layout_header[3].item())
+    logical_in = int(layout_header[4].item())
+    signed = _unpack_bitnet_signed(packed_weight[:logical_out], original_last_dim=logical_in).to(dtype=torch.int8)
+
+    chunk_cols = (logical_in + chunk_k - 1) // chunk_k
+    padded_in = chunk_cols * chunk_k
+    if padded_in > logical_in:
+        signed = torch.cat(
+            (
+                signed,
+                torch.zeros(
+                    logical_out,
+                    padded_in - logical_in,
+                    device=signed.device,
+                    dtype=torch.int8,
+                ),
+            ),
+            dim=1,
+        )
+
+    padded_rows = ((logical_out + tile_n - 1) // tile_n) * tile_n
+    if padded_rows > logical_out:
+        signed = torch.cat(
+            (
+                signed,
+                torch.zeros(
+                    padded_rows - logical_out,
+                    padded_in,
+                    device=signed.device,
+                    dtype=torch.int8,
+                ),
+            ),
+            dim=0,
+        )
+
+    chunked = signed.view(padded_rows, chunk_cols, chunk_k)
+    bit_positions = (1 << torch.arange(chunk_k, device=chunked.device, dtype=torch.int64)).view(1, 1, chunk_k)
+    nz_masks = ((chunked != 0).to(dtype=torch.int64) * bit_positions).sum(dim=-1).to(dtype=torch.int32)
+    sign_masks = ((chunked > 0).to(dtype=torch.int64) * bit_positions).sum(dim=-1).to(dtype=torch.int32)
+    nz_masks = nz_masks.view(padded_rows // tile_n, tile_n, chunk_cols).permute(0, 2, 1).contiguous()
+    sign_masks = sign_masks.view(padded_rows // tile_n, tile_n, chunk_cols).permute(0, 2, 1).contiguous()
+
+    row_scales = _bitnet_row_scales(scale_values, layout_header, segment_offsets)
+    if padded_rows > int(row_scales.shape[0]):
+        row_scales = torch.cat(
+            (
+                row_scales,
+                torch.zeros(
+                    padded_rows - int(row_scales.shape[0]),
+                    device=row_scales.device,
+                    dtype=torch.float32,
+                ),
+            ),
+            dim=0,
+        )
+    row_scales = row_scales.view(padded_rows // tile_n, tile_n).contiguous()
+    return nz_masks, sign_masks, row_scales
+
+
 def _bitnet_row_scale_symmetric(
     row: torch.Tensor,
     *,
@@ -1982,6 +2125,13 @@ class QuantizedLinearBitNet(nn.Module):
         self.layout_meta: dict[str, int] | None = None
         self._cached_weight_key: tuple[object, ...] | None = None
         self._cached_weight: torch.Tensor | None = None
+        self._cached_compute_backend_key: tuple[object, ...] | None = None
+        self._cached_compute_backend_words: torch.Tensor | None = None
+        self._cached_compute_backend_row_scales: torch.Tensor | None = None
+        self._cached_decode_backend_key: tuple[object, ...] | None = None
+        self._cached_decode_backend_nz_masks: torch.Tensor | None = None
+        self._cached_decode_backend_sign_masks: torch.Tensor | None = None
+        self._cached_decode_backend_row_scales: torch.Tensor | None = None
         self._cached_int8_backend_key: tuple[object, ...] | None = None
         self._cached_int8_backend_qweight: torch.Tensor | None = None
         self._cached_int8_backend_inv_scale: torch.Tensor | None = None
@@ -1995,6 +2145,13 @@ class QuantizedLinearBitNet(nn.Module):
     def _invalidate_weight_cache(self) -> None:
         self._cached_weight_key = None
         self._cached_weight = None
+        self._cached_compute_backend_key = None
+        self._cached_compute_backend_words = None
+        self._cached_compute_backend_row_scales = None
+        self._cached_decode_backend_key = None
+        self._cached_decode_backend_nz_masks = None
+        self._cached_decode_backend_sign_masks = None
+        self._cached_decode_backend_row_scales = None
         self._cached_int8_backend_key = None
         self._cached_int8_backend_qweight = None
         self._cached_int8_backend_inv_scale = None
@@ -2264,6 +2421,116 @@ class QuantizedLinearBitNet(nn.Module):
     def _uses_int8_packed_backend(self) -> bool:
         mode_name = str(self.act_quant_mode).strip().lower()
         return (not self._spin_enabled_runtime()) and mode_name in {"dynamic_int8", "static_int8"}
+
+    def _compute_backend_weight(
+        self,
+        *,
+        device: torch.device | str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        target_device = self.packed_weight.device if device is None else torch.device(device)
+        key = (
+            str(target_device),
+            int(_BITNET_COMPUTE_TILE_N),
+            tuple(self.packed_weight.shape),
+            tuple(self.scale_values.shape),
+            tuple(self.layout_header.shape),
+            tuple(self.segment_offsets.shape),
+            int(getattr(self.packed_weight, "_version", 0)),
+            int(getattr(self.scale_values, "_version", 0)),
+            int(getattr(self.layout_header, "_version", 0)),
+            int(getattr(self.segment_offsets, "_version", 0)),
+            int(self.packed_weight.data_ptr()) if self.packed_weight.numel() > 0 else 0,
+            int(self.scale_values.data_ptr()) if self.scale_values.numel() > 0 else 0,
+            int(self.layout_header.data_ptr()) if self.layout_header.numel() > 0 else 0,
+            int(self.segment_offsets.data_ptr()) if self.segment_offsets.numel() > 0 else 0,
+        )
+        if (
+            self._cached_compute_backend_key != key
+            or self._cached_compute_backend_words is None
+            or self._cached_compute_backend_row_scales is None
+        ):
+            packed_weight = (
+                self.packed_weight if self.packed_weight.device == target_device else self.packed_weight.to(device=target_device)
+            )
+            scale_values = (
+                self.scale_values if self.scale_values.device == target_device else self.scale_values.to(device=target_device)
+            )
+            layout_header = (
+                self.layout_header if self.layout_header.device == target_device else self.layout_header.to(device=target_device)
+            )
+            segment_offsets = (
+                self.segment_offsets if self.segment_offsets.device == target_device else self.segment_offsets.to(device=target_device)
+            )
+            packed_words, row_scales = _pack_bitnet_compute_weight(
+                packed_weight,
+                scale_values,
+                layout_header,
+                segment_offsets,
+                tile_n=_BITNET_COMPUTE_TILE_N,
+            )
+            self._cached_compute_backend_words = packed_words.to(device=target_device, dtype=torch.int32).contiguous()
+            self._cached_compute_backend_row_scales = row_scales.to(device=target_device, dtype=torch.float32).contiguous()
+            self._cached_compute_backend_key = key
+        return self._cached_compute_backend_words, self._cached_compute_backend_row_scales
+
+    def _decode_backend_weight(
+        self,
+        *,
+        device: torch.device | str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        target_device = self.packed_weight.device if device is None else torch.device(device)
+        key = (
+            str(target_device),
+            int(_BITNET_DECODE_TILE_N),
+            int(_BITNET_DECODE_CHUNK_K),
+            tuple(self.packed_weight.shape),
+            tuple(self.scale_values.shape),
+            tuple(self.layout_header.shape),
+            tuple(self.segment_offsets.shape),
+            int(getattr(self.packed_weight, "_version", 0)),
+            int(getattr(self.scale_values, "_version", 0)),
+            int(getattr(self.layout_header, "_version", 0)),
+            int(getattr(self.segment_offsets, "_version", 0)),
+            int(self.packed_weight.data_ptr()) if self.packed_weight.numel() > 0 else 0,
+            int(self.scale_values.data_ptr()) if self.scale_values.numel() > 0 else 0,
+            int(self.layout_header.data_ptr()) if self.layout_header.numel() > 0 else 0,
+            int(self.segment_offsets.data_ptr()) if self.segment_offsets.numel() > 0 else 0,
+        )
+        if (
+            self._cached_decode_backend_key != key
+            or self._cached_decode_backend_nz_masks is None
+            or self._cached_decode_backend_sign_masks is None
+            or self._cached_decode_backend_row_scales is None
+        ):
+            packed_weight = (
+                self.packed_weight if self.packed_weight.device == target_device else self.packed_weight.to(device=target_device)
+            )
+            scale_values = (
+                self.scale_values if self.scale_values.device == target_device else self.scale_values.to(device=target_device)
+            )
+            layout_header = (
+                self.layout_header if self.layout_header.device == target_device else self.layout_header.to(device=target_device)
+            )
+            segment_offsets = (
+                self.segment_offsets if self.segment_offsets.device == target_device else self.segment_offsets.to(device=target_device)
+            )
+            nz_masks, sign_masks, row_scales = _pack_bitnet_decode_backend_weight(
+                packed_weight,
+                scale_values,
+                layout_header,
+                segment_offsets,
+                tile_n=_BITNET_DECODE_TILE_N,
+                chunk_k=_BITNET_DECODE_CHUNK_K,
+            )
+            self._cached_decode_backend_nz_masks = nz_masks.to(device=target_device, dtype=torch.int32).contiguous()
+            self._cached_decode_backend_sign_masks = sign_masks.to(device=target_device, dtype=torch.int32).contiguous()
+            self._cached_decode_backend_row_scales = row_scales.to(device=target_device, dtype=torch.float32).contiguous()
+            self._cached_decode_backend_key = key
+        return (
+            self._cached_decode_backend_nz_masks,
+            self._cached_decode_backend_sign_masks,
+            self._cached_decode_backend_row_scales,
+        )
 
     def _int8_backend_weight(
         self,

@@ -100,6 +100,10 @@ def _create_session(model: CausalLM) -> tuple[object | None, torch.Tensor]:
     return runtime_native_mod.create_native_model_session(model, seq), seq
 
 
+def _create_session_with_seq(model: CausalLM, seq: torch.Tensor) -> object | None:
+    return runtime_native_mod.create_native_model_session(model, seq)
+
+
 @pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
 def test_native_causal_executor_uses_module_aware_runtime_paths_for_bitnet(monkeypatch):
     model = CausalLM(_cfg(), block_variant="llama", tie_weights=False)
@@ -107,6 +111,52 @@ def test_native_causal_executor_uses_module_aware_runtime_paths_for_bitnet(monke
     _convert_model_to_bitnet(model)
     logits = _run_native_bitnet_session_without_python_runtime_ops(monkeypatch, model)
     assert logits.shape == (2, model.cfg.vocab_size)
+
+
+@pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
+def test_native_causal_executor_direct_bitnet_uses_compute_backend_cache(monkeypatch):
+    model = CausalLM(_cfg(), block_variant="llama", tie_weights=False)
+    model.eval()
+    modules = _convert_model_to_bitnet(model)
+    counters: list[dict[str, int]] = []
+    for module in modules:
+        seen = {"calls": 0}
+        original = module._compute_backend_weight
+
+        def wrapped(*, device=None, _original=original, _seen=seen):
+            _seen["calls"] += 1
+            return _original(device=device)
+
+        monkeypatch.setattr(module, "_compute_backend_weight", wrapped)
+        counters.append(seen)
+
+    logits = _run_native_bitnet_session_without_python_runtime_ops(monkeypatch, model)
+
+    assert logits.shape == (2, model.cfg.vocab_size)
+    assert all(entry["calls"] > 0 for entry in counters)
+
+
+@pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
+def test_native_causal_executor_direct_bitnet_uses_decode_backend_cache(monkeypatch):
+    model = CausalLM(_cfg(), block_variant="llama", tie_weights=False)
+    model.eval()
+    modules = _convert_model_to_bitnet(model)
+    counters: list[dict[str, int]] = []
+    for module in modules:
+        seen = {"calls": 0}
+        original = module._decode_backend_weight
+
+        def wrapped(*, device=None, _original=original, _seen=seen):
+            _seen["calls"] += 1
+            return _original(device=device)
+
+        monkeypatch.setattr(module, "_decode_backend_weight", wrapped)
+        counters.append(seen)
+
+    logits = _run_native_bitnet_session_without_python_runtime_ops(monkeypatch, model)
+
+    assert logits.shape == (2, model.cfg.vocab_size)
+    assert all(entry["calls"] > 0 for entry in counters)
 
 
 @pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
@@ -186,6 +236,41 @@ def test_native_causal_executor_direct_bitnet_ignores_irrelevant_act_metadata_fo
 
     logits = _run_native_bitnet_session_without_python_runtime_ops(monkeypatch, model)
     assert logits.shape == (2, model.cfg.vocab_size)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not runtime_native_mod.native_model_session_available(),
+    reason="CUDA native causal executor unavailable",
+)
+def test_native_causal_executor_direct_bitnet_noquant_prefill_uses_compute_backend_family(monkeypatch):
+    model = CausalLM(_cfg(), block_variant="llama", tie_weights=False).cuda()
+    model.eval()
+    modules = _convert_model_to_bitnet(model)
+    for module in modules:
+        module.act_quant_mode = "none"
+        module._compute_backend_weight(device="cuda")
+
+    _disable_python_runtime_ops(monkeypatch)
+    seq = torch.randint(0, model.cfg.vocab_size, (2, 3), device="cuda")
+
+    baseline_session = _create_session_with_seq(model, seq)
+    if baseline_session is None or getattr(baseline_session, "native_executor_kind", "python") != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    with torch.no_grad():
+        baseline = baseline_session.full_next_logits()
+
+    for module in modules:
+        module.packed_weight.zero_()
+
+    corrupted_session = _create_session_with_seq(model, seq)
+    if corrupted_session is None or getattr(corrupted_session, "native_executor_kind", "python") != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    with torch.no_grad():
+        actual = corrupted_session.full_next_logits()
+
+    assert torch.allclose(actual, baseline, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")

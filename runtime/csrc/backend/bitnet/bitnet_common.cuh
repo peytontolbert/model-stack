@@ -51,14 +51,11 @@ inline bool DeviceIsSm80OrLater(const torch::Tensor& reference) {
 }
 
 inline int DeviceMultiProcessorCount(const torch::Tensor& reference) {
-  if (!reference.is_cuda()) {
+  const auto* prop = t10::cuda::CachedDeviceProperties(reference);
+  if (prop == nullptr) {
     return 0;
   }
-  cudaDeviceProp prop{};
-  if (cudaGetDeviceProperties(&prop, reference.get_device()) != cudaSuccess) {
-    return 0;
-  }
-  return std::max(1, static_cast<int>(prop.multiProcessorCount));
+  return std::max(1, static_cast<int>(prop->multiProcessorCount));
 }
 
 inline bool SupportsScaleGranularity(const LayoutInfo& layout) {
@@ -305,6 +302,43 @@ __device__ inline float BitNetDotFloatPackedTernaryChunk4Device(
   return acc;
 }
 
+template <typename scalar_t>
+__device__ inline float BitNetDotFloatPackedTernaryWord16Device(
+    const scalar_t* __restrict__ lhs,
+    uint32_t packed_word,
+    int valid_values,
+    float acc) {
+  #pragma unroll
+  for (int byte_idx = 0; byte_idx < 4; ++byte_idx) {
+    const int consumed = byte_idx * 4;
+    if (consumed >= valid_values) {
+      break;
+    }
+    const int valid_chunk = valid_values - consumed >= 4 ? 4 : (valid_values - consumed);
+    const uint8_t packed_value = static_cast<uint8_t>((packed_word >> (byte_idx * 8)) & 0xffu);
+    acc = BitNetDotFloatPackedTernaryChunk4Device(lhs + consumed, packed_value, valid_chunk, acc);
+  }
+  return acc;
+}
+
+__device__ inline uint32_t LoadPackedTernaryWord16Device(
+    const uint8_t* __restrict__ packed_row,
+    int word_idx) {
+  return reinterpret_cast<const uint32_t*>(packed_row)[word_idx];
+}
+
+__device__ inline uint32_t LoadComputePackedTernaryWord16Device(
+    const int32_t* __restrict__ compute_packed_words,
+    int64_t compute_word_cols,
+    int64_t compute_tile_n,
+    int64_t global_col,
+    int64_t global_word_idx) {
+  const int64_t tile_group = global_col / compute_tile_n;
+  const int64_t tile_col = global_col - tile_group * compute_tile_n;
+  return static_cast<uint32_t>(
+      compute_packed_words[(tile_group * compute_word_cols + global_word_idx) * compute_tile_n + tile_col]);
+}
+
 __device__ inline float ResolveRowScaleDevice(
     int64_t out_idx,
     const float* scale_values,
@@ -328,12 +362,49 @@ __device__ inline float ResolveRowScaleDevice(
   return 0.0f;
 }
 
+__device__ inline float ResolveComputePackedRowScaleDevice(
+    int64_t out_idx,
+    const float* compute_row_scales,
+    int64_t compute_tile_n) {
+  const int64_t tile_group = out_idx / compute_tile_n;
+  const int64_t tile_col = out_idx - tile_group * compute_tile_n;
+  return compute_row_scales[tile_group * compute_tile_n + tile_col];
+}
+
 void LaunchBitNetDecodeKernel(
     torch::Tensor& out_2d,
     const torch::Tensor& x_2d,
     const torch::Tensor& packed_weight,
     const torch::Tensor& scale_values,
     const torch::Tensor& segment_offsets,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan);
+
+void LaunchBitNetDecodeKernelComputePacked(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan);
+
+void LaunchBitNetDecodeKernelBitplaneRow1(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& decode_nz_masks,
+    const torch::Tensor& decode_sign_masks,
+    const torch::Tensor& decode_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan);
+
+void LaunchBitNetPrefillKernelComputePacked(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
     const c10::optional<torch::Tensor>& bias,
     const LayoutInfo& layout,
     const Plan& plan);
@@ -380,6 +451,15 @@ void LaunchBitNetPrefillSplitKKernel(
     const torch::Tensor& packed_weight,
     const torch::Tensor& scale_values,
     const torch::Tensor& segment_offsets,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan);
+
+void LaunchBitNetPrefillSplitKKernelComputePacked(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
     const c10::optional<torch::Tensor>& bias,
     const LayoutInfo& layout,
     const Plan& plan);

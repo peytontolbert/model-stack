@@ -110,6 +110,164 @@ torch::Tensor CudaBitNetLinearForward(
   return out_dtype_resolved == compute_dtype ? out : out.to(out_dtype_resolved);
 }
 
+torch::Tensor CudaBitNetLinearForwardComputePacked(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& scale_values,
+    const torch::Tensor& layout_header,
+    const torch::Tensor& segment_offsets,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
+    const torch::Tensor& decode_nz_masks,
+    const torch::Tensor& decode_sign_masks,
+    const torch::Tensor& decode_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  TORCH_CHECK(x.defined() && packed_weight.defined() && scale_values.defined() && layout_header.defined() &&
+                  segment_offsets.defined() && compute_packed_words.defined() && compute_row_scales.defined(),
+              "CudaBitNetLinearForwardComputePacked: tensors must be defined");
+  TORCH_CHECK(x.is_cuda() && compute_packed_words.is_cuda() && compute_row_scales.is_cuda(),
+              "CudaBitNetLinearForwardComputePacked: x and compute-packed tensors must be CUDA");
+  TORCH_CHECK(x.dim() >= 2, "CudaBitNetLinearForwardComputePacked: x must have rank >= 2");
+  TORCH_CHECK(IsSupportedLinearDtype(x.scalar_type()),
+              "CudaBitNetLinearForwardComputePacked: x must use float32, float16, or bfloat16");
+
+  c10::cuda::CUDAGuard device_guard(x.device());
+
+  const auto layout = ParseLayoutHeader(layout_header);
+  ValidateSegmentOffsets(segment_offsets, layout);
+  ValidateScaleValues(scale_values, layout);
+  TORCH_CHECK(SupportsScaleGranularity(layout),
+              "CudaBitNetLinearForwardComputePacked: unsupported scale granularity");
+  TORCH_CHECK(x.size(-1) == layout.logical_in_features,
+              "CudaBitNetLinearForwardComputePacked: input feature size mismatch");
+
+  auto x_contig = x.contiguous();
+  const auto rows = x_contig.numel() / layout.logical_in_features;
+  const auto compute_dtype = x.scalar_type();
+  auto x_2d = x_contig.view({rows, layout.logical_in_features});
+  const auto plan = ResolvePlan(x_2d, layout);
+
+  const int64_t expected_word_cols = (layout.padded_in_features + 15) / 16;
+  const int64_t expected_decode_chunk_cols = (layout.logical_in_features + 31) / 32;
+  const bool compute_layout_valid =
+      compute_packed_words.dim() == 3 &&
+      compute_packed_words.scalar_type() == torch::kInt32 &&
+      compute_row_scales.dim() == 2 &&
+      compute_row_scales.scalar_type() == torch::kFloat32 &&
+      compute_packed_words.device() == x.device() &&
+      compute_row_scales.device() == x.device() &&
+      compute_packed_words.size(1) == expected_word_cols &&
+      compute_packed_words.size(0) == compute_row_scales.size(0) &&
+      compute_packed_words.size(2) == compute_row_scales.size(1) &&
+      compute_row_scales.size(1) > 0 &&
+      compute_row_scales.size(0) * compute_row_scales.size(1) >= layout.padded_out_features;
+  const bool decode_layout_valid =
+      decode_nz_masks.defined() &&
+      decode_sign_masks.defined() &&
+      decode_row_scales.defined() &&
+      decode_nz_masks.dim() == 3 &&
+      decode_sign_masks.dim() == 3 &&
+      decode_row_scales.dim() == 2 &&
+      decode_nz_masks.scalar_type() == torch::kInt32 &&
+      decode_sign_masks.scalar_type() == torch::kInt32 &&
+      decode_row_scales.scalar_type() == torch::kFloat32 &&
+      decode_nz_masks.device() == x.device() &&
+      decode_sign_masks.device() == x.device() &&
+      decode_row_scales.device() == x.device() &&
+      decode_nz_masks.sizes() == decode_sign_masks.sizes() &&
+      decode_nz_masks.size(1) == expected_decode_chunk_cols &&
+      decode_nz_masks.size(0) == decode_row_scales.size(0) &&
+      decode_nz_masks.size(2) == decode_row_scales.size(1) &&
+      decode_row_scales.size(1) > 0 &&
+      decode_row_scales.size(0) * decode_row_scales.size(1) >= layout.padded_out_features;
+
+  c10::optional<torch::Tensor> bias_cast = c10::nullopt;
+  if (bias.has_value() && bias.value().defined()) {
+    TORCH_CHECK(bias.value().dim() == 1, "CudaBitNetLinearForwardComputePacked: bias must be rank-1");
+    TORCH_CHECK(bias.value().size(0) == layout.logical_out_features,
+                "CudaBitNetLinearForwardComputePacked: bias size mismatch");
+    bias_cast = bias.value().to(torch::TensorOptions().device(x.device()).dtype(compute_dtype)).contiguous();
+  }
+
+  auto out_dtype_resolved = out_dtype.has_value() ? out_dtype.value() : compute_dtype;
+  TORCH_CHECK(IsSupportedLinearDtype(out_dtype_resolved),
+              "CudaBitNetLinearForwardComputePacked: out_dtype must use float32, float16, or bfloat16");
+
+  auto out_2d = torch::empty(
+      {rows, layout.logical_out_features},
+      torch::TensorOptions().device(x.device()).dtype(compute_dtype));
+  if (rows == 0 || layout.logical_out_features == 0) {
+    std::vector<int64_t> out_sizes(x_contig.sizes().begin(), x_contig.sizes().end());
+    out_sizes.back() = layout.logical_out_features;
+    auto empty_out = out_2d.view(out_sizes);
+    return out_dtype_resolved == compute_dtype ? empty_out : empty_out.to(out_dtype_resolved);
+  }
+
+  if (plan.kind == KernelKind::kDecodePersistent && rows == 1 && decode_layout_valid) {
+    auto decode_nz_masks_contig = decode_nz_masks.contiguous();
+    auto decode_sign_masks_contig = decode_sign_masks.contiguous();
+    auto decode_scales_contig =
+        decode_row_scales.to(torch::TensorOptions().device(x.device()).dtype(torch::kFloat32)).contiguous();
+    LaunchBitNetDecodeKernelBitplaneRow1(
+        out_2d,
+        x_2d,
+        decode_nz_masks_contig,
+        decode_sign_masks_contig,
+        decode_scales_contig,
+        bias_cast,
+        layout,
+        plan);
+  } else {
+    if (!compute_layout_valid) {
+      return CudaBitNetLinearForward(
+          x_contig,
+          packed_weight,
+          scale_values,
+          layout_header,
+          segment_offsets,
+          bias,
+          out_dtype);
+    }
+    auto compute_words_contig = compute_packed_words.contiguous();
+    auto compute_scales_contig =
+        compute_row_scales.to(torch::TensorOptions().device(x.device()).dtype(torch::kFloat32)).contiguous();
+    if (plan.kind == KernelKind::kDecodePersistent) {
+      LaunchBitNetDecodeKernelComputePacked(
+          out_2d,
+          x_2d,
+          compute_words_contig,
+          compute_scales_contig,
+          bias_cast,
+          layout,
+          plan);
+    } else if (plan.kind == KernelKind::kPrefillSplitK) {
+      LaunchBitNetPrefillSplitKKernelComputePacked(
+          out_2d,
+          x_2d,
+          compute_words_contig,
+          compute_scales_contig,
+          bias_cast,
+          layout,
+          plan);
+    } else {
+      LaunchBitNetPrefillKernelComputePacked(
+          out_2d,
+          x_2d,
+          compute_words_contig,
+          compute_scales_contig,
+          bias_cast,
+          layout,
+          plan);
+    }
+  }
+
+  std::vector<int64_t> out_sizes(x_contig.sizes().begin(), x_contig.sizes().end());
+  out_sizes.back() = layout.logical_out_features;
+  auto out = out_2d.view(out_sizes);
+  return out_dtype_resolved == compute_dtype ? out : out.to(out_dtype_resolved);
+}
+
 torch::Tensor CudaBitNetLinearFromFloatForward(
     const torch::Tensor& x,
     const torch::Tensor& packed_weight,

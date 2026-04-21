@@ -98,70 +98,6 @@ __global__ void bitnet_linear_decode_scalar_static_input_kernel(
 }
 
 template <typename scalar_t, int TileK>
-__global__ __launch_bounds__(32, 8) void bitnet_linear_decode_row1_kernel(
-    const scalar_t* __restrict__ x,
-    const uint8_t* __restrict__ packed_weight,
-    const float* __restrict__ scale_values,
-    const int32_t* __restrict__ segment_offsets,
-    const scalar_t* __restrict__ bias,
-    scalar_t* __restrict__ out,
-    LayoutInfo layout,
-    int64_t packed_cols) {
-  constexpr int kWarpSize = 32;
-  constexpr int kPackedTileK = (TileK + 3) / 4;
-
-  __shared__ scalar_t x_tile[TileK];
-
-  const int lane = static_cast<int>(threadIdx.x);
-  const int64_t global_col = static_cast<int64_t>(blockIdx.x) * kWarpSize + lane;
-
-  float acc = 0.0f;
-  for (int64_t k0 = 0; k0 < layout.logical_in_features; k0 += TileK) {
-    for (int tile_k = lane; tile_k < TileK; tile_k += kWarpSize) {
-      const int64_t global_k = k0 + tile_k;
-      x_tile[tile_k] =
-          global_k < layout.logical_in_features
-              ? x[global_k]
-              : static_cast<scalar_t>(0);
-    }
-    __syncthreads();
-
-    if (global_col < layout.logical_out_features) {
-      const uint8_t* weight_row = packed_weight + (global_col * packed_cols) + (k0 >> 2);
-      #pragma unroll
-      for (int packed_k = 0; packed_k < kPackedTileK; ++packed_k) {
-        const int tile_k0 = packed_k * 4;
-        const int64_t global_k0 = k0 + tile_k0;
-        if (global_k0 >= layout.logical_in_features) {
-          break;
-        }
-        const uint8_t packed_value = weight_row[packed_k];
-        const int valid_values = static_cast<int>(
-            (layout.logical_in_features - global_k0) >= 4 ? 4 : (layout.logical_in_features - global_k0));
-        #pragma unroll
-        for (int offset = 0; offset < 4; ++offset) {
-          if (offset >= valid_values) {
-            break;
-          }
-          acc += static_cast<float>(x_tile[tile_k0 + offset]) *
-              static_cast<float>(DecodeSignedTernaryCode(packed_value, offset));
-        }
-      }
-    }
-    __syncthreads();
-  }
-
-  if (global_col >= layout.logical_out_features) {
-    return;
-  }
-  float value = acc * ResolveRowScaleDevice(global_col, scale_values, segment_offsets, layout);
-  if (bias != nullptr) {
-    value += static_cast<float>(bias[global_col]);
-  }
-  out[global_col] = CastOutput<scalar_t>(value);
-}
-
-template <typename scalar_t, int TileK>
 __global__ __launch_bounds__(32, 8) void bitnet_linear_decode_row1_static_input_kernel(
     const scalar_t* __restrict__ x,
     const scalar_t* __restrict__ pre_scale,
@@ -241,6 +177,72 @@ __global__ __launch_bounds__(32, 8) void bitnet_linear_decode_row1_static_input_
   out[global_col] = CastOutput<scalar_t>(value);
 }
 
+template <typename scalar_t, int WarpsPerBlock>
+__global__ __launch_bounds__(32 * WarpsPerBlock, 2) void bitnet_linear_decode_row1_bitplane_kernel(
+    const scalar_t* __restrict__ x,
+    const int32_t* __restrict__ decode_nz_masks,
+    const int32_t* __restrict__ decode_sign_masks,
+    const float* __restrict__ decode_row_scales,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ out,
+    LayoutInfo layout,
+    int64_t decode_chunk_cols,
+    int64_t decode_tile_n) {
+  constexpr int kWarpSize = 32;
+
+  __shared__ scalar_t x_chunk[kWarpSize];
+
+  const int lane = static_cast<int>(threadIdx.x);
+  const int warp_idx = static_cast<int>(threadIdx.y);
+  const int64_t out_idx = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock + warp_idx;
+  const bool output_active = out_idx < layout.logical_out_features;
+
+  float acc = 0.0f;
+  for (int64_t chunk_idx = 0; chunk_idx < decode_chunk_cols; ++chunk_idx) {
+    if (warp_idx == 0) {
+      const int64_t global_k = chunk_idx * kWarpSize + lane;
+      x_chunk[lane] =
+          global_k < layout.logical_in_features
+              ? x[global_k]
+              : static_cast<scalar_t>(0);
+    }
+    __syncthreads();
+
+    if (output_active) {
+      const int64_t tile_group = out_idx / decode_tile_n;
+      const int64_t tile_col = out_idx - tile_group * decode_tile_n;
+      const int64_t mask_idx = (tile_group * decode_chunk_cols + chunk_idx) * decode_tile_n + tile_col;
+      const uint32_t nz_mask = static_cast<uint32_t>(decode_nz_masks[mask_idx]);
+      const uint32_t sign_mask = static_cast<uint32_t>(decode_sign_masks[mask_idx]);
+      const uint32_t lane_bit = 1u << lane;
+
+      float contrib = 0.0f;
+      if ((nz_mask & lane_bit) != 0u) {
+        contrib = static_cast<float>(x_chunk[lane]);
+        if ((sign_mask & lane_bit) == 0u) {
+          contrib = -contrib;
+        }
+      }
+      #pragma unroll
+      for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        contrib += __shfl_down_sync(0xffffffffu, contrib, offset);
+      }
+      if (lane == 0) {
+        acc += contrib;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (output_active && lane == 0) {
+    float value = acc * ResolveComputePackedRowScaleDevice(out_idx, decode_row_scales, decode_tile_n);
+    if (bias != nullptr) {
+      value += static_cast<float>(bias[out_idx]);
+    }
+    out[out_idx] = CastOutput<scalar_t>(value);
+  }
+}
+
 template <typename scalar_t, int MaxRows, int TileK, int OutputsPerBlock>
 __global__ __launch_bounds__(32 * MaxRows, 2) void bitnet_linear_decode_persistent_kernel(
     const scalar_t* __restrict__ x,
@@ -257,9 +259,10 @@ __global__ __launch_bounds__(32 * MaxRows, 2) void bitnet_linear_decode_persiste
   constexpr int kColsPerLane = OutputsPerBlock / kWarpSize;
   constexpr int kThreads = kWarpSize * MaxRows;
   constexpr int kPackedTileK = (TileK + 3) / 4;
+  constexpr int kPackedTileKWords = (kPackedTileK + 3) / 4;
 
   __shared__ scalar_t x_tile[MaxRows][TileK];
-  __shared__ uint8_t w_tile_packed[OutputsPerBlock][kPackedTileK];
+  __shared__ uint32_t w_tile_words[OutputsPerBlock][kPackedTileKWords];
   __shared__ float row_scales[OutputsPerBlock];
 
   const int lane = static_cast<int>(threadIdx.x);
@@ -294,17 +297,18 @@ __global__ __launch_bounds__(32 * MaxRows, 2) void bitnet_linear_decode_persiste
                 ? x[tile_row * layout.logical_in_features + global_k]
                 : static_cast<scalar_t>(0);
       }
-      for (int index = thread_linear; index < OutputsPerBlock * kPackedTileK; index += kThreads) {
-        const int tile_col = index / kPackedTileK;
-        const int packed_k = index % kPackedTileK;
-        const int tile_k0 = packed_k * 4;
+      for (int index = thread_linear; index < OutputsPerBlock * kPackedTileKWords; index += kThreads) {
+        const int tile_col = index / kPackedTileKWords;
+        const int word_idx = index % kPackedTileKWords;
+        const int tile_k0 = word_idx * 16;
         const int64_t global_col = col_base + tile_col;
         const int64_t global_k0 = k0 + tile_k0;
-        uint8_t packed_value = static_cast<uint8_t>(0x55);
+        uint32_t packed_word = 0;
         if (global_col < layout.logical_out_features && global_k0 < layout.logical_in_features) {
-          packed_value = packed_weight[global_col * packed_cols + (global_k0 >> 2)];
+          const uint8_t* weight_row = packed_weight + (global_col * packed_cols) + (k0 >> 2);
+          packed_word = LoadPackedTernaryWord16Device(weight_row, word_idx);
         }
-        w_tile_packed[tile_col][packed_k] = packed_value;
+        w_tile_words[tile_col][word_idx] = packed_word;
       }
       __syncthreads();
 
@@ -318,17 +322,138 @@ __global__ __launch_bounds__(32 * MaxRows, 2) void bitnet_linear_decode_persiste
           }
           float acc = accum[col_iter];
           #pragma unroll
-          for (int packed_k = 0; packed_k < kPackedTileK; ++packed_k) {
-            const int tile_k0 = packed_k * 4;
+          for (int word_idx = 0; word_idx < kPackedTileKWords; ++word_idx) {
+            const int tile_k0 = word_idx * 16;
             const int64_t global_k0 = k0 + tile_k0;
             if (global_k0 >= layout.logical_in_features) {
               break;
             }
             const int valid_values = static_cast<int>(
-                (layout.logical_in_features - global_k0) >= 4 ? 4 : (layout.logical_in_features - global_k0));
-            acc = BitNetDotFloatPackedTernaryChunk4Device(
+                (layout.logical_in_features - global_k0) >= 16 ? 16 : (layout.logical_in_features - global_k0));
+            acc = BitNetDotFloatPackedTernaryWord16Device(
                 &x_tile[row_slot][tile_k0],
-                w_tile_packed[tile_col][packed_k],
+                w_tile_words[tile_col][word_idx],
+                valid_values,
+                acc);
+          }
+          accum[col_iter] = acc;
+        }
+      }
+      __syncthreads();
+    }
+
+    if (row_active) {
+      #pragma unroll
+      for (int col_iter = 0; col_iter < kColsPerLane; ++col_iter) {
+        const int tile_col = lane + col_iter * kWarpSize;
+        const int64_t global_col = col_base + tile_col;
+        if (global_col >= layout.logical_out_features) {
+          continue;
+        }
+        float value = accum[col_iter] * row_scales[tile_col];
+        if (bias != nullptr) {
+          value += static_cast<float>(bias[global_col]);
+        }
+        out[row_slot * layout.logical_out_features + global_col] = CastOutput<scalar_t>(value);
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <typename scalar_t, int MaxRows, int TileK, int OutputsPerBlock>
+__global__ __launch_bounds__(32 * MaxRows, 2) void bitnet_linear_decode_persistent_compute_packed_kernel(
+    const scalar_t* __restrict__ x,
+    const int32_t* __restrict__ compute_packed_words,
+    const float* __restrict__ compute_row_scales,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ out,
+    LayoutInfo layout,
+    int64_t rows,
+    int64_t compute_word_cols,
+    int64_t compute_tile_n,
+    int64_t total_tiles) {
+  constexpr int kWarpSize = 32;
+  constexpr int kColsPerLane = OutputsPerBlock / kWarpSize;
+  constexpr int kThreads = kWarpSize * MaxRows;
+  constexpr int kPackedTileKWords = (TileK + 15) / 16;
+
+  __shared__ scalar_t x_tile[MaxRows][TileK];
+  __shared__ uint32_t w_tile_words[OutputsPerBlock][kPackedTileKWords];
+  __shared__ float row_scales[OutputsPerBlock];
+
+  const int lane = static_cast<int>(threadIdx.x);
+  const int row_slot = static_cast<int>(threadIdx.y);
+  const int thread_linear = row_slot * kWarpSize + lane;
+  const bool row_active = row_slot < rows;
+
+  for (int64_t tile_idx = static_cast<int64_t>(blockIdx.x); tile_idx < total_tiles; tile_idx += gridDim.x) {
+    const int64_t col_base = tile_idx * OutputsPerBlock;
+    float accum[kColsPerLane];
+    #pragma unroll
+    for (int idx = 0; idx < kColsPerLane; ++idx) {
+      accum[idx] = 0.0f;
+    }
+
+    for (int idx = thread_linear; idx < OutputsPerBlock; idx += kThreads) {
+      const int64_t global_col = col_base + idx;
+      float scale = 0.0f;
+      if (global_col < layout.logical_out_features) {
+        const int64_t tile_group = global_col / compute_tile_n;
+        const int64_t tile_col = global_col - tile_group * compute_tile_n;
+        scale = compute_row_scales[tile_group * compute_tile_n + tile_col];
+      }
+      row_scales[idx] = scale;
+    }
+    __syncthreads();
+
+    for (int64_t k0 = 0; k0 < layout.logical_in_features; k0 += TileK) {
+      for (int index = thread_linear; index < MaxRows * TileK; index += kThreads) {
+        const int tile_row = index / TileK;
+        const int tile_k = index % TileK;
+        const int64_t global_k = k0 + tile_k;
+        x_tile[tile_row][tile_k] =
+            (tile_row < rows && global_k < layout.logical_in_features)
+                ? x[tile_row * layout.logical_in_features + global_k]
+                : static_cast<scalar_t>(0);
+      }
+      for (int index = thread_linear; index < OutputsPerBlock * kPackedTileKWords; index += kThreads) {
+        const int tile_col = index / kPackedTileKWords;
+        const int word_idx = index % kPackedTileKWords;
+        const int64_t global_col = col_base + tile_col;
+        const int64_t global_word_idx = (k0 >> 4) + word_idx;
+        uint32_t packed_word = 0;
+        if (global_col < layout.logical_out_features && global_word_idx < compute_word_cols) {
+          const int64_t tile_group = global_col / compute_tile_n;
+          const int64_t compute_tile_col = global_col - tile_group * compute_tile_n;
+          packed_word = static_cast<uint32_t>(
+              compute_packed_words[(tile_group * compute_word_cols + global_word_idx) * compute_tile_n + compute_tile_col]);
+        }
+        w_tile_words[tile_col][word_idx] = packed_word;
+      }
+      __syncthreads();
+
+      if (row_active) {
+        #pragma unroll
+        for (int col_iter = 0; col_iter < kColsPerLane; ++col_iter) {
+          const int tile_col = lane + col_iter * kWarpSize;
+          const int64_t global_col = col_base + tile_col;
+          if (global_col >= layout.logical_out_features) {
+            continue;
+          }
+          float acc = accum[col_iter];
+          #pragma unroll
+          for (int word_idx = 0; word_idx < kPackedTileKWords; ++word_idx) {
+            const int tile_k0 = word_idx * 16;
+            const int64_t global_k0 = k0 + tile_k0;
+            if (global_k0 >= layout.logical_in_features) {
+              break;
+            }
+            const int valid_values = static_cast<int>(
+                (layout.logical_in_features - global_k0) >= 16 ? 16 : (layout.logical_in_features - global_k0));
+            acc = BitNetDotFloatPackedTernaryWord16Device(
+                &x_tile[row_slot][tile_k0],
+                w_tile_words[tile_col][word_idx],
                 valid_values,
                 acc);
           }
@@ -502,45 +627,6 @@ __global__ __launch_bounds__(32 * MaxRows, 2) void bitnet_linear_decode_persiste
 }
 
 template <typename scalar_t, int MaxRows>
-void launch_decode_row1(
-    const Plan& plan,
-    const torch::Tensor& out_2d,
-    const torch::Tensor& x_2d,
-    const torch::Tensor& packed_weight,
-    const torch::Tensor& scale_values,
-    const torch::Tensor& segment_offsets,
-    const scalar_t* bias_ptr,
-    const LayoutInfo& layout,
-    cudaStream_t stream) {
-  static_assert(MaxRows == 1, "row1 launch only supports a single decode row");
-  const dim3 blocks(static_cast<unsigned int>((layout.logical_out_features + 31) / 32));
-  const dim3 threads(32);
-  if (plan.tile_k >= kPrefillSm80TileK) {
-    bitnet_linear_decode_row1_kernel<scalar_t, kPrefillSm80TileK>
-        <<<blocks, threads, 0, stream>>>(
-            x_2d.data_ptr<scalar_t>(),
-            packed_weight.data_ptr<uint8_t>(),
-            scale_values.data_ptr<float>(),
-            segment_offsets.data_ptr<int32_t>(),
-            bias_ptr,
-            out_2d.data_ptr<scalar_t>(),
-            layout,
-            packed_weight.size(1));
-    return;
-  }
-  bitnet_linear_decode_row1_kernel<scalar_t, kPrefillGenericTileK>
-      <<<blocks, threads, 0, stream>>>(
-          x_2d.data_ptr<scalar_t>(),
-          packed_weight.data_ptr<uint8_t>(),
-          scale_values.data_ptr<float>(),
-          segment_offsets.data_ptr<int32_t>(),
-          bias_ptr,
-          out_2d.data_ptr<scalar_t>(),
-          layout,
-          packed_weight.size(1));
-}
-
-template <typename scalar_t, int MaxRows>
 void launch_decode_row1_static_input(
     const Plan& plan,
     const torch::Tensor& out_2d,
@@ -592,6 +678,32 @@ void launch_decode_row1_static_input(
           out_2d.data_ptr<scalar_t>(),
           layout,
           packed_weight.size(1));
+}
+
+template <typename scalar_t, int WarpsPerBlock>
+void launch_decode_row1_bitplane(
+    const torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& decode_nz_masks,
+    const torch::Tensor& decode_sign_masks,
+    const torch::Tensor& decode_row_scales,
+    const scalar_t* bias_ptr,
+    const LayoutInfo& layout,
+    cudaStream_t stream) {
+  static_assert(WarpsPerBlock > 0, "row1 bitplane launch requires at least one warp");
+  const dim3 blocks(static_cast<unsigned int>((layout.logical_out_features + WarpsPerBlock - 1) / WarpsPerBlock));
+  const dim3 threads(32, WarpsPerBlock);
+  bitnet_linear_decode_row1_bitplane_kernel<scalar_t, WarpsPerBlock>
+      <<<blocks, threads, 0, stream>>>(
+          x_2d.data_ptr<scalar_t>(),
+          decode_nz_masks.data_ptr<int32_t>(),
+          decode_sign_masks.data_ptr<int32_t>(),
+          decode_row_scales.data_ptr<float>(),
+          bias_ptr,
+          out_2d.data_ptr<scalar_t>(),
+          layout,
+          decode_nz_masks.size(1),
+          decode_nz_masks.size(2));
 }
 
 template <typename scalar_t, int MaxRows>
@@ -667,6 +779,82 @@ void launch_decode_bucket(
           layout,
           rows,
           packed_cols,
+          total_tiles);
+}
+
+template <typename scalar_t, int MaxRows>
+void launch_decode_bucket_compute_packed(
+    const Plan& plan,
+    const torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
+    const scalar_t* bias_ptr,
+    const LayoutInfo& layout,
+    cudaStream_t stream) {
+  const int64_t rows = x_2d.size(0);
+  const int64_t compute_word_cols = compute_packed_words.size(1);
+  const int64_t compute_tile_n = compute_packed_words.size(2);
+  const int64_t total_tiles = (layout.logical_out_features + plan.outputs_per_block - 1) / plan.outputs_per_block;
+  const dim3 threads(32, MaxRows);
+  const dim3 blocks(static_cast<unsigned int>(std::max<int64_t>(1, plan.persistent_ctas)));
+
+  if (plan.tile_k >= kPrefillSm80TileK && plan.outputs_per_block >= 128) {
+    bitnet_linear_decode_persistent_compute_packed_kernel<scalar_t, MaxRows, kPrefillSm80TileK, 128>
+        <<<blocks, threads, 0, stream>>>(
+            x_2d.data_ptr<scalar_t>(),
+            compute_packed_words.data_ptr<int32_t>(),
+            compute_row_scales.data_ptr<float>(),
+            bias_ptr,
+            out_2d.data_ptr<scalar_t>(),
+            layout,
+            rows,
+            compute_word_cols,
+            compute_tile_n,
+            total_tiles);
+    return;
+  }
+  if (plan.tile_k >= kPrefillSm80TileK) {
+    bitnet_linear_decode_persistent_compute_packed_kernel<scalar_t, MaxRows, kPrefillSm80TileK, 64>
+        <<<blocks, threads, 0, stream>>>(
+            x_2d.data_ptr<scalar_t>(),
+            compute_packed_words.data_ptr<int32_t>(),
+            compute_row_scales.data_ptr<float>(),
+            bias_ptr,
+            out_2d.data_ptr<scalar_t>(),
+            layout,
+            rows,
+            compute_word_cols,
+            compute_tile_n,
+            total_tiles);
+    return;
+  }
+  if (plan.outputs_per_block >= 128) {
+    bitnet_linear_decode_persistent_compute_packed_kernel<scalar_t, MaxRows, kPrefillGenericTileK, 128>
+        <<<blocks, threads, 0, stream>>>(
+            x_2d.data_ptr<scalar_t>(),
+            compute_packed_words.data_ptr<int32_t>(),
+            compute_row_scales.data_ptr<float>(),
+            bias_ptr,
+            out_2d.data_ptr<scalar_t>(),
+            layout,
+            rows,
+            compute_word_cols,
+            compute_tile_n,
+            total_tiles);
+    return;
+  }
+  bitnet_linear_decode_persistent_compute_packed_kernel<scalar_t, MaxRows, kPrefillGenericTileK, 64>
+      <<<blocks, threads, 0, stream>>>(
+          x_2d.data_ptr<scalar_t>(),
+          compute_packed_words.data_ptr<int32_t>(),
+          compute_row_scales.data_ptr<float>(),
+          bias_ptr,
+          out_2d.data_ptr<scalar_t>(),
+          layout,
+          rows,
+          compute_word_cols,
+          compute_tile_n,
           total_tiles);
 }
 
@@ -798,11 +986,6 @@ void LaunchBitNetDecodeKernel(
           bias_ptr = bias.value().data_ptr<scalar_t>();
         }
         if (plan.kind == KernelKind::kDecodePersistent) {
-          if (rows == 1) {
-            launch_decode_row1<scalar_t, 1>(
-                plan, out_2d, x_2d, packed_weight, scale_values, segment_offsets, bias_ptr, layout, stream.stream());
-            return;
-          }
           switch (plan.rows_bucket) {
             case 1:
               launch_decode_bucket<scalar_t, 1>(
@@ -833,6 +1016,131 @@ void LaunchBitNetDecodeKernel(
             layout,
             rows,
             packed_cols);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void LaunchBitNetDecodeKernelComputePacked(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan) {
+  TORCH_CHECK(
+      plan.kind == KernelKind::kDecodePersistent,
+      "LaunchBitNetDecodeKernelComputePacked only supports decode-persistent plans");
+  c10::cuda::CUDAGuard device_guard(x_2d.device());
+  auto stream = c10::cuda::getCurrentCUDAStream(x_2d.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      x_2d.scalar_type(),
+      "bitnet_linear_decode_compute_packed_cuda",
+      [&] {
+        const scalar_t* bias_ptr = nullptr;
+        if (bias.has_value() && bias.value().defined()) {
+          bias_ptr = bias.value().data_ptr<scalar_t>();
+        }
+        switch (plan.rows_bucket) {
+          case 1:
+            launch_decode_bucket_compute_packed<scalar_t, 1>(
+                plan,
+                out_2d,
+                x_2d,
+                compute_packed_words,
+                compute_row_scales,
+                bias_ptr,
+                layout,
+                stream.stream());
+            break;
+          case 2:
+            launch_decode_bucket_compute_packed<scalar_t, 2>(
+                plan,
+                out_2d,
+                x_2d,
+                compute_packed_words,
+                compute_row_scales,
+                bias_ptr,
+                layout,
+                stream.stream());
+            break;
+          case 4:
+            launch_decode_bucket_compute_packed<scalar_t, 4>(
+                plan,
+                out_2d,
+                x_2d,
+                compute_packed_words,
+                compute_row_scales,
+                bias_ptr,
+                layout,
+                stream.stream());
+            break;
+          default:
+            launch_decode_bucket_compute_packed<scalar_t, 8>(
+                plan,
+                out_2d,
+                x_2d,
+                compute_packed_words,
+                compute_row_scales,
+                bias_ptr,
+                layout,
+                stream.stream());
+            break;
+        }
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void LaunchBitNetDecodeKernelBitplaneRow1(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& decode_nz_masks,
+    const torch::Tensor& decode_sign_masks,
+    const torch::Tensor& decode_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan) {
+  TORCH_CHECK(
+      plan.kind == KernelKind::kDecodePersistent,
+      "LaunchBitNetDecodeKernelBitplaneRow1 only supports decode-persistent plans");
+  TORCH_CHECK(x_2d.size(0) == 1, "LaunchBitNetDecodeKernelBitplaneRow1 requires a single decode row");
+  c10::cuda::CUDAGuard device_guard(x_2d.device());
+  auto stream = c10::cuda::getCurrentCUDAStream(x_2d.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      x_2d.scalar_type(),
+      "bitnet_linear_decode_bitplane_row1_cuda",
+      [&] {
+        const scalar_t* bias_ptr = nullptr;
+        if (bias.has_value() && bias.value().defined()) {
+          bias_ptr = bias.value().data_ptr<scalar_t>();
+        }
+        if (layout.logical_out_features >= 256) {
+          launch_decode_row1_bitplane<scalar_t, 8>(
+              out_2d,
+              x_2d,
+              decode_nz_masks,
+              decode_sign_masks,
+              decode_row_scales,
+              bias_ptr,
+              layout,
+              stream.stream());
+          return;
+        }
+        launch_decode_row1_bitplane<scalar_t, 4>(
+            out_2d,
+            x_2d,
+            decode_nz_masks,
+            decode_sign_masks,
+            decode_row_scales,
+            bias_ptr,
+            layout,
+            stream.stream());
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

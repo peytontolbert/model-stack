@@ -247,6 +247,75 @@ def test_quantized_bitnet_linear_uses_runtime_bitnet_linear(monkeypatch):
     assert layer.runtime_supports_packed_backend("cublaslt") is False
 
 
+def test_quantized_bitnet_compute_backend_weight_packs_words_and_reuses_cache():
+    layer = quant_mod.QuantizedLinearBitNet(20, 5, bias=True).from_float(torch.nn.Linear(20, 5, bias=True))
+
+    packed_words_a, row_scales_a = layer._compute_backend_weight(device="cpu")
+    packed_words_b, row_scales_b = layer._compute_backend_weight(device="cpu")
+
+    assert packed_words_a.data_ptr() == packed_words_b.data_ptr()
+    assert row_scales_a.data_ptr() == row_scales_b.data_ptr()
+    assert packed_words_a.dtype == torch.int32
+    assert row_scales_a.dtype == torch.float32
+    assert tuple(packed_words_a.shape) == (1, 2, 128)
+    assert tuple(row_scales_a.shape) == (1, 128)
+
+    expected_word0_raw = (
+        int(layer.packed_weight[0, 0].item())
+        | (int(layer.packed_weight[0, 1].item()) << 8)
+        | (int(layer.packed_weight[0, 2].item()) << 16)
+        | (int(layer.packed_weight[0, 3].item()) << 24)
+    )
+    expected_word1_raw = int(layer.packed_weight[0, 4].item()) | (0x55 << 8) | (0x55 << 16) | (0x55 << 24)
+    expected_word0 = torch.tensor(expected_word0_raw, dtype=torch.int64).to(dtype=torch.int32).item()
+    expected_word1 = torch.tensor(expected_word1_raw, dtype=torch.int64).to(dtype=torch.int32).item()
+    assert int(packed_words_a[0, 0, 0].item()) == expected_word0
+    assert int(packed_words_a[0, 1, 0].item()) == expected_word1
+
+    expected_row_scales = quant_mod._bitnet_row_scales(
+        layer.scale_values,
+        layer.layout_header,
+        layer.segment_offsets,
+    )
+    assert torch.allclose(row_scales_a[0, : expected_row_scales.numel()], expected_row_scales)
+    assert torch.count_nonzero(row_scales_a[0, expected_row_scales.numel() :]) == 0
+
+
+def test_quantized_bitnet_decode_backend_weight_packs_masks_and_reuses_cache():
+    layer = quant_mod.QuantizedLinearBitNet(20, 5, bias=True).from_float(torch.nn.Linear(20, 5, bias=True))
+
+    nz_masks_a, sign_masks_a, row_scales_a = layer._decode_backend_weight(device="cpu")
+    nz_masks_b, sign_masks_b, row_scales_b = layer._decode_backend_weight(device="cpu")
+
+    assert nz_masks_a.data_ptr() == nz_masks_b.data_ptr()
+    assert sign_masks_a.data_ptr() == sign_masks_b.data_ptr()
+    assert row_scales_a.data_ptr() == row_scales_b.data_ptr()
+    assert nz_masks_a.dtype == torch.int32
+    assert sign_masks_a.dtype == torch.int32
+    assert row_scales_a.dtype == torch.float32
+    assert tuple(nz_masks_a.shape) == (1, 1, 128)
+    assert tuple(sign_masks_a.shape) == (1, 1, 128)
+    assert tuple(row_scales_a.shape) == (1, 128)
+
+    signed = quant_mod._unpack_bitnet_signed(
+        layer.packed_weight[: int(layer.layout_header[3].item())],
+        original_last_dim=int(layer.layout_header[4].item()),
+    ).to(dtype=torch.int8)
+    bit_positions = (1 << torch.arange(signed.shape[1], dtype=torch.int64)).view(1, -1)
+    expected_nz_mask = int((((signed[0] != 0).to(dtype=torch.int64) * bit_positions).sum()).item())
+    expected_sign_mask = int((((signed[0] > 0).to(dtype=torch.int64) * bit_positions).sum()).item())
+    assert int(nz_masks_a[0, 0, 0].item()) == expected_nz_mask
+    assert int(sign_masks_a[0, 0, 0].item()) == expected_sign_mask
+
+    expected_row_scales = quant_mod._bitnet_row_scales(
+        layer.scale_values,
+        layer.layout_header,
+        layer.segment_offsets,
+    )
+    assert torch.allclose(row_scales_a[0, : expected_row_scales.numel()], expected_row_scales)
+    assert torch.count_nonzero(row_scales_a[0, expected_row_scales.numel() :]) == 0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native BitNet input transform dispatch")
 def test_bitnet_transform_input_uses_native_helper_when_available(monkeypatch):
     seen = {}

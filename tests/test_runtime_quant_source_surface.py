@@ -482,7 +482,16 @@ def test_native_bitnet_cuda_kernel_sources_are_registered_in_source() -> None:
     assert "AttentionUsesBitNetInt8AttentionCore" in native_source
     assert "ModuleUsesBitNetInt8PackedPath" in native_source
     assert "ModelUsesBitNetInt8PackedPath" in native_source
+    assert "\"_compute_backend_weight\"" in native_source
+    assert "\"_decode_backend_weight\"" in native_source
     assert "\"_int8_backend_weight\"" in native_source
+    assert "CudaBitNetLinearForwardComputePacked(" in native_source
+    assert "compute_packed_words" in native_source
+    assert "decode_nz_masks" in native_source
+    assert "LaunchBitNetDecodeKernelBitplaneRow1(" in dispatch_source
+    assert "LaunchBitNetPrefillKernelComputePacked(" in dispatch_source
+    assert "LaunchBitNetPrefillSplitKKernelComputePacked(" in dispatch_source
+    assert "if (plan.kind != KernelKind::kDecodePersistent)" not in dispatch_source
     assert "BitNetInt8FusedQkvPackedHeadsProjectionForward(" in native_source
     assert "return BitNetLinearStateForward(MergeHeadsForward(x), state);" in native_source
     assert "ModelUsesAttentionBiases" in native_source
@@ -493,6 +502,10 @@ def test_native_bitnet_cuda_kernel_sources_are_registered_in_source() -> None:
     assert "bitnet_qkv_fused_int8" in ops_source
     assert "bitnet_int8_fused_qkv_packed_heads_projection_forward" in ops_source
     assert "bitnet_w2a8_int8" in ops_source
+    assert "_pack_bitnet_compute_weight" in compress_source
+    assert "_pack_bitnet_decode_backend_weight" in compress_source
+    assert "def _compute_backend_weight(" in compress_source
+    assert "def _decode_backend_weight(" in compress_source
     assert "bitnet_w2a8_int8" in compress_source
     assert "bitnet_decode_rows_buckets" in native_source
     assert "bitnet_decode_scheduler" in native_source
