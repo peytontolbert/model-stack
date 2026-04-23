@@ -48,6 +48,222 @@ struct ModelStackSm80CausalPrefillKernel {
   using MM0 = typename BaseKernel::MM0;
   using MM1 = typename BaseKernel::MM1;
   using SharedStorage = typename BaseKernel::SharedStorage;
+  using MM1DefaultMmaFromSmem = typename BaseKernel::MM1::DefaultMmaFromSmem;
+
+  template <typename IteratorBase>
+  struct MM1FullTileIteratorB {
+    using Shape = typename IteratorBase::Shape;
+    using Element = typename IteratorBase::Element;
+    using Layout = typename IteratorBase::Layout;
+    static int const kAdvanceRank = IteratorBase::kAdvanceRank;
+    using ThreadMap = typename IteratorBase::ThreadMap;
+    using AccessType = typename IteratorBase::AccessType;
+    using Index = typename Layout::Index;
+    using LongIndex = typename Layout::LongIndex;
+    using TensorCoord = typename IteratorBase::TensorCoord;
+    using Pointer = typename IteratorBase::Pointer;
+    using RegularIterator = cutlass::transform::threadblock::RegularTileAccessIterator<
+        Shape,
+        Element,
+        Layout,
+        kAdvanceRank,
+        ThreadMap>;
+    using Fragment = cutlass::Array<
+        Element,
+        ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
+    static int const kAccessesPerVector =
+        ThreadMap::kElementsPerAccess / AccessType::kElements;
+
+    struct Params {
+      Layout layout;
+      CUTLASS_HOST_DEVICE
+      Params() = default;
+      CUTLASS_HOST_DEVICE
+      Params(Layout const& layout_) : layout(layout_) {}
+    };
+
+    RegularIterator iterator_;
+
+    CUTLASS_HOST_DEVICE
+    MM1FullTileIteratorB(
+        Params const& params,
+        Pointer pointer,
+        TensorCoord,
+        int thread_id,
+        TensorCoord const& threadblock_offset)
+        : iterator_(typename RegularIterator::TensorRef(pointer, params.layout), thread_id) {
+      iterator_.add_tile_offset(threadblock_offset);
+    }
+
+    CUTLASS_HOST_DEVICE
+    MM1FullTileIteratorB(
+        Params const& params,
+        Pointer pointer,
+        TensorCoord extent,
+        int thread_id)
+        : MM1FullTileIteratorB(params, pointer, extent, thread_id, cutlass::make_Coord(0, 0)) {}
+
+    CUTLASS_HOST_DEVICE
+    void set_iteration_index(int index) {
+      iterator_.set_iteration_index(index);
+    }
+
+    CUTLASS_HOST_DEVICE
+    void set_residual_tile(bool) {}
+
+    CUTLASS_HOST_DEVICE
+    void add_pointer_offset(LongIndex pointer_offset) {
+      iterator_.add_pointer_offset(pointer_offset);
+    }
+
+    CUTLASS_DEVICE
+    void add_tile_offset(TensorCoord const& tile_offset) {
+      iterator_.add_tile_offset(tile_offset);
+    }
+
+    CUTLASS_HOST_DEVICE
+    AccessType* get() const {
+      return reinterpret_cast<AccessType*>(iterator_.get());
+    }
+
+    CUTLASS_HOST_DEVICE
+    MM1FullTileIteratorB& operator++() {
+      ++iterator_;
+      return *this;
+    }
+
+    CUTLASS_HOST_DEVICE
+    MM1FullTileIteratorB operator++(int) {
+      MM1FullTileIteratorB prev(*this);
+      ++(*this);
+      return prev;
+    }
+
+    CUTLASS_HOST_DEVICE
+    void clear_mask(bool = true) {}
+
+    CUTLASS_HOST_DEVICE
+    bool valid() const {
+      return true;
+    }
+
+    CUTLASS_DEVICE
+    void load(Fragment& frag) const {
+      static_assert(kAccessesPerVector == 1, "full-tile iterator expects one access per vector");
+      auto iter = iterator_;
+      auto* frag_ptr = reinterpret_cast<AccessType*>(&frag);
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
+          int access_idx = c + s * ThreadMap::Iterations::kContiguous;
+          frag_ptr[access_idx] = *iter.get();
+          ++iter;
+        }
+      }
+    }
+  };
+
+  template <typename RegularMma, typename WarpIteratorA, int MM1MaxK>
+  struct MM1FullTileMmaFromSmem;
+
+  template <
+      typename Shape_,
+      typename IteratorA_,
+      typename SmemIteratorA_,
+      typename IteratorB_,
+      typename SmemIteratorB_,
+      typename ElementC_,
+      typename LayoutC_,
+      typename Policy_,
+      typename TransformA_,
+      typename TransformB_,
+      typename WarpIteratorA,
+      int MM1MaxK>
+  struct MM1FullTileMmaFromSmem<
+      cutlass::gemm::threadblock::MmaPipelined<
+          Shape_,
+          IteratorA_,
+          SmemIteratorA_,
+          IteratorB_,
+          SmemIteratorB_,
+          ElementC_,
+          LayoutC_,
+          Policy_,
+          TransformA_,
+          TransformB_>,
+      WarpIteratorA,
+      MM1MaxK> {
+    using IteratorB = MM1FullTileIteratorB<IteratorB_>;
+    using Mma = cutlass::gemm::threadblock::MmaPipelinedFromSharedMemory<
+        Shape_,
+        WarpIteratorA,
+        false,
+        MM1MaxK,
+        IteratorB,
+        SmemIteratorB_,
+        ElementC_,
+        LayoutC_,
+        Policy_,
+        TransformB_>;
+  };
+
+  template <
+      typename Shape_,
+      typename IteratorA_,
+      typename SmemIteratorA_,
+      cutlass::arch::CacheOperation::Kind CacheOpA,
+      typename IteratorB_,
+      typename SmemIteratorB_,
+      cutlass::arch::CacheOperation::Kind CacheOpB,
+      typename ElementC_,
+      typename LayoutC_,
+      typename Policy_,
+      int Stages,
+      cutlass::gemm::SharedMemoryClearOption SharedMemoryClear,
+      typename WarpIteratorA,
+      int MM1MaxK>
+  struct MM1FullTileMmaFromSmem<
+      cutlass::gemm::threadblock::MmaMultistage<
+          Shape_,
+          IteratorA_,
+          SmemIteratorA_,
+          CacheOpA,
+          IteratorB_,
+          SmemIteratorB_,
+          CacheOpB,
+          ElementC_,
+          LayoutC_,
+          Policy_,
+          Stages,
+          SharedMemoryClear>,
+      WarpIteratorA,
+      MM1MaxK> {
+    static constexpr int kStagesMax =
+        (MM1MaxK + int(Shape_::kK) - 1) / int(Shape_::kK);
+    static constexpr int kReducedStages = cutlass::const_min(Stages, kStagesMax);
+    using IteratorB = MM1FullTileIteratorB<IteratorB_>;
+    using Mma = cutlass::gemm::threadblock::MmaMultistageFromSharedMemory<
+        Shape_,
+        WarpIteratorA,
+        false,
+        IteratorB,
+        SmemIteratorB_,
+        CacheOpB,
+        ElementC_,
+        LayoutC_,
+        Policy_,
+        kReducedStages,
+        MM1MaxK>;
+  };
+
+  using MM1FullTileMmaConfig = MM1FullTileMmaFromSmem<
+      typename MM1DefaultMmaFromSmem::RegularMma,
+      typename MM1DefaultMmaFromSmem::WarpIteratorA,
+      MM0::AccumulatorSharedStorage::Shape::kN>;
+  using MM1FullTileMma = typename MM1FullTileMmaConfig::Mma;
+  using MM1FullTileIterator = typename MM1FullTileMmaConfig::IteratorB;
 
   static constexpr int kQueriesPerBlock = BaseKernel::kQueriesPerBlock;
   static constexpr int kKeysPerBlock = BaseKernel::kKeysPerBlock;
@@ -381,6 +597,54 @@ struct ModelStackSm80CausalPrefillKernel {
     }
   }
 
+  static CUTLASS_DEVICE void prologue_v_tile_full_64x64_rf(
+      SharedStorage& shared_storage,
+      Params& p,
+      int32_t iter_key_start,
+      int16_t tid) {
+    typename MM1FullTileIterator::Params params{MM1::LayoutB(p.v_strideM)};
+    MM1FullTileIterator iterator_v(
+        params,
+        const_cast<scalar_t*>(p.value_ptr + iter_key_start * p.v_strideM),
+        {int32_t(kKeysPerBlock), kMaxK},
+        tid,
+        cutlass::MatrixCoord{0, 0});
+    MM1FullTileMma::prologue(
+        shared_storage.after_mm0.mm1,
+        iterator_v,
+        tid,
+        int32_t(kKeysPerBlock));
+  }
+
+  static CUTLASS_DEVICE void mma_pv_tile_full_64x64_rf(
+      SharedStorage& shared_storage,
+      Params& p,
+      int32_t iter_key_start,
+      int16_t tid,
+      int8_t my_warp_id,
+      int8_t my_lane_id,
+      typename MM1::Mma::FragmentC& accum_o) {
+    typename MM1FullTileIterator::Params params{MM1::LayoutB(p.v_strideM)};
+    MM1FullTileIterator iterator_v(
+        params,
+        const_cast<scalar_t*>(p.value_ptr + iter_key_start * p.v_strideM),
+        {int32_t(kKeysPerBlock), kMaxK},
+        tid,
+        cutlass::MatrixCoord{0, 0});
+    MM1FullTileMma mma_pv(
+        shared_storage.after_mm0.si.accum_ref(),
+        shared_storage.after_mm0.mm1.operand_B_ref(),
+        (int)tid,
+        (int)my_warp_id,
+        (int)my_lane_id);
+    mma_pv.set_prologue_done(kPreloadV);
+    static_assert(
+        kKeysPerBlock % MM1FullTileMma::Shape::kK == 0,
+        "full-tile MM1 fast lane expects 64-wide V tiles to map cleanly onto MM1");
+    constexpr int kFullPvIterations = kKeysPerBlock / MM1FullTileMma::Shape::kK;
+    mma_pv(kFullPvIterations, accum_o, iterator_v, accum_o);
+  }
+
   static void CUTLASS_DEVICE attention_kernel(Params& p) {
     extern __shared__ char smem_buffer[];
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
@@ -447,6 +711,8 @@ struct ModelStackSm80CausalPrefillKernel {
           full_key_tile ? int32_t(kKeysPerBlock) : remaining_keys;
       const int32_t problem_size_1_k = problem_size_0_n;
       const bool full_tile_extent = full_query_tile && full_key_tile;
+      const bool diagonal_tile =
+          iter_key_start >= int32_t(query_start);
 
       auto iterator_a = full_query_tile
           ? make_q_iterator<true>(p, tid, tb_offset_a, problem_size_0_m)
@@ -472,12 +738,29 @@ struct ModelStackSm80CausalPrefillKernel {
       __syncthreads();
 
       if (full_tile_extent) {
-        prologue_v_tile<true>(
-            shared_storage,
-            p,
-            iter_key_start,
-            tid,
-            problem_size_1_k);
+        if constexpr (kQueriesPerBlock == 64 && kKeysPerBlock == 64 && kMaxK == 64) {
+          if (!diagonal_tile) {
+            prologue_v_tile_full_64x64_rf(
+                shared_storage,
+                p,
+                iter_key_start,
+                tid);
+          } else {
+            prologue_v_tile<true>(
+                shared_storage,
+                p,
+                iter_key_start,
+                tid,
+                problem_size_1_k);
+          }
+        } else {
+          prologue_v_tile<true>(
+              shared_storage,
+              p,
+              iter_key_start,
+              tid,
+              problem_size_1_k);
+        }
       } else {
         prologue_v_tile<false>(
             shared_storage,
@@ -487,8 +770,6 @@ struct ModelStackSm80CausalPrefillKernel {
             problem_size_1_k);
       }
 
-      const bool diagonal_tile =
-          iter_key_start >= int32_t(query_start);
       if (diagonal_tile) {
         auto lane_offset = MM0::AccumLambdaIterator::get_lane_offset(
             my_lane_id,
@@ -604,15 +885,38 @@ struct ModelStackSm80CausalPrefillKernel {
       __syncthreads();
 
       if (full_tile_extent) {
-        mma_pv_tile<true>(
-            shared_storage,
-            p,
-            iter_key_start,
-            tid,
-            my_warp_id,
-            my_lane_id,
-            problem_size_1_k,
-            accum_o);
+        if constexpr (kQueriesPerBlock == 64 && kKeysPerBlock == 64 && kMaxK == 64) {
+          if (!diagonal_tile) {
+            mma_pv_tile_full_64x64_rf(
+                shared_storage,
+                p,
+                iter_key_start,
+                tid,
+                my_warp_id,
+                my_lane_id,
+                accum_o);
+          } else {
+            mma_pv_tile<true>(
+                shared_storage,
+                p,
+                iter_key_start,
+                tid,
+                my_warp_id,
+                my_lane_id,
+                problem_size_1_k,
+                accum_o);
+          }
+        } else {
+          mma_pv_tile<true>(
+              shared_storage,
+              p,
+              iter_key_start,
+              tid,
+              my_warp_id,
+              my_lane_id,
+              problem_size_1_k,
+              accum_o);
+        }
       } else {
         mma_pv_tile<false>(
             shared_storage,
