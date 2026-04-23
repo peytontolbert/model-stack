@@ -107,11 +107,12 @@ def graph_replay_step(step_fn, static_args: tuple, static_kwargs: dict | None = 
         import torch.cuda as cuda
         g = cuda.CUDAGraph()
         stream = cuda.Stream()
+        current = cuda.current_stream()
+        stream.wait_stream(current)
         with cuda.stream(stream):
-            cuda.synchronize()
-            g.capture_begin()
-            out = step_fn(*static_args, **static_kwargs)
-            g.capture_end()
+            with cuda.graph(g, stream=stream):
+                out = step_fn(*static_args, **static_kwargs)
+        current.wait_stream(stream)
         def replay():
             g.replay()
             return out
@@ -148,5 +149,4 @@ def custom_grad(fn, grad_fn):
             return gx
 
     return _Fn.apply
-
 

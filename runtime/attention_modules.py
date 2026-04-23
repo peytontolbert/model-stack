@@ -10,6 +10,7 @@ from runtime.attention import _read_backend_from_env_or_file, scaled_dot_product
 from runtime.hardware import prefer_hopper_library_attention
 from runtime.attention_interfaces import Attention, KVCache
 from runtime.native import has_native_op, native_module, resolve_linear_backend
+from runtime.positional import resolve_rope_parameters, resolve_rope_seq_len
 from runtime.quant import int8_attention as runtime_int8_attention
 from runtime.ops import (
     attention as runtime_attention,
@@ -68,8 +69,10 @@ class EagerAttention(nn.Module):
         self.scaling = self.head_dim ** -0.5
         self.use_rope = bool(use_rope if use_rope is not None else getattr(cfg, "use_rope", True))
         self.rope_theta = float(rope_theta if rope_theta is not None else getattr(cfg, "rope_theta", 1e6))
+        self.max_position_embeddings = getattr(cfg, "max_position_embeddings", None)
         self.rope_scaling_type = getattr(cfg, "rope_scaling_type", None)
         self.rope_scaling_factor = getattr(cfg, "rope_scaling_factor", None)
+        self.rope_scaling_original_max_position_embeddings = getattr(cfg, "rope_scaling_original_max_position_embeddings", None)
         self.rope_scaling_low_freq_factor = getattr(cfg, "rope_scaling_low_freq_factor", None)
         self.rope_scaling_high_freq_factor = getattr(cfg, "rope_scaling_high_freq_factor", None)
         self.attn_dropout_p = float(attn_dropout if attn_dropout is not None else getattr(cfg, "attn_dropout", 0.0))
@@ -234,27 +237,34 @@ class EagerAttention(nn.Module):
             self._packed_o_spec = spec
         return self._packed_o_spec
 
-    def _ensure_rope_cache(self, seq_len: int, reference: torch.Tensor):
+    def _ensure_rope_cache(self, seq_len: int, reference: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
         if not self.use_rope:
             return
+        rope_seq_len = resolve_rope_seq_len(int(seq_len), position_ids)
         if (
             self._rope_cos.numel() == 0
-            or self._rope_cos.shape[0] < seq_len
+            or self._rope_cos.shape[0] < rope_seq_len
             or self._rope_cos.device != reference.device
             or self._rope_cos.dtype != reference.dtype
         ):
-            base_theta = self.rope_theta
-            st = (self.rope_scaling_type or "").lower() if isinstance(self.rope_scaling_type, str) else None
-            if st == "linear" and self.rope_scaling_factor is not None:
-                try:
-                    base_theta = float(base_theta) * float(self.rope_scaling_factor)
-                except Exception:
-                    base_theta = float(base_theta)
+            base_theta, attn_scale = resolve_rope_parameters(
+                seq_len=int(rope_seq_len),
+                head_dim=int(self.head_dim),
+                base_theta=float(self.rope_theta),
+                attention_scaling=float(self.rope_attention_scaling),
+                scaling_type=self.rope_scaling_type,
+                scaling_factor=self.rope_scaling_factor,
+                original_max_position_embeddings=self.rope_scaling_original_max_position_embeddings
+                or self.max_position_embeddings,
+                low_freq_factor=self.rope_scaling_low_freq_factor,
+                high_freq_factor=self.rope_scaling_high_freq_factor,
+            )
+            rope_reference = reference.new_empty((1, int(rope_seq_len), 1))
             cos, sin = runtime_resolve_rotary_embedding(
-                reference=reference[:, :seq_len, :],
+                reference=rope_reference,
                 head_dim=self.head_dim,
                 base_theta=float(base_theta),
-                attention_scaling=float(self.rope_attention_scaling),
+                attention_scaling=float(attn_scale),
             )
             self._rope_cos = cos
             self._rope_sin = sin
@@ -339,17 +349,8 @@ class EagerAttention(nn.Module):
                 sin_t = sin[:T]
                 qh, kh_new = runtime_apply_rotary(qh, kh_new, cos_t, sin_t)
             else:
-                self._ensure_rope_cache(T, x)
-                st = (self.rope_scaling_type or "").lower() if isinstance(self.rope_scaling_type, str) else None
-                if st == "yarn" and self.rope_scaling_factor is not None:
-                    qh_rot, kh_rot = runtime_apply_rotary(qh, kh_new, self._rope_cos[:T], self._rope_sin[:T])
-                    from runtime.positional import rope_yarn_factors
-
-                    sq, sk = rope_yarn_factors(T, self.rope_theta, float(self.rope_scaling_factor))
-                    qh = qh_rot * float(sq)
-                    kh_new = kh_rot * float(sk)
-                else:
-                    qh, kh_new = runtime_apply_rotary(qh, kh_new, self._rope_cos[:T], self._rope_sin[:T])
+                self._ensure_rope_cache(T, x, position_ids=position_ids)
+                qh, kh_new = runtime_apply_rotary(qh, kh_new, self._rope_cos[:T], self._rope_sin[:T])
 
         parity_exact = os.environ.get("ATTN_PARITY_EXACT", "0") == "1"
         appended_to_cache = False

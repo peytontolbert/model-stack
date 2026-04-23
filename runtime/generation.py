@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Callable, Optional
 
 import torch
@@ -723,6 +724,39 @@ def _cache_length(cache) -> int:
         return 0
 
 
+def _native_decode_graph_enabled_by_env() -> bool:
+    return os.getenv("MODEL_STACK_DISABLE_NATIVE_DECODE_GRAPH", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _try_build_native_decode_graph_replay(native_session) -> tuple[Callable[[], torch.Tensor | None] | None, torch.Tensor | None]:
+    if native_session is None or not torch.cuda.is_available():
+        return None, None
+    decode_graph_eligible = getattr(native_session, "decode_graph_eligible", None)
+    set_decode_graph_enabled = getattr(native_session, "set_decode_graph_enabled", None)
+    if not callable(decode_graph_eligible) or not callable(set_decode_graph_enabled):
+        return None, None
+    try:
+        if not bool(decode_graph_eligible()):
+            return None, None
+        set_decode_graph_enabled(True)
+        from tensor.compile import cuda_graph_warmup, graph_replay_step
+
+        warm = cuda_graph_warmup(native_session.decode_next_logits)
+        replay = graph_replay_step(native_session.decode_next_logits, ())
+        return replay, warm
+    except Exception:
+        try:
+            set_decode_graph_enabled(False)
+        except Exception:
+            pass
+        return None, None
+
+
 def _build_target_speculative_probs(
     seq: torch.Tensor,
     current_logits: torch.Tensor,
@@ -1088,6 +1122,7 @@ class RuntimeGenerationSession:
         self.model = model
         self.trace = bool(trace)
         self._native_session = None
+        self._native_decode_graph_replay: Callable[[], torch.Tensor | None] | None = None
         self._seq = seq
         self._attention_mask = attention_mask
         self._attention_mask_mode = _resolve_attention_mask_mode(
@@ -1113,6 +1148,17 @@ class RuntimeGenerationSession:
                 self._native_session = native_session
             except Exception:
                 self._native_session = None
+
+    def _clear_native_decode_graph(self) -> None:
+        self._native_decode_graph_replay = None
+        if self._native_session is None:
+            return
+        disable = getattr(self._native_session, "set_decode_graph_enabled", None)
+        if callable(disable):
+            try:
+                disable(False)
+            except Exception:
+                pass
 
     @classmethod
     def from_model(
@@ -1169,6 +1215,7 @@ class RuntimeGenerationSession:
     def seq(self, value: torch.Tensor) -> None:
         self._seq = value
         if self._native_session is not None:
+            self._clear_native_decode_graph()
             self._native_session.seq = value
             if _token_mask_has_padding(self._seq, self._attention_mask):
                 self._native_session = None
@@ -1193,6 +1240,7 @@ class RuntimeGenerationSession:
             )
         self._attention_mask_mode = str(mode)
         if self._native_session is not None:
+            self._clear_native_decode_graph()
             self._native_session.attention_mask = value
             if _token_mask_has_padding(self._seq, self._attention_mask):
                 self._native_session = None
@@ -1211,6 +1259,7 @@ class RuntimeGenerationSession:
     def cache(self, value) -> None:
         self._cache = value
         if self._native_session is not None:
+            self._clear_native_decode_graph()
             self._native_session.cache = value
 
     @property
@@ -1228,6 +1277,7 @@ class RuntimeGenerationSession:
     def disable_cache(self) -> None:
         self._cache = None
         if self._native_session is not None:
+            self._clear_native_decode_graph()
             self._native_session.disable_cache()
             return
         self.cache = None
@@ -1239,6 +1289,21 @@ class RuntimeGenerationSession:
         if self._native_session is not None and (chunk is None or chunk <= 0 or self.seq_len <= chunk):
             return self._native_session.prefill_next_logits()
         if chunk is not None and chunk > 0 and self.seq_len > chunk and self.attention_mask_mode != "explicit":
+            if self._native_session is not None:
+                full_seq = self.seq.contiguous()
+                full_seq_len = int(full_seq.shape[1])
+                full_attention_mask = self.attention_mask
+                last_logits = None
+                try:
+                    for start in range(0, full_seq_len, chunk):
+                        end = min(start + chunk, full_seq_len)
+                        self.seq = full_seq[:, start:end].contiguous()
+                        self.attention_mask = _slice_prefill_attention_mask(full_attention_mask, start, end)
+                        last_logits = self._native_session.prefill_next_logits()
+                    return last_logits
+                finally:
+                    self.seq = full_seq
+                    self.attention_mask = full_attention_mask
             last_logits = None
             for start in range(0, self.seq_len, chunk):
                 end = min(start + chunk, self.seq_len)
@@ -1280,6 +1345,7 @@ class RuntimeGenerationSession:
                 self._native_session.append(next_id)
                 return
             except Exception:
+                self._clear_native_decode_graph()
                 self._seq = self._native_session.seq
                 self._attention_mask = self._native_session.attention_mask
                 self._cache = self._native_session.cache
@@ -1315,6 +1381,18 @@ class RuntimeGenerationSession:
         if self.cache is None:
             return None
         if self._native_session is not None:
+            if self._native_decode_graph_replay is None and _native_decode_graph_enabled_by_env():
+                replay, warm = _try_build_native_decode_graph_replay(self._native_session)
+                if replay is not None:
+                    self._native_decode_graph_replay = replay
+                    if warm is not None:
+                        return warm
+                    return replay()
+            if self._native_decode_graph_replay is not None:
+                try:
+                    return self._native_decode_graph_replay()
+                except Exception:
+                    self._clear_native_decode_graph()
             return self._native_session.decode_next_logits()
         decode_tokens, pos_ids, cache_pos = _resolve_decode_step_inputs(self.seq, self.attention_mask)
         if pos_ids is None or cache_pos is None:
@@ -1361,6 +1439,7 @@ class RuntimeGenerationSession:
         policy: str = "sliding-window",
     ) -> torch.Tensor | None:
         if self._native_session is not None:
+            self._clear_native_decode_graph()
             max_tokens_arg = -1 if max_tokens is None else int(max_tokens)
             return self._native_session.advance_beam_decode(
                 next_beams,

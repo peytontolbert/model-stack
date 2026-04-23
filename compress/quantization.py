@@ -13,12 +13,14 @@ from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from runtime.native import has_native_op, native_module
 from runtime.ops import linear as runtime_linear
 from runtime.ops import bitnet_transform_input as runtime_bitnet_transform_input
 from runtime.ops import pack_bitnet_weight as runtime_pack_bitnet_weight
 from runtime.quant import bitnet_linear as runtime_bitnet_linear
 from runtime.quant import bitnet_int8_linear_from_float as runtime_bitnet_int8_linear_from_float
 from runtime.quant import bitnet_linear_from_float as runtime_bitnet_linear_from_float
+from runtime.quant import _should_use_eager_autograd_fallback
 from runtime.quant import nf4_dequantize as runtime_nf4_dequantize
 from runtime.quant import nf4_linear as runtime_nf4_linear
 from runtime.quant import nf4_quantize as runtime_nf4_quantize
@@ -2831,9 +2833,28 @@ class QuantizedLinearBitNet(nn.Module):
     def runtime_linear(self, x: torch.Tensor, *, backend: str | None = None) -> torch.Tensor:
         del backend
         mode_name = str(self.act_quant_mode).strip().lower()
+        target_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
+        target_device = x.device
+
+        if (
+            mode_name in {"", "none", "off"}
+            and x.is_cuda
+            and not self._spin_enabled_runtime()
+            and not self._pre_scale_active_runtime()
+            and not _should_use_eager_autograd_fallback(x, self.bias)
+        ):
+            module = native_module()
+            if (
+                has_native_op("bitnet_linear_module")
+                and module is not None
+                and hasattr(module, "bitnet_linear_module_forward")
+            ):
+                return module.bitnet_linear_module_forward(
+                    x.to(device=target_device, dtype=target_dtype),
+                    self,
+                )
+
         if self._uses_int8_packed_backend():
-            target_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
-            target_device = x.device
             qweight, inv_scale = self._int8_backend_weight(device=target_device)
             pre_scale = self.pre_scale.to(device=target_device) if self._pre_scale_active_runtime() else None
             act_scale = self.act_scale.to(device=target_device) if mode_name == "static_int8" else None
@@ -2850,8 +2871,6 @@ class QuantizedLinearBitNet(nn.Module):
                 act_quant_percentile=float(self.act_quant_percentile),
             )
 
-        target_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
-        target_device = x.device
         spin_enabled = self._spin_enabled_runtime()
         spin_signs = self.spin_signs.to(device=target_device) if spin_enabled else None
         pre_scale = self.pre_scale.to(device=target_device) if self._pre_scale_active_runtime() else None

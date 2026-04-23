@@ -16,6 +16,7 @@ from runtime.ops import embedding as runtime_embedding
 from runtime.ops import linear_module as runtime_linear_module
 from runtime.ops import resolve_position_ids as runtime_resolve_position_ids
 from runtime.ops import resolve_rotary_embedding as runtime_resolve_rotary_embedding
+from runtime.positional import resolve_rope_parameters, resolve_rope_seq_len
 from serve.engine import generate as engine_generate
 from specs.config import ModelConfig
 from tensor.norms import RMSNorm
@@ -120,15 +121,19 @@ class CausalLM(nn.Module):
                 position_ids=position_ids,
             )
         head_dim = getattr(self.cfg, "head_dim", None) or int(self.cfg.d_model // self.cfg.n_heads)
-        rope_theta = float(getattr(self.cfg, "rope_theta", 1e6))
-        try:
-            scaling_type = (getattr(self.cfg, "rope_scaling_type", None) or "").lower()
-            scaling_factor = getattr(self.cfg, "rope_scaling_factor", None)
-            if scaling_type == "linear" and scaling_factor is not None:
-                rope_theta = rope_theta * float(scaling_factor)
-        except Exception:
-            pass
-        attn_scale = float(getattr(self.cfg, "rope_attention_scaling", 1.0) or 1.0)
+        rope_seq_len = resolve_rope_seq_len(int(T), position_ids)
+        rope_theta, attn_scale = resolve_rope_parameters(
+            seq_len=int(rope_seq_len),
+            head_dim=int(head_dim),
+            base_theta=float(getattr(self.cfg, "rope_theta", 1e6)),
+            attention_scaling=float(getattr(self.cfg, "rope_attention_scaling", 1.0) or 1.0),
+            scaling_type=getattr(self.cfg, "rope_scaling_type", None),
+            scaling_factor=getattr(self.cfg, "rope_scaling_factor", None),
+            original_max_position_embeddings=getattr(self.cfg, "rope_scaling_original_max_position_embeddings", None)
+            or getattr(self.cfg, "max_position_embeddings", None),
+            low_freq_factor=getattr(self.cfg, "rope_scaling_low_freq_factor", None),
+            high_freq_factor=getattr(self.cfg, "rope_scaling_high_freq_factor", None),
+        )
         cos, sin = runtime_resolve_rotary_embedding(
             reference=x,
             head_dim=head_dim,

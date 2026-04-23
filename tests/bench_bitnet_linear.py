@@ -196,100 +196,101 @@ def main() -> None:
     module_max_abs_err_vs_ref = float((module_out - dequant_ref_out).abs().max().item())
     native_max_abs_err_vs_ref = float((native_out - dequant_ref_out).abs().max().item())
 
-    pack_ms = _timeit(
-        lambda: pack_bitnet_weight(weight),
-        warmup=args.warmup,
-        iters=args.iters,
-        use_cuda_events=use_cuda_events,
-    )
-    dense_ms = _timeit(
-        lambda: torch.nn.functional.linear(x, weight, bias),
-        warmup=args.warmup,
-        iters=args.iters,
-        use_cuda_events=use_cuda_events,
-    )
-    dequant_ref_ms = _timeit(
-        lambda: torch.nn.functional.linear(x, dequant_weight, bias),
-        warmup=args.warmup,
-        iters=args.iters,
-        use_cuda_events=use_cuda_events,
-    )
-    wrapper_ms = _timeit(
-        lambda: bitnet_linear(
-            x,
-            packed_weight,
-            scale_values,
-            layout_header,
-            segment_offsets,
-            bias=bias,
-        ),
-        warmup=args.warmup,
-        iters=args.iters,
-        use_cuda_events=use_cuda_events,
-    )
-    wrapper_from_float_ms = _timeit(
-        lambda: bitnet_linear_from_float(
-            x,
-            bitnet_layer.packed_weight,
-            bitnet_layer.scale_values,
-            bitnet_layer.layout_header,
-            bitnet_layer.segment_offsets,
-            bias=bitnet_layer.bias,
-            spin_enabled=bool(args.spin),
-            spin_signs=spin_signs,
-            pre_scale=bitnet_layer.pre_scale,
-            act_quant_mode=str(args.activation_quant),
-            act_scale=static_act_scale,
-            act_quant_bits=int(args.activation_quant_bits),
-            act_quant_method=str(args.activation_quant_method),
-            act_quant_percentile=float(args.activation_quant_percentile),
-        ),
-        warmup=args.warmup,
-        iters=args.iters,
-        use_cuda_events=use_cuda_events,
-    )
-    module_ms = _timeit(
-        lambda: bitnet_layer.runtime_linear(x),
-        warmup=args.warmup,
-        iters=args.iters,
-        use_cuda_events=use_cuda_events,
-    )
-    native_bitnet_ms = (
-        _timeit(
-            lambda: module.bitnet_linear_from_float_forward(
+    with torch.inference_mode():
+        pack_ms = _timeit(
+            lambda: pack_bitnet_weight(weight),
+            warmup=args.warmup,
+            iters=args.iters,
+            use_cuda_events=use_cuda_events,
+        )
+        dense_ms = _timeit(
+            lambda: torch.nn.functional.linear(x, weight, bias),
+            warmup=args.warmup,
+            iters=args.iters,
+            use_cuda_events=use_cuda_events,
+        )
+        dequant_ref_ms = _timeit(
+            lambda: torch.nn.functional.linear(x, dequant_weight, bias),
+            warmup=args.warmup,
+            iters=args.iters,
+            use_cuda_events=use_cuda_events,
+        )
+        wrapper_ms = _timeit(
+            lambda: bitnet_linear(
                 x,
-                bitnet_layer.packed_weight,
-                bitnet_layer.scale_values,
-                bitnet_layer.layout_header,
-                bitnet_layer.segment_offsets,
-                bitnet_layer.bias,
-                bool(args.spin),
-                spin_signs,
-                bitnet_layer.pre_scale,
-                str(args.activation_quant),
-                str(args.activation_quant_method),
-                int(args.activation_quant_bits),
-                float(args.activation_quant_percentile),
-                static_act_scale,
-                dtype,
+                packed_weight,
+                scale_values,
+                layout_header,
+                segment_offsets,
+                bias=bias,
             ),
             warmup=args.warmup,
             iters=args.iters,
             use_cuda_events=use_cuda_events,
         )
-        if native_bitnet_available
-        else float("nan")
-    )
-    native_dense_ms = (
-        _timeit(
-            lambda: module.linear_forward(x, dequant_weight, bias, "auto"),
+        wrapper_from_float_ms = _timeit(
+            lambda: bitnet_linear_from_float(
+                x,
+                bitnet_layer.packed_weight,
+                bitnet_layer.scale_values,
+                bitnet_layer.layout_header,
+                bitnet_layer.segment_offsets,
+                bias=bitnet_layer.bias,
+                spin_enabled=bool(args.spin),
+                spin_signs=spin_signs,
+                pre_scale=bitnet_layer.pre_scale,
+                act_quant_mode=str(args.activation_quant),
+                act_scale=static_act_scale,
+                act_quant_bits=int(args.activation_quant_bits),
+                act_quant_method=str(args.activation_quant_method),
+                act_quant_percentile=float(args.activation_quant_percentile),
+            ),
             warmup=args.warmup,
             iters=args.iters,
             use_cuda_events=use_cuda_events,
         )
-        if native_dense_available
-        else float("nan")
-    )
+        module_ms = _timeit(
+            lambda: bitnet_layer.runtime_linear(x),
+            warmup=args.warmup,
+            iters=args.iters,
+            use_cuda_events=use_cuda_events,
+        )
+        native_bitnet_ms = (
+            _timeit(
+                lambda: module.bitnet_linear_from_float_forward(
+                    x,
+                    bitnet_layer.packed_weight,
+                    bitnet_layer.scale_values,
+                    bitnet_layer.layout_header,
+                    bitnet_layer.segment_offsets,
+                    bitnet_layer.bias,
+                    bool(args.spin),
+                    spin_signs,
+                    bitnet_layer.pre_scale,
+                    str(args.activation_quant),
+                    str(args.activation_quant_method),
+                    int(args.activation_quant_bits),
+                    float(args.activation_quant_percentile),
+                    static_act_scale,
+                    dtype,
+                ),
+                warmup=args.warmup,
+                iters=args.iters,
+                use_cuda_events=use_cuda_events,
+            )
+            if native_bitnet_available
+            else float("nan")
+        )
+        native_dense_ms = (
+            _timeit(
+                lambda: module.linear_forward(x, dequant_weight, bias, "auto"),
+                warmup=args.warmup,
+                iters=args.iters,
+                use_cuda_events=use_cuda_events,
+            )
+            if native_dense_available
+            else float("nan")
+        )
     speedup_vs_ref = dequant_ref_ms / native_bitnet_ms if native_bitnet_available and native_bitnet_ms > 0 else float("nan")
 
     print(f"device={device} dtype={dtype} batch={args.batch} seq={args.seq}")

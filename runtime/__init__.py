@@ -217,6 +217,7 @@ _EXPORTS = {
     "has_native_op": "runtime.native",
     "hopper_optimizations_enabled": "runtime.hardware",
     "is_hopper_device": "runtime.hardware",
+    "prefer_torch_library_attention": "runtime.hardware",
     "native_module": "runtime.native",
     "native_available": "runtime.native",
     "native_model_session_available": "runtime.native",

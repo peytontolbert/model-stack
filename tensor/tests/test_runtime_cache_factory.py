@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -17,8 +18,11 @@ import runtime.factory as runtime_factory_mod
 import runtime.loader as runtime_loader_mod
 import runtime.generation as runtime_generation_mod
 import runtime.kv_cache as runtime_kv_cache_mod
+import runtime.attention_modules as runtime_attention_modules_mod
+import runtime.causal as runtime_causal_mod
 import runtime.positional as runtime_positional_mod
 import runtime.sampling as runtime_sampling_mod
+import tensor.compile as tensor_compile_mod
 import blocks.block_sparse_attn_block as block_sparse_attn_block_mod
 import blocks.local_attn_block as local_attn_block_mod
 import blocks.native_fusion as blocks_native_fusion_mod
@@ -1306,8 +1310,135 @@ def test_transformers_hf_llama_config_helper_derives_runtime_model_config():
     assert cfg.rope_scaling_original_max_position_embeddings == 8192
     assert cfg.rope_scaling_low_freq_factor == 1.0
     assert cfg.rope_scaling_high_freq_factor == 4.0
+    assert cfg.max_position_embeddings == 4096
     assert n_kv_heads == 3
     assert tie_weights is True
+
+
+def test_runtime_positional_resolve_rope_parameters_supports_dynamic_and_yarn():
+    base_theta = 1_000_000.0
+    dynamic_base, dynamic_scale = runtime_positional_mod.resolve_rope_parameters(
+        seq_len=8192,
+        head_dim=128,
+        base_theta=base_theta,
+        attention_scaling=1.0,
+        scaling_type="dynamic",
+        scaling_factor=8.0,
+        original_max_position_embeddings=4096,
+    )
+    assert dynamic_base > base_theta
+    assert dynamic_scale == pytest.approx(1.0)
+
+    unchanged_base, unchanged_scale = runtime_positional_mod.resolve_rope_parameters(
+        seq_len=2048,
+        head_dim=128,
+        base_theta=base_theta,
+        attention_scaling=1.0,
+        scaling_type="dynamic",
+        scaling_factor=8.0,
+        original_max_position_embeddings=4096,
+    )
+    assert unchanged_base == pytest.approx(base_theta)
+    assert unchanged_scale == pytest.approx(1.0)
+
+    yarn_base, yarn_scale = runtime_positional_mod.resolve_rope_parameters(
+        seq_len=131072,
+        head_dim=128,
+        base_theta=base_theta,
+        attention_scaling=1.0,
+        scaling_type="yarn",
+        scaling_factor=8.0,
+        original_max_position_embeddings=4096,
+        low_freq_factor=1.0,
+        high_freq_factor=4.0,
+    )
+    assert yarn_base == pytest.approx(base_theta)
+    assert yarn_scale > 1.0
+
+
+def test_runtime_positional_resolve_rope_seq_len_uses_absolute_position_ids():
+    position_ids = torch.tensor([[4096, 8191]], dtype=torch.long)
+    assert runtime_positional_mod.resolve_rope_seq_len(2, position_ids) == 8192
+    assert runtime_positional_mod.resolve_rope_seq_len(16, None) == 16
+
+
+def test_eager_attention_rope_cache_uses_absolute_position_ids_for_dynamic_scaling(monkeypatch):
+    captured: dict[str, float | int] = {}
+
+    def fake_resolve_rotary_embedding(reference, head_dim, base_theta, attention_scaling=1.0, position_ids=None):
+        del position_ids
+        captured["seq_len"] = int(reference.shape[1])
+        captured["base_theta"] = float(base_theta)
+        captured["attention_scaling"] = float(attention_scaling)
+        cos = torch.ones((int(reference.shape[1]), int(head_dim)), dtype=reference.dtype, device=reference.device)
+        sin = torch.zeros_like(cos)
+        return cos, sin
+
+    monkeypatch.setattr(runtime_attention_modules_mod, "runtime_resolve_rotary_embedding", fake_resolve_rotary_embedding)
+
+    cfg = _cfg()
+    cfg.use_rope = True
+    cfg.rope_theta = 1_000_000.0
+    cfg.rope_scaling_type = "dynamic"
+    cfg.rope_scaling_factor = 8.0
+    cfg.max_position_embeddings = 4096
+    attn = runtime_attention_modules_mod.EagerAttention(cfg)
+    x = torch.zeros((1, 1, cfg.d_model), dtype=torch.float32)
+    position_ids = torch.tensor([[8191]], dtype=torch.long)
+
+    attn._ensure_rope_cache(1, x, position_ids=position_ids)
+
+    assert captured["seq_len"] == 8192
+    assert captured["base_theta"] > float(cfg.rope_theta)
+    assert captured["attention_scaling"] == pytest.approx(1.0)
+    assert attn._rope_cos.shape == (8192, attn.head_dim)
+    assert attn._rope_sin.shape == (8192, attn.head_dim)
+
+
+def test_runtime_causal_forward_uses_absolute_position_ids_for_dynamic_rope(monkeypatch):
+    captured: dict[str, float | int] = {}
+
+    def fake_build_block_stack(cfg, **kwargs):
+        del cfg, kwargs
+        return torch.nn.ModuleList([])
+
+    def fake_resolve_rotary_embedding(reference, head_dim, base_theta, attention_scaling=1.0, position_ids=None):
+        captured["seq_len"] = int(reference.shape[1])
+        captured["head_dim"] = int(head_dim)
+        captured["base_theta"] = float(base_theta)
+        captured["attention_scaling"] = float(attention_scaling)
+        captured["position_max"] = int(position_ids.max().item()) if position_ids is not None else -1
+        cos = torch.ones((int(reference.shape[1]), int(head_dim)), dtype=reference.dtype, device=reference.device)
+        sin = torch.zeros_like(cos)
+        return cos, sin
+
+    monkeypatch.setattr(runtime_causal_mod, "build_block_stack", fake_build_block_stack)
+    monkeypatch.setattr(runtime_causal_mod, "runtime_resolve_rotary_embedding", fake_resolve_rotary_embedding)
+    monkeypatch.setattr(runtime_causal_mod, "execute_block_stack", lambda blocks, x, *args, **kwargs: x)
+    monkeypatch.setattr(runtime_causal_mod, "apply_native_norm", lambda x, norm: x)
+    monkeypatch.setattr(
+        runtime_causal_mod,
+        "runtime_linear_module",
+        lambda x, module: torch.zeros((int(x.shape[0]), int(x.shape[1]), int(module.out_features)), dtype=x.dtype, device=x.device),
+    )
+
+    cfg = _cfg()
+    cfg.use_rope = True
+    cfg.rope_theta = 1_000_000.0
+    cfg.rope_scaling_type = "dynamic"
+    cfg.rope_scaling_factor = 8.0
+    cfg.max_position_embeddings = 4096
+    model = runtime_causal_mod.CausalLM(cfg, tie_weights=False)
+    inputs_embeds = torch.zeros((1, 1, cfg.d_model), dtype=torch.float32)
+    position_ids = torch.tensor([[8191]], dtype=torch.long)
+
+    logits = model(inputs_embeds=inputs_embeds, position_ids=position_ids)
+
+    assert logits.shape == (1, 1, cfg.vocab_size)
+    assert captured["seq_len"] == 1
+    assert captured["position_max"] == 8191
+    assert captured["base_theta"] > float(cfg.rope_theta)
+    assert captured["attention_scaling"] == pytest.approx(1.0)
 
 
 def test_build_local_llama_from_snapshot_uses_runtime_hf_loader(monkeypatch, tmp_path):
@@ -2860,6 +2991,225 @@ def test_runtime_generation_session_discards_python_executor_wrappers(monkeypatc
     assert session.uses_native_session is False
     assert session.native_executor_kind == "python"
     assert torch.equal(session.seq, torch.tensor([[1, 2]], dtype=torch.long))
+
+
+def test_runtime_generation_session_chunked_prefill_uses_native_session_and_restores_state(monkeypatch):
+    class FakeNativeSession:
+        native_executor_kind = "causal_lm"
+
+        def __init__(self, model, seq, attention_mask=None, cache=None, trace=False):
+            del model, trace
+            self._seq = seq
+            self._attention_mask = attention_mask
+            self.cache = cache
+            self.chunks: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+
+        @property
+        def seq(self):
+            return self._seq
+
+        @seq.setter
+        def seq(self, value):
+            self._seq = value
+
+        @property
+        def seq_len(self):
+            return int(self._seq.shape[1])
+
+        @property
+        def batch_size(self):
+            return int(self._seq.shape[0])
+
+        @property
+        def attention_mask(self):
+            return self._attention_mask
+
+        @attention_mask.setter
+        def attention_mask(self, value):
+            self._attention_mask = value
+
+        def prefill_next_logits(self):
+            mask = None if self._attention_mask is None else self._attention_mask.clone()
+            self.chunks.append((self._seq.clone(), mask))
+            token_value = float(self._seq[0, -1].item())
+            return torch.full((int(self._seq.shape[0]), 5), token_value, dtype=torch.float32)
+
+    def fake_create_native_model_session(model, seq, attention_mask=None, cache=None, trace=False):
+        return FakeNativeSession(model, seq, attention_mask=attention_mask, cache=cache, trace=trace)
+
+    monkeypatch.setattr(runtime_generation_mod, "create_native_model_session", fake_create_native_model_session)
+
+    class BoomModel(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            raise AssertionError("python model forward should not be called for native chunked prefill")
+
+    seq = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    session = runtime_generation_mod.RuntimeGenerationSession(
+        BoomModel(),
+        seq,
+        attention_mask=None,
+        cache=object(),
+    )
+
+    logits = session.prefill_next_logits(chunk_size=2)
+
+    assert logits is not None
+    assert torch.equal(logits, torch.full((1, 5), 5.0, dtype=torch.float32))
+    assert torch.equal(session.seq, seq)
+    assert session.attention_mask is None
+    assert len(session.native_session.chunks) == 3
+    assert torch.equal(session.native_session.chunks[0][0], torch.tensor([[1, 2]], dtype=torch.long))
+    assert torch.equal(session.native_session.chunks[1][0], torch.tensor([[3, 4]], dtype=torch.long))
+    assert torch.equal(session.native_session.chunks[2][0], torch.tensor([[5]], dtype=torch.long))
+    assert session.native_session.chunks[0][1] is None
+    assert session.native_session.chunks[1][1] is None
+    assert session.native_session.chunks[2][1] is None
+
+
+def test_runtime_generation_session_native_decode_graph_replay_uses_warm_then_replay(monkeypatch):
+    class FakeNativeSession:
+        native_executor_kind = "causal_lm"
+
+        def __init__(self, model, seq, attention_mask=None, cache=None, trace=False):
+            del model, trace
+            self.seq = seq
+            self.attention_mask = attention_mask
+            self.cache = cache
+            self.graph_enabled: list[bool] = []
+
+        def set_decode_graph_enabled(self, enabled=True):
+            self.graph_enabled.append(bool(enabled))
+
+        def decode_next_logits(self):
+            return torch.full((int(self.seq.shape[0]), 7), -1.0, dtype=torch.float32)
+
+    builds = {"count": 0}
+
+    def fake_create_native_model_session(model, seq, attention_mask=None, cache=None, trace=False):
+        return FakeNativeSession(model, seq, attention_mask=attention_mask, cache=cache, trace=trace)
+
+    def fake_try_build(native_session):
+        builds["count"] += 1
+        native_session.set_decode_graph_enabled(True)
+        build_idx = float(builds["count"])
+
+        def replay():
+            return torch.full((int(native_session.seq.shape[0]), 7), 10.0 + build_idx, dtype=torch.float32)
+
+        warm = torch.full((int(native_session.seq.shape[0]), 7), build_idx, dtype=torch.float32)
+        return replay, warm
+
+    monkeypatch.setattr(runtime_generation_mod, "create_native_model_session", fake_create_native_model_session)
+    monkeypatch.setattr(runtime_generation_mod, "_try_build_native_decode_graph_replay", fake_try_build)
+
+    session = runtime_generation_mod.RuntimeGenerationSession(
+        model=torch.nn.Identity(),
+        seq=torch.tensor([[1, 2]], dtype=torch.long),
+        attention_mask=None,
+        cache=object(),
+        trace=False,
+    )
+
+    first = session.decode_next_logits()
+    second = session.decode_next_logits()
+
+    assert first is not None
+    assert second is not None
+    assert builds["count"] == 1
+    assert torch.equal(first, torch.full((1, 7), 1.0, dtype=torch.float32))
+    assert torch.equal(second, torch.full((1, 7), 11.0, dtype=torch.float32))
+    assert session.native_session.graph_enabled == [True]
+
+
+def test_graph_replay_step_falls_back_cleanly_when_capture_setup_fails(monkeypatch):
+    class FakeStream:
+        def wait_stream(self, other):
+            del other
+
+    @contextlib.contextmanager
+    def fake_stream_ctx(stream):
+        del stream
+        yield
+
+    @contextlib.contextmanager
+    def fake_graph_ctx(graph, stream=None):
+        del graph, stream
+        raise RuntimeError("capture failed")
+        yield  # pragma: no cover
+
+    calls = {"count": 0}
+
+    def step_fn():
+        calls["count"] += 1
+        return "ok"
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: object())
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: FakeStream())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: FakeStream())
+    monkeypatch.setattr(torch.cuda, "stream", fake_stream_ctx)
+    monkeypatch.setattr(torch.cuda, "graph", fake_graph_ctx)
+
+    replay = tensor_compile_mod.graph_replay_step(step_fn, ())
+
+    assert callable(replay)
+    assert replay() == "ok"
+    assert calls["count"] == 1
+
+
+def test_runtime_generation_session_native_decode_graph_replay_clears_on_state_change(monkeypatch):
+    class FakeNativeSession:
+        native_executor_kind = "causal_lm"
+
+        def __init__(self, model, seq, attention_mask=None, cache=None, trace=False):
+            del model, trace
+            self.seq = seq
+            self.attention_mask = attention_mask
+            self.cache = cache
+            self.graph_enabled: list[bool] = []
+
+        def set_decode_graph_enabled(self, enabled=True):
+            self.graph_enabled.append(bool(enabled))
+
+        def decode_next_logits(self):
+            return torch.full((int(self.seq.shape[0]), 7), -1.0, dtype=torch.float32)
+
+    builds = {"count": 0}
+
+    def fake_create_native_model_session(model, seq, attention_mask=None, cache=None, trace=False):
+        return FakeNativeSession(model, seq, attention_mask=attention_mask, cache=cache, trace=trace)
+
+    def fake_try_build(native_session):
+        builds["count"] += 1
+        native_session.set_decode_graph_enabled(True)
+        build_idx = float(builds["count"])
+
+        def replay():
+            return torch.full((int(native_session.seq.shape[0]), 7), 20.0 + build_idx, dtype=torch.float32)
+
+        warm = torch.full((int(native_session.seq.shape[0]), 7), build_idx, dtype=torch.float32)
+        return replay, warm
+
+    monkeypatch.setattr(runtime_generation_mod, "create_native_model_session", fake_create_native_model_session)
+    monkeypatch.setattr(runtime_generation_mod, "_try_build_native_decode_graph_replay", fake_try_build)
+
+    session = runtime_generation_mod.RuntimeGenerationSession(
+        model=torch.nn.Identity(),
+        seq=torch.tensor([[1, 2]], dtype=torch.long),
+        attention_mask=None,
+        cache=object(),
+        trace=False,
+    )
+
+    first = session.decode_next_logits()
+    session.seq = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    second = session.decode_next_logits()
+
+    assert first is not None
+    assert second is not None
+    assert builds["count"] == 2
+    assert torch.equal(first, torch.full((1, 7), 1.0, dtype=torch.float32))
+    assert torch.equal(second, torch.full((1, 7), 2.0, dtype=torch.float32))
+    assert session.native_session.graph_enabled == [True, False, True]
 
 
 def test_prefix_causal_lm_accepts_attention_mask_alias():

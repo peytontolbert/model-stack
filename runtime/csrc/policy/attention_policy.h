@@ -55,6 +55,21 @@ inline int BucketAttentionHeadDim(int64_t head_dim) {
 }
 
 inline int SelectAttentionRowThreads(const t10::desc::AttentionDesc& desc) {
+  if (desc.phase == t10::desc::AttentionPhase::kPrefill) {
+    if (desc.head_dim <= 64) {
+      if (desc.kv_len >= 512) {
+        return 256;
+      }
+      if (desc.kv_len >= 256) {
+        return 128;
+      }
+      return 64;
+    }
+    if (desc.head_dim <= 128) {
+      return 128;
+    }
+    return 256;
+  }
   if (desc.kv_len <= 64 && desc.head_dim <= 64) {
     return 64;
   }

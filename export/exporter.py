@@ -30,6 +30,8 @@ def _prepare_io_examples(cfg: ModelConfig, device: torch.device) -> Tuple[torch.
 
 def _export_card_meta(cfg: ExportConfig, **extra: object) -> dict[str, object]:
     meta: dict[str, object] = dict(extra)
+    if getattr(cfg, "max_seq_len", None) is not None:
+        meta["max_seq_len"] = int(cfg.max_seq_len)
     if cfg.quantize is not None:
         meta["quantize"] = str(cfg.quantize)
         meta["quant_spin"] = bool(cfg.quant_spin)

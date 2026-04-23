@@ -18,6 +18,7 @@ _FALLBACK_NATIVE_OPS = [
     "linear",
     "bitnet_transform_input",
     "bitnet_linear",
+    "bitnet_linear_module",
     "bitnet_linear_from_float",
     "bitnet_int8_linear_from_float",
     "bitnet_int8_fused_qkv_packed_heads_projection",

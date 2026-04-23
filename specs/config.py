@@ -14,6 +14,7 @@ class ModelConfig:
     head_dim: int | None = None
     attn_impl: Literal["eager", "flash", "triton", "xformers", "sdpa", "torch", "flash2", "xformers2"] = "eager"
     rope_theta: float = 1e6
+    max_position_embeddings: Optional[int] = None
     dtype: DType = "bfloat16"
     kv_cache_paged: bool = True
     # attention options

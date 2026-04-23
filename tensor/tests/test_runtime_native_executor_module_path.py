@@ -213,6 +213,21 @@ def test_native_model_session_runs_bitnet_w2a8_sub8_models_on_native_executor(mo
 
 
 @pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
+def test_native_model_session_exposes_decode_graph_controls():
+    model = CausalLM(_cfg(), block_variant="llama", tie_weights=False)
+    model.eval()
+    session, _seq = _create_session(model)
+    if session is None or getattr(session, "native_executor_kind", "python") != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    assert hasattr(session, "decode_graph_eligible")
+    assert hasattr(session, "set_decode_graph_enabled")
+    assert isinstance(session.decode_graph_eligible(), bool)
+    session.set_decode_graph_enabled(True)
+    assert isinstance(session.decode_graph_eligible(), bool)
+
+
+@pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
 def test_native_causal_executor_direct_bitnet_ignores_irrelevant_act_metadata_for_fused_qkv(monkeypatch):
     model = CausalLM(_cfg(), block_variant="llama", tie_weights=False)
     model.eval()
@@ -273,6 +288,62 @@ def test_native_causal_executor_direct_bitnet_noquant_prefill_uses_compute_backe
     assert torch.allclose(actual, baseline, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not runtime_native_mod.native_model_session_available(),
+    reason="CUDA native causal executor unavailable",
+)
+def test_runtime_generation_session_native_bitnet_noquant_cached_decode_uses_decode_backend_family(monkeypatch):
+    model = CausalLM(_cfg(), block_variant="llama", tie_weights=False).cuda()
+    model.eval()
+    modules = _convert_model_to_bitnet(model)
+    for module in modules:
+        module.act_quant_mode = "none"
+        module._compute_backend_weight(device="cuda")
+        module._decode_backend_weight(device="cuda")
+
+    _disable_python_runtime_ops(monkeypatch)
+    seq = torch.tensor([[1, 2]], device="cuda", dtype=torch.long)
+
+    baseline_session = runtime_generation_mod.RuntimeGenerationSession.from_model(
+        model,
+        seq,
+        cache_pagesize=16,
+        cache_backend="native-paged",
+    )
+    if not baseline_session.uses_native_session or baseline_session.native_executor_kind != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    with torch.no_grad():
+        baseline_prefill = baseline_session.prefill_next_logits()
+        assert baseline_prefill is not None
+        next_id = torch.argmax(baseline_prefill, dim=-1, keepdim=True)
+        baseline_session.append(next_id)
+        baseline_decode = baseline_session.decode_next_logits()
+
+    for module in modules:
+        module.packed_weight.zero_()
+
+    corrupted_session = runtime_generation_mod.RuntimeGenerationSession.from_model(
+        model,
+        seq,
+        cache_pagesize=16,
+        cache_backend="native-paged",
+    )
+    if not corrupted_session.uses_native_session or corrupted_session.native_executor_kind != "causal_lm":
+        pytest.skip("native causal executor unavailable")
+
+    with torch.no_grad():
+        actual_prefill = corrupted_session.prefill_next_logits()
+        assert actual_prefill is not None
+        corrupted_session.append(next_id)
+        actual_decode = corrupted_session.decode_next_logits()
+
+    assert baseline_decode is not None
+    assert actual_decode is not None
+    assert torch.allclose(actual_prefill, baseline_prefill, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(actual_decode, baseline_decode, atol=1e-4, rtol=1e-4)
+
+
 @pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")
 def test_runtime_generation_session_native_executor_supports_bitnet_w2a8_cached_decode(monkeypatch):
     model = CausalLM(_cfg(), block_variant="llama", tie_weights=False)
@@ -313,6 +384,8 @@ def test_runtime_generation_session_native_executor_supports_bitnet_w2a8_cached_
     rope_sin = getattr(model.blocks[0].attn, "_rope_sin", None)
     assert isinstance(rope_cos, torch.Tensor)
     assert isinstance(rope_sin, torch.Tensor)
+    assert rope_cos.shape[0] >= 3
+    assert rope_sin.shape[0] >= 3
 
 
 @pytest.mark.skipif(not runtime_native_mod.native_model_session_available(), reason="native causal executor unavailable")

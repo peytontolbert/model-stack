@@ -125,6 +125,41 @@ def prefer_hopper_library_attention(
     return max(int(q_seq), int(kv_seq)) >= max(min_seq, 1)
 
 
+def prefer_torch_library_attention(
+    *,
+    device: Any | None,
+    dtype,
+    q_seq: int,
+    kv_seq: int,
+    head_dim: int,
+    forced_backend: str | None = None,
+) -> bool:
+    if torch is None:
+        return False
+    if forced_backend is not None and str(forced_backend).strip().lower() not in {"", "auto"}:
+        return False
+    index = _device_index(device)
+    if index is None:
+        return False
+    if dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if int(q_seq) <= 1:
+        return False
+    if is_hopper_device(device):
+        return prefer_hopper_library_attention(
+            device=device,
+            dtype=dtype,
+            q_seq=int(q_seq),
+            kv_seq=int(kv_seq),
+            forced_backend=forced_backend,
+        )
+    if not _env_flag("MODEL_STACK_ENABLE_TORCH_LIBRARY_ATTENTION", "1"):
+        return False
+    min_seq = _env_int("MODEL_STACK_TORCH_LIBRARY_ATTN_MIN_SEQ", 16)
+    max_head_dim = _env_int("MODEL_STACK_TORCH_LIBRARY_ATTN_MAX_HEAD_DIM", 256)
+    return max(int(q_seq), int(kv_seq)) >= max(min_seq, 1) and int(head_dim) <= max(max_head_dim, 1)
+
+
 def prefer_hopper_library_linear(
     *,
     device: Any | None,
@@ -162,5 +197,6 @@ __all__ = [
     "hopper_optimizations_enabled",
     "is_hopper_device",
     "prefer_hopper_library_attention",
+    "prefer_torch_library_attention",
     "prefer_hopper_library_linear",
 ]

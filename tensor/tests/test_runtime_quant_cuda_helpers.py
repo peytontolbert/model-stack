@@ -428,6 +428,40 @@ def test_int8_attention_uses_native_float_frontend_when_available(monkeypatch):
     assert seen["v_scale_shape"] is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native int8 attention mask broadcast parity")
+def test_int8_attention_native_cuda_accepts_batch_broadcast_mask():
+    if not runtime_quant_mod.has_native_op("int8_attention_from_float"):
+        pytest.skip("native int8 attention frontend unavailable")
+
+    torch.manual_seed(0)
+    q = torch.randn(2, 4, 32, 64, dtype=torch.float16, device="cuda")
+    k = torch.randn(2, 4, 32, 64, dtype=torch.float16, device="cuda")
+    v = torch.randn(2, 4, 32, 64, dtype=torch.float16, device="cuda")
+    batch_broadcast_mask = torch.zeros((1, 1, 32, 32), dtype=torch.float32, device="cuda")
+    batch_broadcast_mask[..., -1] = float("-inf")
+    expanded_mask = batch_broadcast_mask.expand(2, 1, 32, 32).contiguous()
+
+    out_broadcast = runtime_quant_mod.int8_attention(
+        q,
+        k,
+        v,
+        attn_mask=batch_broadcast_mask,
+        is_causal=False,
+        out_dtype=torch.float16,
+    )
+    out_expanded = runtime_quant_mod.int8_attention(
+        q,
+        k,
+        v,
+        attn_mask=expanded_mask,
+        is_causal=False,
+        out_dtype=torch.float16,
+    )
+
+    assert out_broadcast.shape == q.shape
+    assert torch.allclose(out_broadcast, out_expanded, atol=5e-2, rtol=5e-2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native BitNet linear frontend dispatch")
 def test_bitnet_linear_from_float_uses_native_module_when_available(monkeypatch):
     seen = {}

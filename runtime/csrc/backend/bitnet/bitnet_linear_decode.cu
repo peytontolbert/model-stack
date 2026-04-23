@@ -12,6 +12,14 @@
 namespace t10::bitnet {
 namespace {
 
+__device__ inline float WarpReduceSumDevice(float value) {
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(0xffffffffu, value, offset);
+  }
+  return value;
+}
+
 template <typename scalar_t>
 __global__ void bitnet_linear_decode_scalar_kernel(
     const scalar_t* __restrict__ x,
@@ -190,48 +198,234 @@ __global__ __launch_bounds__(32 * WarpsPerBlock, 2) void bitnet_linear_decode_ro
     int64_t decode_tile_n) {
   constexpr int kWarpSize = 32;
 
-  __shared__ scalar_t x_chunk[kWarpSize];
-
   const int lane = static_cast<int>(threadIdx.x);
   const int warp_idx = static_cast<int>(threadIdx.y);
   const int64_t out_idx = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock + warp_idx;
   const bool output_active = out_idx < layout.logical_out_features;
+  const int64_t tile_group = output_active ? out_idx / decode_tile_n : 0;
+  const int64_t tile_col = output_active ? out_idx - tile_group * decode_tile_n : 0;
+  const int64_t mask_base = output_active ? ((tile_group * decode_chunk_cols) * decode_tile_n + tile_col) : 0;
+  const uint32_t lane_bit = 1u << lane;
 
   float acc = 0.0f;
   for (int64_t chunk_idx = 0; chunk_idx < decode_chunk_cols; ++chunk_idx) {
-    if (warp_idx == 0) {
-      const int64_t global_k = chunk_idx * kWarpSize + lane;
-      x_chunk[lane] =
-          global_k < layout.logical_in_features
-              ? x[global_k]
-              : static_cast<scalar_t>(0);
-    }
-    __syncthreads();
-
     if (output_active) {
-      const int64_t tile_group = out_idx / decode_tile_n;
-      const int64_t tile_col = out_idx - tile_group * decode_tile_n;
-      const int64_t mask_idx = (tile_group * decode_chunk_cols + chunk_idx) * decode_tile_n + tile_col;
+      const int64_t global_k = chunk_idx * kWarpSize + lane;
+      const float x_value =
+          global_k < layout.logical_in_features
+              ? static_cast<float>(x[global_k])
+              : 0.0f;
+      const int64_t mask_idx = mask_base + chunk_idx * decode_tile_n;
       const uint32_t nz_mask = static_cast<uint32_t>(decode_nz_masks[mask_idx]);
       const uint32_t sign_mask = static_cast<uint32_t>(decode_sign_masks[mask_idx]);
-      const uint32_t lane_bit = 1u << lane;
 
       float contrib = 0.0f;
       if ((nz_mask & lane_bit) != 0u) {
-        contrib = static_cast<float>(x_chunk[lane]);
+        contrib = x_value;
         if ((sign_mask & lane_bit) == 0u) {
           contrib = -contrib;
         }
       }
-      #pragma unroll
-      for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-        contrib += __shfl_down_sync(0xffffffffu, contrib, offset);
-      }
+      contrib = WarpReduceSumDevice(contrib);
       if (lane == 0) {
         acc += contrib;
       }
     }
-    __syncthreads();
+  }
+
+  if (output_active && lane == 0) {
+    float value = acc * ResolveComputePackedRowScaleDevice(out_idx, decode_row_scales, decode_tile_n);
+    if (bias != nullptr) {
+      value += static_cast<float>(bias[out_idx]);
+    }
+    out[out_idx] = CastOutput<scalar_t>(value);
+  }
+}
+
+template <typename scalar_t, int WarpsPerBlock>
+__global__ __launch_bounds__(32 * WarpsPerBlock, 2) void bitnet_linear_decode_row1_bitplane_rms_norm_kernel(
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ rms_weight,
+    float eps,
+    const int32_t* __restrict__ decode_nz_masks,
+    const int32_t* __restrict__ decode_sign_masks,
+    const float* __restrict__ decode_row_scales,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ out,
+    LayoutInfo layout,
+    int64_t decode_chunk_cols,
+    int64_t decode_tile_n) {
+  constexpr int kWarpSize = 32;
+  constexpr int kThreads = kWarpSize * WarpsPerBlock;
+
+  __shared__ float warp_sums[WarpsPerBlock];
+  __shared__ float inv_rms_shared;
+
+  const int lane = static_cast<int>(threadIdx.x);
+  const int warp_idx = static_cast<int>(threadIdx.y);
+  const int thread_linear = warp_idx * kWarpSize + lane;
+  const int64_t out_idx = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock + warp_idx;
+  const bool output_active = out_idx < layout.logical_out_features;
+  const int64_t tile_group = output_active ? out_idx / decode_tile_n : 0;
+  const int64_t tile_col = output_active ? out_idx - tile_group * decode_tile_n : 0;
+  const int64_t mask_base = output_active ? ((tile_group * decode_chunk_cols) * decode_tile_n + tile_col) : 0;
+  const uint32_t lane_bit = 1u << lane;
+
+  float thread_sum = 0.0f;
+  for (int64_t col = thread_linear; col < layout.logical_in_features; col += kThreads) {
+    const float value = static_cast<float>(x[col]);
+    thread_sum += value * value;
+  }
+  thread_sum = WarpReduceSumDevice(thread_sum);
+  if (lane == 0) {
+    warp_sums[warp_idx] = thread_sum;
+  }
+  __syncthreads();
+
+  if (warp_idx == 0) {
+    float block_sum = lane < WarpsPerBlock ? warp_sums[lane] : 0.0f;
+    block_sum = WarpReduceSumDevice(block_sum);
+    if (lane == 0) {
+      inv_rms_shared = rsqrtf((block_sum / static_cast<float>(layout.logical_in_features)) + eps);
+    }
+  }
+  __syncthreads();
+  const float inv_rms = inv_rms_shared;
+
+  float acc = 0.0f;
+  for (int64_t chunk_idx = 0; chunk_idx < decode_chunk_cols; ++chunk_idx) {
+    if (output_active) {
+      const int64_t global_k = chunk_idx * kWarpSize + lane;
+      float contrib = 0.0f;
+      if (global_k < layout.logical_in_features) {
+        contrib = static_cast<float>(x[global_k]) * inv_rms;
+        if (rms_weight != nullptr) {
+          contrib *= static_cast<float>(rms_weight[global_k]);
+        }
+        const int64_t mask_idx = mask_base + chunk_idx * decode_tile_n;
+        const uint32_t nz_mask = static_cast<uint32_t>(decode_nz_masks[mask_idx]);
+        if ((nz_mask & lane_bit) == 0u) {
+          contrib = 0.0f;
+        } else {
+          const uint32_t sign_mask = static_cast<uint32_t>(decode_sign_masks[mask_idx]);
+          if ((sign_mask & lane_bit) == 0u) {
+            contrib = -contrib;
+          }
+        }
+      } else {
+        const int64_t mask_idx = mask_base + chunk_idx * decode_tile_n;
+        const uint32_t nz_mask = static_cast<uint32_t>(decode_nz_masks[mask_idx]);
+        if ((nz_mask & lane_bit) != 0u) {
+          const uint32_t sign_mask = static_cast<uint32_t>(decode_sign_masks[mask_idx]);
+          contrib = (sign_mask & lane_bit) != 0u ? 0.0f : -0.0f;
+        }
+      }
+      contrib = WarpReduceSumDevice(contrib);
+      if (lane == 0) {
+        acc += contrib;
+      }
+    }
+  }
+
+  if (output_active && lane == 0) {
+    float value = acc * ResolveComputePackedRowScaleDevice(out_idx, decode_row_scales, decode_tile_n);
+    if (bias != nullptr) {
+      value += static_cast<float>(bias[out_idx]);
+    }
+    out[out_idx] = CastOutput<scalar_t>(value);
+  }
+}
+
+template <typename scalar_t, int WarpsPerBlock>
+__global__ __launch_bounds__(32 * WarpsPerBlock, 2) void bitnet_linear_decode_row1_bitplane_add_rms_norm_kernel(
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ update,
+    const scalar_t* __restrict__ rms_weight,
+    float residual_scale,
+    float eps,
+    const int32_t* __restrict__ decode_nz_masks,
+    const int32_t* __restrict__ decode_sign_masks,
+    const float* __restrict__ decode_row_scales,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ combined,
+    scalar_t* __restrict__ out,
+    LayoutInfo layout,
+    int64_t decode_chunk_cols,
+    int64_t decode_tile_n) {
+  constexpr int kWarpSize = 32;
+  constexpr int kThreads = kWarpSize * WarpsPerBlock;
+
+  __shared__ float warp_sums[WarpsPerBlock];
+  __shared__ float inv_rms_shared;
+
+  const int lane = static_cast<int>(threadIdx.x);
+  const int warp_idx = static_cast<int>(threadIdx.y);
+  const int thread_linear = warp_idx * kWarpSize + lane;
+  const int64_t out_idx = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock + warp_idx;
+  const bool output_active = out_idx < layout.logical_out_features;
+  const int64_t tile_group = output_active ? out_idx / decode_tile_n : 0;
+  const int64_t tile_col = output_active ? out_idx - tile_group * decode_tile_n : 0;
+  const int64_t mask_base = output_active ? ((tile_group * decode_chunk_cols) * decode_tile_n + tile_col) : 0;
+  const uint32_t lane_bit = 1u << lane;
+
+  float thread_sum = 0.0f;
+  for (int64_t col = thread_linear; col < layout.logical_in_features; col += kThreads) {
+    const float value =
+        static_cast<float>(x[col]) + (residual_scale * static_cast<float>(update[col]));
+    const scalar_t combined_value = static_cast<scalar_t>(value);
+    combined[col] = combined_value;
+    const float rounded = static_cast<float>(combined_value);
+    thread_sum += rounded * rounded;
+  }
+  thread_sum = WarpReduceSumDevice(thread_sum);
+  if (lane == 0) {
+    warp_sums[warp_idx] = thread_sum;
+  }
+  __syncthreads();
+
+  if (warp_idx == 0) {
+    float block_sum = lane < WarpsPerBlock ? warp_sums[lane] : 0.0f;
+    block_sum = WarpReduceSumDevice(block_sum);
+    if (lane == 0) {
+      inv_rms_shared = rsqrtf((block_sum / static_cast<float>(layout.logical_in_features)) + eps);
+    }
+  }
+  __syncthreads();
+  const float inv_rms = inv_rms_shared;
+
+  float acc = 0.0f;
+  for (int64_t chunk_idx = 0; chunk_idx < decode_chunk_cols; ++chunk_idx) {
+    if (output_active) {
+      float contrib = 0.0f;
+      const int64_t global_k = chunk_idx * kWarpSize + lane;
+      if (global_k < layout.logical_in_features) {
+        contrib = static_cast<float>(combined[global_k]) * inv_rms;
+        if (rms_weight != nullptr) {
+          contrib *= static_cast<float>(rms_weight[global_k]);
+        }
+        const int64_t mask_idx = mask_base + chunk_idx * decode_tile_n;
+        const uint32_t nz_mask = static_cast<uint32_t>(decode_nz_masks[mask_idx]);
+        if ((nz_mask & lane_bit) == 0u) {
+          contrib = 0.0f;
+        } else {
+          const uint32_t sign_mask = static_cast<uint32_t>(decode_sign_masks[mask_idx]);
+          if ((sign_mask & lane_bit) == 0u) {
+            contrib = -contrib;
+          }
+        }
+      } else {
+        const int64_t mask_idx = mask_base + chunk_idx * decode_tile_n;
+        const uint32_t nz_mask = static_cast<uint32_t>(decode_nz_masks[mask_idx]);
+        if ((nz_mask & lane_bit) != 0u) {
+          const uint32_t sign_mask = static_cast<uint32_t>(decode_sign_masks[mask_idx]);
+          contrib = (sign_mask & lane_bit) != 0u ? 0.0f : -0.0f;
+        }
+      }
+      contrib = WarpReduceSumDevice(contrib);
+      if (lane == 0) {
+        acc += contrib;
+      }
+    }
   }
 
   if (output_active && lane == 0) {
@@ -706,6 +900,80 @@ void launch_decode_row1_bitplane(
           decode_nz_masks.size(2));
 }
 
+template <typename scalar_t, int WarpsPerBlock>
+void launch_decode_row1_bitplane_rms_norm(
+    const torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const c10::optional<torch::Tensor>& rms_weight,
+    double eps,
+    const torch::Tensor& decode_nz_masks,
+    const torch::Tensor& decode_sign_masks,
+    const torch::Tensor& decode_row_scales,
+    const scalar_t* bias_ptr,
+    const LayoutInfo& layout,
+    cudaStream_t stream) {
+  static_assert(WarpsPerBlock > 0, "row1 fused RMSNorm+bitplane launch requires at least one warp");
+  const dim3 blocks(static_cast<unsigned int>((layout.logical_out_features + WarpsPerBlock - 1) / WarpsPerBlock));
+  const dim3 threads(32, WarpsPerBlock);
+  const scalar_t* rms_weight_ptr = nullptr;
+  if (rms_weight.has_value() && rms_weight.value().defined()) {
+    rms_weight_ptr = rms_weight.value().data_ptr<scalar_t>();
+  }
+  bitnet_linear_decode_row1_bitplane_rms_norm_kernel<scalar_t, WarpsPerBlock>
+      <<<blocks, threads, 0, stream>>>(
+          x_2d.data_ptr<scalar_t>(),
+          rms_weight_ptr,
+          static_cast<float>(eps),
+          decode_nz_masks.data_ptr<int32_t>(),
+          decode_sign_masks.data_ptr<int32_t>(),
+          decode_row_scales.data_ptr<float>(),
+          bias_ptr,
+          out_2d.data_ptr<scalar_t>(),
+          layout,
+          decode_nz_masks.size(1),
+          decode_nz_masks.size(2));
+}
+
+template <typename scalar_t, int WarpsPerBlock>
+void launch_decode_row1_bitplane_add_rms_norm(
+    const torch::Tensor& combined_2d,
+    const torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& update_2d,
+    const c10::optional<torch::Tensor>& rms_weight,
+    double residual_scale,
+    double eps,
+    const torch::Tensor& decode_nz_masks,
+    const torch::Tensor& decode_sign_masks,
+    const torch::Tensor& decode_row_scales,
+    const scalar_t* bias_ptr,
+    const LayoutInfo& layout,
+    cudaStream_t stream) {
+  static_assert(WarpsPerBlock > 0, "row1 fused AddRmsNorm+bitplane launch requires at least one warp");
+  const dim3 blocks(static_cast<unsigned int>((layout.logical_out_features + WarpsPerBlock - 1) / WarpsPerBlock));
+  const dim3 threads(32, WarpsPerBlock);
+  const scalar_t* rms_weight_ptr = nullptr;
+  if (rms_weight.has_value() && rms_weight.value().defined()) {
+    rms_weight_ptr = rms_weight.value().data_ptr<scalar_t>();
+  }
+  bitnet_linear_decode_row1_bitplane_add_rms_norm_kernel<scalar_t, WarpsPerBlock>
+      <<<blocks, threads, 0, stream>>>(
+          x_2d.data_ptr<scalar_t>(),
+          update_2d.data_ptr<scalar_t>(),
+          rms_weight_ptr,
+          static_cast<float>(residual_scale),
+          static_cast<float>(eps),
+          decode_nz_masks.data_ptr<int32_t>(),
+          decode_sign_masks.data_ptr<int32_t>(),
+          decode_row_scales.data_ptr<float>(),
+          bias_ptr,
+          combined_2d.data_ptr<scalar_t>(),
+          out_2d.data_ptr<scalar_t>(),
+          layout,
+          decode_nz_masks.size(1),
+          decode_nz_masks.size(2));
+}
+
 template <typename scalar_t, int MaxRows>
 void launch_decode_bucket(
     const Plan& plan,
@@ -1135,6 +1403,131 @@ void LaunchBitNetDecodeKernelBitplaneRow1(
         launch_decode_row1_bitplane<scalar_t, 4>(
             out_2d,
             x_2d,
+            decode_nz_masks,
+            decode_sign_masks,
+            decode_row_scales,
+            bias_ptr,
+            layout,
+            stream.stream());
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void LaunchBitNetDecodeKernelBitplaneRow1RmsNorm(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const c10::optional<torch::Tensor>& rms_weight,
+    double eps,
+    const torch::Tensor& decode_nz_masks,
+    const torch::Tensor& decode_sign_masks,
+    const torch::Tensor& decode_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan) {
+  TORCH_CHECK(
+      plan.kind == KernelKind::kDecodePersistent,
+      "LaunchBitNetDecodeKernelBitplaneRow1RmsNorm only supports decode-persistent plans");
+  TORCH_CHECK(x_2d.size(0) == 1, "LaunchBitNetDecodeKernelBitplaneRow1RmsNorm requires a single decode row");
+  c10::cuda::CUDAGuard device_guard(x_2d.device());
+  auto stream = c10::cuda::getCurrentCUDAStream(x_2d.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      x_2d.scalar_type(),
+      "bitnet_linear_decode_bitplane_row1_rms_norm_cuda",
+      [&] {
+        const scalar_t* bias_ptr = nullptr;
+        if (bias.has_value() && bias.value().defined()) {
+          bias_ptr = bias.value().data_ptr<scalar_t>();
+        }
+        if (layout.logical_out_features >= 256) {
+          launch_decode_row1_bitplane_rms_norm<scalar_t, 8>(
+              out_2d,
+              x_2d,
+              rms_weight,
+              eps,
+              decode_nz_masks,
+              decode_sign_masks,
+              decode_row_scales,
+              bias_ptr,
+              layout,
+              stream.stream());
+          return;
+        }
+        launch_decode_row1_bitplane_rms_norm<scalar_t, 4>(
+            out_2d,
+            x_2d,
+            rms_weight,
+            eps,
+            decode_nz_masks,
+            decode_sign_masks,
+            decode_row_scales,
+            bias_ptr,
+            layout,
+            stream.stream());
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void LaunchBitNetDecodeKernelBitplaneRow1AddRmsNorm(
+    torch::Tensor& combined_2d,
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& update_2d,
+    const c10::optional<torch::Tensor>& rms_weight,
+    double residual_scale,
+    double eps,
+    const torch::Tensor& decode_nz_masks,
+    const torch::Tensor& decode_sign_masks,
+    const torch::Tensor& decode_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan) {
+  TORCH_CHECK(
+      plan.kind == KernelKind::kDecodePersistent,
+      "LaunchBitNetDecodeKernelBitplaneRow1AddRmsNorm only supports decode-persistent plans");
+  TORCH_CHECK(
+      x_2d.size(0) == 1 && update_2d.size(0) == 1,
+      "LaunchBitNetDecodeKernelBitplaneRow1AddRmsNorm requires a single decode row");
+  c10::cuda::CUDAGuard device_guard(x_2d.device());
+  auto stream = c10::cuda::getCurrentCUDAStream(x_2d.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      x_2d.scalar_type(),
+      "bitnet_linear_decode_bitplane_row1_add_rms_norm_cuda",
+      [&] {
+        const scalar_t* bias_ptr = nullptr;
+        if (bias.has_value() && bias.value().defined()) {
+          bias_ptr = bias.value().data_ptr<scalar_t>();
+        }
+        if (layout.logical_out_features >= 256) {
+          launch_decode_row1_bitplane_add_rms_norm<scalar_t, 8>(
+              combined_2d,
+              out_2d,
+              x_2d,
+              update_2d,
+              rms_weight,
+              residual_scale,
+              eps,
+              decode_nz_masks,
+              decode_sign_masks,
+              decode_row_scales,
+              bias_ptr,
+              layout,
+              stream.stream());
+          return;
+        }
+        launch_decode_row1_bitplane_add_rms_norm<scalar_t, 4>(
+            combined_2d,
+            out_2d,
+            x_2d,
+            update_2d,
+            rms_weight,
+            residual_scale,
+            eps,
             decode_nz_masks,
             decode_sign_masks,
             decode_row_scales,

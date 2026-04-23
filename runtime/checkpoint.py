@@ -352,6 +352,13 @@ def model_config_from_hf_llama_transformers_config(
         vocab_size=vocab_size,
         attn_impl="sdpa",
         rope_theta=float(rope_theta if rope_theta is not None else getattr(cfg_hf, "rope_theta", 1e6)),
+        max_position_embeddings=int(
+            getattr(
+                cfg_hf,
+                "max_position_embeddings",
+                int(seq_len if seq_len is not None else 2048),
+            )
+        ),
         dtype=("bfloat16" if dtype == torch.bfloat16 else ("float16" if dtype == torch.float16 else "float32")),
         rms_norm_eps=rms_eps,
         head_dim=head_dim,

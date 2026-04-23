@@ -153,6 +153,38 @@ def test_runtime_attention_uses_eager_reference_when_grad_enabled(monkeypatch):
     assert v.grad is not None
 
 
+def test_runtime_attention_prefers_torch_library_attention_when_heuristic_enabled(monkeypatch):
+    q = torch.randn(2, 4, 8, 16)
+    k = torch.randn(2, 4, 8, 16)
+    v = torch.randn(2, 4, 8, 16)
+    calls = {"torch": 0, "native": 0}
+
+    class _NativeShouldNotRun:
+        def attention_forward(self, *args, **kwargs):
+            del args, kwargs
+            calls["native"] += 1
+            raise AssertionError("native attention should not run when torch library heuristic is selected")
+
+    def fake_sdpa(q_in, k_in, v_in, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+        del k_in, v_in, attn_mask, dropout_p, is_causal, scale
+        calls["torch"] += 1
+        return torch.zeros_like(q_in)
+
+    monkeypatch.setattr(runtime_ops_mod, "prefer_torch_library_attention", lambda **kwargs: True)
+    monkeypatch.setattr(
+        runtime_ops_mod,
+        "has_native_op",
+        lambda name: name in {"attention_prefill", "attention_decode"},
+    )
+    monkeypatch.setattr(runtime_ops_mod, "native_module", lambda: _NativeShouldNotRun())
+    monkeypatch.setattr(F, "scaled_dot_product_attention", fake_sdpa)
+
+    out = runtime_ops_mod.attention(q, k, v, is_causal=True)
+
+    assert out.shape == q.shape
+    assert calls == {"torch": 1, "native": 0}
+
+
 def test_runtime_projection_and_embedding_ops_use_eager_reference_when_grad_enabled(monkeypatch):
     x = torch.randn(2, 3, 8, requires_grad=True)
     q_weight = torch.randn(8, 8, requires_grad=True)

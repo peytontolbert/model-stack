@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn.functional as F
 
+from runtime.hardware import cuda_arch_family, prefer_torch_library_attention
 from runtime.native import has_native_op, native_module, resolve_linear_backend
 
 
@@ -15,6 +17,158 @@ def _should_use_eager_autograd_fallback(*tensors: torch.Tensor | None) -> bool:
         if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
             return True
     return False
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def _is_auto_backend(backend: str | None) -> bool:
+    return str(backend or "auto").strip().lower() in {"", "auto"}
+
+
+def _cuda_rows_lastdim(x: torch.Tensor) -> int:
+    if x.ndim == 0:
+        return 1
+    last_dim = int(x.shape[-1]) if x.ndim > 0 else 1
+    if last_dim <= 0:
+        return 0
+    return int(x.numel() // last_dim)
+
+
+def _prefer_ampere_eager_cuda_path(tensor: torch.Tensor) -> bool:
+    if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+        return False
+    if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return False
+    return cuda_arch_family(tensor.device) in {"ampere", "ada"}
+
+
+def _prefer_eager_cuda_embedding(weight: torch.Tensor, indices: torch.Tensor) -> bool:
+    if _env_flag("MODEL_STACK_ENABLE_CUDA_EMBEDDING_NATIVE", "0"):
+        return False
+    return _prefer_ampere_eager_cuda_path(weight) and indices.device == weight.device
+
+
+def _prefer_eager_cuda_add_layer_norm(x: torch.Tensor, update: torch.Tensor) -> bool:
+    if _env_flag("MODEL_STACK_ENABLE_CUDA_ADD_LAYER_NORM_NATIVE", "0"):
+        return False
+    return _prefer_ampere_eager_cuda_path(x) and update.is_cuda and update.device == x.device
+
+
+def _prefer_eager_cuda_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    backend: str | None,
+) -> bool:
+    if not _is_auto_backend(backend):
+        return False
+    if not _prefer_ampere_eager_cuda_path(x):
+        return False
+    if not weight.is_cuda or weight.device != x.device or weight.ndim != 2 or x.ndim < 2:
+        return False
+    native_min_rows = _env_int("MODEL_STACK_CUDA_LINEAR_NATIVE_MIN_ROWS", 2048)
+    return _cuda_rows_lastdim(x) < max(native_min_rows, 1)
+
+
+def _prefer_eager_cuda_qkv_projection(
+    x: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    *,
+    backend: str | None,
+) -> bool:
+    if not _is_auto_backend(backend):
+        return False
+    if not _prefer_ampere_eager_cuda_path(x):
+        return False
+    if (
+        not q_weight.is_cuda
+        or not k_weight.is_cuda
+        or not v_weight.is_cuda
+        or q_weight.device != x.device
+        or k_weight.device != x.device
+        or v_weight.device != x.device
+    ):
+        return False
+    native_min_rows = _env_int("MODEL_STACK_CUDA_QKV_NATIVE_MIN_ROWS", 2048)
+    return _cuda_rows_lastdim(x) < max(native_min_rows, 1)
+
+
+def _prefer_eager_cuda_mlp(
+    x: torch.Tensor,
+    w_in_weight: torch.Tensor,
+    w_out_weight: torch.Tensor,
+    *,
+    backend: str | None,
+) -> bool:
+    if not _is_auto_backend(backend):
+        return False
+    if not _prefer_ampere_eager_cuda_path(x):
+        return False
+    if (
+        not w_in_weight.is_cuda
+        or not w_out_weight.is_cuda
+        or w_in_weight.device != x.device
+        or w_out_weight.device != x.device
+    ):
+        return False
+    native_min_rows = _env_int("MODEL_STACK_CUDA_MLP_NATIVE_MIN_ROWS", 2048)
+    return _cuda_rows_lastdim(x) < max(native_min_rows, 1)
+
+
+def _prefer_native_sm80_inference_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    *,
+    is_causal: bool,
+    op_name: str,
+) -> bool:
+    if op_name != "attention_prefill":
+        return False
+    if not _env_flag("MODEL_STACK_PREFER_NATIVE_SM80_INFERENCE_ATTENTION", "1"):
+        return False
+    if _env_flag("MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_INFERENCE", "0"):
+        return False
+    if attn_mask is not None or not is_causal:
+        return False
+    if (
+        not q.is_cuda
+        or not k.is_cuda
+        or not v.is_cuda
+        or q.device != k.device
+        or q.device != v.device
+    ):
+        return False
+    if q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
+        return False
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        return False
+    if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
+        return False
+    if q.shape[1] != k.shape[1] or q.shape[1] != v.shape[1]:
+        return False
+    if q.shape[2] <= 1 or q.shape[2] != k.shape[2] or q.shape[2] != v.shape[2]:
+        return False
+    if q.shape[3] != 64 or k.shape[3] != 64 or v.shape[3] != 64:
+        return False
+    if cuda_arch_family(q.device) not in {"ampere", "ada"}:
+        return False
+    return has_native_op(op_name)
 
 
 def _to_tuple_dims(dim: int | tuple[int, ...], ndim: int) -> tuple[int, ...]:
@@ -175,6 +329,9 @@ def add_layer_norm(
     eps: float = 1e-5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if _should_use_eager_autograd_fallback(x, update, weight, bias):
+        combined = x + (update * float(residual_scale))
+        return combined, _layer_norm_reference(combined, weight=weight, bias=bias, eps=eps, dim=-1)
+    if _prefer_eager_cuda_add_layer_norm(x, update):
         combined = x + (update * float(residual_scale))
         return combined, _layer_norm_reference(combined, weight=weight, bias=bias, eps=eps, dim=-1)
     if has_native_op("add_layer_norm"):
@@ -748,9 +905,69 @@ def attention(
     is_causal: bool = False,
     scale: float | None = None,
 ) -> torch.Tensor:
+    def _expand_gqa_kv(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if q_in.shape[1] == k_in.shape[1]:
+            return k_in, v_in
+        if q_in.shape[1] % k_in.shape[1] != 0 or k_in.shape[1] != v_in.shape[1]:
+            raise ValueError("attention requires q heads to be a multiple of kv heads")
+        repeat = q_in.shape[1] // k_in.shape[1]
+        return k_in.repeat_interleave(repeat, dim=1), v_in.repeat_interleave(repeat, dim=1)
+
+    def _torch_library_attention(
+        q_in: torch.Tensor,
+        k_in: torch.Tensor,
+        v_in: torch.Tensor,
+        mask_in: torch.Tensor | None,
+        *,
+        is_causal_in: bool,
+        scale_in: float | None,
+    ) -> torch.Tensor:
+        k_all, v_all = _expand_gqa_kv(q_in, k_in, v_in)
+        sdpa_mask = mask_in
+        if sdpa_mask is not None:
+            if sdpa_mask.dtype == torch.bool:
+                sdpa_mask = torch.zeros_like(sdpa_mask, dtype=q_in.dtype).masked_fill(sdpa_mask, float("-inf"))
+            elif sdpa_mask.dtype != q_in.dtype:
+                sdpa_mask = sdpa_mask.to(dtype=q_in.dtype)
+        return F.scaled_dot_product_attention(
+            q_in,
+            k_all,
+            v_all,
+            attn_mask=sdpa_mask,
+            dropout_p=0.0,
+            is_causal=is_causal_in,
+            scale=scale_in,
+        )
+
     op_name = "attention_decode" if q.shape[2] == 1 else "attention_prefill"
     if _should_use_eager_autograd_fallback(q, k, v, attn_mask):
         op_name = ""
+    if _prefer_native_sm80_inference_attention(
+        q,
+        k,
+        v,
+        attn_mask,
+        is_causal=bool(is_causal),
+        op_name=op_name,
+    ):
+        module = native_module()
+        if module is not None and hasattr(module, "attention_forward"):
+            return module.attention_forward(q, k, v, attn_mask, is_causal, scale)
+    if prefer_torch_library_attention(
+        device=q.device,
+        dtype=q.dtype,
+        q_seq=int(q.shape[2]),
+        kv_seq=int(k.shape[2]),
+        head_dim=int(q.shape[3]),
+    ):
+        return _torch_library_attention(
+            q,
+            k,
+            v,
+            attn_mask,
+            is_causal_in=bool(is_causal),
+            scale_in=scale,
+        )
     if has_native_op(op_name):
         module = native_module()
         if module is not None and hasattr(module, "attention_forward"):
@@ -759,11 +976,7 @@ def attention(
     k_all = k
     v_all = v
     if q.shape[1] != k.shape[1]:
-        if q.shape[1] % k.shape[1] != 0 or k.shape[1] != v.shape[1]:
-            raise ValueError("attention fallback requires q heads to be a multiple of kv heads")
-        repeat = q.shape[1] // k.shape[1]
-        k_all = k.repeat_interleave(repeat, dim=1)
-        v_all = v.repeat_interleave(repeat, dim=1)
+        k_all, v_all = _expand_gqa_kv(q, k, v)
 
     scores = torch.matmul(q, k_all.transpose(2, 3))
     if scale is None:
@@ -1449,6 +1662,8 @@ def linear(
     backend: str | None = None,
 ) -> torch.Tensor:
     if _should_use_eager_autograd_fallback(x, weight, bias):
+        return F.linear(x, weight, bias)
+    if _prefer_eager_cuda_linear(x, weight, backend=backend):
         return F.linear(x, weight, bias)
     if has_native_op("linear"):
         module = native_module()
@@ -2668,6 +2883,12 @@ def qkv_projection(
             linear(x, k_weight, k_bias, backend=backend),
             linear(x, v_weight, v_bias, backend=backend),
         )
+    if _prefer_eager_cuda_qkv_projection(x, q_weight, k_weight, v_weight, backend=backend):
+        return (
+            linear(x, q_weight, q_bias, backend=backend),
+            linear(x, k_weight, k_bias, backend=backend),
+            linear(x, v_weight, v_bias, backend=backend),
+        )
     if has_native_op("qkv_projection"):
         module = native_module()
         if module is not None and hasattr(module, "qkv_projection_forward"):
@@ -3057,6 +3278,31 @@ def gated_activation(
     return globals()["activation"](x, act) * gate
 
 
+def _apply_mlp_hidden_activation(
+    hidden: torch.Tensor,
+    *,
+    activation: str,
+    gated: bool,
+) -> torch.Tensor:
+    act = str(activation).lower()
+    if gated:
+        a, b = hidden.chunk(2, dim=-1)
+        if act in ("swiglu", "gated-silu"):
+            return F.silu(a) * b
+        if act == "geglu":
+            return F.gelu(a) * b
+        if act == "reglu":
+            return F.relu(a) * b
+        return F.silu(a) * b
+    if act in ("gelu",):
+        return F.gelu(hidden)
+    if act in ("silu", "swish"):
+        return F.silu(hidden)
+    if act in ("relu",):
+        return F.relu(hidden)
+    return F.gelu(hidden)
+
+
 def mlp(
     x: torch.Tensor,
     w_in_weight: torch.Tensor,
@@ -3070,24 +3316,11 @@ def mlp(
 ) -> torch.Tensor:
     if _should_use_eager_autograd_fallback(x, w_in_weight, w_in_bias, w_out_weight, w_out_bias):
         hidden = linear(x, w_in_weight, w_in_bias, backend=backend)
-        act = str(activation).lower()
-        if gated:
-            a, b = hidden.chunk(2, dim=-1)
-            if act in ("swiglu", "gated-silu"):
-                hidden = gated_activation(a, b, "silu")
-            elif act == "geglu":
-                hidden = gated_activation(a, b, "gelu")
-            elif act == "reglu":
-                hidden = gated_activation(a, b, "relu")
-            else:
-                hidden = gated_activation(a, b, "silu")
-        else:
-            if act in ("gelu",):
-                hidden = globals()["activation"](hidden, "gelu")
-            elif act in ("silu", "swish"):
-                hidden = globals()["activation"](hidden, "silu")
-            else:
-                hidden = globals()["activation"](hidden, "gelu")
+        hidden = _apply_mlp_hidden_activation(hidden, activation=activation, gated=gated)
+        return linear(hidden, w_out_weight, w_out_bias, backend=backend)
+    if _prefer_eager_cuda_mlp(x, w_in_weight, w_out_weight, backend=backend):
+        hidden = linear(x, w_in_weight, w_in_bias, backend=backend)
+        hidden = _apply_mlp_hidden_activation(hidden, activation=activation, gated=gated)
         return linear(hidden, w_out_weight, w_out_bias, backend=backend)
     if has_native_op("mlp"):
         module = native_module()
@@ -3103,12 +3336,7 @@ def mlp(
                 str(backend or "auto"),
             )
     hidden = linear(x, w_in_weight, w_in_bias, backend=backend)
-    act = str(activation).lower()
-    if gated:
-        a, b = hidden.chunk(2, dim=-1)
-        hidden = gated_activation(a, b, act)
-    else:
-        hidden = globals()["activation"](hidden, act)
+    hidden = _apply_mlp_hidden_activation(hidden, activation=activation, gated=gated)
     return linear(hidden, w_out_weight, w_out_bias, backend=backend)
 
 
@@ -3152,6 +3380,8 @@ def embedding(
     padding_idx: int | None = None,
 ) -> torch.Tensor:
     if _should_use_eager_autograd_fallback(weight):
+        return F.embedding(indices, weight, padding_idx=padding_idx)
+    if _prefer_eager_cuda_embedding(weight, indices):
         return F.embedding(indices, weight, padding_idx=padding_idx)
     if has_native_op("embedding"):
         module = native_module()

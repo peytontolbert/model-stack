@@ -39,6 +39,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         help="Path to torch-saved calibration input map used for AWQ/GPTQ and static activation quantization.",
     )
     p.add_argument("--dynamic-axes", action="store_true", default=True)
+    p.add_argument("--max-seq-len", type=int, default=None)
     p.add_argument("--outdir", type=str, default="artifacts/")
     p.add_argument("--trt-workspace-mb", type=int, default=4096)
 
@@ -57,6 +58,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         quant_activation_quant_percentile=args.quant_activation_quant_percentile,
         quant_calibration_inputs_path=args.quant_calibration_inputs,
         dynamic_axes=args.dynamic_axes,
+        max_seq_len=args.max_seq_len,
         outdir=args.outdir,
         trt_max_workspace_mb=args.trt_workspace_mb,
     )

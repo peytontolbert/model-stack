@@ -2458,11 +2458,15 @@ torch::Tensor CudaInt8AttentionForward(
     auto mask = attn_mask.value();
     TORCH_CHECK(mask.is_cuda(), "CudaInt8AttentionForward: attn_mask must be a CUDA tensor");
     TORCH_CHECK(mask.dim() == 4, "CudaInt8AttentionForward: attn_mask must be rank-4");
-    TORCH_CHECK(mask.size(0) == q_contig.size(0), "CudaInt8AttentionForward: attn_mask batch size mismatch");
+    TORCH_CHECK(mask.size(0) == 1 || mask.size(0) == q_contig.size(0),
+                "CudaInt8AttentionForward: attn_mask batch size mismatch");
     TORCH_CHECK(mask.size(1) == 1 || mask.size(1) == q_contig.size(1),
                 "CudaInt8AttentionForward: attn_mask head dimension must be 1 or q_heads");
     TORCH_CHECK(mask.size(2) == q_contig.size(2), "CudaInt8AttentionForward: attn_mask tgt_len mismatch");
     TORCH_CHECK(mask.size(3) == k_contig.size(2), "CudaInt8AttentionForward: attn_mask src_len mismatch");
+    if (mask.size(0) == 1 && q_contig.size(0) != 1) {
+      mask = mask.expand({q_contig.size(0), mask.size(1), q_contig.size(2), k_contig.size(2)});
+    }
     if (mask.size(1) == 1 && q_contig.size(1) != 1) {
       mask = mask.expand({q_contig.size(0), q_contig.size(1), q_contig.size(2), k_contig.size(2)});
     }

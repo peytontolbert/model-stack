@@ -21,6 +21,28 @@ def env_value(name: str, default: str | None = None) -> str | None:
     return value or default
 
 
+def resolve_pytorch_source_path() -> Path | None:
+    candidates = [env_value("MODEL_STACK_PYTORCH_SOURCE_PATH")]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        root = Path(candidate).expanduser()
+        marker = root / "aten" / "src" / "ATen" / "native" / "transformers" / "cuda" / "mem_eff_attention" / "kernel_forward.h"
+        if marker.exists():
+            return root
+    return None
+
+
+def installed_torch_has_pytorch_memeff_headers() -> bool:
+    try:
+        import torch
+    except Exception:
+        return False
+    root = Path(torch.__file__).resolve().parent
+    marker = root / "include" / "ATen" / "native" / "transformers" / "cuda" / "mem_eff_attention" / "kernel_forward.h"
+    return marker.exists()
+
+
 _CUDA_VERSION_RE = re.compile(r"(?P<major>\d+)\.(?P<minor>\d+)(?:\.\d+)?")
 _CUDA_ARCH_RE = re.compile(
     r"^(?P<major>\d+)(?:\.(?P<minor>\d+))?(?P<suffix>[a-z]*)?(?:\+ptx)?$",
@@ -165,6 +187,7 @@ def native_extensions():
     sources = ["runtime/csrc/model_stack_native.cpp", "runtime/csrc/reference/aten_reference.cpp"]
     define_macros = [("MODEL_STACK_ABI_VERSION", "1")]
     extra_compile_args = {"cxx": ["-O3", "-std=c++17"]}
+    include_dirs = []
 
     extension_cls = CppExtension
     if use_cuda:
@@ -180,6 +203,8 @@ def native_extensions():
         sources.append("runtime/csrc/backend/cuda_attention.cu")
         sources.append("runtime/csrc/backend/attention/cuda_attention_decode_dispatch.cu")
         sources.append("runtime/csrc/backend/attention/cuda_attention_prefill_dispatch.cu")
+        sources.append("runtime/csrc/backend/attention/cuda_attention_sm80_inference_prefill.cu")
+        sources.append("runtime/csrc/backend/attention/cuda_attention_pytorch_memeff_prefill.cu")
         sources.append("runtime/csrc/backend/cuda_kv_cache.cu")
         sources.append("runtime/csrc/backend/cuda_rope.cu")
         sources.append("runtime/csrc/backend/cuda_activation.cu")
@@ -205,6 +230,23 @@ def native_extensions():
             define_macros.append(("MODEL_STACK_CUDA_VERSION_MINOR", str(cuda_version[1])))
         if env_enabled("MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL", "0"):
             define_macros.append(("MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL", "1"))
+        cutlass_path = env_value("MODEL_STACK_CUTLASS_PATH")
+        if cutlass_path is not None:
+            cutlass_root = Path(cutlass_path)
+            include_dirs.extend(
+                [
+                    str(cutlass_root / "include"),
+                    str(cutlass_root / "tools" / "util" / "include"),
+                    str(cutlass_root / "examples" / "41_fused_multi_head_attention"),
+                ]
+            )
+            define_macros.append(("MODEL_STACK_WITH_CUTLASS_FMHA", "1"))
+        pytorch_source_path = resolve_pytorch_source_path()
+        if pytorch_source_path is not None:
+            include_dirs.append(str(pytorch_source_path / "aten" / "src"))
+            define_macros.append(("MODEL_STACK_WITH_PYTORCH_MEMEFF_FMHA", "1"))
+        elif installed_torch_has_pytorch_memeff_headers():
+            define_macros.append(("MODEL_STACK_WITH_PYTORCH_MEMEFF_FMHA", "1"))
         extra_compile_args["nvcc"] = [
             "-O3",
             "-std=c++17",
@@ -217,6 +259,7 @@ def native_extensions():
     ext = extension_cls(
         "_model_stack_native",
         sources,
+        include_dirs=include_dirs,
         define_macros=define_macros,
         extra_compile_args=extra_compile_args,
     )

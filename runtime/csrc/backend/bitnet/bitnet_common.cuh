@@ -400,6 +400,33 @@ void LaunchBitNetDecodeKernelBitplaneRow1(
     const LayoutInfo& layout,
     const Plan& plan);
 
+void LaunchBitNetDecodeKernelBitplaneRow1RmsNorm(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const c10::optional<torch::Tensor>& rms_weight,
+    double eps,
+    const torch::Tensor& decode_nz_masks,
+    const torch::Tensor& decode_sign_masks,
+    const torch::Tensor& decode_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan);
+
+void LaunchBitNetDecodeKernelBitplaneRow1AddRmsNorm(
+    torch::Tensor& combined_2d,
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& update_2d,
+    const c10::optional<torch::Tensor>& rms_weight,
+    double residual_scale,
+    double eps,
+    const torch::Tensor& decode_nz_masks,
+    const torch::Tensor& decode_sign_masks,
+    const torch::Tensor& decode_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan);
+
 void LaunchBitNetPrefillKernelComputePacked(
     torch::Tensor& out_2d,
     const torch::Tensor& x_2d,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 
 from runtime.ops import apply_rotary as runtime_apply_rotary
@@ -26,14 +28,102 @@ def apply_rotary_scaled(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin
     return q_out * scale, k_out * scale
 
 
-def rope_ntk_scaling(seq_len: int, base_theta: float, factor: float = 1.0) -> float:
-    del seq_len, base_theta
-    return float(factor)
+def rope_ntk_scaling(
+    seq_len: int,
+    base_theta: float,
+    factor: float = 1.0,
+    *,
+    original_max_position_embeddings: int | None = None,
+    head_dim: int | None = None,
+) -> float:
+    base = float(base_theta)
+    scale_factor = float(factor)
+    if scale_factor <= 1.0:
+        return base
+    orig = int(original_max_position_embeddings) if original_max_position_embeddings is not None else int(seq_len)
+    if orig <= 0 or int(seq_len) <= orig:
+        return base
+    ratio = (scale_factor * float(seq_len) / float(orig)) - (scale_factor - 1.0)
+    ratio = max(ratio, 1.0)
+    exponent = 1.0
+    if head_dim is not None and int(head_dim) > 2:
+        exponent = float(int(head_dim)) / float(int(head_dim) - 2)
+    return base * (ratio ** exponent)
 
 
-def rope_yarn_factors(seq_len: int, base_theta: float, factor: float) -> tuple[float, float]:
-    del seq_len, base_theta
-    return float(factor), float(factor)
+def rope_yarn_factors(
+    seq_len: int,
+    base_theta: float,
+    factor: float,
+    *,
+    original_max_position_embeddings: int | None = None,
+    low_freq_factor: float | None = None,
+    high_freq_factor: float | None = None,
+) -> tuple[float, float]:
+    del base_theta, low_freq_factor, high_freq_factor
+    scale = float(factor)
+    orig = int(original_max_position_embeddings) if original_max_position_embeddings is not None else 0
+    if orig > 0:
+        scale = max(scale, float(seq_len) / float(orig))
+    scale = max(scale, 1.0)
+    if scale <= 1.0:
+        return 1.0, 1.0
+    attention_factor = 0.1 * math.log(scale) + 1.0
+    return float(attention_factor), float(attention_factor)
+
+
+def resolve_rope_seq_len(seq_len: int, position_ids: torch.Tensor | None = None) -> int:
+    needed = int(seq_len)
+    if position_ids is None or not isinstance(position_ids, torch.Tensor) or position_ids.numel() == 0:
+        return needed
+    try:
+        gather_pos = position_ids
+        if gather_pos.dim() == 2:
+            gather_pos = gather_pos[0]
+        if gather_pos.numel() > 0:
+            needed = max(needed, int(gather_pos.max().item()) + 1)
+    except Exception:
+        return needed
+    return needed
+
+
+def resolve_rope_parameters(
+    *,
+    seq_len: int,
+    head_dim: int,
+    base_theta: float,
+    attention_scaling: float = 1.0,
+    scaling_type: str | None = None,
+    scaling_factor: float | None = None,
+    original_max_position_embeddings: int | None = None,
+    low_freq_factor: float | None = None,
+    high_freq_factor: float | None = None,
+) -> tuple[float, float]:
+    base = float(base_theta)
+    attn = float(attention_scaling)
+    st = (scaling_type or "").lower() if isinstance(scaling_type, str) else None
+    factor = None if scaling_factor is None else float(scaling_factor)
+    if st == "linear" and factor is not None:
+        base = float(base) * factor
+    elif st in {"dynamic", "ntk"} and factor is not None:
+        base = rope_ntk_scaling(
+            int(seq_len),
+            float(base),
+            factor=factor,
+            original_max_position_embeddings=original_max_position_embeddings,
+            head_dim=int(head_dim),
+        )
+    elif st == "yarn" and factor is not None:
+        sq, sk = rope_yarn_factors(
+            int(seq_len),
+            float(base),
+            factor=factor,
+            original_max_position_embeddings=original_max_position_embeddings,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
+        )
+        attn *= math.sqrt(float(sq) * float(sk))
+    return float(base), float(attn)
 
 
 def relative_position_bucket(t: int, s: int, num_buckets: int, max_distance: int) -> int:
@@ -243,17 +333,21 @@ class RotaryEmbeddingHF:
     @torch.no_grad()
     def _ensure(self, T: int, dtype: torch.dtype, device):
         if self._cos.numel() == 0 or self._cos.shape[0] < T or self._cos.device != device:
-            base = float(self.base_theta)
-            st = (self.scaling_type or "").lower() if isinstance(self.scaling_type, str) else None
-            if st == "linear" and self.scaling_factor is not None:
-                try:
-                    base = float(base) * float(self.scaling_factor)
-                except Exception:
-                    base = float(base)
+            base, attn = resolve_rope_parameters(
+                seq_len=int(T),
+                head_dim=int(self.head_dim),
+                base_theta=float(self.base_theta),
+                attention_scaling=float(self.attention_scaling),
+                scaling_type=self.scaling_type,
+                scaling_factor=self.scaling_factor,
+                original_max_position_embeddings=self.original_max_position_embeddings,
+                low_freq_factor=self.low_freq_factor,
+                high_freq_factor=self.high_freq_factor,
+            )
             cos, sin = build_rope_cache(T, self.head_dim, device=device, base_theta=base)
-            if self.attention_scaling != 1.0:
-                cos = cos * float(self.attention_scaling)
-                sin = sin * float(self.attention_scaling)
+            if attn != 1.0:
+                cos = cos * float(attn)
+                sin = sin * float(attn)
             self._cos = cos.to(dtype=dtype)
             self._sin = sin.to(dtype=dtype)
 
@@ -289,8 +383,10 @@ __all__ = [
     "fit_alibi_slopes",
     "relative_position_bias_from_table",
     "relative_position_bucket",
+    "resolve_rope_seq_len",
     "rescale_positions",
     "rope_ntk_scaling",
+    "resolve_rope_parameters",
     "rope_yarn_factors",
     "rotary_fft",
 ]

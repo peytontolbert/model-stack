@@ -140,6 +140,7 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     adapters_source = _read("runtime/block_adapters.py")
     block_source = _read("runtime/block_modules.py")
     quant_source = _read("compress/quantization.py")
+    generation_source = _read("runtime/generation.py")
     bitnet_frontend_source = _read("runtime/csrc/backend/bitnet/bitnet_frontend.cu")
     assert "def resolve_linear_module_tensors(" in ops_source
     assert "def linear_module(" in ops_source
@@ -164,6 +165,10 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "def runtime_quantize_int8_input(" in quant_source
     assert "def runtime_linear_from_quantized_input(" in quant_source
     assert "runtime_bitnet_int8_linear_from_float(" in quant_source
+    assert "def _native_decode_graph_enabled_by_env()" in generation_source
+    assert "def _try_build_native_decode_graph_replay(" in generation_source
+    assert "MODEL_STACK_DISABLE_NATIVE_DECODE_GRAPH" in generation_source
+    assert "def _clear_native_decode_graph(self) -> None:" in generation_source
     assert "def runtime_packed_linear_signature(self, backend: str):" in quant_source
     assert "def runtime_packed_linear_spec(" in quant_source
     assert "def _pre_scale_active_runtime(self) -> bool:" in quant_source
@@ -223,6 +228,8 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "torch::Tensor ApplyBitNetModuleInputTransforms(" in native_source
     assert "torch::Tensor BitNetLinearFromFloatForward(" in native_source
     assert "torch::Tensor BitNetLinearStateForward(" in native_source
+    assert "bool DecodeGraphEligible() const" in native_source
+    assert "void SetDecodeGraphEnabled(bool enabled = true)" in native_source
     assert "torch::Tensor BitNetInt8LinearFromFloatForward(" in native_source
     assert "TryBitNetGatedInt8LinearStateForward(" in native_source
     assert "torch::Tensor BitNetLinearModuleForward(" in native_source
@@ -249,6 +256,8 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "return LinearLikeModuleForward(x, lm_head, \"auto\");" in native_source
     assert "int64_t MaxLength() const { return max_length_; }" in native_source
     assert ".def(\"max_length\", &PagedKvLayerState::MaxLength)" in native_source
+    assert ".def(\"decode_graph_eligible\", &NativeModelSession::DecodeGraphEligible)" in native_source
+    assert ".def(\"set_decode_graph_enabled\", &NativeModelSession::SetDecodeGraphEnabled" in native_source
     assert "return Layer(layer_idx)->MaxLength();" in native_source
     assert "return py::cast<int64_t>(layer.attr(\"max_length\")());" in native_source
     assert "if hasattr(self.parent, \"layer_max_length\"):" in cache_source
@@ -486,9 +495,18 @@ def test_native_bitnet_cuda_kernel_sources_are_registered_in_source() -> None:
     assert "\"_decode_backend_weight\"" in native_source
     assert "\"_int8_backend_weight\"" in native_source
     assert "CudaBitNetLinearForwardComputePacked(" in native_source
+    assert "CudaBitNetRmsNormLinearForwardRow1(" in native_source
+    assert "CudaBitNetAddRmsNormLinearForwardRow1(" in native_source
     assert "compute_packed_words" in native_source
     assert "decode_nz_masks" in native_source
+    assert "FusedRmsNormBitNetLinearStateForward(" in native_source
+    assert "FusedAddRmsNormBitNetLinearStateForward(" in native_source
+    assert "TryFusedRmsNormPreparedAttentionQkv(" in native_source
+    assert "ExecutePreparedAttentionProjected(" in native_source
+    assert "ExecutePreparedMlpHidden(" in native_source
     assert "LaunchBitNetDecodeKernelBitplaneRow1(" in dispatch_source
+    assert "LaunchBitNetDecodeKernelBitplaneRow1RmsNorm(" in dispatch_source
+    assert "LaunchBitNetDecodeKernelBitplaneRow1AddRmsNorm(" in dispatch_source
     assert "LaunchBitNetPrefillKernelComputePacked(" in dispatch_source
     assert "LaunchBitNetPrefillSplitKKernelComputePacked(" in dispatch_source
     assert "if (plan.kind != KernelKind::kDecodePersistent)" not in dispatch_source

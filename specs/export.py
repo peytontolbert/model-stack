@@ -18,7 +18,7 @@ class ExportConfig:
     quant_activation_quant_percentile: float = 0.999
     quant_calibration_inputs_path: Optional[str] = None
     dynamic_axes: bool = True
-    max_seq_len: int = 4096
+    max_seq_len: Optional[int] = None
     trt_max_workspace_mb: int = 4096
     outdir: str = "artifacts/"
 
