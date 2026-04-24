@@ -123,16 +123,16 @@ inline bool TryLaunchPyTorchMemEffAttentionKernel(
   // directly into our output buffer without a layout-conversion copy.
   params.num_batches = static_cast<int32_t>(desc.batch * desc.q_heads);
   params.num_heads = 1;
-  params.q_strideM = desc.head_dim;
-  params.k_strideM = desc.head_dim;
-  params.v_strideM = desc.head_dim;
+  params.q_strideM = static_cast<int32_t>(q_contig.stride(2));
+  params.k_strideM = static_cast<int32_t>(k_contig.stride(2));
+  params.v_strideM = static_cast<int32_t>(v_contig.stride(2));
   params.q_strideH = 0;
   params.k_strideH = 0;
   params.v_strideH = 0;
-  params.q_strideB = static_cast<int64_t>(desc.q_len * desc.head_dim);
-  params.k_strideB = static_cast<int64_t>(desc.kv_len * desc.head_dim);
-  params.v_strideB = static_cast<int64_t>(desc.kv_len * desc.head_dim);
-  params.o_strideM = desc.head_dim;
+  params.q_strideB = static_cast<int64_t>(q_contig.stride(1));
+  params.k_strideB = static_cast<int64_t>(k_contig.stride(1));
+  params.v_strideB = static_cast<int64_t>(v_contig.stride(1));
+  params.o_strideM = static_cast<int32_t>(out.stride(2));
 
   torch::Tensor output_accum;
   if constexpr (Kernel::kNeedsOutputAccumulatorBuffer) {

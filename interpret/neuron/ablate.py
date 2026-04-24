@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from interpret.model_adapter import get_model_adapter
 from tensor.mlp import MLP
-from tensor.activations import silu as act_silu, gelu as act_gelu
+from tensor.activations import silu as act_silu, gelu as act_gelu, leaky_relu_0p5_squared as act_leaky_relu_0p5_squared
 
 
 def _wrap_mlp_forward_zero_channels(mlp: MLP, channels: List[int]):
@@ -21,12 +21,20 @@ def _wrap_mlp_forward_zero_channels(mlp: MLP, channels: List[int]):
             x_proj = mlp.w_in(x)
             a, b = x_proj.chunk(2, dim=-1)
             name = mlp.activation_name.lower()
+            leaky_relu_0p5_squared_aliases = {
+                "leaky_relu_0p5_squared",
+                "leaky-relu-0p5-squared",
+                "leaky_relu_0.5_squared",
+                "leaky-relu-0.5-squared",
+            }
             if name in ("swiglu", "gated-silu"):
                 x_mid = act_silu(a) * b
             elif name == "geglu":
                 x_mid = act_gelu(a) * b
             elif name == "reglu":
                 x_mid = F.relu(a) * b
+            elif name in leaky_relu_0p5_squared_aliases:
+                x_mid = act_leaky_relu_0p5_squared(a) * b
             else:
                 x_mid = act_silu(a) * b
         else:
@@ -64,4 +72,3 @@ def ablate_mlp_channels(
     finally:
         for mlp, orig in origs:
             mlp.forward = orig  # type: ignore
-

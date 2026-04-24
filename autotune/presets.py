@@ -47,7 +47,7 @@ def blocks_wiring() -> SearchSpace:
     return SearchSpace({
         "norm_policy": Choice(["prenorm", "postnorm"]),
         "norm_type": Choice(["rms", "layer"]),
-        "activation": Choice(["gelu", "silu", "swiglu", "geglu", "reglu"]),
+        "activation": Choice(["gelu", "silu", "leaky_relu_0p5_squared", "swiglu", "geglu", "reglu"]),
         "residual_scale": Uniform(0.5, 1.5),
         "checkpoint_forward": Choice([False, True]),
         "resid_dropout": Uniform(0.0, 0.2),
@@ -73,5 +73,4 @@ def numerics() -> SearchSpace:
         "matmul_precision": Choice(["high", "medium", "highest"]),
         "logits_fp32": Choice([True, False]),
     })
-
 

@@ -116,16 +116,16 @@ inline bool LaunchCutlassAttentionPrefillKernel(
 
     // Q/K/V arrive as BHSD contiguous. With batch and heads flattened together,
     // each logical batch is a single contiguous [seq, dim] matrix.
-    params.q_strideM = HeadDim;
-    params.k_strideM = HeadDim;
-    params.v_strideM = HeadDim;
+    params.q_strideM = static_cast<int32_t>(q_contig.stride(2));
+    params.k_strideM = static_cast<int32_t>(k_contig.stride(2));
+    params.v_strideM = static_cast<int32_t>(v_contig.stride(2));
     params.q_strideH = 0;
     params.k_strideH = 0;
     params.v_strideH = 0;
-    params.q_strideB = static_cast<int64_t>(desc.q_len * HeadDim);
-    params.k_strideB = static_cast<int64_t>(desc.kv_len * HeadDim);
-    params.v_strideB = static_cast<int64_t>(desc.kv_len * HeadDim);
-    params.o_strideM = HeadDim;
+    params.q_strideB = static_cast<int64_t>(q_contig.stride(1));
+    params.k_strideB = static_cast<int64_t>(k_contig.stride(1));
+    params.v_strideB = static_cast<int64_t>(v_contig.stride(1));
+    params.o_strideM = static_cast<int32_t>(out.stride(2));
 
     if (!Attention::check_supported(params)) {
       return false;

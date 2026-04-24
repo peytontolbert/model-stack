@@ -33,6 +33,11 @@ def relu2(x: torch.Tensor) -> torch.Tensor:
     return y * y
 
 
+def leaky_relu_0p5_squared(x: torch.Tensor) -> torch.Tensor:
+    y = F.leaky_relu(x, negative_slope=0.5)
+    return y * y
+
+
 def _apply_act(x: torch.Tensor, act: str, gelu_approx: str | None = None) -> torch.Tensor:
     a = act.lower()
     if a in ("identity", "none"):
@@ -41,6 +46,13 @@ def _apply_act(x: torch.Tensor, act: str, gelu_approx: str | None = None) -> tor
         return runtime_activation(x, "relu")
     if a in ("relu2", "squared_relu", "squared-relu"):
         return relu2(x)
+    if a in (
+        "leaky_relu_0p5_squared",
+        "leaky-relu-0p5-squared",
+        "leaky_relu_0.5_squared",
+        "leaky-relu-0.5-squared",
+    ):
+        return runtime_activation(x, a)
     if a in ("silu", "swish"):
         return runtime_activation(x, a)
     if a in ("gelu",):
@@ -65,7 +77,18 @@ def with_bias_act(
     if gate is not None:
         a = act.lower()
         if (
-            (a in ("relu", "silu", "swish", "gelu"))
+            (
+                a in (
+                    "relu",
+                    "silu",
+                    "swish",
+                    "gelu",
+                    "leaky_relu_0p5_squared",
+                    "leaky-relu-0p5-squared",
+                    "leaky_relu_0.5_squared",
+                    "leaky-relu-0.5-squared",
+                )
+            )
             and (a != "gelu" or (gelu_approx or "exact") in ("exact", "none"))
         ):
             return runtime_gated_activation(x, gate, a)

@@ -232,7 +232,7 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "void SetDecodeGraphEnabled(bool enabled = true)" in native_source
     assert "torch::Tensor BitNetInt8LinearFromFloatForward(" in native_source
     assert "TryBitNetGatedInt8LinearStateForward(" in native_source
-    assert "torch::Tensor BitNetLinearModuleForward(" in native_source
+    assert "bool PreferDirectBitNetRuntimeLinear(" in native_source
     assert "return BitNetLinearStateForward(x, bitnet_state);" in native_source
     assert "PyCallableAttr(module, \"_spin_enabled_runtime\")" in native_source
     assert "PyCallableAttr(module, \"_pre_scale_active_runtime\")" in native_source
@@ -511,7 +511,8 @@ def test_native_bitnet_cuda_kernel_sources_are_registered_in_source() -> None:
     assert "LaunchBitNetPrefillSplitKKernelComputePacked(" in dispatch_source
     assert "if (plan.kind != KernelKind::kDecodePersistent)" not in dispatch_source
     assert "BitNetInt8FusedQkvPackedHeadsProjectionForward(" in native_source
-    assert "return BitNetLinearStateForward(MergeHeadsForward(x), state);" in native_source
+    assert "return PythonLinearModuleForward(merged, module, \"auto\");" in native_source
+    assert "return BitNetLinearStateForward(merged, state);" in native_source
     assert "ModelUsesAttentionBiases" in native_source
     assert "SupportsNativeCausalRuntimeInputs" in native_source
     assert "if (ModelUsesBitNetInt8PackedPath(model)) {" not in native_source

@@ -135,13 +135,25 @@ torch::Tensor CudaAttentionForward(
   if (!TryBuildAttentionDesc(q, k, v, attn_mask, is_causal, &desc)) {
     return ReferenceAttentionForward(q, k, v, attn_mask, is_causal, scale);
   }
-  const auto plan = t10::policy::ResolveAttentionPlan(desc);
 
   c10::cuda::CUDAGuard device_guard{q.device()};
 
   auto q_contig = q.contiguous();
   auto k_contig = k.contiguous();
   auto v_contig = v.contiguous();
+  const auto initial_plan = t10::policy::ResolveAttentionPlan(desc);
+  const int64_t effective_kv_len = t10::policy::AttentionEffectiveKvLen(desc);
+  if (effective_kv_len < desc.kv_len) {
+    if (initial_plan.kernel == t10::policy::AttentionKernelKind::kPrefillHdim64) {
+      k_contig = k_contig.narrow(2, 0, effective_kv_len);
+      v_contig = v_contig.narrow(2, 0, effective_kv_len);
+    } else {
+      k_contig = k_contig.narrow(2, 0, effective_kv_len).contiguous();
+      v_contig = v_contig.narrow(2, 0, effective_kv_len).contiguous();
+    }
+    desc.kv_len = effective_kv_len;
+  }
+  const auto plan = t10::policy::ResolveAttentionPlan(desc);
   torch::Tensor mask_contig;
   int mask_kind = 0;
   const void* mask_ptr = nullptr;

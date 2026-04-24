@@ -1065,6 +1065,8 @@ inline void LaunchPrefillAttentionSpecialized(
     float scale_value,
     cudaStream_t stream,
     int row_reduce_threads) {
+  const bool prefer_cutlass_for_strided_kv =
+      !k_contig.is_contiguous() || !v_contig.is_contiguous();
   if (TryLaunchModelStackSm80InferenceAttentionPrefill<scalar_t, HeadDim>(
           q_contig,
           k_contig,
@@ -1075,25 +1077,58 @@ inline void LaunchPrefillAttentionSpecialized(
           stream)) {
     return;
   }
-  if (TryLaunchPyTorchMemEffAttentionPrefill<scalar_t, HeadDim>(
-          q_contig,
-          k_contig,
-          v_contig,
-          out,
-          desc,
-          scale_value,
-          stream)) {
-    return;
+  if (prefer_cutlass_for_strided_kv) {
+    if (TryLaunchCutlassAttentionPrefill<scalar_t, HeadDim>(
+            q_contig,
+            k_contig,
+            v_contig,
+            out,
+            desc,
+            scale_value,
+            stream)) {
+      return;
+    }
+    if (TryLaunchPyTorchMemEffAttentionPrefill<scalar_t, HeadDim>(
+            q_contig,
+            k_contig,
+            v_contig,
+            out,
+            desc,
+            scale_value,
+            stream)) {
+      return;
+    }
+  } else {
+    if (TryLaunchPyTorchMemEffAttentionPrefill<scalar_t, HeadDim>(
+            q_contig,
+            k_contig,
+            v_contig,
+            out,
+            desc,
+            scale_value,
+            stream)) {
+      return;
+    }
+    if (TryLaunchCutlassAttentionPrefill<scalar_t, HeadDim>(
+            q_contig,
+            k_contig,
+            v_contig,
+            out,
+            desc,
+            scale_value,
+            stream)) {
+      return;
+    }
   }
-  if (TryLaunchCutlassAttentionPrefill<scalar_t, HeadDim>(
-          q_contig,
-          k_contig,
-          v_contig,
-          out,
-          desc,
-          scale_value,
-          stream)) {
-    return;
+  torch::Tensor k_fallback;
+  torch::Tensor v_fallback;
+  const torch::Tensor* k_dense = &k_contig;
+  const torch::Tensor* v_dense = &v_contig;
+  if (!k_contig.is_contiguous() || !v_contig.is_contiguous()) {
+    k_fallback = k_contig.contiguous();
+    v_fallback = v_contig.contiguous();
+    k_dense = &k_fallback;
+    v_dense = &v_fallback;
   }
   const dim3 blocks(static_cast<unsigned int>(desc.batch * desc.q_heads * desc.q_len));
   const bool use_sm90 = t10::cuda::DeviceIsSm90OrLater(q_contig);
@@ -1122,8 +1157,8 @@ inline void LaunchPrefillAttentionSpecialized(
         prefill_attention_hdim_sm90_forward_kernel<scalar_t, kSmallRowThreads, HeadDim>
             <<<blocks, kSmallRowThreads, 0, stream>>>(
                 q_contig.data_ptr<scalar_t>(),
-                k_contig.data_ptr<scalar_t>(),
-                v_contig.data_ptr<scalar_t>(),
+                k_dense->data_ptr<scalar_t>(),
+                v_dense->data_ptr<scalar_t>(),
                 mask_ptr,
                 mask_kind,
                 out.data_ptr<scalar_t>(),
@@ -1144,8 +1179,8 @@ inline void LaunchPrefillAttentionSpecialized(
               prefill_attention_hdim_tensorcore_forward_kernel<scalar_t, HeadDim, true>
                   <<<tensorcore_blocks, kPrefillTensorCoreThreads, 0, stream>>>(
                       q_contig.data_ptr<scalar_t>(),
-                      k_contig.data_ptr<scalar_t>(),
-                      v_contig.data_ptr<scalar_t>(),
+                      k_dense->data_ptr<scalar_t>(),
+                      v_dense->data_ptr<scalar_t>(),
                       out.data_ptr<scalar_t>(),
                       desc.batch,
                       desc.q_heads,
@@ -1157,8 +1192,8 @@ inline void LaunchPrefillAttentionSpecialized(
               prefill_attention_hdim_tensorcore_forward_kernel<scalar_t, HeadDim, false>
                   <<<tensorcore_blocks, kPrefillTensorCoreThreads, 0, stream>>>(
                       q_contig.data_ptr<scalar_t>(),
-                      k_contig.data_ptr<scalar_t>(),
-                      v_contig.data_ptr<scalar_t>(),
+                      k_dense->data_ptr<scalar_t>(),
+                      v_dense->data_ptr<scalar_t>(),
                       out.data_ptr<scalar_t>(),
                       desc.batch,
                       desc.q_heads,
@@ -1177,8 +1212,8 @@ inline void LaunchPrefillAttentionSpecialized(
             prefill_attention_hdim_tiled_forward_kernel<scalar_t, kSmallRowThreads, HeadDim, kTiledPrefillTileN>
                 <<<tiled_blocks, kSmallRowThreads, 0, stream>>>(
                     q_contig.data_ptr<scalar_t>(),
-                    k_contig.data_ptr<scalar_t>(),
-                    v_contig.data_ptr<scalar_t>(),
+                    k_dense->data_ptr<scalar_t>(),
+                    v_dense->data_ptr<scalar_t>(),
                     mask_ptr,
                     mask_kind,
                     out.data_ptr<scalar_t>(),
@@ -1198,8 +1233,8 @@ inline void LaunchPrefillAttentionSpecialized(
           prefill_attention_hdim_forward_kernel<scalar_t, kSmallRowThreads, HeadDim>
               <<<blocks, kSmallRowThreads, shared_score_bytes, stream>>>(
                   q_contig.data_ptr<scalar_t>(),
-                  k_contig.data_ptr<scalar_t>(),
-                  v_contig.data_ptr<scalar_t>(),
+                  k_dense->data_ptr<scalar_t>(),
+                  v_dense->data_ptr<scalar_t>(),
                   mask_ptr,
                   mask_kind,
                   out.data_ptr<scalar_t>(),
@@ -1214,8 +1249,8 @@ inline void LaunchPrefillAttentionSpecialized(
           prefill_attention_hdim_legacy_forward_kernel<scalar_t, kSmallRowThreads, HeadDim>
               <<<blocks, kSmallRowThreads, 0, stream>>>(
                   q_contig.data_ptr<scalar_t>(),
-                  k_contig.data_ptr<scalar_t>(),
-                  v_contig.data_ptr<scalar_t>(),
+                  k_dense->data_ptr<scalar_t>(),
+                  v_dense->data_ptr<scalar_t>(),
                   mask_ptr,
                   mask_kind,
                   out.data_ptr<scalar_t>(),
@@ -1234,8 +1269,8 @@ inline void LaunchPrefillAttentionSpecialized(
         prefill_attention_hdim_sm90_forward_kernel<scalar_t, kMediumRowThreads, HeadDim>
             <<<blocks, kMediumRowThreads, 0, stream>>>(
                 q_contig.data_ptr<scalar_t>(),
-                k_contig.data_ptr<scalar_t>(),
-                v_contig.data_ptr<scalar_t>(),
+                k_dense->data_ptr<scalar_t>(),
+                v_dense->data_ptr<scalar_t>(),
                 mask_ptr,
                 mask_kind,
                 out.data_ptr<scalar_t>(),
@@ -1256,8 +1291,8 @@ inline void LaunchPrefillAttentionSpecialized(
               prefill_attention_hdim_tensorcore_forward_kernel<scalar_t, HeadDim, true>
                   <<<tensorcore_blocks, kPrefillTensorCoreThreads, 0, stream>>>(
                       q_contig.data_ptr<scalar_t>(),
-                      k_contig.data_ptr<scalar_t>(),
-                      v_contig.data_ptr<scalar_t>(),
+                      k_dense->data_ptr<scalar_t>(),
+                      v_dense->data_ptr<scalar_t>(),
                       out.data_ptr<scalar_t>(),
                       desc.batch,
                       desc.q_heads,
@@ -1269,8 +1304,8 @@ inline void LaunchPrefillAttentionSpecialized(
               prefill_attention_hdim_tensorcore_forward_kernel<scalar_t, HeadDim, false>
                   <<<tensorcore_blocks, kPrefillTensorCoreThreads, 0, stream>>>(
                       q_contig.data_ptr<scalar_t>(),
-                      k_contig.data_ptr<scalar_t>(),
-                      v_contig.data_ptr<scalar_t>(),
+                      k_dense->data_ptr<scalar_t>(),
+                      v_dense->data_ptr<scalar_t>(),
                       out.data_ptr<scalar_t>(),
                       desc.batch,
                       desc.q_heads,
@@ -1289,8 +1324,8 @@ inline void LaunchPrefillAttentionSpecialized(
             prefill_attention_hdim_tiled_forward_kernel<scalar_t, kMediumRowThreads, HeadDim, kTiledPrefillTileN>
                 <<<tiled_blocks, kMediumRowThreads, 0, stream>>>(
                     q_contig.data_ptr<scalar_t>(),
-                    k_contig.data_ptr<scalar_t>(),
-                    v_contig.data_ptr<scalar_t>(),
+                    k_dense->data_ptr<scalar_t>(),
+                    v_dense->data_ptr<scalar_t>(),
                     mask_ptr,
                     mask_kind,
                     out.data_ptr<scalar_t>(),
@@ -1310,8 +1345,8 @@ inline void LaunchPrefillAttentionSpecialized(
           prefill_attention_hdim_forward_kernel<scalar_t, kMediumRowThreads, HeadDim>
               <<<blocks, kMediumRowThreads, shared_score_bytes, stream>>>(
                   q_contig.data_ptr<scalar_t>(),
-                  k_contig.data_ptr<scalar_t>(),
-                  v_contig.data_ptr<scalar_t>(),
+                  k_dense->data_ptr<scalar_t>(),
+                  v_dense->data_ptr<scalar_t>(),
                   mask_ptr,
                   mask_kind,
                   out.data_ptr<scalar_t>(),
@@ -1326,8 +1361,8 @@ inline void LaunchPrefillAttentionSpecialized(
           prefill_attention_hdim_legacy_forward_kernel<scalar_t, kMediumRowThreads, HeadDim>
               <<<blocks, kMediumRowThreads, 0, stream>>>(
                   q_contig.data_ptr<scalar_t>(),
-                  k_contig.data_ptr<scalar_t>(),
-                  v_contig.data_ptr<scalar_t>(),
+                  k_dense->data_ptr<scalar_t>(),
+                  v_dense->data_ptr<scalar_t>(),
                   mask_ptr,
                   mask_kind,
                   out.data_ptr<scalar_t>(),
@@ -1346,8 +1381,8 @@ inline void LaunchPrefillAttentionSpecialized(
         prefill_attention_hdim_sm90_forward_kernel<scalar_t, kLargeRowThreads, HeadDim>
             <<<blocks, kLargeRowThreads, 0, stream>>>(
                 q_contig.data_ptr<scalar_t>(),
-                k_contig.data_ptr<scalar_t>(),
-                v_contig.data_ptr<scalar_t>(),
+                k_dense->data_ptr<scalar_t>(),
+                v_dense->data_ptr<scalar_t>(),
                 mask_ptr,
                 mask_kind,
                 out.data_ptr<scalar_t>(),
@@ -1368,8 +1403,8 @@ inline void LaunchPrefillAttentionSpecialized(
               prefill_attention_hdim_tensorcore_forward_kernel<scalar_t, HeadDim, true>
                   <<<tensorcore_blocks, kPrefillTensorCoreThreads, 0, stream>>>(
                       q_contig.data_ptr<scalar_t>(),
-                      k_contig.data_ptr<scalar_t>(),
-                      v_contig.data_ptr<scalar_t>(),
+                      k_dense->data_ptr<scalar_t>(),
+                      v_dense->data_ptr<scalar_t>(),
                       out.data_ptr<scalar_t>(),
                       desc.batch,
                       desc.q_heads,
@@ -1381,8 +1416,8 @@ inline void LaunchPrefillAttentionSpecialized(
               prefill_attention_hdim_tensorcore_forward_kernel<scalar_t, HeadDim, false>
                   <<<tensorcore_blocks, kPrefillTensorCoreThreads, 0, stream>>>(
                       q_contig.data_ptr<scalar_t>(),
-                      k_contig.data_ptr<scalar_t>(),
-                      v_contig.data_ptr<scalar_t>(),
+                      k_dense->data_ptr<scalar_t>(),
+                      v_dense->data_ptr<scalar_t>(),
                       out.data_ptr<scalar_t>(),
                       desc.batch,
                       desc.q_heads,
@@ -1401,8 +1436,8 @@ inline void LaunchPrefillAttentionSpecialized(
             prefill_attention_hdim_tiled_forward_kernel<scalar_t, kLargeRowThreads, HeadDim, kTiledPrefillTileN>
                 <<<tiled_blocks, kLargeRowThreads, 0, stream>>>(
                     q_contig.data_ptr<scalar_t>(),
-                    k_contig.data_ptr<scalar_t>(),
-                    v_contig.data_ptr<scalar_t>(),
+                    k_dense->data_ptr<scalar_t>(),
+                    v_dense->data_ptr<scalar_t>(),
                     mask_ptr,
                     mask_kind,
                     out.data_ptr<scalar_t>(),
@@ -1422,8 +1457,8 @@ inline void LaunchPrefillAttentionSpecialized(
           prefill_attention_hdim_forward_kernel<scalar_t, kLargeRowThreads, HeadDim>
               <<<blocks, kLargeRowThreads, shared_score_bytes, stream>>>(
                   q_contig.data_ptr<scalar_t>(),
-                  k_contig.data_ptr<scalar_t>(),
-                  v_contig.data_ptr<scalar_t>(),
+                  k_dense->data_ptr<scalar_t>(),
+                  v_dense->data_ptr<scalar_t>(),
                   mask_ptr,
                   mask_kind,
                   out.data_ptr<scalar_t>(),
@@ -1438,8 +1473,8 @@ inline void LaunchPrefillAttentionSpecialized(
           prefill_attention_hdim_legacy_forward_kernel<scalar_t, kLargeRowThreads, HeadDim>
               <<<blocks, kLargeRowThreads, 0, stream>>>(
                   q_contig.data_ptr<scalar_t>(),
-                  k_contig.data_ptr<scalar_t>(),
-                  v_contig.data_ptr<scalar_t>(),
+                  k_dense->data_ptr<scalar_t>(),
+                  v_dense->data_ptr<scalar_t>(),
                   mask_ptr,
                   mask_kind,
                   out.data_ptr<scalar_t>(),

@@ -16,6 +16,7 @@ enum class ActivationKind : int {
   kSiLU = 0,
   kGELU = 1,
   kReLU = 2,
+  kLeakyRelu0p5Squared = 3,
 };
 
 ActivationKind ParseActivation(const std::string& activation) {
@@ -27,6 +28,10 @@ ActivationKind ParseActivation(const std::string& activation) {
   }
   if (activation == "relu" || activation == "reglu") {
     return ActivationKind::kReLU;
+  }
+  if (activation == "leaky_relu_0p5_squared" || activation == "leaky-relu-0p5-squared" ||
+      activation == "leaky_relu_0.5_squared" || activation == "leaky-relu-0.5-squared") {
+    return ActivationKind::kLeakyRelu0p5Squared;
   }
   return ActivationKind::kGELU;
 }
@@ -44,6 +49,10 @@ __device__ inline float ApplyActivationValue(float x, ActivationKind activation)
       return GeluExact(x);
     case ActivationKind::kReLU:
       return x > 0.0f ? x : 0.0f;
+    case ActivationKind::kLeakyRelu0p5Squared: {
+      const float y = x > 0.0f ? x : (0.5f * x);
+      return y * y;
+    }
   }
   return x;
 }

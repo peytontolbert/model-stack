@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import types
+from pathlib import Path
+import sys
 
 import pytest
 import torch
 import torch.nn as nn
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import interpret.attribution.direct as direct_module
 import interpret.attn.weights as weights_module
@@ -229,8 +235,9 @@ def test_sae_and_ablate_remaining_branches(monkeypatch) -> None:
     assert sae.encoder.weight.shape[0] == 2
 
     x = torch.randn(1, 2, 8)
-    for activation in ("swiglu", "geglu", "reglu"):
-        mlp = MLP(8, 4, activation=activation)
+    for activation in ("swiglu", "geglu", "reglu", "leaky_relu_0p5_squared"):
+        mlp = MLP(8, 4, activation="swiglu" if activation == "leaky_relu_0p5_squared" else activation)
+        mlp.activation_name = activation
         _, wrapped = _wrap_mlp_forward_zero_channels(mlp, [0, 1])
         assert wrapped(x).shape == (1, 2, 8)
 

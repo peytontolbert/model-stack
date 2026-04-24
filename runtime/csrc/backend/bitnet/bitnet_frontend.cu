@@ -60,6 +60,7 @@ enum class GatedActivationKind : int {
   kSiLU = 0,
   kGELU = 1,
   kReLU = 2,
+  kLeakyRelu0p5Squared = 3,
 };
 
 GatedActivationKind ParseGatedActivation(const std::string& activation) {
@@ -71,6 +72,10 @@ GatedActivationKind ParseGatedActivation(const std::string& activation) {
   }
   if (activation == "reglu" || activation == "relu") {
     return GatedActivationKind::kReLU;
+  }
+  if (activation == "leaky_relu_0p5_squared" || activation == "leaky-relu-0p5-squared" ||
+      activation == "leaky_relu_0.5_squared" || activation == "leaky-relu-0.5-squared") {
+    return GatedActivationKind::kLeakyRelu0p5Squared;
   }
   return GatedActivationKind::kSiLU;
 }
@@ -88,6 +93,10 @@ __device__ inline float ApplyGatedActivationValue(float x, GatedActivationKind a
       return GatedActivationGeluExact(x);
     case GatedActivationKind::kReLU:
       return x > 0.0f ? x : 0.0f;
+    case GatedActivationKind::kLeakyRelu0p5Squared: {
+      const float y = x > 0.0f ? x : (0.5f * x);
+      return y * y;
+    }
   }
   return x;
 }
@@ -709,8 +718,8 @@ std::tuple<torch::Tensor, torch::Tensor> CudaBitNetQuantizeGatedActivationInt8Co
         act_quant_method == "absmax" || act_quant_method == "mse" || act_quant_method.empty(),
         "CudaBitNetQuantizeGatedActivationInt8CodesForward: unsupported dynamic activation calibration method");
     TORCH_CHECK(
-        rows == 1,
-        "CudaBitNetQuantizeGatedActivationInt8CodesForward: fused dynamic gating path only supports rows == 1");
+        rows > 0 && rows <= 8,
+        "CudaBitNetQuantizeGatedActivationInt8CodesForward: fused dynamic gating path only supports rows in [1, 8]");
   }
 
   if (rows == 0 || hidden == 0) {

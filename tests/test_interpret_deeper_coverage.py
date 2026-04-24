@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import types
+from pathlib import Path
+import sys
 
 import pytest
 import torch
 import torch.nn as nn
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import interpret.model_adapter as model_adapter_module
 import runtime.seq2seq as runtime_seq2seq_module
@@ -430,6 +436,11 @@ def test_attention_and_mlp_helper_branches(monkeypatch) -> None:
     reglu = MLP(8, 4, activation="reglu")
     out_reglu = mlp_forward(reglu, x_grad, keep_grad=True)
     assert out_reglu.shape == (1, 3, 8)
+
+    gated_leaky = MLP(8, 4, activation="swiglu")
+    gated_leaky.activation_name = "leaky_relu_0p5_squared"
+    out_gated_leaky = mlp_forward(gated_leaky, x_grad, keep_grad=True)
+    assert out_gated_leaky.shape == (1, 3, 8)
 
     dense = MLP(8, 4, activation="gelu")
     out_dense = mlp_forward(dense, x_grad, keep_grad=True)

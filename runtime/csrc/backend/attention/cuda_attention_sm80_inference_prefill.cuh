@@ -82,6 +82,9 @@ inline bool TryLaunchModelStackSm80InferenceAttentionPrefill(
         t10::cuda::DeviceIsSm90OrLater(q_contig)) {
       return false;
     }
+    if (!k_contig.is_contiguous() || !v_contig.is_contiguous()) {
+      return false;
+    }
     if (desc.phase != t10::desc::AttentionPhase::kPrefill || !desc.causal) {
       return false;
     }

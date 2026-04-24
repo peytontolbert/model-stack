@@ -1026,8 +1026,16 @@ def attention_plan_info(
         "kv_heads": int(k.shape[1]),
         "q_len": int(q.shape[2]),
         "kv_len": int(k.shape[2]),
+        "effective_kv_len": int(k.shape[2]),
         "head_dim": int(q.shape[3]),
         "causal": bool(is_causal),
+        "trimmed_causal_tail": bool(is_causal and attn_mask is None and q.shape[2] < k.shape[2]),
+        "split_kv_eligible": False,
+        "split_kv_block_n": 0,
+        "split_kv_num_m_blocks": 0,
+        "split_kv_num_n_blocks": 0,
+        "split_kv_effective_sms": 0,
+        "split_kv_splits": 1,
     }
 
 
@@ -3240,13 +3248,32 @@ def activation(
     activation: str,
 ) -> torch.Tensor:
     act = str(activation).lower()
-    if act not in {"gelu", "geglu", "silu", "swish", "swiglu", "gated-silu", "relu", "reglu"}:
+    leaky_relu_0p5_squared_aliases = {
+        "leaky_relu_0p5_squared",
+        "leaky-relu-0p5-squared",
+        "leaky_relu_0.5_squared",
+        "leaky-relu-0.5-squared",
+    }
+    if act not in {
+        "gelu",
+        "geglu",
+        "silu",
+        "swish",
+        "swiglu",
+        "gated-silu",
+        "relu",
+        "reglu",
+        *leaky_relu_0p5_squared_aliases,
+    }:
         raise ValueError(f"Unsupported activation: {activation}")
     if _should_use_eager_autograd_fallback(x):
         if act in {"gelu", "geglu"}:
             return F.gelu(x)
         if act in {"silu", "swish", "swiglu", "gated-silu"}:
             return F.silu(x)
+        if act in leaky_relu_0p5_squared_aliases:
+            y = F.leaky_relu(x, negative_slope=0.5)
+            return y * y
         return F.relu(x)
     if has_native_op("activation"):
         module = native_module()
@@ -3256,6 +3283,9 @@ def activation(
         return F.gelu(x)
     if act in {"silu", "swish", "swiglu", "gated-silu"}:
         return F.silu(x)
+    if act in leaky_relu_0p5_squared_aliases:
+        y = F.leaky_relu(x, negative_slope=0.5)
+        return y * y
     return F.relu(x)
 
 
@@ -3265,7 +3295,23 @@ def gated_activation(
     activation: str,
 ) -> torch.Tensor:
     act = str(activation).lower()
-    if act not in {"gelu", "geglu", "silu", "swish", "swiglu", "gated-silu", "relu", "reglu"}:
+    leaky_relu_0p5_squared_aliases = {
+        "leaky_relu_0p5_squared",
+        "leaky-relu-0p5-squared",
+        "leaky_relu_0.5_squared",
+        "leaky-relu-0.5-squared",
+    }
+    if act not in {
+        "gelu",
+        "geglu",
+        "silu",
+        "swish",
+        "swiglu",
+        "gated-silu",
+        "relu",
+        "reglu",
+        *leaky_relu_0p5_squared_aliases,
+    }:
         raise ValueError(f"Unsupported activation: {activation}")
     if x.shape != gate.shape:
         raise ValueError(f"gated_activation requires x and gate to have the same shape, got {tuple(x.shape)} and {tuple(gate.shape)}")
@@ -3285,6 +3331,12 @@ def _apply_mlp_hidden_activation(
     gated: bool,
 ) -> torch.Tensor:
     act = str(activation).lower()
+    leaky_relu_0p5_squared_aliases = {
+        "leaky_relu_0p5_squared",
+        "leaky-relu-0p5-squared",
+        "leaky_relu_0.5_squared",
+        "leaky-relu-0.5-squared",
+    }
     if gated:
         a, b = hidden.chunk(2, dim=-1)
         if act in ("swiglu", "gated-silu"):
@@ -3293,6 +3345,9 @@ def _apply_mlp_hidden_activation(
             return F.gelu(a) * b
         if act == "reglu":
             return F.relu(a) * b
+        if act in leaky_relu_0p5_squared_aliases:
+            y = F.leaky_relu(a, negative_slope=0.5)
+            return (y * y) * b
         return F.silu(a) * b
     if act in ("gelu",):
         return F.gelu(hidden)
@@ -3300,6 +3355,9 @@ def _apply_mlp_hidden_activation(
         return F.silu(hidden)
     if act in ("relu",):
         return F.relu(hidden)
+    if act in leaky_relu_0p5_squared_aliases:
+        y = F.leaky_relu(hidden, negative_slope=0.5)
+        return y * y
     return F.gelu(hidden)
 
 

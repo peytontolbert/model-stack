@@ -16,6 +16,7 @@ enum class GatedActivationKind : int {
   kSiLU = 0,
   kGELU = 1,
   kReLU = 2,
+  kLeakyRelu0p5Squared = 3,
 };
 
 GatedActivationKind ParseActivation(const std::string& activation) {
@@ -27,6 +28,10 @@ GatedActivationKind ParseActivation(const std::string& activation) {
   }
   if (activation == "reglu" || activation == "relu") {
     return GatedActivationKind::kReLU;
+  }
+  if (activation == "leaky_relu_0p5_squared" || activation == "leaky-relu-0p5-squared" ||
+      activation == "leaky_relu_0.5_squared" || activation == "leaky-relu-0.5-squared") {
+    return GatedActivationKind::kLeakyRelu0p5Squared;
   }
   return GatedActivationKind::kSiLU;
 }
@@ -44,6 +49,10 @@ __device__ inline float ApplyActivation(float x, GatedActivationKind activation)
       return GeluExact(x);
     case GatedActivationKind::kReLU:
       return x > 0.0f ? x : 0.0f;
+    case GatedActivationKind::kLeakyRelu0p5Squared: {
+      const float y = x > 0.0f ? x : (0.5f * x);
+      return y * y;
+    }
   }
   return x;
 }
@@ -66,7 +75,9 @@ __global__ void gated_activation_forward_kernel(
   const int64_t base = row * cols;
   const float a = static_cast<float>(x[base + col]);
   const float gate = static_cast<float>(x[base + hidden + col]);
-  const float value = ApplyActivation(a, activation) * gate;
+  const scalar_t activated =
+      static_cast<scalar_t>(ApplyActivation(a, activation));
+  const float value = static_cast<float>(activated) * gate;
   out[idx] = static_cast<scalar_t>(value);
 }
 

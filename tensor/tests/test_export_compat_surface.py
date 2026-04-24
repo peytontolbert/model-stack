@@ -167,3 +167,40 @@ def test_runtime_exporter_accepts_nf4_quantization(monkeypatch):
 
     assert seen["quant"] is not None
     assert seen["quant"]["scheme"] == "nf4"
+
+
+def test_runtime_exporter_card_meta_derives_long_context_metadata_from_model_config():
+    cfg = runtime_exporter_mod.ExportConfig(target="onnx", outdir="artifacts")
+    model_cfg = _cfg()
+    model_cfg.rope_theta = 1_000_000.0
+    model_cfg.max_position_embeddings = 131072
+    model_cfg.rope_scaling_type = "dynamic"
+    model_cfg.rope_scaling_factor = 8.0
+    model_cfg.rope_scaling_original_max_position_embeddings = 4096
+    model_cfg.rope_scaling_low_freq_factor = 1.0
+    model_cfg.rope_scaling_high_freq_factor = 4.0
+    model_cfg.rope_attention_scaling = 1.25
+
+    meta = runtime_exporter_mod._export_card_meta(cfg, model_cfg=model_cfg, format="onnx")
+
+    assert meta["format"] == "onnx"
+    assert meta["max_seq_len"] == 131072
+    assert meta["max_position_embeddings"] == 131072
+    assert meta["rope_theta"] == 1_000_000.0
+    assert meta["rope_scaling_type"] == "dynamic"
+    assert meta["rope_scaling_factor"] == 8.0
+    assert meta["rope_scaling_original_max_position_embeddings"] == 4096
+    assert meta["rope_scaling_low_freq_factor"] == 1.0
+    assert meta["rope_scaling_high_freq_factor"] == 4.0
+    assert meta["rope_attention_scaling"] == 1.25
+
+
+def test_runtime_exporter_card_meta_prefers_explicit_max_seq_len_override():
+    cfg = runtime_exporter_mod.ExportConfig(target="onnx", outdir="artifacts", max_seq_len=32768)
+    model_cfg = _cfg()
+    model_cfg.max_position_embeddings = 131072
+
+    meta = runtime_exporter_mod._export_card_meta(cfg, model_cfg=model_cfg, format="onnx")
+
+    assert meta["max_seq_len"] == 32768
+    assert meta["max_position_embeddings"] == 131072

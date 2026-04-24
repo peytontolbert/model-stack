@@ -1,5 +1,8 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+
 #include "../descriptors/attention_desc.h"
 
 namespace t10::policy {
@@ -77,6 +80,111 @@ inline int SelectAttentionRowThreads(const t10::desc::AttentionDesc& desc) {
     return 128;
   }
   return 256;
+}
+
+inline bool AttentionHasDeadTopLeftCausalKvTail(const t10::desc::AttentionDesc& desc) {
+  return desc.phase == t10::desc::AttentionPhase::kPrefill &&
+      desc.causal &&
+      desc.mask_kind == t10::desc::AttentionMaskKind::kNone &&
+      desc.q_len > 0 &&
+      desc.q_len < desc.kv_len;
+}
+
+inline int64_t AttentionEffectiveKvLen(const t10::desc::AttentionDesc& desc) {
+  return AttentionHasDeadTopLeftCausalKvTail(desc)
+      ? desc.q_len
+      : desc.kv_len;
+}
+
+inline int AttentionSplitKvBlockN(const t10::desc::AttentionDesc& desc) {
+  if (desc.head_dim <= 64) {
+    return 256;
+  }
+  if (desc.head_dim <= 128) {
+    return 128;
+  }
+  return 64;
+}
+
+inline int AttentionSplitKvNumMBlocks(const t10::desc::AttentionDesc& desc) {
+  return static_cast<int>((desc.q_len + 64 - 1) / 64);
+}
+
+inline int AttentionSplitKvNumNBlocks(const t10::desc::AttentionDesc& desc) {
+  const int block_n = AttentionSplitKvBlockN(desc);
+  const int64_t effective_kv_len = AttentionEffectiveKvLen(desc);
+  return static_cast<int>((effective_kv_len + block_n - 1) / block_n);
+}
+
+inline bool SupportsAttentionSplitKv(const t10::desc::AttentionDesc& desc) {
+  return desc.phase == t10::desc::AttentionPhase::kPrefill &&
+      desc.causal &&
+      desc.mask_kind == t10::desc::AttentionMaskKind::kNone &&
+      !AttentionHasDeadTopLeftCausalKvTail(desc) &&
+      desc.head_mode == t10::desc::AttentionHeadMode::kMHA &&
+      desc.q_layout == t10::desc::AttentionLayoutKind::kBHSD &&
+      desc.kv_layout == t10::desc::AttentionLayoutKind::kBHSD &&
+      desc.head_dim > 0 &&
+      desc.head_dim <= 128 &&
+      desc.q_len > 0 &&
+      desc.kv_len > 0;
+}
+
+inline int SelectAttentionSplitKvSplits(
+    const t10::desc::AttentionDesc& desc,
+    int effective_sms,
+    int max_splits = 128) {
+  if (!SupportsAttentionSplitKv(desc) || effective_sms <= 0) {
+    return 1;
+  }
+
+  const int num_n_blocks = AttentionSplitKvNumNBlocks(desc);
+  const int num_m_blocks = AttentionSplitKvNumMBlocks(desc);
+  const int batch_nheads_mblocks =
+      static_cast<int>(desc.batch * desc.q_heads * num_m_blocks);
+  if (batch_nheads_mblocks >= static_cast<int>(0.8f * effective_sms)) {
+    return 1;
+  }
+
+  max_splits = std::min({max_splits, effective_sms, num_n_blocks});
+  if (max_splits <= 1) {
+    return 1;
+  }
+
+  auto ceil_div = [](int a, int b) { return (a + b - 1) / b; };
+  auto is_split_eligible = [&](int num_splits) {
+    return num_splits == 1 ||
+        ceil_div(num_n_blocks, num_splits) != ceil_div(num_n_blocks, num_splits - 1);
+  };
+
+  float max_efficiency = 0.0f;
+  int best_split = 1;
+  for (int num_splits = 1; num_splits <= max_splits; ++num_splits) {
+    if (!is_split_eligible(num_splits)) {
+      continue;
+    }
+    const float waves =
+        static_cast<float>(batch_nheads_mblocks * num_splits) /
+        static_cast<float>(effective_sms);
+    const float efficiency = waves / std::ceil(waves);
+    if (efficiency > max_efficiency) {
+      max_efficiency = efficiency;
+    }
+  }
+  for (int num_splits = 1; num_splits <= max_splits; ++num_splits) {
+    if (!is_split_eligible(num_splits)) {
+      continue;
+    }
+    const float waves =
+        static_cast<float>(batch_nheads_mblocks * num_splits) /
+        static_cast<float>(effective_sms);
+    const float efficiency = waves / std::ceil(waves);
+    if (efficiency >= 0.85f * max_efficiency) {
+      best_split = num_splits;
+      break;
+    }
+  }
+  return best_split;
 }
 
 inline AttentionPlan ResolveAttentionPlan(const t10::desc::AttentionDesc& desc) {

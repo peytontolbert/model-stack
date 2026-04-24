@@ -281,6 +281,128 @@ def test_quantized_bitnet_compute_backend_weight_packs_words_and_reuses_cache():
     assert torch.count_nonzero(row_scales_a[0, expected_row_scales.numel() :]) == 0
 
 
+def test_quantized_bitnet_none_runtime_linear_uses_dense_cached_weight(monkeypatch):
+    seen = {}
+
+    def fake_dense_linear(x, weight, bias=None):
+        seen["x"] = tuple(x.shape)
+        seen["weight"] = weight.detach().clone()
+        seen["bias"] = None if bias is None else bias.detach().clone()
+        return torch.full((*x.shape[:-1], weight.shape[0]), 8.0, dtype=x.dtype)
+
+    def fail_runtime_bitnet_linear(*args, **kwargs):
+        raise AssertionError("none-mode BitNet should not use runtime_bitnet_linear")
+
+    monkeypatch.setattr(torch.nn.functional, "linear", fake_dense_linear)
+    monkeypatch.setattr(quant_mod, "runtime_bitnet_linear", fail_runtime_bitnet_linear)
+
+    layer = quant_mod.QuantizedLinearBitNet(4, 3, bias=True).from_float(torch.nn.Linear(4, 3, bias=True))
+    x = torch.randn(2, 4)
+    expected_weight = layer._dequantized_weight(x.dtype, device=x.device)
+    expected_bias = layer.bias.to(device=x.device, dtype=x.dtype)
+
+    out = layer.runtime_linear(x)
+
+    assert out.shape == (2, 3)
+    assert torch.all(out == 8.0)
+    assert seen["x"] == (2, 4)
+    assert torch.allclose(seen["weight"], expected_weight)
+    assert torch.allclose(seen["bias"], expected_bias)
+
+
+def test_quantized_bitnet_dynamic_int8_decode_can_use_dense_fallback(monkeypatch):
+    seen = {}
+
+    def fake_dense_linear(x, weight, bias=None):
+        seen["x"] = tuple(x.shape)
+        seen["weight"] = weight.detach().clone()
+        seen["bias"] = None if bias is None else bias.detach().clone()
+        return torch.full((*x.shape[:-1], weight.shape[0]), 9.0, dtype=x.dtype)
+
+    def fail_runtime_bitnet_int8_linear_from_float(*args, **kwargs):
+        raise AssertionError("dynamic_int8 dense decode fallback should bypass runtime_bitnet_int8_linear_from_float")
+
+    monkeypatch.setattr(torch.nn.functional, "linear", fake_dense_linear)
+    monkeypatch.setattr(quant_mod, "runtime_bitnet_int8_linear_from_float", fail_runtime_bitnet_int8_linear_from_float)
+
+    layer = quant_mod.QuantizedLinearBitNet(4, 6, bias=True).from_float(
+        torch.nn.Linear(4, 6, bias=True),
+        activation_quant="dynamic_int8",
+    )
+    x = torch.randn(4, 1, 4)
+    dense_weight = torch.randn(6, 4)
+    expected_bias = layer.runtime_bias(dtype=x.dtype, device=x.device)
+
+    monkeypatch.setattr(layer, "_prefer_dynamic_int8_dense_decode_fallback", lambda _x: True)
+    monkeypatch.setattr(layer, "_dequantized_int8_backend_weight", lambda dtype, device=None: dense_weight.to(dtype=dtype))
+
+    out = layer.runtime_linear(x)
+
+    assert out.shape == (4, 1, 6)
+    assert torch.all(out == 9.0)
+    assert seen["x"] == (4, 1, 4)
+    assert torch.allclose(seen["weight"], dense_weight.to(dtype=x.dtype))
+    assert torch.allclose(seen["bias"], expected_bias)
+
+
+def test_quantized_bitnet_dynamic_int8_sub8_decode_does_not_use_dense_fallback(monkeypatch):
+    seen = {}
+
+    def fail_dense_linear(x, weight, bias=None):
+        del x, weight, bias
+        raise AssertionError("sub-8 dynamic_int8 decode should not use dense fallback")
+
+    def fake_runtime_bitnet_int8_linear_from_float(
+        x,
+        qweight,
+        inv_scale,
+        bias=None,
+        *,
+        pre_scale=None,
+        act_quant_mode="dynamic_int8",
+        act_scale=None,
+        act_quant_bits=8,
+        act_quant_method="absmax",
+        act_quant_percentile=0.999,
+    ):
+        seen["x"] = tuple(x.shape)
+        seen["qweight_shape"] = tuple(qweight.shape)
+        seen["inv_scale_shape"] = tuple(inv_scale.shape)
+        seen["bias"] = None if bias is None else bias.detach().clone()
+        seen["pre_scale"] = pre_scale
+        seen["act_quant_mode"] = act_quant_mode
+        seen["act_scale"] = act_scale
+        seen["act_quant_bits"] = act_quant_bits
+        seen["act_quant_method"] = act_quant_method
+        seen["act_quant_percentile"] = act_quant_percentile
+        return torch.full((*x.shape[:-1], qweight.shape[0]), 11.0, dtype=x.dtype, device=x.device)
+
+    monkeypatch.setattr(torch.nn.functional, "linear", fail_dense_linear)
+    monkeypatch.setattr(quant_mod, "runtime_bitnet_int8_linear_from_float", fake_runtime_bitnet_int8_linear_from_float)
+
+    layer = quant_mod.QuantizedLinearBitNet(2560, 2560, bias=True).from_float(
+        torch.nn.Linear(2560, 2560, bias=True),
+        activation_quant="dynamic_int8",
+        activation_quant_bits=6,
+    )
+    x = torch.randn(4, 1, 2560)
+
+    out = layer.runtime_linear(x)
+
+    assert out.shape == (4, 1, 2560)
+    assert torch.all(out == 11.0)
+    assert seen["x"] == (4, 1, 2560)
+    assert seen["qweight_shape"] == (2560, 2560)
+    assert seen["inv_scale_shape"] == (2560,)
+    assert seen["bias"].shape == (2560,)
+    assert seen["pre_scale"] is None
+    assert seen["act_quant_mode"] == "dynamic_int8"
+    assert seen["act_scale"] is None
+    assert seen["act_quant_bits"] == 6
+    assert seen["act_quant_method"] == "absmax"
+    assert seen["act_quant_percentile"] == 0.999
+
+
 def test_quantized_bitnet_decode_backend_weight_packs_masks_and_reuses_cache():
     layer = quant_mod.QuantizedLinearBitNet(20, 5, bias=True).from_float(torch.nn.Linear(20, 5, bias=True))
 

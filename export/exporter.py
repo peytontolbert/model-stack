@@ -30,8 +30,37 @@ def _prepare_io_examples(cfg: ModelConfig, device: torch.device) -> Tuple[torch.
 
 def _export_card_meta(cfg: ExportConfig, **extra: object) -> dict[str, object]:
     meta: dict[str, object] = dict(extra)
-    if getattr(cfg, "max_seq_len", None) is not None:
-        meta["max_seq_len"] = int(cfg.max_seq_len)
+    model_cfg = meta.pop("model_cfg", None)
+    max_seq_len = getattr(cfg, "max_seq_len", None)
+    if max_seq_len is None and model_cfg is not None:
+        max_seq_len = getattr(model_cfg, "max_position_embeddings", None)
+    if max_seq_len is not None:
+        meta["max_seq_len"] = int(max_seq_len)
+    if model_cfg is not None:
+        rope_theta = getattr(model_cfg, "rope_theta", None)
+        if rope_theta is not None:
+            meta["rope_theta"] = float(rope_theta)
+        max_position_embeddings = getattr(model_cfg, "max_position_embeddings", None)
+        if max_position_embeddings is not None:
+            meta["max_position_embeddings"] = int(max_position_embeddings)
+        rope_scaling_type = getattr(model_cfg, "rope_scaling_type", None)
+        if rope_scaling_type is not None:
+            meta["rope_scaling_type"] = str(rope_scaling_type)
+        rope_scaling_factor = getattr(model_cfg, "rope_scaling_factor", None)
+        if rope_scaling_factor is not None:
+            meta["rope_scaling_factor"] = float(rope_scaling_factor)
+        rope_scaling_original_max = getattr(model_cfg, "rope_scaling_original_max_position_embeddings", None)
+        if rope_scaling_original_max is not None:
+            meta["rope_scaling_original_max_position_embeddings"] = int(rope_scaling_original_max)
+        rope_scaling_low_freq = getattr(model_cfg, "rope_scaling_low_freq_factor", None)
+        if rope_scaling_low_freq is not None:
+            meta["rope_scaling_low_freq_factor"] = float(rope_scaling_low_freq)
+        rope_scaling_high_freq = getattr(model_cfg, "rope_scaling_high_freq_factor", None)
+        if rope_scaling_high_freq is not None:
+            meta["rope_scaling_high_freq_factor"] = float(rope_scaling_high_freq)
+        rope_attention_scaling = getattr(model_cfg, "rope_attention_scaling", None)
+        if rope_attention_scaling is not None:
+            meta["rope_attention_scaling"] = float(rope_attention_scaling)
     if cfg.quantize is not None:
         meta["quantize"] = str(cfg.quantize)
         meta["quant_spin"] = bool(cfg.quant_spin)
@@ -120,7 +149,7 @@ def export_model(model: torch.nn.Module, cfg: ExportConfig, *, model_cfg: Option
         # execution, so replay-based trace checking is not a stable signal here.
         scripted = torch.jit.trace(export_model_wrapper, (ids, mask), check_trace=False)
         out = outdir / "model.ts"; scripted.save(str(out))
-        _write_card(outdir, _export_card_meta(cfg, format="torchscript"), out); return out
+        _write_card(outdir, _export_card_meta(cfg, model_cfg=model_cfg, format="torchscript"), out); return out
 
     if cfg.target == "onnx":
         if importlib.util.find_spec("onnx") is None:
@@ -152,13 +181,13 @@ def export_model(model: torch.nn.Module, cfg: ExportConfig, *, model_cfg: Option
             dynamic_axes=dynamic_axes,
             do_constant_folding=True,
         )
-        _write_card(outdir, _export_card_meta(cfg, format="onnx", opset=int(cfg.opset)), out); return out
+        _write_card(outdir, _export_card_meta(cfg, model_cfg=model_cfg, format="onnx", opset=int(cfg.opset)), out); return out
 
     if cfg.target == "tensorrt":
         # Placeholder: produce a sentinel plan file and card; real build handled by external toolchain
         out = outdir / "model.plan"
         out.write_bytes(b"")
-        _write_card(outdir, _export_card_meta(cfg, format="tensorrt", workspace_mb=int(cfg.trt_max_workspace_mb)), out); return out
+        _write_card(outdir, _export_card_meta(cfg, model_cfg=model_cfg, format="tensorrt", workspace_mb=int(cfg.trt_max_workspace_mb)), out); return out
 
     raise ValueError("Unknown target")
 

@@ -123,6 +123,50 @@ def test_tensor_with_bias_act_quick_gelu_gated_keeps_reference_path(monkeypatch)
     assert torch.allclose(out, (x * torch.sigmoid(1.702 * x)) * gate)
 
 
+def test_runtime_activation_leaky_relu_half_squared_matches_reference_without_native(monkeypatch):
+    x = torch.randn(2, 3)
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: False)
+
+    out = runtime_ops_mod.activation(x, "leaky_relu_0p5_squared")
+    ref = F.leaky_relu(x, negative_slope=0.5).square()
+
+    assert torch.allclose(out, ref)
+
+
+def test_runtime_gated_activation_leaky_relu_half_squared_matches_reference_without_native(monkeypatch):
+    x = torch.randn(2, 3)
+    gate = torch.randn(2, 3)
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: False)
+
+    out = runtime_ops_mod.gated_activation(x, gate, "leaky_relu_0p5_squared")
+    ref = F.leaky_relu(x, negative_slope=0.5).square() * gate
+
+    assert torch.allclose(out, ref)
+
+
+def test_tensor_with_bias_act_leaky_relu_half_squared_gated_prefers_runtime_gated_activation(monkeypatch):
+    x = torch.randn(2, 3)
+    gate = torch.randn(2, 3)
+    seen = {}
+
+    def fake_runtime_gated_activation(x_in, gate_in, activation):
+        seen["x"] = x_in
+        seen["gate"] = gate_in
+        seen["activation"] = activation
+        return x_in + gate_in
+
+    monkeypatch.setattr(activations_mod, "runtime_gated_activation", fake_runtime_gated_activation)
+
+    out = activations_mod.with_bias_act(x, act="leaky_relu_0p5_squared", gate=gate)
+
+    assert torch.equal(out, x + gate)
+    assert torch.equal(seen["x"], x)
+    assert torch.equal(seen["gate"], gate)
+    assert seen["activation"] == "leaky_relu_0p5_squared"
+
+
 def test_runtime_linear_uses_eager_reference_when_grad_enabled(monkeypatch):
     x = torch.randn(2, 3, requires_grad=True)
     weight = torch.randn(4, 3, requires_grad=True)
@@ -258,4 +302,29 @@ def test_runtime_mlp_runs_dense_reference_path_without_activation_name_collision
     )
 
     ref = F.linear(F.silu(F.linear(x, w_in, b_in)), w_out, b_out)
+    assert torch.allclose(out, ref)
+
+
+def test_runtime_mlp_runs_dense_reference_path_with_leaky_relu_half_squared(monkeypatch):
+    x = torch.randn(2, 3, 4)
+    w_in = torch.randn(10, 4)
+    b_in = torch.randn(10)
+    w_out = torch.randn(4, 10)
+    b_out = torch.randn(4)
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: False)
+
+    out = runtime_ops_mod.mlp(
+        x,
+        w_in,
+        b_in,
+        w_out,
+        b_out,
+        activation="leaky_relu_0p5_squared",
+        gated=False,
+    )
+
+    hidden = F.linear(x, w_in, b_in)
+    activated = F.leaky_relu(hidden, negative_slope=0.5).square()
+    ref = F.linear(activated, w_out, b_out)
     assert torch.allclose(out, ref)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
+import statistics
 import time
 from pathlib import Path
 import sys
@@ -156,6 +158,18 @@ def _prepare_decode_sessions(
     return [_clone_generation_session(base_session, enabled=enabled) for _ in range(int(count))]
 
 
+def _prepare_native_decode_sessions(
+    sessions: list[RuntimeGenerationSession],
+) -> list[object]:
+    native_sessions: list[object] = []
+    for session in sessions:
+        native = getattr(session, "_native_session", None)
+        if native is None:
+            raise RuntimeError("native-direct decode driver requires a live native session on every prepared session")
+        native_sessions.append(native)
+    return native_sessions
+
+
 def _to_bitnet_linear(
     linear: torch.nn.Linear,
     *,
@@ -272,15 +286,33 @@ def main() -> None:
     parser.add_argument("--dtype", type=str, default="bf16")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--activation-quant", type=str, default="dynamic_int8")
-    parser.add_argument("--activation-quant-bits", type=int, default=6)
+    parser.add_argument("--activation-quant-bits", type=int, default=8)
     parser.add_argument("--activation-quant-method", type=str, default="absmax")
     parser.add_argument("--activation-quant-percentile", type=float, default=0.999)
     parser.add_argument("--packed-backend", choices=("disabled", "auto"), default="auto")
     parser.add_argument("--native-session", dest="native_session", action="store_true")
     parser.add_argument("--no-native-session", dest="native_session", action="store_false")
     parser.add_argument("--spin", action="store_true")
+    parser.add_argument(
+        "--driver",
+        choices=("generation_session", "native_direct"),
+        default="generation_session",
+        help="Benchmark through the RuntimeGenerationSession wrapper or directly through NativeModelSession.",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="Repeat the timed decode benchmark this many times and report summary stats. "
+             "The legacy *_ms lines report the median when repeats > 1.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a single JSON object instead of the human-readable text report.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.set_defaults(native_session=True)
     args = parser.parse_args()
@@ -291,6 +323,8 @@ def main() -> None:
     use_cuda_events = device.type == "cuda"
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is False")
+    if args.driver == "native_direct" and not bool(args.native_session):
+        raise RuntimeError("--driver native_direct requires --native-session")
 
     d_model = int(args.heads) * int(args.head_dim)
     cfg = ModelConfig(
@@ -341,10 +375,6 @@ def main() -> None:
         next_id=next_id,
     )
 
-    dense_sessions = _prepare_decode_sessions(dense_base, enabled=bool(args.native_session), count=prepared_count)
-    bitnet_sessions = _prepare_decode_sessions(bitnet_base, enabled=bool(args.native_session), count=prepared_count)
-    dequant_sessions = _prepare_decode_sessions(dequant_base, enabled=bool(args.native_session), count=prepared_count)
-
     with torch.no_grad():
         dense_logits = dense_base.decode_next_logits()
         dequant_logits = dequant_base.decode_next_logits()
@@ -354,28 +384,95 @@ def main() -> None:
     max_abs_err_vs_dense = float((bitnet_logits - dense_logits).abs().max().item())
     max_abs_err_vs_bitnet_ref = float((bitnet_logits - dequant_logits).abs().max().item())
 
-    dense_ms = _time_session_calls(
-        dense_sessions,
-        method_name="decode_next_logits",
-        warmup=args.warmup,
-        iters=args.iters,
-        use_cuda_events=use_cuda_events,
-    )
-    dequant_ms = _time_session_calls(
-        dequant_sessions,
-        method_name="decode_next_logits",
-        warmup=args.warmup,
-        iters=args.iters,
-        use_cuda_events=use_cuda_events,
-    )
-    bitnet_ms = _time_session_calls(
-        bitnet_sessions,
-        method_name="decode_next_logits",
-        warmup=args.warmup,
-        iters=args.iters,
-        use_cuda_events=use_cuda_events,
-    )
+    repeat_count = max(int(args.repeats), 1)
+    dense_runs: list[float] = []
+    dequant_runs: list[float] = []
+    bitnet_runs: list[float] = []
+
+    for _ in range(repeat_count):
+        dense_sessions = _prepare_decode_sessions(dense_base, enabled=bool(args.native_session), count=prepared_count)
+        bitnet_sessions = _prepare_decode_sessions(bitnet_base, enabled=bool(args.native_session), count=prepared_count)
+        dequant_sessions = _prepare_decode_sessions(dequant_base, enabled=bool(args.native_session), count=prepared_count)
+        if args.driver == "native_direct":
+            dense_bench_targets = _prepare_native_decode_sessions(dense_sessions)
+            bitnet_bench_targets = _prepare_native_decode_sessions(bitnet_sessions)
+            dequant_bench_targets = _prepare_native_decode_sessions(dequant_sessions)
+        else:
+            dense_bench_targets = dense_sessions
+            bitnet_bench_targets = bitnet_sessions
+            dequant_bench_targets = dequant_sessions
+
+        dense_runs.append(
+            _time_session_calls(
+                dense_bench_targets,
+                method_name="decode_next_logits",
+                warmup=args.warmup,
+                iters=args.iters,
+                use_cuda_events=use_cuda_events,
+            )
+        )
+        dequant_runs.append(
+            _time_session_calls(
+                dequant_bench_targets,
+                method_name="decode_next_logits",
+                warmup=args.warmup,
+                iters=args.iters,
+                use_cuda_events=use_cuda_events,
+            )
+        )
+        bitnet_runs.append(
+            _time_session_calls(
+                bitnet_bench_targets,
+                method_name="decode_next_logits",
+                warmup=args.warmup,
+                iters=args.iters,
+                use_cuda_events=use_cuda_events,
+            )
+        )
+
+    dense_ms = statistics.median(dense_runs)
+    dequant_ms = statistics.median(dequant_runs)
+    bitnet_ms = statistics.median(bitnet_runs)
     speedup = dequant_ms / bitnet_ms if bitnet_ms > 0 else float("inf")
+
+    result = {
+        "device": str(device),
+        "dtype": str(dtype),
+        "batch": int(args.batch),
+        "prompt": int(args.prompt),
+        "layers": int(args.layers),
+        "heads": int(args.heads),
+        "head_dim": int(args.head_dim),
+        "activation_quant": str(args.activation_quant),
+        "activation_quant_bits": int(args.activation_quant_bits),
+        "activation_quant_method": str(args.activation_quant_method),
+        "activation_quant_percentile": float(args.activation_quant_percentile),
+        "spin": bool(args.spin),
+        "bench_stage": "decode_cached",
+        "bench_driver": str(args.driver),
+        "repeat_count": int(repeat_count),
+        "packed_backend_mode": str(args.packed_backend),
+        "native_session_enabled": bool(args.native_session),
+        "native_dense_executor_kind": str(dense_executor_kind),
+        "native_executor_kind": str(native_executor_kind),
+        "native_dequant_executor_kind": str(dequant_executor_kind),
+        "dense_original_ms": float(dense_ms),
+        "dense_bitnet_ref_ms": float(dequant_ms),
+        "bitnet_ms": float(bitnet_ms),
+        "speedup_vs_bitnet_ref": float(speedup),
+        "max_abs_err_vs_dense": float(max_abs_err_vs_dense),
+        "max_abs_err_vs_bitnet_ref": float(max_abs_err_vs_bitnet_ref),
+        "dense_original_runs_ms": [float(v) for v in dense_runs],
+        "dense_bitnet_ref_runs_ms": [float(v) for v in dequant_runs],
+        "bitnet_runs_ms": [float(v) for v in bitnet_runs],
+        "dense_original_mean_ms": float(statistics.mean(dense_runs)),
+        "dense_bitnet_ref_mean_ms": float(statistics.mean(dequant_runs)),
+        "bitnet_mean_ms": float(statistics.mean(bitnet_runs)),
+    }
+
+    if bool(args.json):
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
 
     print(f"device={device} dtype={dtype} batch={args.batch} prompt={args.prompt}")
     print(f"layers={args.layers} heads={args.heads} head_dim={args.head_dim}")
@@ -386,6 +483,8 @@ def main() -> None:
         f"spin={bool(args.spin)}"
     )
     print("bench_stage=decode_cached")
+    print(f"bench_driver={args.driver}")
+    print(f"repeat_count={repeat_count}")
     print(f"packed_backend_mode={args.packed_backend}")
     print(f"native_session_enabled={bool(args.native_session)}")
     print(f"native_dense_executor_kind={dense_executor_kind}")
@@ -397,6 +496,16 @@ def main() -> None:
     print(f"speedup_vs_bitnet_ref={speedup:.3f}x")
     print(f"max_abs_err_vs_dense={max_abs_err_vs_dense:.6f}")
     print(f"max_abs_err_vs_bitnet_ref={max_abs_err_vs_bitnet_ref:.6f}")
+    if repeat_count > 1:
+        dense_runs_str = ",".join(f"{v:.3f}" for v in dense_runs)
+        dequant_runs_str = ",".join(f"{v:.3f}" for v in dequant_runs)
+        bitnet_runs_str = ",".join(f"{v:.3f}" for v in bitnet_runs)
+        print(f"dense_original_runs_ms={dense_runs_str}")
+        print(f"dense_bitnet_ref_runs_ms={dequant_runs_str}")
+        print(f"bitnet_runs_ms={bitnet_runs_str}")
+        print(f"dense_original_mean_ms={statistics.mean(dense_runs):.3f}")
+        print(f"dense_bitnet_ref_mean_ms={statistics.mean(dequant_runs):.3f}")
+        print(f"bitnet_mean_ms={statistics.mean(bitnet_runs):.3f}")
 
 
 if __name__ == "__main__":

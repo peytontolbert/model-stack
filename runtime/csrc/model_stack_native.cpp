@@ -5,6 +5,7 @@
 #include <ATen/ops/gelu.h>
 #include <ATen/ops/index_select.h>
 #include <ATen/ops/layer_norm.h>
+#include <ATen/ops/leaky_relu.h>
 #include <ATen/ops/relu.h>
 #include <ATen/ops/silu.h>
 
@@ -24,6 +25,8 @@
 #include "reference/aten_reference.h"
 #include "backend/bitnet/bitnet_formats.h"
 #if MODEL_STACK_WITH_CUDA
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include "backend/cuda_device_arch.cuh"
 #endif
 
@@ -650,7 +653,6 @@ std::map<std::string, bool> NativeOpMap() {
       {"linear", true},
       {"bitnet_transform_input", true},
       {"bitnet_linear", true},
-      {"bitnet_linear_module", true},
       {"bitnet_linear_from_float", true},
       {"bitnet_int8_linear_from_float", true},
       {"bitnet_int8_fused_qkv_packed_heads_projection", true},
@@ -1091,6 +1093,11 @@ torch::Tensor ApplyActivation(const torch::Tensor& x, const std::string& activat
   }
   if (act == "relu" || act == "reglu") {
     return at::relu(x);
+  }
+  if (act == "leaky_relu_0p5_squared" || act == "leaky-relu-0p5-squared" ||
+      act == "leaky_relu_0.5_squared" || act == "leaky-relu-0.5-squared") {
+    auto y = at::leaky_relu(x, 0.5);
+    return y * y;
   }
   return at::gelu(x, "none");
 }
@@ -1912,9 +1919,6 @@ py::dict RuntimeInfo() {
   }
   if (t10::bitnet::HasCudaBitNetLinearKernel()) {
     cuda_backend_ops.push_back("bitnet_linear");
-  }
-  if (t10::bitnet::HasCudaBitNetLinearKernel()) {
-    cuda_backend_ops.push_back("bitnet_linear_module");
   }
   if (t10::bitnet::HasCudaBitNetLinearKernel() && t10::bitnet::HasCudaBitNetInputFrontendKernel()) {
     cuda_backend_ops.push_back("bitnet_linear_from_float");
@@ -3809,8 +3813,30 @@ py::dict NativeAttentionPlanInfo(
   info["kv_heads"] = desc.kv_heads;
   info["q_len"] = desc.q_len;
   info["kv_len"] = desc.kv_len;
+  info["effective_kv_len"] = t10::policy::AttentionEffectiveKvLen(desc);
   info["head_dim"] = desc.head_dim;
   info["causal"] = desc.causal;
+  info["trimmed_causal_tail"] = t10::policy::AttentionHasDeadTopLeftCausalKvTail(desc);
+  info["split_kv_eligible"] = t10::policy::SupportsAttentionSplitKv(desc);
+  info["split_kv_block_n"] = t10::policy::AttentionSplitKvBlockN(desc);
+  info["split_kv_num_m_blocks"] = t10::policy::AttentionSplitKvNumMBlocks(desc);
+  info["split_kv_num_n_blocks"] = t10::policy::AttentionSplitKvNumNBlocks(desc);
+  info["split_kv_splits"] = 1;
+#if MODEL_STACK_WITH_CUDA
+  if (q.is_cuda()) {
+    const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+    const auto* prop = at::cuda::getCurrentDeviceProperties();
+    const int effective_sms =
+        std::max(1, static_cast<int>(prop->multiProcessorCount)) * 2;
+    info["split_kv_effective_sms"] = effective_sms;
+    info["split_kv_splits"] =
+        t10::policy::SelectAttentionSplitKvSplits(desc, effective_sms);
+  } else {
+    info["split_kv_effective_sms"] = 0;
+  }
+#else
+  info["split_kv_effective_sms"] = 0;
+#endif
   return info;
 }
 
@@ -4799,7 +4825,8 @@ torch::Tensor BitNetLinearForward(
                   x.scalar_type() == torch::kBFloat16,
               "bitnet_linear_forward: x must use float32, float16, or bfloat16");
 #if MODEL_STACK_WITH_CUDA
-  if (x.is_cuda() && packed_weight.is_cuda() && scale_values.is_cuda() && layout_header.is_cuda() &&
+  if (!debug_dense_fallback &&
+      x.is_cuda() && packed_weight.is_cuda() && scale_values.is_cuda() && layout_header.is_cuda() &&
       segment_offsets.is_cuda() && t10::bitnet::HasCudaBitNetLinearKernel()) {
     return t10::bitnet::CudaBitNetLinearForward(
         x,
@@ -4815,7 +4842,6 @@ torch::Tensor BitNetLinearForward(
   if (out_dtype.has_value()) {
     out = out.to(out_dtype.value());
   }
-  (void)debug_dense_fallback;
   return out;
 }
 
@@ -6596,12 +6622,6 @@ torch::Tensor BitNetLinearStateForward(
     const BitNetModuleState& state,
     const c10::optional<torch::ScalarType>& out_dtype = c10::nullopt);
 
-torch::Tensor BitNetLinearModuleForward(const torch::Tensor& x, const py::object& module) {
-  BitNetModuleState state;
-  TORCH_CHECK(BitNetModuleDirectSupported(module, &state), "BitNet module is not directly supported in native executor");
-  return BitNetLinearStateForward(x, state);
-}
-
 torch::Tensor BitNetLinearStateForward(
     const torch::Tensor& x,
     const BitNetModuleState& state,
@@ -6675,7 +6695,8 @@ c10::optional<torch::Tensor> TryBitNetGatedInt8LinearStateForward(
   const auto rows = x.size(-1) > 0 ? x.numel() / x.size(-1) : 0;
   const bool static_supported = mode == "static_int8" && state.act_scale.defined();
   const bool dynamic_supported =
-      mode == "dynamic_int8" && rows == 1 && (method.empty() || method == "absmax" || method == "mse");
+      mode == "dynamic_int8" && rows > 0 && rows <= 8 &&
+      (method.empty() || method == "absmax" || method == "mse");
   const auto resolved_out_dtype =
       out_dtype.has_value() ? out_dtype : c10::optional<torch::ScalarType>(x.scalar_type());
   if (!static_supported && !dynamic_supported) {
@@ -6713,12 +6734,52 @@ torch::Tensor PythonLinearModuleForward(
       RuntimeOpsModule().attr("linear_module")(x, module, "backend"_a = backend));
 }
 
+bool PreferDirectBitNetRuntimeLinear(
+    const torch::Tensor& x,
+    const py::object& module,
+    const BitNetModuleState& state) {
+  if (!PyCallableAttr(module, "runtime_linear") || !x.is_cuda() || x.dim() < 2) {
+    return false;
+  }
+  if (state.spin_enabled || state.pre_scale.defined()) {
+    return false;
+  }
+  if (NormalizeBackendName(state.act_quant_mode) != "dynamic_int8" || state.act_quant_bits != 8) {
+    return false;
+  }
+  const auto rows = x.size(-1) > 0 ? x.numel() / x.size(-1) : 0;
+  if (rows <= 0 || rows > 8) {
+    return false;
+  }
+  const auto out_features = state.qweight.defined() && state.qweight.dim() == 2 ? state.qweight.size(0) : 0;
+  // Match the Python/runtime policy: only the validated 8-bit decode route may
+  // escape to module runtime_linear() here. Sub-8-bit dynamic decode stays on
+  // the native packed/int8 path until it has its own tuned policy.
+  return x.size(-1) >= 2048 || out_features >= 2048;
+}
+
+bool PreferDirectBitNetRuntimeLinearQkv(
+    const torch::Tensor& x,
+    const py::object& q_module,
+    const BitNetModuleState& q_state,
+    const py::object& k_module,
+    const BitNetModuleState& k_state,
+    const py::object& v_module,
+    const BitNetModuleState& v_state) {
+  return PreferDirectBitNetRuntimeLinear(x, q_module, q_state) &&
+      PreferDirectBitNetRuntimeLinear(x, k_module, k_state) &&
+      PreferDirectBitNetRuntimeLinear(x, v_module, v_state);
+}
+
 torch::Tensor LinearLikeModuleForward(
     const torch::Tensor& x,
     const py::object& module,
     const std::string& backend) {
   BitNetModuleState bitnet_state;
   if (BitNetModuleDirectSupported(module, &bitnet_state)) {
+    if (PreferDirectBitNetRuntimeLinear(x, module, bitnet_state)) {
+      return PythonLinearModuleForward(x, module, backend);
+    }
     return BitNetLinearStateForward(x, bitnet_state);
   }
   if (ModuleHasRuntimeLinear(module)) {
@@ -6877,15 +6938,19 @@ std::vector<torch::Tensor> AttentionPackedBitNetQkvForward(
 torch::Tensor AttentionPackedBitNetOutputForward(
     const torch::Tensor& x,
     const py::object& module) {
+  auto merged = MergeHeadsForward(x);
   BitNetModuleState state;
   if (BitNetModuleDirectSupported(module, &state)) {
-    return BitNetLinearStateForward(MergeHeadsForward(x), state);
+    if (PreferDirectBitNetRuntimeLinear(merged, module, state)) {
+      return PythonLinearModuleForward(merged, module, "auto");
+    }
+    return BitNetLinearStateForward(merged, state);
   }
   auto runtime_ops = RuntimeOpsModule();
   auto spec = runtime_ops.attr("resolve_packed_linear_module_spec")(
       module,
       "backend"_a = "bitnet",
-      "reference"_a = MergeHeadsForward(x));
+      "reference"_a = merged);
   return py::cast<torch::Tensor>(
       runtime_ops.attr("head_output_packed_projection")(x, spec, "backend"_a = "bitnet"));
 }
@@ -7170,6 +7235,10 @@ torch::Tensor PreparedLinearLikeForward(
     const torch::Tensor& x,
     const PreparedLinearLikeModule& prepared,
     const std::string& backend) {
+  if (prepared.direct_bitnet &&
+      PreferDirectBitNetRuntimeLinear(x, prepared.module, prepared.bitnet_state)) {
+    return PythonLinearModuleForward(x, prepared.module, backend);
+  }
   if (prepared.direct_bitnet) {
     return BitNetLinearStateForward(x, prepared.bitnet_state);
   }
@@ -7310,7 +7379,6 @@ struct PreparedAttentionModule {
   int64_t fused_v_size = 0;
   bool use_bitnet_int8_attention_core = false;
   bool use_packed_bitnet_qkv = false;
-  bool direct_bitnet_output = false;
 };
 
 std::pair<double, double> ResolvePreparedAttentionRopeParameters(
@@ -7436,7 +7504,6 @@ bool PrepareAttentionModule(const py::object& attn, PreparedAttentionModule* out
       prepared.w_q.supports_bitnet_packed &&
       prepared.w_k.supports_bitnet_packed &&
       prepared.w_v.supports_bitnet_packed;
-  prepared.direct_bitnet_output = prepared.w_o.direct_bitnet;
   *out = std::move(prepared);
   return true;
 }
@@ -8172,9 +8239,6 @@ torch::Tensor ExecutePreparedAttentionProjected(
   }
 
   auto project_output = [&](const torch::Tensor& heads_out) {
-    if (prepared.direct_bitnet_output) {
-      return BitNetLinearStateForward(MergeHeadsForward(heads_out), prepared.w_o.bitnet_state);
-    }
     if (prepared.w_o.supports_bitnet_packed) {
       return AttentionPackedBitNetOutputForward(heads_out, prepared.w_o.module);
     }
@@ -8234,7 +8298,24 @@ torch::Tensor ExecutePreparedAttention(
     const c10::optional<torch::Tensor>& position_ids,
     const c10::optional<int64_t>& known_single_position) {
   std::vector<torch::Tensor> qkv;
-  if (prepared.use_packed_bitnet_qkv) {
+  if (prepared.direct_bitnet_qkv &&
+      PreferDirectBitNetRuntimeLinearQkv(
+          x,
+          prepared.w_q.module,
+          prepared.w_q.bitnet_state,
+          prepared.w_k.module,
+          prepared.w_k.bitnet_state,
+          prepared.w_v.module,
+          prepared.w_v.bitnet_state)) {
+    auto q = PreparedLinearLikeForward(x, prepared.w_q, "auto");
+    auto k = PreparedLinearLikeForward(x, prepared.w_k, "auto");
+    auto v = PreparedLinearLikeForward(x, prepared.w_v, "auto");
+    qkv = {
+        SplitHeadsForward(q, prepared.q_heads),
+        SplitHeadsForward(k, prepared.kv_heads),
+        SplitHeadsForward(v, prepared.kv_heads),
+    };
+  } else if (prepared.use_packed_bitnet_qkv) {
     if (prepared.direct_bitnet_qkv) {
       if (prepared.direct_fused_bitnet_qkv) {
         if (prepared.fused_bitnet_qkv_state.qweight.defined() && prepared.fused_bitnet_qkv_state.inv_scale.defined()) {
@@ -8320,21 +8401,16 @@ torch::Tensor ExecutePreparedAttention(
       known_single_position);
 }
 
+torch::Tensor ExecutePreparedMlpHidden(
+    const PreparedMlpModule& prepared,
+    torch::Tensor hidden);
+
 torch::Tensor ExecutePreparedMlp(
     const PreparedMlpModule& prepared,
     const torch::Tensor& x) {
-  auto hidden = PreparedLinearLikeForward(x, prepared.w_in, "auto");
-  if (prepared.gated) {
-    if (prepared.w_out.direct_bitnet) {
-      if (auto fused = TryBitNetGatedInt8LinearStateForward(hidden, prepared.activation, prepared.w_out.bitnet_state)) {
-        return fused.value();
-      }
-    }
-    hidden = ApplyGatedActivation(hidden, prepared.activation);
-  } else {
-    hidden = ApplyActivation(hidden, prepared.activation);
-  }
-  return PreparedLinearLikeForward(hidden, prepared.w_out, "auto");
+  return ExecutePreparedMlpHidden(
+      prepared,
+      PreparedLinearLikeForward(x, prepared.w_in, "auto"));
 }
 
 torch::Tensor ExecutePreparedMlpHidden(
@@ -8342,11 +8418,25 @@ torch::Tensor ExecutePreparedMlpHidden(
     torch::Tensor hidden) {
   if (prepared.gated) {
     if (prepared.w_out.direct_bitnet) {
+      torch::Tensor gated_hidden;
+      const auto mode = NormalizeBackendName(prepared.w_out.bitnet_state.act_quant_mode);
+      if (mode == "dynamic_int8" && prepared.w_out.bitnet_state.act_quant_bits == 8) {
+        gated_hidden = ApplyGatedActivation(hidden, prepared.activation);
+        if (PreferDirectBitNetRuntimeLinear(gated_hidden, prepared.w_out.module, prepared.w_out.bitnet_state)) {
+          return PythonLinearModuleForward(gated_hidden, prepared.w_out.module, "auto");
+        }
+      }
       if (auto fused = TryBitNetGatedInt8LinearStateForward(hidden, prepared.activation, prepared.w_out.bitnet_state)) {
         return fused.value();
       }
+      if (gated_hidden.defined()) {
+        hidden = std::move(gated_hidden);
+      } else {
+        hidden = ApplyGatedActivation(hidden, prepared.activation);
+      }
+    } else {
+      hidden = ApplyGatedActivation(hidden, prepared.activation);
     }
-    hidden = ApplyGatedActivation(hidden, prepared.activation);
   } else {
     hidden = ApplyActivation(hidden, prepared.activation);
   }
@@ -8500,7 +8590,8 @@ c10::optional<torch::Tensor> TryPreparedNativeCausalModelForward(
     ++layer_idx;
   }
 
-  if (prepared->lm_head.direct_bitnet) {
+  if (prepared->lm_head.direct_bitnet &&
+      CanUseFusedRmsNormBitNetLinearStateForward(x, prepared->norm, prepared->lm_head.bitnet_state)) {
     return FusedRmsNormBitNetLinearStateForward(x, prepared->norm, prepared->lm_head.bitnet_state);
   }
   x = ApplyNormModuleForward(x, prepared->norm);
@@ -8540,7 +8631,17 @@ torch::Tensor ExecuteSupportedAttention(
   BitNetModuleState w_o_state;
   const bool direct_bitnet_output = BitNetModuleDirectSupported(w_o, &w_o_state);
   std::vector<torch::Tensor> qkv;
-  if (use_packed_bitnet_qkv) {
+  if (direct_bitnet_qkv &&
+      PreferDirectBitNetRuntimeLinearQkv(x, w_q, q_state, w_k, k_state, w_v, v_state)) {
+    auto q = LinearLikeModuleForward(x, w_q, "auto");
+    auto k = LinearLikeModuleForward(x, w_k, "auto");
+    auto v = LinearLikeModuleForward(x, w_v, "auto");
+    qkv = {
+        SplitHeadsForward(q, q_heads),
+        SplitHeadsForward(k, kv_heads),
+        SplitHeadsForward(v, kv_heads),
+    };
+  } else if (use_packed_bitnet_qkv) {
     qkv = direct_bitnet_qkv
         ? AttentionPackedBitNetQkvForwardFromStates(x, q_state, k_state, v_state, q_heads, kv_heads)
         : AttentionPackedBitNetQkvForward(x, attn, q_heads, kv_heads);
@@ -8618,7 +8719,11 @@ torch::Tensor ExecuteSupportedAttention(
           attention_scale);
       if (paged_out.has_value()) {
         if (direct_bitnet_output) {
-          return BitNetLinearStateForward(MergeHeadsForward(paged_out.value()), w_o_state);
+          auto merged = MergeHeadsForward(paged_out.value());
+          if (PreferDirectBitNetRuntimeLinear(merged, w_o, w_o_state)) {
+            return PythonLinearModuleForward(merged, w_o, "auto");
+          }
+          return BitNetLinearStateForward(merged, w_o_state);
         }
         if (ModuleSupportsPackedBackend(w_o, "bitnet")) {
           return AttentionPackedBitNetOutputForward(paged_out.value(), w_o);
@@ -8658,7 +8763,11 @@ torch::Tensor ExecuteSupportedAttention(
             !mask.has_value(),
             attention_scale);
   if (direct_bitnet_output) {
-    return BitNetLinearStateForward(MergeHeadsForward(out), w_o_state);
+    auto merged = MergeHeadsForward(out);
+    if (PreferDirectBitNetRuntimeLinear(merged, w_o, w_o_state)) {
+      return PythonLinearModuleForward(merged, w_o, "auto");
+    }
+    return BitNetLinearStateForward(merged, w_o_state);
   }
   if (ModuleSupportsPackedBackend(w_o, "bitnet")) {
     return AttentionPackedBitNetOutputForward(out, w_o);
@@ -8835,6 +8944,11 @@ c10::optional<torch::Tensor> TryNativeCausalModelForward(
     ++layer_idx;
   }
 
+  BitNetModuleState lm_head_state;
+  if (BitNetModuleDirectSupported(lm_head, &lm_head_state) &&
+      CanUseFusedRmsNormBitNetLinearStateForward(x, norm, lm_head_state)) {
+    return FusedRmsNormBitNetLinearStateForward(x, norm, lm_head_state);
+  }
   x = ApplyNormModuleForward(x, norm);
   return LinearLikeModuleForward(x, lm_head, "auto");
 }
@@ -9084,7 +9198,6 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("act_quant_method") = "absmax", py::arg("act_quant_bits") = 8,
         py::arg("act_quant_percentile") = 0.999, py::arg("act_scale") = py::none(),
         py::arg("out_dtype") = py::none());
-  m.def("bitnet_linear_module_forward", &BitNetLinearModuleForward, py::arg("x"), py::arg("module"));
   m.def(
       "bitnet_int8_linear_from_float_forward",
       [](const torch::Tensor& x,

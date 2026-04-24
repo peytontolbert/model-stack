@@ -782,12 +782,20 @@ def mlp_forward(
         proj = runtime_linear(x, mlp.w_in.weight, mlp.w_in.bias)
         a, b = proj.chunk(2, dim=-1)
         name = mlp.activation_name.lower()
+        leaky_relu_0p5_squared_aliases = {
+            "leaky_relu_0p5_squared",
+            "leaky-relu-0p5-squared",
+            "leaky_relu_0.5_squared",
+            "leaky-relu-0.5-squared",
+        }
         if name in ("swiglu", "gated-silu"):
             mid = runtime_gated_activation(a, b, "silu")
         elif name == "geglu":
             mid = runtime_gated_activation(a, b, "gelu")
         elif name == "reglu":
             mid = runtime_gated_activation(a, b, "relu")
+        elif name in leaky_relu_0p5_squared_aliases:
+            mid = runtime_gated_activation(a, b, "leaky_relu_0p5_squared")
         else:
             mid = runtime_gated_activation(a, b, "silu")
     else:

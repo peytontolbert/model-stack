@@ -15,7 +15,7 @@ from .norms import (
     online_rms,
 )
 from .mlp import MLP
-from .activations import gelu, silu, bias_gelu, bias_silu
+from .activations import gelu, silu, bias_gelu, bias_silu, leaky_relu_0p5_squared
 from .activations import fast_gelu, quick_gelu, mish, tanh_gelu, swiglu, geglu, reglu
 from .masking import (
     build_causal_mask,
@@ -197,6 +197,7 @@ __all__ = [
     "online_rms",
     "gelu",
     "silu",
+    "leaky_relu_0p5_squared",
     "bias_gelu",
     "bias_silu",
     "fast_gelu",
@@ -585,5 +586,4 @@ __all__ = [
     "sparsify_topk",
     "magnitude_prune",
 ]
-
 

@@ -599,10 +599,10 @@ struct ModelStackSm80CausalPrefillKernel {
 
   static CUTLASS_DEVICE void prologue_v_tile_full_64x64_rf(
       SharedStorage& shared_storage,
+      const typename MM1FullTileIterator::Params& params,
       Params& p,
       int32_t iter_key_start,
       int16_t tid) {
-    typename MM1FullTileIterator::Params params{MM1::LayoutB(p.v_strideM)};
     MM1FullTileIterator iterator_v(
         params,
         const_cast<scalar_t*>(p.value_ptr + iter_key_start * p.v_strideM),
@@ -645,6 +645,148 @@ struct ModelStackSm80CausalPrefillKernel {
     mma_pv(kFullPvIterations, accum_o, iterator_v, accum_o);
   }
 
+  template <bool kFirstTile, bool kDiagonalTile>
+  static CUTLASS_DEVICE void attention_full_tile_64x64_rf(
+      SharedStorage& shared_storage,
+      Params& p,
+      int32_t iter_key_start,
+      int32_t query_start,
+      int16_t tid,
+      int8_t my_warp_id,
+      int8_t my_lane_id,
+      const typename MM0::IteratorA& base_iterator_a,
+      cutlass::MatrixCoord const& tb_offset_b,
+      typename MM0::Mma::Operator::IteratorC::TensorCoord const& iterator_c_tile_offset,
+      cutlass::MatrixCoord const& output_tile_coords,
+      const typename MM1FullTileIterator::Params& full_v_params,
+      cutlass::Array<accum_t, kQueriesPerBlock>& mi,
+      cutlass::Array<accum_t, kQueriesPerBlock>& m_prime,
+      cutlass::Array<accum_t, kQueriesPerBlock>& s_prime,
+      cutlass::Array<accum_t, kQueriesPerBlock>& out_rescale,
+      typename MM1::Mma::FragmentC& accum_o) {
+    auto iterator_a = base_iterator_a;
+    auto iterator_b =
+        make_k_iterator<true>(p, iter_key_start, tid, tb_offset_b, int32_t(kKeysPerBlock));
+
+    typename MM0::Mma mma(
+        shared_storage.mm0,
+        tid,
+        my_warp_id,
+        my_lane_id);
+    typename MM0::Mma::FragmentC accum;
+    accum.clear();
+
+    static_assert(
+        kMaxK % MM0::Mma::Shape::kK == 0,
+        "SM80 causal prefill fast lane expects head_dim == 64 to map cleanly onto MM0");
+    constexpr int kQkGemmIterations = kMaxK / MM0::Mma::Shape::kK;
+    mma(kQkGemmIterations, accum, iterator_a, iterator_b, accum);
+    __syncthreads();
+
+    if constexpr (kDiagonalTile) {
+      prologue_v_tile<true>(
+          shared_storage,
+          p,
+          iter_key_start,
+          tid,
+          int32_t(kKeysPerBlock));
+    } else {
+      prologue_v_tile_full_64x64_rf(
+          shared_storage,
+          full_v_params,
+          p,
+          iter_key_start,
+          tid);
+    }
+
+    if constexpr (kDiagonalTile) {
+      auto lane_offset = MM0::AccumLambdaIterator::get_lane_offset(
+          my_lane_id,
+          my_warp_id,
+          iterator_c_tile_offset);
+      int32_t last_col;
+      MM0::AccumLambdaIterator::iterateRows(
+          lane_offset,
+          [&](int accum_m) {
+            last_col = query_start + accum_m - iter_key_start;
+          },
+          [&](int accum_m, int accum_n, int idx) {
+            if (accum_n > last_col) {
+              accum[idx] = -cutlass::platform::numeric_limits<accum_t>::infinity();
+            }
+          },
+          [&](int accum_m) {});
+    }
+
+    if constexpr (kDiagonalTile) {
+      iterative_softmax_64x64_rf<
+          false,
+          kFirstTile,
+          typename MM0::Mma::Operator::IteratorC>(
+          accum_o,
+          accum,
+          mi,
+          m_prime,
+          s_prime,
+          out_rescale,
+          shared_storage.addition_storage,
+          my_lane_id,
+          tid,
+          my_warp_id,
+          int32_t(kKeysPerBlock),
+          kFirstTile,
+          iterator_c_tile_offset,
+          p.scale);
+    } else {
+      iterative_softmax_64x64_rf<
+          true,
+          kFirstTile,
+          typename MM0::Mma::Operator::IteratorC>(
+          accum_o,
+          accum,
+          mi,
+          m_prime,
+          s_prime,
+          out_rescale,
+          shared_storage.addition_storage,
+          my_lane_id,
+          tid,
+          my_warp_id,
+          int32_t(kKeysPerBlock),
+          kFirstTile,
+          iterator_c_tile_offset,
+          p.scale);
+    }
+
+    MM0::B2bGemm::accumToSmem(
+        shared_storage.after_mm0.si,
+        accum,
+        my_lane_id,
+        output_tile_coords);
+    __syncthreads();
+
+    if constexpr (kDiagonalTile) {
+      mma_pv_tile<true>(
+          shared_storage,
+          p,
+          iter_key_start,
+          tid,
+          my_warp_id,
+          my_lane_id,
+          int32_t(kKeysPerBlock),
+          accum_o);
+    } else {
+      mma_pv_tile_full_64x64_rf(
+          shared_storage,
+          p,
+          iter_key_start,
+          tid,
+          my_warp_id,
+          my_lane_id,
+          accum_o);
+    }
+  }
+
   static void CUTLASS_DEVICE attention_kernel(Params& p) {
     extern __shared__ char smem_buffer[];
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
@@ -652,7 +794,8 @@ struct ModelStackSm80CausalPrefillKernel {
     auto& s_prime = shared_storage.s_prime;
     auto& mi = shared_storage.mi;
     auto& out_rescale = shared_storage.out_rescale;
-    const uint32_t query_start = blockIdx.x * kQueriesPerBlock;
+    const int32_t query_start =
+        static_cast<int32_t>(blockIdx.x * kQueriesPerBlock);
 
     static_assert(kQueriesPerBlock < kNumWarpsPerBlock * kWarpSize, "");
     if (thread_id() < kQueriesPerBlock) {
@@ -703,6 +846,132 @@ struct ModelStackSm80CausalPrefillKernel {
     const auto output_tile_coords = cutlass::MatrixCoord{
         warp_idx_mn_0 % MM0::Mma::Base::WarpCount::kM,
         warp_idx_mn_0 / MM0::Mma::Base::WarpCount::kM};
+    const typename MM1FullTileIterator::Params full_v_params{
+        MM1::LayoutB(p.v_strideM)};
+    const auto base_iterator_a = full_query_tile
+        ? make_q_iterator<true>(p, tid, tb_offset_a, problem_size_0_m)
+        : make_q_iterator<false>(p, tid, tb_offset_a, problem_size_0_m);
+    if constexpr (kQueriesPerBlock == 64 && kKeysPerBlock == 64 && kMaxK == 64) {
+      if (full_query_tile && (p.num_keys & int32_t(kKeysPerBlock - 1)) == 0) {
+        if (query_start == 0) {
+          attention_full_tile_64x64_rf<true, true>(
+              shared_storage,
+              p,
+              0,
+              query_start,
+              tid,
+              my_warp_id,
+              my_lane_id,
+              base_iterator_a,
+              tb_offset_b,
+              iterator_c_tile_offset,
+              output_tile_coords,
+              full_v_params,
+              mi,
+              m_prime,
+              s_prime,
+              out_rescale,
+              accum_o);
+        } else {
+          attention_full_tile_64x64_rf<true, false>(
+              shared_storage,
+              p,
+              0,
+              query_start,
+              tid,
+              my_warp_id,
+              my_lane_id,
+              base_iterator_a,
+              tb_offset_b,
+              iterator_c_tile_offset,
+              output_tile_coords,
+              full_v_params,
+              mi,
+              m_prime,
+              s_prime,
+              out_rescale,
+              accum_o);
+          for (int32_t iter_key_start = int32_t(kKeysPerBlock);
+               iter_key_start < query_start;
+               iter_key_start += int32_t(kKeysPerBlock)) {
+            attention_full_tile_64x64_rf<false, false>(
+                shared_storage,
+                p,
+                iter_key_start,
+                query_start,
+                tid,
+                my_warp_id,
+                my_lane_id,
+                base_iterator_a,
+                tb_offset_b,
+                iterator_c_tile_offset,
+                output_tile_coords,
+                full_v_params,
+                mi,
+                m_prime,
+                s_prime,
+                out_rescale,
+                accum_o);
+          }
+          attention_full_tile_64x64_rf<false, true>(
+              shared_storage,
+              p,
+              query_start,
+              query_start,
+              tid,
+              my_warp_id,
+              my_lane_id,
+              base_iterator_a,
+              tb_offset_b,
+              iterator_c_tile_offset,
+              output_tile_coords,
+              full_v_params,
+              mi,
+              m_prime,
+              s_prime,
+              out_rescale,
+              accum_o);
+        }
+
+        using DefaultEpilogue = typename MM1::DefaultEpilogue;
+        using DefaultOp = typename MM1::DefaultConfig::EpilogueOutputOp;
+        using ElementCompute = typename DefaultOp::ElementCompute;
+        using EpilogueOutputOp =
+            typename cutlass::epilogue::thread::MemoryEfficientAttentionNormalize<
+                output_t,
+                accum_t,
+                DefaultOp::kCount,
+                typename DefaultOp::ElementAccumulator,
+                accum_t,
+                true,
+                true,
+                cutlass::Array<ElementCompute, kQueriesPerBlock>>;
+        using Epilogue =
+            typename cutlass::epilogue::threadblock::EpiloguePipelined<
+                typename DefaultEpilogue::Shape,
+                typename MM1::Mma::Operator,
+                DefaultEpilogue::kPartitionsK,
+                typename MM1::OutputTileIterator,
+                typename DefaultEpilogue::AccumulatorFragmentIterator,
+                typename DefaultEpilogue::WarpTileIterator,
+                typename DefaultEpilogue::SharedLoadIterator,
+                EpilogueOutputOp,
+                typename DefaultEpilogue::Padding,
+                DefaultEpilogue::kFragmentsPerIteration,
+                true,
+                typename MM1::OutputTileIteratorAccum>;
+
+        auto dest_iter = create_output_iter(0);
+        EpilogueOutputOp rescale(s_prime, out_rescale);
+        Epilogue epilogue(
+            shared_storage.epilogue_shared_storage(),
+            tid,
+            my_warp_id,
+            my_lane_id);
+        epilogue(rescale, dest_iter, accum_o);
+        return;
+      }
+    }
 
     for (int32_t iter_key_start = 0; iter_key_start < p.num_keys; iter_key_start += kKeysPerBlock) {
       const int32_t remaining_keys = p.num_keys - iter_key_start;
@@ -711,12 +980,9 @@ struct ModelStackSm80CausalPrefillKernel {
           full_key_tile ? int32_t(kKeysPerBlock) : remaining_keys;
       const int32_t problem_size_1_k = problem_size_0_n;
       const bool full_tile_extent = full_query_tile && full_key_tile;
-      const bool diagonal_tile =
-          iter_key_start >= int32_t(query_start);
+      const bool diagonal_tile = iter_key_start == query_start;
 
-      auto iterator_a = full_query_tile
-          ? make_q_iterator<true>(p, tid, tb_offset_a, problem_size_0_m)
-          : make_q_iterator<false>(p, tid, tb_offset_a, problem_size_0_m);
+      auto iterator_a = base_iterator_a;
 
       auto iterator_b = full_key_tile
           ? make_k_iterator<true>(p, iter_key_start, tid, tb_offset_b, problem_size_0_n)
@@ -742,6 +1008,7 @@ struct ModelStackSm80CausalPrefillKernel {
           if (!diagonal_tile) {
             prologue_v_tile_full_64x64_rf(
                 shared_storage,
+                full_v_params,
                 p,
                 iter_key_start,
                 tid);
@@ -1021,14 +1288,14 @@ inline bool TryLaunchModelStackSm80InferenceAttentionKernel(
   params.head_dim_value = static_cast<int32_t>(desc.head_dim);
   params.num_queries = static_cast<int32_t>(desc.q_len);
   params.num_keys = static_cast<int32_t>(desc.kv_len);
-  params.q_strideM = static_cast<int32_t>(desc.head_dim);
-  params.k_strideM = static_cast<int32_t>(desc.head_dim);
-  params.v_strideM = static_cast<int32_t>(desc.head_dim);
-  params.o_strideM = static_cast<int32_t>(desc.head_dim);
-  params.q_strideB = static_cast<int64_t>(desc.q_len * desc.head_dim);
-  params.k_strideB = static_cast<int64_t>(desc.kv_len * desc.head_dim);
-  params.v_strideB = static_cast<int64_t>(desc.kv_len * desc.head_dim);
-  params.o_strideB = static_cast<int64_t>(desc.q_len * desc.head_dim);
+  params.q_strideM = static_cast<int32_t>(q_contig.stride(2));
+  params.k_strideM = static_cast<int32_t>(k_contig.stride(2));
+  params.v_strideM = static_cast<int32_t>(v_contig.stride(2));
+  params.o_strideM = static_cast<int32_t>(out.stride(2));
+  params.q_strideB = static_cast<int64_t>(q_contig.stride(1));
+  params.k_strideB = static_cast<int64_t>(k_contig.stride(1));
+  params.v_strideB = static_cast<int64_t>(v_contig.stride(1));
+  params.o_strideB = static_cast<int64_t>(out.stride(1));
   params.num_batches = static_cast<int32_t>(desc.batch * desc.q_heads);
 
   if (!Kernel::check_supported(params)) {

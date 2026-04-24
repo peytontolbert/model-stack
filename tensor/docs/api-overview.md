@@ -4,7 +4,7 @@ This is a high-level map of modules and notable functions/classes exposed by `te
 
 ### Activations (`tensor/activations.py`)
 - `gelu`, `silu`, `bias_gelu`, `bias_silu`
-- Variants: `fast_gelu`, `quick_gelu`, `mish`, `tanh_gelu`, `swiglu`, `geglu`, `reglu`
+- Variants: `leaky_relu_0p5_squared`, `fast_gelu`, `quick_gelu`, `mish`, `tanh_gelu`, `swiglu`, `geglu`, `reglu`
 
 ### Norms (`tensor/norms.py`)
 - Modules: `RMSNorm`, `ScaleNorm`
@@ -89,5 +89,4 @@ This is a high-level map of modules and notable functions/classes exposed by `te
 
 ### Arena/checkpoint/einsum/debug
 - `TensorArena`, `remat`, `checkpoint_sequential`, `plan_einsum`, numerical/debug guards and checks
-
 

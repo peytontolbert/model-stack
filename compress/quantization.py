@@ -20,6 +20,8 @@ from runtime.ops import pack_bitnet_weight as runtime_pack_bitnet_weight
 from runtime.quant import bitnet_linear as runtime_bitnet_linear
 from runtime.quant import bitnet_int8_linear_from_float as runtime_bitnet_int8_linear_from_float
 from runtime.quant import bitnet_linear_from_float as runtime_bitnet_linear_from_float
+from runtime.quant import _dequantize_int8_activation
+from runtime.quant import _dequantize_int8_weight
 from runtime.quant import _should_use_eager_autograd_fallback
 from runtime.quant import nf4_dequantize as runtime_nf4_dequantize
 from runtime.quant import nf4_linear as runtime_nf4_linear
@@ -61,17 +63,29 @@ def _reshape_channel_values(values: torch.Tensor, like: torch.Tensor, ch_axis: i
 def _parameter_signature(tensor: torch.Tensor | None):
     if tensor is None:
         return None
+    version = 0
+    try:
+        version = int(getattr(tensor, "_version", 0))
+    except Exception:
+        version = 0
     return (
         str(tensor.device),
         str(tensor.dtype),
         tuple(tensor.shape),
-        int(getattr(tensor, "_version", 0)),
+        version,
         int(tensor.data_ptr()),
     )
 
 
 def _spin_enabled(spin_enabled_flag: torch.Tensor) -> bool:
     return bool(int(spin_enabled_flag.item()) != 0)
+
+
+def _tensor_version_safe(tensor: torch.Tensor) -> int:
+    try:
+        return int(getattr(tensor, "_version", 0))
+    except Exception:
+        return 0
 
 
 def _power_of_two_segments(size: int) -> tuple[int, ...]:
@@ -2137,6 +2151,8 @@ class QuantizedLinearBitNet(nn.Module):
         self._cached_int8_backend_key: tuple[object, ...] | None = None
         self._cached_int8_backend_qweight: torch.Tensor | None = None
         self._cached_int8_backend_inv_scale: torch.Tensor | None = None
+        self._cached_int8_dense_weight_key: tuple[object, ...] | None = None
+        self._cached_int8_dense_weight: torch.Tensor | None = None
         self._cached_shared_int8_input_signature_key: tuple[object, ...] | None = None
         self._cached_shared_int8_input_signature: tuple[object, ...] | None = None
         self._cached_spin_enabled_key: tuple[object, ...] | None = None
@@ -2157,6 +2173,8 @@ class QuantizedLinearBitNet(nn.Module):
         self._cached_int8_backend_key = None
         self._cached_int8_backend_qweight = None
         self._cached_int8_backend_inv_scale = None
+        self._cached_int8_dense_weight_key = None
+        self._cached_int8_dense_weight = None
         self._cached_shared_int8_input_signature_key = None
         self._cached_shared_int8_input_signature = None
         self._cached_spin_enabled_key = None
@@ -2587,6 +2605,46 @@ class QuantizedLinearBitNet(nn.Module):
             self._cached_int8_backend_key = key
         return self._cached_int8_backend_qweight, self._cached_int8_backend_inv_scale
 
+    def _dequantized_int8_backend_weight(
+        self,
+        dtype: torch.dtype,
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        target_device = self.packed_weight.device if device is None else torch.device(device)
+        qweight, inv_scale = self._int8_backend_weight(device=target_device)
+        key = (
+            str(target_device),
+            str(dtype),
+            tuple(qweight.shape),
+            tuple(inv_scale.shape),
+            _tensor_version_safe(qweight),
+            _tensor_version_safe(inv_scale),
+            int(qweight.data_ptr()) if qweight.numel() > 0 else 0,
+            int(inv_scale.data_ptr()) if inv_scale.numel() > 0 else 0,
+        )
+        if self._cached_int8_dense_weight_key != key or self._cached_int8_dense_weight is None:
+            self._cached_int8_dense_weight = _dequantize_int8_weight(
+                qweight,
+                inv_scale,
+                dtype=dtype,
+            ).to(device=target_device, dtype=dtype).contiguous()
+            self._cached_int8_dense_weight_key = key
+        return self._cached_int8_dense_weight
+
+    def _prefer_dynamic_int8_dense_decode_fallback(self, x: torch.Tensor) -> bool:
+        if not x.is_cuda or x.ndim < 2:
+            return False
+        rows = int(x.numel() // max(int(x.shape[-1]), 1))
+        if rows <= 0 or rows > 8:
+            return False
+        if self._pre_scale_active_runtime():
+            return False
+        # Production decode fallback is intentionally 8-bit only. Sub-8-bit
+        # dynamic decode still relies on the native int8-from-float path and
+        # needs separate policy work if we want it to route differently.
+        return int(self.in_features) >= 2048 or int(self.out_features) >= 2048
+
     def runtime_packed_linear_signature(self, backend: str):
         if not self.runtime_supports_packed_backend(backend):
             return None
@@ -2831,32 +2889,43 @@ class QuantizedLinearBitNet(nn.Module):
         return self
 
     def runtime_linear(self, x: torch.Tensor, *, backend: str | None = None) -> torch.Tensor:
-        del backend
         mode_name = str(self.act_quant_mode).strip().lower()
         target_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
         target_device = x.device
 
-        if (
-            mode_name in {"", "none", "off"}
-            and x.is_cuda
-            and not self._spin_enabled_runtime()
-            and not self._pre_scale_active_runtime()
-            and not _should_use_eager_autograd_fallback(x, self.bias)
-        ):
-            module = native_module()
-            if (
-                has_native_op("bitnet_linear_module")
-                and module is not None
-                and hasattr(module, "bitnet_linear_module_forward")
-            ):
-                return module.bitnet_linear_module_forward(
-                    x.to(device=target_device, dtype=target_dtype),
-                    self,
-                )
+        if mode_name in {"", "none", "off"}:
+            x_local = x.to(device=target_device, dtype=target_dtype)
+            spin_enabled = self._spin_enabled_runtime()
+            pre_scale_active = self._pre_scale_active_runtime()
+            if not spin_enabled and not pre_scale_active:
+                weight = self._dequantized_weight(target_dtype, device=target_device)
+                bias = None if self.bias is None else self.bias.to(device=target_device, dtype=target_dtype)
+                backend_name = str(backend or "auto").strip().lower()
+                if backend_name in {"", "auto", "aten"}:
+                    return torch.nn.functional.linear(x_local, weight, bias)
+                return runtime_linear(x_local, weight, bias, backend=backend)
+            bias = self.runtime_bias(dtype=target_dtype, device=target_device)
+            weight = self.runtime_weight(dtype=target_dtype, device=target_device)
+            if backend is None:
+                return runtime_linear(x_local, weight, bias)
+            return runtime_linear(x_local, weight, bias, backend=backend)
 
         if self._uses_int8_packed_backend():
+            backend_name = str(backend or "auto").strip().lower()
+            if (
+                mode_name == "dynamic_int8"
+                and backend_name in {"", "auto", "aten"}
+                and self._prefer_dynamic_int8_dense_decode_fallback(x)
+                and not self._spin_enabled_runtime()
+                and int(self.act_quant_bits) == 8
+            ):
+                x_local = x.to(device=target_device, dtype=target_dtype)
+                weight = self._dequantized_int8_backend_weight(target_dtype, device=target_device)
+                bias = self.runtime_bias(dtype=target_dtype, device=target_device)
+                return torch.nn.functional.linear(x_local, weight, bias)
             qweight, inv_scale = self._int8_backend_weight(device=target_device)
-            pre_scale = self.pre_scale.to(device=target_device) if self._pre_scale_active_runtime() else None
+            pre_scale_active = self._pre_scale_active_runtime()
+            pre_scale = self.pre_scale.to(device=target_device) if pre_scale_active else None
             act_scale = self.act_scale.to(device=target_device) if mode_name == "static_int8" else None
             return runtime_bitnet_int8_linear_from_float(
                 x.to(device=target_device, dtype=target_dtype),

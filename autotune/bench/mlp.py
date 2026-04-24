@@ -30,7 +30,7 @@ def bench_mlp(hidden_size: int, ff_size: int, activations: List[str] | None = No
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     B, T = 4, 256
     x = torch.randn(B, T, hidden_size, device=device, dtype=dtype)
-    acts = activations or ["silu", "gelu", "swiglu", "geglu", "reglu"]
+    acts = activations or ["silu", "gelu", "leaky_relu_0p5_squared", "swiglu", "geglu", "reglu"]
     results: List[Tuple[str, float]] = []
     for act in acts:
         try:
@@ -41,6 +41,5 @@ def bench_mlp(hidden_size: int, ff_size: int, activations: List[str] | None = No
             continue
     results.sort(key=lambda x: x[1])
     return results
-
 
 

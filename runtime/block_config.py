@@ -14,7 +14,7 @@ class BlockConfig:
     n_kv_heads: Optional[int] = None
     norm_policy: Literal["prenorm", "postnorm"] = "prenorm"
     norm_type: Literal["rms", "layer"] = "rms"
-    activation: Literal["gelu", "silu", "swiglu", "geglu", "reglu"] = "swiglu"
+    activation: Literal["gelu", "silu", "swiglu", "geglu", "reglu", "leaky_relu_0p5_squared"] = "swiglu"
     resid_dropout: float = 0.0
     attn_dropout: float = 0.0
     mlp_dropout: float = 0.0

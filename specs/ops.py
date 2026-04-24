@@ -9,6 +9,7 @@ CATEGORIES: Dict[str, Dict[str, Callable]] = {
     "activations": {
         "gelu": T.gelu,
         "silu": T.silu,
+        "leaky_relu_0p5_squared": T.leaky_relu_0p5_squared,
         "fast_gelu": T.fast_gelu,
         "quick_gelu": T.quick_gelu,
         "mish": T.mish,
@@ -212,5 +213,4 @@ def list_ops(category: Optional[str] = None) -> Dict[str, Iterable[str]]:
     if category is None:
         return {k: tuple(v.keys()) for k, v in CATEGORIES.items()}
     return {category: tuple(CATEGORIES.get(category, {}).keys())}
-
 

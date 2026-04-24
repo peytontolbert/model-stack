@@ -85,7 +85,7 @@ def main() -> None:
     parser.add_argument("--dtype", type=str, default="bf16")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--activation-quant", type=str, default="dynamic_int8")
-    parser.add_argument("--activation-quant-bits", type=int, default=6)
+    parser.add_argument("--activation-quant-bits", type=int, default=8)
     parser.add_argument("--activation-quant-method", type=str, default="absmax")
     parser.add_argument("--activation-quant-percentile", type=float, default=0.999)
     parser.add_argument("--spin", action="store_true")

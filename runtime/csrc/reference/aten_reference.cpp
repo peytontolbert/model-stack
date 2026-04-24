@@ -2,6 +2,7 @@
 
 #include <ATen/ops/gelu.h>
 #include <ATen/ops/index_select.h>
+#include <ATen/ops/leaky_relu.h>
 #include <ATen/ops/linear.h>
 #include <ATen/ops/relu.h>
 #include <ATen/ops/silu.h>
@@ -33,6 +34,11 @@ torch::Tensor ApplyActivationReference(
   }
   if (act == "relu" || act == "reglu") {
     return at::relu(x);
+  }
+  if (act == "leaky_relu_0p5_squared" || act == "leaky-relu-0p5-squared" ||
+      act == "leaky_relu_0.5_squared" || act == "leaky-relu-0.5-squared") {
+    auto y = at::leaky_relu(x, 0.5);
+    return y * y;
   }
   return at::gelu(x, "none");
 }
