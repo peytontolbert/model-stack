@@ -5,6 +5,7 @@
 *.log
 *.pth
 *.pt
+*.ptz
 *.safetensors
 *.so
 __pycache__/
@@ -12,6 +13,7 @@ __pycache__/
 build/
 experiments/
 checkpoints/
+artifacts/
 cloned-repos/
 examples/repo_grounded_adapters/artifacts/
 examples/repo_grounded_adapters/smoke_repo/
