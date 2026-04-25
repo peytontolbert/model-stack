@@ -1,10 +1,90 @@
-### Description
+# Model Stack
 
-This repository is a modular, production‑oriented model stack that cleanly separates the concerns required to train, serve, and evaluate large language models. It defines stable contracts (versioned configs, tensor/shape specs, KV‑cache API, kernel registry, checkpoints, and streaming data) and organizes implementations into focused domains (attention, blocks, data, training, serving, evaluation, kernels, distribution, export, and observability), with supporting areas for compression, autotuning, interpretability, governance, RAG, and packaging. The split enables swappable implementations, targeted performance work, and reproducible artifacts without churn across the rest of the system.
+Model Stack is a transformer runtime and training stack built for measurable
+systems work: custom CUDA kernels, paged KV cache, packed BitNet/ternary
+execution, quantization, export, and H100 benchmarking.
 
-### Native CUDA Build
+The core advantage is that performance work lands in a real runtime instead of
+staying as isolated kernels. The same repository contains model assembly,
+generation, native dispatch, compression/export, tests, and restartable H100
+recipes, so an optimization can be trained, packed, exported, benchmarked, and
+served without rewriting glue code.
 
-The runtime C++/CUDA extension is optional and is only built when explicitly enabled:
+## Why Model Stack
+
+- Beats Hugging Face Transformers BitNet module execution on H100 for the
+  focused projection and `lm_head` benchmark.
+- Keeps packed BitNet/ternary weights in runtime-owned formats instead of
+  paying Python/module overhead at every layer.
+- Uses native paged KV cache and a decode-side SDPA bridge to keep long-context
+  decode fast at 1024/2048/4096 context.
+- Provides restartable 8xH100 Parameter Golf scripts for training runtime-row
+  ternary artifacts and exporting them into the Model Stack runtime bundle.
+- Keeps CUDA kernels, runtime policy, export verification, and source-surface
+  tests in one tree so benchmark wins are reproducible.
+
+## H100 Benchmark Wins
+
+Focused BitNet module benchmark against `microsoft/bitnet-b1.58-2B-4T` through
+Transformers:
+
+| Module | Transformers BitNet | Model Stack | Speedup |
+| --- | ---: | ---: | ---: |
+| `q_proj` | 0.0771 ms | 0.0413 ms | 1.87x |
+| `o_proj` | 0.0779 ms | 0.0411 ms | 1.89x |
+| `gate_proj` | 0.0774 ms | 0.0408 ms | 1.90x |
+| `down_proj` | 0.0801 ms | 0.0432 ms | 1.85x |
+| `lm_head` | 0.2252 ms | 0.1238 ms | 1.82x |
+
+Native 4-layer decode benchmark with packed BitNet runtime:
+
+| Context / batch | Dense BF16 reference | Model Stack BitNet | Speedup |
+| --- | ---: | ---: | ---: |
+| 1024 / batch 4 | 2.411 ms | 2.336 ms | 1.03x |
+| 2048 / batch 2 | 2.595 ms | 2.573 ms | 1.01x |
+| 4096 / batch 1 | 1.656 ms | 1.619 ms | 1.02x |
+
+Paged decode attention on the H100 path also moved from the old custom paged
+kernel path to the SDPA-bridged native-cache path, reducing the 4096-context
+4-layer decode run from roughly 33.75 ms to 1.62 ms.
+
+## Repository Layout
+
+| Path | Purpose |
+| --- | --- |
+| `specs/` | versioned configs, tensor specs, export schemas |
+| `tensor/` | stateless tensor utilities: init, masks, RoPE, numerics |
+| `attn/` | attention modules, masks, KV cache contracts |
+| `blocks/` | transformer block wiring, norms, MLPs, residual policies |
+| `model/` and `runtime/` | model assembly, generation, native runtime dispatch |
+| `kernel/` and `runtime/csrc/` | CUDA/C++ kernels and extension bindings |
+| `compress/` | quantization, BitNet, LoRA, pruning, compression deltas |
+| `data/` and `corpus/` | tokenization, sharding, datasets, corpus tooling |
+| `train/` and `dist/` | training loops, optimizers, distributed launch helpers |
+| `eval/` and `tests/` | correctness, source-surface tests, perf harnesses |
+| `serve/` | decode loops, sampling, paged cache serving pieces |
+| `export/` | TorchScript/ONNX/export flows and metadata |
+| `governance/` | SBOMs, checksums, receipts, lineage, model cards |
+| `examples/` | reproducible demos and operational recipes |
+
+## Setup
+
+Create an environment with PyTorch and the dependencies needed for the part of
+the stack you are using, then run tests or examples from the repo root.
+
+```bash
+python -m pytest tests/test_runtime_paged_attention_source_surface.py -q
+python examples/00_tiny_lm/run.py
+```
+
+The repository intentionally keeps large generated artifacts out of Git. Model
+outputs, packed bundles, logs, and training artifacts should live under ignored
+paths such as `artifacts/`, `checkpoints/`, or machine-local storage.
+
+## Native CUDA Build
+
+The C++/CUDA runtime extension is optional. Build it explicitly when you need
+native kernels:
 
 ```bash
 MODEL_STACK_BUILD_NATIVE=1 \
@@ -13,296 +93,121 @@ MODEL_STACK_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0+PTX" \
 python setup.py build_ext --inplace
 ```
 
-Build environment notes:
-
-- `MODEL_STACK_CUDA_ARCH_LIST` is a repo-local alias for `TORCH_CUDA_ARCH_LIST`. If `TORCH_CUDA_ARCH_LIST` is already set, PyTorch's value wins.
-- `MODEL_STACK_MAX_JOBS` is a repo-local alias for PyTorch/Ninja's `MAX_JOBS`.
-- `MODEL_STACK_USE_NINJA=0` disables the Ninja backend if you need the slower setuptools fallback.
-- `MODEL_STACK_CUTLASS_PATH=/path/to/cutlass` enables optional CUTLASS-backed kernels; if omitted, setup also checks CUTLASS copies bundled in the `ai` conda environment.
-- The patched `setup.py` validates CUDA 13.x architecture targets and rejects pre-Turing entries (`< 7.5`), matching NVIDIA's CUDA 13 release notes.
-- On Windows with CUDA 13.1 or newer, install the NVIDIA driver separately; it is no longer bundled with the CUDA Toolkit installer.
-
-If you do not set an architecture list explicitly, PyTorch's extension tooling defaults to building for the visible GPU architectures plus PTX. For reproducible CI or wheel builds, set `MODEL_STACK_CUDA_ARCH_LIST` or `TORCH_CUDA_ARCH_LIST` explicitly.
-
-Runtime dispatch notes:
-
-- Native embedding is enabled by default when the extension is available; use `MODEL_STACK_DISABLE_CUDA_EMBEDDING_NATIVE=1` to force the PyTorch fallback.
-- Native add+LayerNorm is shape-gated by default; tune `MODEL_STACK_CUDA_ADD_LAYER_NORM_NATIVE_MIN_ROWS` or use `MODEL_STACK_DISABLE_CUDA_ADD_LAYER_NORM_NATIVE=1` / `MODEL_STACK_ENABLE_CUDA_ADD_LAYER_NORM_NATIVE=1` for experiments.
-- The SM80/Ada native prefill attention lane is opt-in with `MODEL_STACK_PREFER_NATIVE_SM80_INFERENCE_ATTENTION=1` until its CUDA implementation consistently beats PyTorch SDPA in benchmarks. The experimental local FlashAttention-style lane is separately opt-in with `MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_FLASH=1`.
-
-Current constellation (by plane)
-Foundations (math, shapes, kernels)
-
-attn — MHA/GQA/MQA, masks, KV-cache interface/paging shims
-
-autotune — HP search, schedule factories, kernel picking
-
-blocks — norms/MLP/residual wiring, block policies (pre/post-norm)
-
-compress — quant/prune/LoRA deltas, KV compaction
-
-corpus — corpus curation, dedup/PII/licensing, manifests
-
-data — tokenizers, iterable datasets, sharding/mmap/collation
-
-dist — DDP/FSDP/ZeRO strategies, offload, launchers
-
-eval — benchmarks, metrics, perf/latency harness
-
-examples — e2e demos & smoke tests
-
-experiments — research scripts, configs, and ablations
-
-export — TorchScript/ONNX/TensorRT, PTQ/FP8, model-card w/ hashes
-
-governance — lineage, SBOM, license packs, reproducibility receipts
-
-interpret — logit lens, causal tracing, SAE/feature dictionaries
-
-kernel — Triton/CUDA/Flash-Attn adapters + registry
-
-model — Encoder/Decoder/LM-Head assemblers, checkpoint I/O
-
-pack — SDK/CLIs/templates, config validators, env bootstrap
-
-rag — retrieval bridges (indexes, chunkers, caches, tool spec)
-
-registry — artifact registry (promotions, retention, signatures)
-
-rl — SFT/DPO/ORPO/RLHF trainers, reward models, preference data I/O
-
-safety — policy-as-code, guardrails, red-team suites
-
-serve — decode loops (greedy/beam/speculative), paged caches, server
-
-specs — configs, tensor/shape/dtype contracts, schema/versioning
-
-tensor — stateless numerics (init, masking, RoPE/ALiBi, residual math)
-
-train — trainers, optim/schedules, AMP, gradient ckpt
-
-viz — scalars, activation probes, profiler traces (TB/W&B/CSV)
-
-
-
-Model graph (attention → blocks → model)
-
-
-Data, training, serving, eval
-
-Scale, artifactization, observability
-
-Safety, data quality, compression, autotune, interpretability, governance, DX
-
-
------------------------
-Core Contracts (stable across repos)
-
-Config: versioned @dataclass schemas in specs. JSON/YAML load/dump; schema migration utilities.
-
-TensorSpec: shape/dtype/layout descriptors to prevent drift ((B,T,D), (H,KV,T,Dh), etc.).
-
-Cache API: opaque KVCache handle (append/read/evict/paging) with no globals.
-
-Kernel Registry: kernel exposes KernelRegistry looked up by symbolic names in attn.
-
-Checkpoint: model writes/reads a layout-aware state dict + ModelCard metadata.
-
-StreamingData: data yields Batch objects with masks/positions normalized to specs.
-
-
-Assembly Paths
-Inference Path (Runtime)
-sequenceDiagram
-  participant D as data
-  participant M as model
-  participant A as attn
-  participant K as kernel
-  participant S as serve
-
-  D->>M: Batch(input_ids, attn_mask)
-  M->>A: qkv + mask per block
-  A->>K: resolve("flash") → fused kernel
-  K-->>A: attn_out
-  A-->>M: attn_out
-  M-->>S: logits
-  S-->>S: decode loop (KV cache)
-
-Training Path (Orchestration)
-flowchart LR
-  G[data Dataloader] --> T[train Trainer]
-  F[model TransformerLM] --> T
-  T -->|loss/ckpt| E[eval Metrics]
-  T -->|state_dict| F
-
-Why this split scales
-
-Swappable implementations without churn: attention rewrites (e.g., Flash-Decoding, paged KV) don’t perturb blocks/model/training.
-
-Performance experiments are sandboxed: kernel can evolve (Triton/CUDA) with a stable registry shim.
-
-Interop is explicit: one source of truth for shapes/config (specs), one for checkpoints (model).
-
-Operational clarity: training (train) vs. serving (serve) evolve independently (very different constraints).
-
-Versioning & Compatibility Matrix
-
-specs MAJOR bumps ripple outward (requires minor bumps elsewhere).
-
-kernel may add implementations without breaking attn as long as names/semantics hold.
-
-model checkpoint ModelCard.version gates loader behavior; provide migration utilities (v1→v2).
-
-serve guarantees ABI for generate() (sampler interface) across minor versions.
-
-CI/CD Touchpoints (per-repo)
-
-Unit: shapes, dtype flows, numerical invariants (grad checks in tensor, KV append/read in attn).
-
-Property: determinism under fixed seeds, loss non-increase with no-op migrations.
-
-Perf: microbenchmarks pinned in kernel + macro e2e in eval.
-
-Artifacts: wheels w/ CUDA extras for kernel (pip install kernel[cuda12x]).
-
-Example: Building a small LM from the 10 repos
-from specs.config import ModelConfig
-from model import TransformerLM
-from data.loader import build_dataloader
-from train.trainer import Trainer
-from serve.generate import generate
-from eval.metrics import perplexity
-
-cfg = ModelConfig(d_model=512, n_heads=8, n_layers=8, d_ff=2048, vocab_size=32000, attn_impl="flash")
-
-model = TransformerLM(cfg).cuda()
-dl = build_dataloader("/corpus/shards", batch_size=8, seq_len=1024)
-trainer = Trainer(model, cfg, dl)
-
-for step, batch in enumerate(dl):
-    loss = trainer.step(batch)
-    if step % 100 == 0:
-        print("ppl:", perplexity(loss))
-
-# Inference
-out = generate(model, batch.input_ids[:1].cuda(), max_new_tokens=64)
-
-Extensions (future repos if you need them)
-
-dist (distributed/FSdp wrappers), export (ONNX/TensorRT), viz (activation probes). But the 10 above are sufficient for a clean, production-oriented split.
-
-Quickstart Snippets
-1) Scale training across 8 GPUs (FSDP + bf16)
-torchrun --nproc_per_node=8 -m train.run \
-  --config cfgs/llm_small.yaml \
-  --dist.strategy FSDP --dist.precision bf16 --dist.grad_ckpt true \
-  --viz.backend csv --viz.profile_every_n_steps 500
-
-2) Export ONNX + int8 PTQ for server
-from export.exporter import export
-from specs.export import ExportConfig
-out = export(model, ExportConfig(target="onnx", opset=19, quantize="int8", dynamic_axes=True, outdir="artifacts/"), vocab_size=32000, d_model=cfg.d_model)
-print("artifact:", out)  # artifacts/model.onnx + modelcard.json
-
-3) Instrument a serve loop
-from viz.session import VizSession
-viz = VizSession(cfg.viz)
-tokens = generate_instrumented(model, input_ids, viz=viz, max_new_tokens=128, step=global_step)
-
-Why these three repos help
-
-dist lets you chase bigger context / deeper stacks without refactoring your trainer—just a strategy switch.
-
-export gives repeatable, verifiable deployables with hashes and model cards—critical for supply-chain trust.
-
-viz makes bottlenecks visible (math, memory, or serving), so optimization becomes targeted, not guesswork.
-
-Governance (artifacts + CI gate)
-
-Where to wire it in:
-
-- Train end: write a reproducibility receipt and lineage graph next to the latest checkpoint.
-- Export step: after producing deployable artifacts, generate SBOM + checksums/signatures and a model card.
-- CI gate: verify expected artifacts exist before releasing or serving.
-- Serve packaging: include the artifacts directory in the image/tarball for traceability.
-
-Minimal commands:
+Useful build variables:
+
+- `MODEL_STACK_CUDA_ARCH_LIST`: repo-local alias for `TORCH_CUDA_ARCH_LIST`.
+  If `TORCH_CUDA_ARCH_LIST` is already set, PyTorch's value wins.
+- `MODEL_STACK_MAX_JOBS`: repo-local alias for PyTorch/Ninja `MAX_JOBS`.
+- `MODEL_STACK_USE_NINJA=0`: use the slower setuptools fallback.
+- `MODEL_STACK_CUTLASS_PATH=/path/to/cutlass`: enable optional CUTLASS-backed
+  kernels.
+
+For H100-only work, build with:
 
 ```bash
-# SBOM from current env (SPDX 2.3)
-python -m governance sbom --out artifacts/SBOM.spdx.json --name $MODEL_NAME
+MODEL_STACK_BUILD_NATIVE=1 \
+MODEL_STACK_BUILD_CUDA=1 \
+MODEL_STACK_CUDA_ARCH_LIST="9.0" \
+MODEL_STACK_MAX_JOBS=4 \
+python setup.py build_ext --inplace
+```
 
-# Checksums (and optional Ed25519 signatures if you have a 32-byte key)
+## Runtime Flags
+
+Common dispatch controls:
+
+- `MODEL_STACK_DISABLE_CUDA_EMBEDDING_NATIVE=1`: force PyTorch embedding.
+- `MODEL_STACK_DISABLE_CUDA_ADD_LAYER_NORM_NATIVE=1`: force PyTorch add+norm.
+- `MODEL_STACK_ENABLE_CUDA_ADD_LAYER_NORM_NATIVE=1`: force native add+norm for
+  experiments.
+- `MODEL_STACK_PREFER_NATIVE_SM80_INFERENCE_ATTENTION=1`: opt into the SM80/Ada
+  native prefill attention lane.
+- `MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_FLASH=1`: opt into the local
+  experimental SM80 FlashAttention-style prefill lane.
+- `MODEL_STACK_PAGED_DECODE_SDPA_MAX_LENGTH=8192`: max decode cache length for
+  the paged decode SDPA bridge.
+- `MODEL_STACK_DISABLE_PAGED_DECODE_SDPA_BRIDGE=1`: disable the paged decode
+  SDPA bridge and use the older paged decode kernel/fallback path.
+
+## Examples
+
+See [examples/README.md](examples/README.md) for runnable demos.
+
+Important current examples:
+
+- `examples/00_tiny_lm/`: tiny LM training smoke
+- `examples/02_int8_export/`: tiny export and quantization smoke
+- `examples/03_fsdp_8gpu/`: multi-GPU launcher notes
+- `examples/11_compress_quantize/`: weight-only quantization demo
+- `examples/13_parameter_golf_h100/`: restartable 8xH100 Parameter Golf
+  ternary training/export recipe
+
+Parameter Golf H100 quick start:
+
+```bash
+cd /root/transformer_10_h100
+bash examples/13_parameter_golf_h100/build_runtime_h100.sh
+
+PG_DIR=/root/parameter_golf \
+PG_PRESET=runtime_row_1024 \
+bash examples/13_parameter_golf_h100/run_pg_8xh100.sh
+```
+
+Export the trained ternary artifact:
+
+```bash
+PG_DIR=/root/parameter_golf \
+ARTIFACT=/root/parameter_golf/final_model.ternary.ptz \
+OUT=/root/transformer_10_h100/artifacts/parameter_golf/final_model.runtime_bitnet.pt \
+bash examples/13_parameter_golf_h100/export_runtime_bundle.sh
+```
+
+## Minimal Usage
+
+```python
+from specs.config import ModelConfig
+from runtime.factory import build_causal_lm
+
+cfg = ModelConfig(
+    d_model=512,
+    n_heads=8,
+    n_layers=8,
+    d_ff=2048,
+    vocab_size=32000,
+    dtype="bf16",
+)
+
+model = build_causal_lm(cfg, block="llama")
+```
+
+For a complete smoke run:
+
+```bash
+python example.py
+```
+
+## Governance Utilities
+
+The `governance/` package can emit release metadata for artifacts:
+
+```bash
+python -m governance sbom --out artifacts/SBOM.spdx.json --name "$MODEL_NAME"
 python -m governance sign --files artifacts/model.onnx artifacts/tokenizer.json \
   --out artifacts/CHECKSUMS.sha256 --key path/to/ed25519.key
-
-# Reproducibility receipt (system, env, packages, git)
 python -m governance receipt --artifacts artifacts/model.onnx \
   --out artifacts/RECEIPT.json --metadata train/metadata.json
-
-# Lineage graph from training metadata (writes .dot and optional .png if graphviz available)
 python -m governance lineage --metadata train/metadata.json --out artifacts/LINEAGE.dot
-
-# Model card (Markdown + JSON sidecar)
 python -m governance card artifacts/model.onnx --metadata train/metadata.json \
   --sbom artifacts/SBOM.spdx.json --out artifacts/MODEL_CARD.md
-
-# CI verify (fails if any governance artifacts are missing)
 python -m governance verify artifacts/model.onnx
 ```
 
-Typical integration points:
+## Compatibility Notes
 
-- train/trainer.py: on checkpoint save, emit RECEIPT.json and LINEAGE.dot
-- export/exporter.py: after write, emit SBOM.spdx.json, CHECKSUMS.sha256, MODEL_CARD.md
-- .github/workflows/release.yml: run `python -m governance verify` before publishing assets
-- serve/Dockerfile or pack step: copy artifacts/ into image and surface MODEL_CARD.md
-
-flowchart LR
-  subgraph Data Plane
-    C[corpus] --> D[data]
-  end
-
-  subgraph Model Plane
-    A[specs] --> F[model]
-    B[kernel] --> E[attn]
-    E --> G[blocks] --> F
-    F --> H[train] --> I[eval]
-    F --> J[serve]
-  end
-
-  subgraph Ops & Safety
-    K[safety] --> J
-    K --> H
-    L[compress] --> F
-    L --> M[export]
-    N[autotune] --> H
-    O[interpret] --> I
-    P[governance] --> M
-    Q[pack] --> H
-    Q --> J
-    R[examples] --> Q
-  end
-
-  A --> K
-  A --> N
-  A --> P
-
-Examples
-
-1) Minimal end-to-end sample (train a few steps, then generate)
-python example.py
-
-2) Build a tiny toy shard, then run the minimal sample
-python -m corpus.cli build \
-  --input ./raw_corpus \
-  --outdir ./corpus/shards \
-  --tokenizer gpt2 \
-  --shard-size-tokens 1048576 \
-  --redact-pii --dedup
-python example.py
-
-3) Blocks-only model assembly reference
-See blocks/examples/example_lm.py for constructing a stack from `LlamaBlock`/`GPTBlock`.
-
-For the roadmap of larger, reproducible examples, see examples/README.md.
+- `specs/` schema major-version changes are expected to ripple outward.
+- Kernel implementations can change as long as runtime names and semantics are
+  preserved.
+- Checkpoint loaders should gate behavior on model-card/checkpoint versions and
+  provide migrations for incompatible layouts.
+- Serving entry points should keep generation and sampler interfaces stable
+  across minor changes.
