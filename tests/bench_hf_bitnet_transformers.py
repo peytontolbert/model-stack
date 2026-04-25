@@ -175,10 +175,11 @@ def _bench_module_pair(
     iters: int,
     repeats: int,
     use_cuda_events: bool,
+    backend: str | None,
 ) -> BenchResult:
     with torch.inference_mode():
         hf_out = hf_module(x)
-        kernel_out = bitnet_module.runtime_linear(x)
+        kernel_out = bitnet_module.runtime_linear(x, backend=backend)
     max_abs_err = float((hf_out - kernel_out).abs().max().item())
     repeat_count = max(int(repeats), 1)
     hf_runs = [
@@ -188,7 +189,7 @@ def _bench_module_pair(
     kernel_runs = [
         float(
             _timeit(
-                lambda: bitnet_module.runtime_linear(x),
+                lambda: bitnet_module.runtime_linear(x, backend=backend),
                 warmup=warmup,
                 iters=iters,
                 use_cuda_events=use_cuda_events,
@@ -217,6 +218,7 @@ def main() -> None:
     parser.add_argument("--mode", type=str, choices=("prefill", "decode"), default="decode")
     parser.add_argument("--modules", type=str, default="q_proj,o_proj,gate_proj,down_proj,lm_head")
     parser.add_argument("--activation-quant", type=str, default="dynamic_int8")
+    parser.add_argument("--backend", type=str, default=None)
     parser.add_argument("--prompt", type=str, default="Explain why RoPE scaling matters for long-context decode.")
     parser.add_argument("--prompt-repeat", type=int, default=1)
     parser.add_argument("--max-prompt-tokens", type=int, default=256)
@@ -272,6 +274,7 @@ def main() -> None:
             iters=int(args.iters),
             repeats=int(args.repeats),
             use_cuda_events=not bool(args.no_cuda_events),
+            backend=args.backend,
         )
         results.append(result)
 
@@ -283,6 +286,7 @@ def main() -> None:
         "mode": str(args.mode),
         "layer": int(args.layer),
         "activation_quant": str(args.activation_quant),
+        "backend": args.backend,
         "prompt_repeat": max(int(args.prompt_repeat), 1),
         "max_prompt_tokens": int(args.max_prompt_tokens) if args.max_prompt_tokens is not None else None,
         "warmup": int(args.warmup),
@@ -317,6 +321,7 @@ def main() -> None:
     print(f"mode={args.mode}")
     print(f"layer={int(args.layer)}")
     print(f"activation_quant={args.activation_quant}")
+    print(f"backend={args.backend}")
     print(f"prompt_repeat={max(int(args.prompt_repeat), 1)}")
     print(f"repeats={int(args.repeats)}")
     print(f"modules={','.join(module_names)}")

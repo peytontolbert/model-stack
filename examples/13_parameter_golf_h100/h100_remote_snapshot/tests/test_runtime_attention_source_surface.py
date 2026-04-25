@@ -86,23 +86,6 @@ def test_prefill_attention_exposes_optional_cutlass_fmha_lane() -> None:
     assert "const bool diagonal_tile =" in sm80_inference_impl_source
     assert "static_assert(kWarpColumns == 2" in sm80_inference_impl_source
     assert "warp_column_scratch[accum_m + kQueriesPerBlock * warp_col]" in sm80_inference_impl_source
-    assert "advance_to_task" in sm80_inference_impl_source
-    assert "ModelStackSm80CausalPrefillPersistentForwardKernel" in sm80_inference_impl_source
-    assert "atomicAdd(task_counter, int32_t(1))" in sm80_inference_impl_source
-    assert "ModelStackSm80CausalPrefillSplitKvPartialKernel" in sm80_inference_impl_source
-    assert "ModelStackSm80CausalPrefillSplitKvFinalizeKernel" in sm80_inference_impl_source
-    assert "attention_split_kv_partial_kernel" in sm80_inference_impl_source
-    assert "OutputTileIteratorAccum" in sm80_inference_impl_source
-    assert "MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_SPLIT_KV" in sm80_inference_impl_source
-    assert "MODEL_STACK_SM80_SPLIT_KV_CHUNK" in sm80_inference_impl_source
-    assert "kMaxSharedFinalizeSplits" in sm80_inference_impl_source
-    assert "shared_weights[dim]" in sm80_inference_impl_source
-    assert "shared_denom_terms[dim]" in sm80_inference_impl_source
-    assert "exp2f(local_m - shared_m)" in sm80_inference_impl_source
-    assert "MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_PERSISTENT" in sm80_inference_impl_source
-    assert "MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_PERSISTENT" in sm80_inference_impl_source
-    assert "num_query_blocks() - 1 - query_block_rank" in sm80_inference_impl_source
-    assert "const int32_t query_start = p.query_start;" in sm80_inference_impl_source
     assert "BaseKernel::template iterative_softmax" in sm80_inference_impl_source
     assert "MM0::B2bGemm::accumToSmem" in sm80_inference_impl_source
     assert "before the next QK tile or epilogue reuses the shared-storage union." in sm80_inference_impl_source

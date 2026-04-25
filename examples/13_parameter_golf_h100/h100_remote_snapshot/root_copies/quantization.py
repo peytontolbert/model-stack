@@ -2641,8 +2641,6 @@ class QuantizedLinearBitNet(nn.Module):
             return False
         if self._pre_scale_active_runtime():
             return False
-        if int(self.out_features) >= 32768:
-            return False
         # Production decode fallback is intentionally 8-bit only. Sub-8-bit
         # dynamic decode still relies on the native int8-from-float path and
         # needs separate policy work if we want it to route differently.

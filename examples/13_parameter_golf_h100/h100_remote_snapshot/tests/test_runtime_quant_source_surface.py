@@ -502,7 +502,6 @@ def test_native_bitnet_cuda_kernel_sources_are_registered_in_source() -> None:
     assert "\"_compute_backend_weight\"" in native_source
     assert "\"_decode_backend_weight\"" in native_source
     assert "\"_int8_backend_weight\"" in native_source
-    assert "if int(self.out_features) >= 32768:" in compress_source
     assert "CudaBitNetLinearForwardComputePacked(" in native_source
     assert "CudaBitNetRmsNormLinearForwardRow1(" in native_source
     assert "CudaBitNetAddRmsNormLinearForwardRow1(" in native_source

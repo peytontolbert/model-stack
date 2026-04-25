@@ -30,6 +30,8 @@ End-to-end demos and reproducible scripts for training, evaluation, export, inte
   Run: `python examples/11_compress_quantize/run.py`
 - `12_data_tokenize_shard/`: tokenizer encode/decode smoke
   Run: `python examples/12_data_tokenize_shard/run.py`
+- `13_parameter_golf_h100/`: H100 Parameter Golf ternary train/export recipe
+  See: [13_parameter_golf_h100/README.md](13_parameter_golf_h100/README.md)
 
 ### Larger Example Trees
 

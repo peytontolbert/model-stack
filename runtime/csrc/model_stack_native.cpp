@@ -7,6 +7,7 @@
 #include <ATen/ops/layer_norm.h>
 #include <ATen/ops/leaky_relu.h>
 #include <ATen/ops/relu.h>
+#include <ATen/ops/scaled_dot_product_attention.h>
 #include <ATen/ops/silu.h>
 
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -801,6 +803,15 @@ int64_t HopperDenseBitNetDecodeFusedAppendMaxCacheLength() {
   return std::max<int64_t>(
       0,
       EnvInt64OrDefault("MODEL_STACK_HOPPER_DENSE_DECODE_FUSED_APPEND_MAX_CACHE_LENGTH", 4096));
+}
+
+int64_t PagedDecodeSdpaMaxLength() {
+  if (EnvFlagEnabled("MODEL_STACK_DISABLE_PAGED_DECODE_SDPA_BRIDGE")) {
+    return 0;
+  }
+  return std::max<int64_t>(
+      0,
+      EnvInt64OrDefault("MODEL_STACK_PAGED_DECODE_SDPA_MAX_LENGTH", 8192));
 }
 
 std::string ResolveLinearBackend(const std::string& requested) {
@@ -3876,6 +3887,67 @@ std::vector<torch::Tensor> ResolveRotaryEmbeddingRangeForward(
 
 torch::Tensor ToAdditiveMask(const torch::Tensor& mask);
 
+torch::Tensor PagedKvReadRangeForwardTrusted(
+    const torch::Tensor& pages,
+    const torch::Tensor& block_table_safe,
+    const torch::Tensor& lengths_long,
+    int64_t start,
+    int64_t end) {
+  const auto gather_seq = end - start;
+  auto out = torch::zeros({block_table_safe.size(0), pages.size(1), gather_seq, pages.size(3)}, pages.options());
+  if (block_table_safe.size(0) == 0 || gather_seq == 0) {
+    return out;
+  }
+#if MODEL_STACK_WITH_CUDA
+  if (pages.is_cuda() && block_table_safe.is_cuda() && lengths_long.is_cuda() && HasCudaKvCacheKernel()) {
+    return CudaPagedKvReadRangeForward(pages, block_table_safe, lengths_long, start, end);
+  }
+#endif
+  return PagedKvReadRangeForward(pages, block_table_safe, lengths_long, start, end);
+}
+
+c10::optional<torch::Tensor> TryPagedAttentionDecodeSdpaBridgeForward(
+    const torch::Tensor& q,
+    const torch::Tensor& k_pages,
+    const torch::Tensor& v_pages,
+    const torch::Tensor& block_table_safe,
+    const torch::Tensor& lengths_long,
+    int64_t max_len,
+    const c10::optional<torch::Tensor>& attn_mask,
+    const c10::optional<double>& scale) {
+  const int64_t sdpa_max_len = PagedDecodeSdpaMaxLength();
+  if (sdpa_max_len <= 0 || max_len <= 0 || max_len > sdpa_max_len ||
+      !q.is_cuda() || !k_pages.is_cuda() || !v_pages.is_cuda() ||
+      !block_table_safe.is_cuda() || !lengths_long.is_cuda()) {
+    return c10::nullopt;
+  }
+
+  auto k = PagedKvReadRangeForwardTrusted(k_pages, block_table_safe, lengths_long, 0, max_len);
+  auto v = PagedKvReadRangeForwardTrusted(v_pages, block_table_safe, lengths_long, 0, max_len);
+  c10::optional<torch::Tensor> sdpa_mask = c10::nullopt;
+  if (attn_mask.has_value() && attn_mask.value().defined()) {
+    auto invalid = torch::arange(max_len, lengths_long.options()).view({1, 1, 1, max_len}) >=
+        lengths_long.view({q.size(0), 1, 1, 1});
+    auto mask = attn_mask.value();
+    sdpa_mask = mask.scalar_type() == torch::kBool ? ToAdditiveMask(mask) : mask.to(torch::kFloat32);
+    sdpa_mask = sdpa_mask.value().to(q.scalar_type());
+    sdpa_mask = sdpa_mask.value().masked_fill(invalid, -std::numeric_limits<float>::infinity());
+  } else if (q.size(0) > 1) {
+    auto invalid = torch::arange(max_len, lengths_long.options()).view({1, 1, 1, max_len}) >=
+        lengths_long.view({q.size(0), 1, 1, 1});
+    sdpa_mask = ToAdditiveMask(invalid).to(q.scalar_type());
+  }
+  return at::scaled_dot_product_attention(
+      q,
+      k,
+      v,
+      sdpa_mask,
+      0.0,
+      false,
+      scale.has_value() ? std::optional<double>(scale.value()) : std::nullopt,
+      q.size(1) != k.size(1));
+}
+
 torch::Tensor NativeAttentionForward(
     const torch::Tensor& q,
     const torch::Tensor& k,
@@ -3953,6 +4025,11 @@ torch::Tensor PagedAttentionDecodeForward(
   const auto max_len = lengths_long.numel() > 0 ? lengths_long.max().item<int64_t>() : 0;
   if (max_len <= 0 || q.size(0) == 0) {
     return torch::zeros_like(q);
+  }
+
+  if (auto bridged = TryPagedAttentionDecodeSdpaBridgeForward(
+          q, k_pages, v_pages, block_table_safe, lengths_long, max_len, attn_mask, scale)) {
+    return bridged.value();
   }
 
 #if MODEL_STACK_WITH_CUDA
@@ -8330,12 +8407,16 @@ c10::optional<torch::Tensor> NativeCachePagedAttentionDecodeLayer(
                                const c10::optional<torch::Tensor>& normalized_mask,
                                int64_t known_mask_seq) -> c10::optional<torch::Tensor> {
 #if MODEL_STACK_WITH_CUDA
+    auto block_table_safe = block_table.to(torch::kLong).contiguous();
+    auto lengths_long = lengths.to(torch::kLong).contiguous().view(-1);
+    if (auto bridged = TryPagedAttentionDecodeSdpaBridgeForward(
+            q, k_pages, v_pages, block_table_safe, lengths_long, known_mask_seq, normalized_mask, scale)) {
+      return bridged;
+    }
     if (q.is_cuda() && k_pages.is_cuda() && v_pages.is_cuda() && block_table.is_cuda() && lengths.is_cuda() &&
         (!normalized_mask.has_value() || !normalized_mask.value().defined() || normalized_mask.value().is_cuda()) &&
         HasCudaPagedAttentionDecodeKernel()) {
-      auto block_table_safe = block_table.to(torch::kLong).contiguous();
       block_table_safe.clamp_min_(0);
-      auto lengths_long = lengths.to(torch::kLong).contiguous().view(-1);
       return CudaPagedAttentionDecodeForward(
           q,
           k_pages,

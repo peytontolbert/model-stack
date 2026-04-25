@@ -42,6 +42,11 @@ def test_native_runtime_exposes_paged_attention_decode_kernel_surface() -> None:
     assert '{"paged_attention_decode", true}' in native_source
     assert '"paged_attention_decode", "attention_decode"' in native_source
     assert "torch::Tensor PagedAttentionDecodeForward(" in native_source
+    assert "PagedDecodeSdpaMaxLength()" in native_source
+    assert "MODEL_STACK_DISABLE_PAGED_DECODE_SDPA_BRIDGE" in native_source
+    assert "TryPagedAttentionDecodeSdpaBridgeForward(" in native_source
+    assert "PagedKvReadRangeForwardTrusted(" in native_source
+    assert "at::scaled_dot_product_attention(" in native_source
     assert "torch::Tensor CudaPagedAttentionDecodeForward(" in native_source
     assert "bool HasCudaPagedAttentionDecodeKernel();" in native_source
     assert "bool HasCudaPagedAttentionDecodeKernel() {" in native_source
