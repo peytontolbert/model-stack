@@ -43,6 +43,22 @@ torch::Tensor ApplyActivationReference(
   return at::gelu(x, "none");
 }
 
+std::pair<torch::Tensor, torch::Tensor> ExpandAttentionKvHeadsReference(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v) {
+  auto k_all = k;
+  auto v_all = v;
+  if (q.size(1) != k.size(1)) {
+    const auto repeat = q.size(1) / k.size(1);
+    auto head_index = torch::arange(k.size(1), torch::TensorOptions().dtype(torch::kLong).device(k.device()))
+                          .repeat_interleave(repeat);
+    k_all = at::index_select(k, 1, head_index);
+    v_all = at::index_select(v, 1, head_index);
+  }
+  return {k_all, v_all};
+}
+
 }  // namespace
 
 torch::Tensor ReferenceLinearForward(
@@ -81,15 +97,7 @@ torch::Tensor ReferenceAttentionForward(
     const c10::optional<torch::Tensor>& attn_mask,
     bool is_causal,
     const c10::optional<double>& scale) {
-  auto k_all = k;
-  auto v_all = v;
-  if (q.size(1) != k.size(1)) {
-    const auto repeat = q.size(1) / k.size(1);
-    auto head_index = torch::arange(k.size(1), torch::TensorOptions().dtype(torch::kLong).device(k.device()))
-                          .repeat_interleave(repeat);
-    k_all = at::index_select(k, 1, head_index);
-    v_all = at::index_select(v, 1, head_index);
-  }
+  auto [k_all, v_all] = ExpandAttentionKvHeadsReference(q, k, v);
 
   const double scale_value = scale.has_value() ? scale.value() : (1.0 / std::sqrt(static_cast<double>(q.size(3))));
   auto scores = torch::matmul(q, k_all.transpose(-2, -1)) * scale_value;
@@ -112,4 +120,88 @@ torch::Tensor ReferenceAttentionForward(
 
   auto probs = torch::softmax(scores.to(torch::kFloat32), -1).to(q.scalar_type());
   return torch::matmul(probs, v_all);
+}
+
+torch::Tensor ReferenceAttentionPartitionedForward(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    const c10::optional<double>& scale,
+    int64_t kv_chunk_size) {
+  TORCH_CHECK(kv_chunk_size > 0, "ReferenceAttentionPartitionedForward: kv_chunk_size must be positive");
+
+  auto [k_all, v_all] = ExpandAttentionKvHeadsReference(q, k, v);
+
+  const double scale_value =
+      scale.has_value() ? scale.value() : (1.0 / std::sqrt(static_cast<double>(q.size(3))));
+  const auto tgt_len = q.size(2);
+  const auto src_len = k_all.size(2);
+  const auto float_opts = q.options().dtype(torch::kFloat32);
+  auto running_max = torch::full({q.size(0), q.size(1), tgt_len, 1}, -std::numeric_limits<float>::infinity(), float_opts);
+  auto running_denom = torch::zeros({q.size(0), q.size(1), tgt_len, 1}, float_opts);
+  auto numerator = torch::zeros({q.size(0), q.size(1), tgt_len, v_all.size(3)}, float_opts);
+
+  const auto v_float = v_all.to(torch::kFloat32);
+
+  for (int64_t chunk_start = 0; chunk_start < src_len; chunk_start += kv_chunk_size) {
+    const auto chunk_len = std::min<int64_t>(kv_chunk_size, src_len - chunk_start);
+    auto k_chunk = k_all.narrow(2, chunk_start, chunk_len);
+    auto v_chunk = v_float.narrow(2, chunk_start, chunk_len);
+
+    auto scores =
+        torch::matmul(q, k_chunk.transpose(-2, -1)).to(torch::kFloat32) * static_cast<float>(scale_value);
+
+    if (attn_mask.has_value() && attn_mask.value().defined()) {
+      auto mask_chunk = attn_mask.value().narrow(-1, chunk_start, chunk_len);
+      if (mask_chunk.scalar_type() == torch::kBool) {
+        scores = scores.masked_fill(mask_chunk, -std::numeric_limits<float>::infinity());
+      } else {
+        scores = scores + mask_chunk.to(torch::kFloat32);
+      }
+    }
+
+    if (is_causal && tgt_len > 1) {
+      auto q_pos = torch::arange(tgt_len, torch::TensorOptions().dtype(torch::kLong).device(q.device()))
+                       .view({tgt_len, 1});
+      auto k_pos = torch::arange(
+                       chunk_start,
+                       chunk_start + chunk_len,
+                       torch::TensorOptions().dtype(torch::kLong).device(q.device()))
+                       .view({1, chunk_len});
+      auto causal = k_pos > q_pos;
+      scores = scores.masked_fill(causal.view({1, 1, tgt_len, chunk_len}), -std::numeric_limits<float>::infinity());
+    }
+
+    auto local_max = std::get<0>(scores.max(-1, true));
+    auto safe_local_max = torch::where(
+        torch::isfinite(local_max),
+        local_max,
+        torch::zeros_like(local_max));
+    auto exp_scores = torch::exp(scores - safe_local_max);
+    auto local_sum = exp_scores.sum(-1, true);
+    auto local_weighted = torch::matmul(exp_scores, v_chunk);
+
+    auto new_max = torch::maximum(running_max, local_max);
+    auto safe_new_max = torch::where(
+        torch::isfinite(new_max),
+        new_max,
+        torch::zeros_like(new_max));
+    auto alpha = torch::where(
+        torch::isfinite(running_max),
+        torch::exp(running_max - safe_new_max),
+        torch::zeros_like(running_max));
+    auto beta = torch::where(
+        torch::isfinite(local_max),
+        torch::exp(local_max - safe_new_max),
+        torch::zeros_like(local_max));
+
+    numerator = numerator * alpha + local_weighted * beta;
+    running_denom = running_denom * alpha + local_sum * beta;
+    running_max = new_max;
+  }
+
+  auto out = numerator / running_denom.clamp_min(1e-20f);
+  return out.to(q.scalar_type());
 }

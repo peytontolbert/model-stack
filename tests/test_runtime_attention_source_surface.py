@@ -40,15 +40,34 @@ def test_prefill_attention_exposes_optional_cutlass_fmha_lane() -> None:
     cutlass_source = _read("runtime/csrc/backend/attention/cuda_attention_cutlass_prefill.cuh")
     memeff_source = _read("runtime/csrc/backend/attention/cuda_attention_pytorch_memeff_prefill.cuh")
     memeff_impl_source = _read("runtime/csrc/backend/attention/cuda_attention_pytorch_memeff_prefill.cu")
+    flash_source = _read("runtime/csrc/backend/attention/cuda_attention_sm80_flash_prefill.cuh")
+    flash_impl_source = _read("runtime/csrc/backend/attention/cuda_attention_sm80_flash_prefill.cu")
+    policy_source = _read("runtime/csrc/policy/attention_policy.h")
     sm80_inference_source = _read("runtime/csrc/backend/attention/cuda_attention_sm80_inference_prefill.cuh")
     sm80_inference_impl_source = _read("runtime/csrc/backend/attention/cuda_attention_sm80_inference_prefill.cu")
     setup_source = _read("setup.py")
 
+    assert "TryLaunchModelStackSm80FlashAttentionPrefill<scalar_t, HeadDim>" in prefill_source
     assert "TryLaunchModelStackSm80InferenceAttentionPrefill<scalar_t, HeadDim>" in prefill_source
     assert "TryLaunchPyTorchMemEffAttentionPrefill<scalar_t, HeadDim>" in prefill_source
     assert "TryLaunchCutlassAttentionPrefill<scalar_t, HeadDim>" in prefill_source
     assert "const bool prefer_cutlass_for_strided_kv =" in prefill_source
     assert "if (prefer_cutlass_for_strided_kv) {" in prefill_source
+    assert "AttentionPrefillModelStackSm80FlashDisabled" in flash_source
+    assert "t10::policy::AttentionSm80FlashPrefillDisabled()" in flash_source
+    assert "t10::policy::AttentionSm80FlashPrefillMinSeq()" in flash_source
+    assert "t10::policy::SupportsAttentionSm80FlashPrefill(desc)" in flash_source
+    assert "t10::policy::PreferAttentionSm80FlashPrefill(desc)" in flash_source
+    assert "MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_FLASH" in policy_source
+    assert "MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_FLASH" in policy_source
+    assert "MODEL_STACK_SM80_FLASH_PREFILL_MIN_SEQ" in policy_source
+    assert policy_source.count("return 2688;") >= 2
+    assert "run_mha_fwd_hdim64" in flash_impl_source
+    assert "Flash_fwd_params params" in flash_impl_source
+    assert "SetModelStackSm80FlashFwdParams" in flash_impl_source
+    assert "AcquireModelStackSm80FlashSoftmaxLseWorkspace" in flash_impl_source
+    assert "std::unordered_map<" in flash_impl_source
+    assert "CUDACachingAllocator::recordStream" in flash_impl_source
     assert "AttentionPrefillModelStackSm80InferenceDisabled" in sm80_inference_source
     assert "MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_INFERENCE" in sm80_inference_source
     assert "MODEL_STACK_SM80_INFERENCE_PREFILL_KERNEL" in sm80_inference_source
@@ -67,8 +86,24 @@ def test_prefill_attention_exposes_optional_cutlass_fmha_lane() -> None:
     assert "const bool diagonal_tile =" in sm80_inference_impl_source
     assert "static_assert(kWarpColumns == 2" in sm80_inference_impl_source
     assert "warp_column_scratch[accum_m + kQueriesPerBlock * warp_col]" in sm80_inference_impl_source
+    assert "advance_to_task" in sm80_inference_impl_source
+    assert "ModelStackSm80CausalPrefillPersistentForwardKernel" in sm80_inference_impl_source
+    assert "atomicAdd(task_counter, int32_t(1))" in sm80_inference_impl_source
+    assert "ModelStackSm80CausalPrefillSplitKvPartialKernel" in sm80_inference_impl_source
+    assert "ModelStackSm80CausalPrefillSplitKvFinalizeKernel" in sm80_inference_impl_source
+    assert "attention_split_kv_partial_kernel" in sm80_inference_impl_source
+    assert "OutputTileIteratorAccum" in sm80_inference_impl_source
+    assert "MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_SPLIT_KV" in sm80_inference_impl_source
+    assert "MODEL_STACK_SM80_SPLIT_KV_CHUNK" in sm80_inference_impl_source
+    assert "exp2f(local_m - m)" in sm80_inference_impl_source
+    assert "exp2f(local_m - shared_m)" in sm80_inference_impl_source
+    assert "MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_PERSISTENT" in sm80_inference_impl_source
+    assert "MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_PERSISTENT" in sm80_inference_impl_source
+    assert "num_query_blocks() - 1 - query_block_rank" in sm80_inference_impl_source
+    assert "const int32_t query_start = p.query_start;" in sm80_inference_impl_source
     assert "BaseKernel::template iterative_softmax" in sm80_inference_impl_source
     assert "MM0::B2bGemm::accumToSmem" in sm80_inference_impl_source
+    assert "before the next QK tile or epilogue reuses the shared-storage union." in sm80_inference_impl_source
     assert "ModelStackSm80CausalPrefillForwardKernel<Kernel>" in sm80_inference_impl_source
     assert "return try_64x64();" in sm80_inference_impl_source
     assert "MM1FullTileRunnerFromSmem" not in sm80_inference_impl_source
@@ -100,9 +135,12 @@ def test_prefill_attention_exposes_optional_cutlass_fmha_lane() -> None:
     assert "MODEL_STACK_CUTLASS_PREFILL_QUERIES_PER_BLOCK" in cutlass_source
     assert "LaunchCutlassAttentionPrefillKernel<scalar_t, HeadDim, 128, 64>" in cutlass_source
     assert "MODEL_STACK_CUTLASS_PATH" in setup_source
+    assert "resolve_cutlass_path" in setup_source
     assert "MODEL_STACK_WITH_CUTLASS_FMHA" in setup_source
+    assert "MODEL_STACK_WITH_LOCAL_FLASH_STYLE_PREFILL" in setup_source
     assert "MODEL_STACK_PYTORCH_SOURCE_PATH" in setup_source
     assert "MODEL_STACK_WITH_PYTORCH_MEMEFF_FMHA" in setup_source
+    assert "runtime/csrc/backend/attention/cuda_attention_sm80_flash_prefill.cu" in setup_source
     assert "runtime/csrc/backend/attention/cuda_attention_sm80_inference_prefill.cu" in setup_source
     assert "runtime/csrc/backend/attention/cuda_attention_pytorch_memeff_prefill.cu" in setup_source
 
@@ -120,6 +158,10 @@ def test_attention_policy_prefers_smaller_prefill_row_threads_for_fixed_head_dim
     assert "return 128;" in source
     assert "inline bool SupportsAttentionSplitKv" in source
     assert "inline int SelectAttentionSplitKvSplits" in source
+    assert "inline bool AttentionSm80FlashPrefillDisabled()" in source
+    assert "inline int64_t AttentionSm80FlashPrefillMinSeq()" in source
+    assert "inline bool SupportsAttentionSm80FlashPrefill" in source
+    assert "inline bool PreferAttentionSm80FlashPrefill" in source
     assert "inline bool AttentionHasDeadTopLeftCausalKvTail" in source
     assert "inline int64_t AttentionEffectiveKvLen" in source
     assert "const int batch_nheads_mblocks =" in source
@@ -132,18 +174,36 @@ def test_attention_plan_info_exposes_split_kv_recommendation() -> None:
     native_source = _read("runtime/csrc/model_stack_native.cpp")
     ops_source = _read("runtime/ops.py")
     cuda_source = _read("runtime/csrc/backend/cuda_attention.cu")
+    reference_source = _read("runtime/csrc/reference/aten_reference.cpp")
     sm80_source = _read("runtime/csrc/backend/attention/cuda_attention_sm80_inference_prefill.cu")
     memeff_source = _read("runtime/csrc/backend/attention/cuda_attention_pytorch_memeff_prefill.cu")
     cutlass_source = _read("runtime/csrc/backend/attention/cuda_attention_cutlass_prefill.cuh")
 
+    assert "attention_partitioned_reference_forward" in native_source
+    assert "ReferenceAttentionPartitionedForward" in reference_source
+    assert "ExpandAttentionKvHeadsReference" in reference_source
+    assert "running_max = torch::full" in reference_source
+    assert "numerator = numerator * alpha + local_weighted * beta;" in reference_source
     assert 'info["effective_kv_len"]' in native_source
     assert 'info["trimmed_causal_tail"]' in native_source
+    assert 'info["attention_sm80_inference_prefill_compiled"]' in native_source
+    assert 'info["attention_pytorch_memeff_prefill_compiled"]' in native_source
+    assert 'info["attention_cutlass_prefill_compiled"]' in native_source
+    assert 'info["attention_sm80_flash_prefill_compiled"]' in native_source
+    assert 'info["attention_sm80_inference_prefill_kernel_family"]' in native_source
+    assert 'info["attention_sm80_flash_prefill_enable_env"]' in native_source
+    assert 'info["sm80_flash_prefill_disabled"]' in native_source
+    assert 'info["sm80_flash_prefill_min_seq"]' in native_source
+    assert 'info["sm80_flash_prefill_eligible"]' in native_source
+    assert 'info["sm80_flash_prefill_device_supported"]' in native_source
+    assert 'info["sm80_flash_prefill_selected"]' in native_source
     assert 'info["split_kv_eligible"]' in native_source
     assert 'info["split_kv_block_n"]' in native_source
     assert 'info["split_kv_num_m_blocks"]' in native_source
     assert 'info["split_kv_num_n_blocks"]' in native_source
     assert 'info["split_kv_effective_sms"]' in native_source
     assert 'info["split_kv_splits"]' in native_source
+    assert "PreferAttentionSm80FlashPrefill(desc)" in native_source
     assert "SelectAttentionSplitKvSplits(desc, effective_sms)" in native_source
     assert "const int64_t effective_kv_len = t10::policy::AttentionEffectiveKvLen(desc);" in cuda_source
     assert "initial_plan.kernel == t10::policy::AttentionKernelKind::kPrefillHdim64" in cuda_source
@@ -153,6 +213,11 @@ def test_attention_plan_info_exposes_split_kv_recommendation() -> None:
     assert "v_contig = v_contig.narrow(2, 0, effective_kv_len).contiguous();" in cuda_source
     assert '"effective_kv_len": int(k.shape[2])' in ops_source
     assert '"trimmed_causal_tail": bool(is_causal and attn_mask is None and q.shape[2] < k.shape[2])' in ops_source
+    assert '"sm80_flash_prefill_disabled": False' in ops_source
+    assert '"sm80_flash_prefill_min_seq": 0' in ops_source
+    assert '"sm80_flash_prefill_eligible": False' in ops_source
+    assert '"sm80_flash_prefill_device_supported": False' in ops_source
+    assert '"sm80_flash_prefill_selected": False' in ops_source
     assert '"split_kv_eligible": False' in ops_source
     assert '"split_kv_splits": 1' in ops_source
     assert "params.k_strideB = static_cast<int64_t>(k_contig.stride(1));" in sm80_source
@@ -160,3 +225,19 @@ def test_attention_plan_info_exposes_split_kv_recommendation() -> None:
     assert "params.q_strideB = static_cast<int64_t>(q_contig.stride(1));" in memeff_source
     assert "params.k_strideB = static_cast<int64_t>(k_contig.stride(1));" in memeff_source
     assert "params.k_strideB = static_cast<int64_t>(k_contig.stride(1));" in cutlass_source
+
+
+def test_decode_fused_dense_qkv_rotary_paged_append_is_guarded() -> None:
+    native_source = _read("runtime/csrc/model_stack_native.cpp")
+    kv_source = _read("runtime/csrc/backend/cuda_kv_cache.cu")
+
+    assert "projected_qkv_rotary_paged_write_kernel" in kv_source
+    assert "CudaProjectedQkvRotaryPagedWriteForward" in kv_source
+    assert "CudaProjectedQkvRotaryPagedWriteForward" in native_source
+    assert "AppendProjectedQkvRotary" in native_source
+    assert "NativeCacheAppendProjectedQkvRotaryLayer" in native_source
+    assert "ProjectPreparedAttentionOutput" in native_source
+    assert "x.size(0) >= 4" in native_source
+    assert "HopperDenseBitNetDecodeFusedAppendMaxCacheLength()" in native_source
+    assert "MODEL_STACK_HOPPER_DENSE_DECODE_FUSED_APPEND_MAX_CACHE_LENGTH" in native_source
+    assert "bitnet_hopper_dense_decode_fused_append_default_max_cache_length" in native_source

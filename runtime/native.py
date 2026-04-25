@@ -18,6 +18,7 @@ _FALLBACK_NATIVE_OPS = [
     "linear",
     "bitnet_transform_input",
     "bitnet_linear",
+    "bitnet_linear_compute_packed",
     "bitnet_linear_from_float",
     "bitnet_int8_linear_from_float",
     "bitnet_int8_fused_qkv_packed_heads_projection",
@@ -168,6 +169,13 @@ def runtime_status() -> NativeRuntimeStatus:
     )
 
 
+@lru_cache(maxsize=1)
+def _native_module_cached():
+    if not native_available():
+        return None
+    return importlib.import_module(NATIVE_MODULE_NAME)
+
+
 def native_available() -> bool:
     return runtime_status().available
 
@@ -194,19 +202,13 @@ def full_cuda_inference_available() -> bool:
 
 
 def native_module():
-    if not native_available():
-        return None
-    return importlib.import_module(NATIVE_MODULE_NAME)
+    return _native_module_cached()
 
 
 def has_native_op(name: str) -> bool:
-    module = native_module()
-    if module is None or not hasattr(module, "has_op"):
+    if not native_available():
         return False
-    try:
-        return bool(module.has_op(name))
-    except Exception:
-        return False
+    return str(name) in set(runtime_info().get("native_ops", ()))
 
 
 def resolve_linear_backend(requested: str | None = None) -> str:

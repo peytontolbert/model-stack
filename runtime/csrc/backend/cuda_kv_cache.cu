@@ -150,6 +150,123 @@ __global__ void paged_kv_write_forward_kernel(
   pages[page_offset_linear] = values[value_offset];
 }
 
+template <typename scalar_t, bool BatchedPositions>
+__global__ void paged_kv_write_forward_strided_values_kernel(
+    scalar_t* __restrict__ pages,
+    const int64_t* __restrict__ block_table,
+    const int64_t* __restrict__ positions,
+    const scalar_t* __restrict__ values,
+    int64_t batch,
+    int64_t max_blocks,
+    int64_t heads,
+    int64_t page_size,
+    int64_t write_seq,
+    int64_t head_dim,
+    int64_t value_s0,
+    int64_t value_s1,
+    int64_t value_s2,
+    int64_t value_s3) {
+  const int64_t total = batch * heads * write_seq * head_dim;
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+
+  const int64_t d = idx % head_dim;
+  const int64_t t = (idx / head_dim) % write_seq;
+  const int64_t h = (idx / (head_dim * write_seq)) % heads;
+  const int64_t b = idx / (head_dim * write_seq * heads);
+  const int64_t pos = BatchedPositions ? positions[b * write_seq + t] : positions[t];
+  const int64_t block_idx = pos / page_size;
+  const int64_t page_offset = pos % page_size;
+  const int64_t page_id = block_table[b * max_blocks + block_idx];
+
+  const int64_t page_offset_linear = (((page_id * heads) + h) * page_size + page_offset) * head_dim + d;
+  const int64_t value_offset = b * value_s0 + h * value_s1 + t * value_s2 + d * value_s3;
+  pages[page_offset_linear] = values[value_offset];
+}
+
+template <typename scalar_t>
+__global__ void projected_qkv_rotary_paged_write_kernel(
+    const scalar_t* __restrict__ projected,
+    const scalar_t* __restrict__ cos,
+    const scalar_t* __restrict__ sin,
+    scalar_t* __restrict__ k_pages,
+    scalar_t* __restrict__ v_pages,
+    const int64_t* __restrict__ block_table,
+    const int64_t* __restrict__ positions,
+    scalar_t* __restrict__ q_out,
+    int64_t batch,
+    int64_t max_blocks,
+    int64_t q_heads,
+    int64_t kv_heads,
+    int64_t page_size,
+    int64_t head_dim,
+    int64_t q_size,
+    int64_t k_size,
+    int64_t total_size) {
+  const int64_t half = head_dim / 2;
+  const int64_t q_elements = batch * q_heads * half;
+  const int64_t k_elements = batch * kv_heads * half;
+  const int64_t v_elements = batch * kv_heads * head_dim;
+  const int64_t total = q_elements + k_elements + v_elements;
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+
+  if (idx < q_elements) {
+    const int64_t col = idx % half;
+    const int64_t h = (idx / half) % q_heads;
+    const int64_t b = idx / (half * q_heads);
+    const int64_t projected_base = b * total_size + h * head_dim;
+    const int64_t out_base = ((b * q_heads + h) * head_dim);
+    const float cos_lo = static_cast<float>(cos[col]);
+    const float cos_hi = static_cast<float>(cos[half + col]);
+    const float sin_lo = static_cast<float>(sin[col]);
+    const float sin_hi = static_cast<float>(sin[half + col]);
+    const float q_lo = static_cast<float>(projected[projected_base + col]);
+    const float q_hi = static_cast<float>(projected[projected_base + half + col]);
+    q_out[out_base + col] = static_cast<scalar_t>((q_lo * cos_lo) - (q_hi * sin_lo));
+    q_out[out_base + half + col] = static_cast<scalar_t>((q_hi * cos_hi) + (q_lo * sin_hi));
+    return;
+  }
+
+  const int64_t cache_idx = idx - q_elements;
+  if (cache_idx < k_elements) {
+    const int64_t col = cache_idx % half;
+    const int64_t h = (cache_idx / half) % kv_heads;
+    const int64_t b = cache_idx / (half * kv_heads);
+    const int64_t pos = positions[b];
+    const int64_t block_idx = pos / page_size;
+    const int64_t page_offset = pos % page_size;
+    const int64_t page_id = block_table[b * max_blocks + block_idx];
+    const int64_t projected_base = b * total_size + q_size + h * head_dim;
+    const int64_t page_base = (((page_id * kv_heads) + h) * page_size + page_offset) * head_dim;
+    const float cos_lo = static_cast<float>(cos[col]);
+    const float cos_hi = static_cast<float>(cos[half + col]);
+    const float sin_lo = static_cast<float>(sin[col]);
+    const float sin_hi = static_cast<float>(sin[half + col]);
+    const float k_lo = static_cast<float>(projected[projected_base + col]);
+    const float k_hi = static_cast<float>(projected[projected_base + half + col]);
+    k_pages[page_base + col] = static_cast<scalar_t>((k_lo * cos_lo) - (k_hi * sin_lo));
+    k_pages[page_base + half + col] = static_cast<scalar_t>((k_hi * cos_hi) + (k_lo * sin_hi));
+    return;
+  }
+
+  const int64_t v_idx = cache_idx - k_elements;
+  const int64_t d = v_idx % head_dim;
+  const int64_t h = (v_idx / head_dim) % kv_heads;
+  const int64_t b = v_idx / (head_dim * kv_heads);
+  const int64_t pos = positions[b];
+  const int64_t block_idx = pos / page_size;
+  const int64_t page_offset = pos % page_size;
+  const int64_t page_id = block_table[b * max_blocks + block_idx];
+  const int64_t projected_offset = b * total_size + q_size + k_size + h * head_dim + d;
+  const int64_t page_offset_linear = (((page_id * kv_heads) + h) * page_size + page_offset) * head_dim + d;
+  v_pages[page_offset_linear] = projected[projected_offset];
+}
+
 template <typename scalar_t>
 __global__ void paged_kv_read_last_forward_kernel(
     const scalar_t* __restrict__ pages,
@@ -447,9 +564,11 @@ torch::Tensor CudaPagedKvWriteForward(
   auto pages_contig = pages.contiguous();
   auto block_table_contig = block_table.to(torch::kLong).contiguous();
   auto positions_contig = positions.to(torch::kLong).contiguous();
-  auto values_contig = values.contiguous();
+  const bool values_fast_contig = values.is_contiguous();
+  auto values_contig = values_fast_contig ? values : torch::Tensor();
+  const auto& values_ref = values_fast_contig ? values_contig : values;
   const auto write_seq = positions_contig.dim() == 1 ? positions_contig.size(0) : positions_contig.size(1);
-  const auto total = values_contig.numel();
+  const auto total = values_ref.numel();
   const dim3 blocks(static_cast<unsigned int>((total + kThreads - 1) / kThreads));
   const dim3 threads(kThreads);
   auto stream = c10::cuda::getCurrentCUDAStream(pages.get_device());
@@ -461,17 +580,35 @@ torch::Tensor CudaPagedKvWriteForward(
         pages_contig.scalar_type(),
         "model_stack_cuda_paged_kv_write_forward_shared",
         [&] {
-          paged_kv_write_forward_kernel<scalar_t, false><<<blocks, threads, 0, stream.stream()>>>(
-              pages_contig.data_ptr<scalar_t>(),
-              block_table_contig.data_ptr<int64_t>(),
-              positions_contig.data_ptr<int64_t>(),
-              values_contig.data_ptr<scalar_t>(),
-              block_table_contig.size(0),
-              block_table_contig.size(1),
-              pages_contig.size(1),
-              pages_contig.size(2),
-              write_seq,
-              pages_contig.size(3));
+          if (values_fast_contig) {
+            paged_kv_write_forward_kernel<scalar_t, false><<<blocks, threads, 0, stream.stream()>>>(
+                pages_contig.data_ptr<scalar_t>(),
+                block_table_contig.data_ptr<int64_t>(),
+                positions_contig.data_ptr<int64_t>(),
+                values_contig.data_ptr<scalar_t>(),
+                block_table_contig.size(0),
+                block_table_contig.size(1),
+                pages_contig.size(1),
+                pages_contig.size(2),
+                write_seq,
+                pages_contig.size(3));
+          } else {
+            paged_kv_write_forward_strided_values_kernel<scalar_t, false><<<blocks, threads, 0, stream.stream()>>>(
+                pages_contig.data_ptr<scalar_t>(),
+                block_table_contig.data_ptr<int64_t>(),
+                positions_contig.data_ptr<int64_t>(),
+                values.data_ptr<scalar_t>(),
+                block_table_contig.size(0),
+                block_table_contig.size(1),
+                pages_contig.size(1),
+                pages_contig.size(2),
+                write_seq,
+                pages_contig.size(3),
+                values.stride(0),
+                values.stride(1),
+                values.stride(2),
+                values.stride(3));
+          }
         });
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -480,22 +617,142 @@ torch::Tensor CudaPagedKvWriteForward(
         pages_contig.scalar_type(),
         "model_stack_cuda_paged_kv_write_forward_batched",
         [&] {
-          paged_kv_write_forward_kernel<scalar_t, true><<<blocks, threads, 0, stream.stream()>>>(
-              pages_contig.data_ptr<scalar_t>(),
-              block_table_contig.data_ptr<int64_t>(),
-              positions_contig.data_ptr<int64_t>(),
-              values_contig.data_ptr<scalar_t>(),
-              block_table_contig.size(0),
-              block_table_contig.size(1),
-              pages_contig.size(1),
-              pages_contig.size(2),
-              write_seq,
-              pages_contig.size(3));
+          if (values_fast_contig) {
+            paged_kv_write_forward_kernel<scalar_t, true><<<blocks, threads, 0, stream.stream()>>>(
+                pages_contig.data_ptr<scalar_t>(),
+                block_table_contig.data_ptr<int64_t>(),
+                positions_contig.data_ptr<int64_t>(),
+                values_contig.data_ptr<scalar_t>(),
+                block_table_contig.size(0),
+                block_table_contig.size(1),
+                pages_contig.size(1),
+                pages_contig.size(2),
+                write_seq,
+                pages_contig.size(3));
+          } else {
+            paged_kv_write_forward_strided_values_kernel<scalar_t, true><<<blocks, threads, 0, stream.stream()>>>(
+                pages_contig.data_ptr<scalar_t>(),
+                block_table_contig.data_ptr<int64_t>(),
+                positions_contig.data_ptr<int64_t>(),
+                values.data_ptr<scalar_t>(),
+                block_table_contig.size(0),
+                block_table_contig.size(1),
+                pages_contig.size(1),
+                pages_contig.size(2),
+                write_seq,
+                pages_contig.size(3),
+                values.stride(0),
+                values.stride(1),
+                values.stride(2),
+                values.stride(3));
+          }
         });
   }
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return pages_contig;
+}
+
+std::vector<torch::Tensor> CudaProjectedQkvRotaryPagedWriteForward(
+    const torch::Tensor& projected,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin,
+    const torch::Tensor& k_pages,
+    const torch::Tensor& v_pages,
+    const torch::Tensor& block_table,
+    const torch::Tensor& positions,
+    int64_t q_size,
+    int64_t k_size,
+    int64_t v_size,
+    int64_t q_heads,
+    int64_t kv_heads) {
+  TORCH_CHECK(projected.is_cuda() && cos.is_cuda() && sin.is_cuda() && k_pages.is_cuda() &&
+                  v_pages.is_cuda() && block_table.is_cuda() && positions.is_cuda(),
+              "CudaProjectedQkvRotaryPagedWriteForward: tensors must be CUDA");
+  TORCH_CHECK(projected.dim() == 3 && projected.size(1) == 1,
+              "CudaProjectedQkvRotaryPagedWriteForward: projected must have shape (B,1,QKV)");
+  TORCH_CHECK(k_pages.dim() == 4 && v_pages.dim() == 4,
+              "CudaProjectedQkvRotaryPagedWriteForward: pages must be rank-4");
+  TORCH_CHECK(k_pages.sizes() == v_pages.sizes(),
+              "CudaProjectedQkvRotaryPagedWriteForward: K/V pages shape mismatch");
+  TORCH_CHECK(block_table.dim() == 2, "CudaProjectedQkvRotaryPagedWriteForward: block_table must be rank-2");
+  TORCH_CHECK(positions.dim() == 1 || (positions.dim() == 2 && positions.size(1) == 1),
+              "CudaProjectedQkvRotaryPagedWriteForward: positions must be rank-1 or (B,1)");
+  TORCH_CHECK(cos.dim() == 2 && sin.dim() == 2 && cos.sizes() == sin.sizes(),
+              "CudaProjectedQkvRotaryPagedWriteForward: cos/sin must be matching rank-2 tensors");
+  TORCH_CHECK(projected.scalar_type() == k_pages.scalar_type() &&
+                  projected.scalar_type() == v_pages.scalar_type() &&
+                  projected.scalar_type() == cos.scalar_type() &&
+                  projected.scalar_type() == sin.scalar_type(),
+              "CudaProjectedQkvRotaryPagedWriteForward: dtype mismatch");
+  TORCH_CHECK(q_heads > 0 && kv_heads > 0, "CudaProjectedQkvRotaryPagedWriteForward: head counts must be positive");
+  TORCH_CHECK(q_size + k_size + v_size == projected.size(2),
+              "CudaProjectedQkvRotaryPagedWriteForward: projected QKV size mismatch");
+  TORCH_CHECK(q_size % q_heads == 0 && k_size % kv_heads == 0 && v_size % kv_heads == 0,
+              "CudaProjectedQkvRotaryPagedWriteForward: sizes must divide by head counts");
+  const auto head_dim = q_size / q_heads;
+  TORCH_CHECK(head_dim > 0 && (head_dim % 2) == 0,
+              "CudaProjectedQkvRotaryPagedWriteForward: head_dim must be positive and even");
+  TORCH_CHECK(k_size / kv_heads == head_dim && v_size / kv_heads == head_dim,
+              "CudaProjectedQkvRotaryPagedWriteForward: Q/K/V head_dim mismatch");
+  TORCH_CHECK(k_pages.size(1) == kv_heads && k_pages.size(3) == head_dim,
+              "CudaProjectedQkvRotaryPagedWriteForward: page head shape mismatch");
+  TORCH_CHECK(block_table.size(0) == projected.size(0),
+              "CudaProjectedQkvRotaryPagedWriteForward: block_table batch mismatch");
+  TORCH_CHECK(positions.numel() == projected.size(0),
+              "CudaProjectedQkvRotaryPagedWriteForward: positions batch mismatch");
+  TORCH_CHECK(cos.size(0) == 1 && cos.size(1) == head_dim,
+              "CudaProjectedQkvRotaryPagedWriteForward: single-token cos/sin row required");
+
+  c10::cuda::CUDAGuard device_guard{projected.device()};
+
+  auto projected_contig = projected.contiguous();
+  auto cos_contig = cos.contiguous();
+  auto sin_contig = sin.contiguous();
+  auto k_pages_contig = k_pages.contiguous();
+  auto v_pages_contig = v_pages.contiguous();
+  auto block_table_contig = block_table.to(torch::kLong).contiguous();
+  auto positions_contig = positions.to(torch::kLong).contiguous().view({projected_contig.size(0)});
+  auto q_out = torch::empty({projected_contig.size(0), q_heads, 1, head_dim}, projected_contig.options());
+
+  const int64_t total = projected_contig.size(0) * q_heads * (head_dim / 2) +
+      projected_contig.size(0) * kv_heads * (head_dim / 2) +
+      projected_contig.size(0) * kv_heads * head_dim;
+  if (total == 0) {
+    return {q_out, k_pages_contig, v_pages_contig};
+  }
+  const dim3 blocks(static_cast<unsigned int>((total + kThreads - 1) / kThreads));
+  const dim3 threads(kThreads);
+  auto stream = c10::cuda::getCurrentCUDAStream(projected.get_device());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      projected_contig.scalar_type(),
+      "model_stack_cuda_projected_qkv_rotary_paged_write_forward",
+      [&] {
+        projected_qkv_rotary_paged_write_kernel<scalar_t><<<blocks, threads, 0, stream.stream()>>>(
+            projected_contig.data_ptr<scalar_t>(),
+            cos_contig.data_ptr<scalar_t>(),
+            sin_contig.data_ptr<scalar_t>(),
+            k_pages_contig.data_ptr<scalar_t>(),
+            v_pages_contig.data_ptr<scalar_t>(),
+            block_table_contig.data_ptr<int64_t>(),
+            positions_contig.data_ptr<int64_t>(),
+            q_out.data_ptr<scalar_t>(),
+            projected_contig.size(0),
+            block_table_contig.size(1),
+            q_heads,
+            kv_heads,
+            k_pages_contig.size(2),
+            head_dim,
+            q_size,
+            k_size,
+            projected_contig.size(2));
+      });
+
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {q_out, k_pages_contig, v_pages_contig};
 }
 
 std::vector<torch::Tensor> CudaPagedKvReadLastForward(

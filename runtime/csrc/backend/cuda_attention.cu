@@ -5,10 +5,12 @@
 
 #include "attention/cuda_attention_common.cuh"
 #include "attention/cuda_attention_dispatch.cuh"
+#include "cuda_device_arch.cuh"
 #include "../descriptors/attention_desc.h"
 #include "../policy/attention_policy.h"
 #include "../reference/aten_reference.h"
 
+#include <cstdlib>
 #include <cmath>
 
 namespace {
@@ -230,10 +232,24 @@ bool UseCudaPagedAttentionDecodeKernel(
 }
 
 int SelectPagedDecodeThreads(int64_t seq_len, int64_t head_dim) {
+  const char* env = std::getenv("MODEL_STACK_PAGED_DECODE_THREADS");
+  if (env != nullptr && *env != '\0') {
+    const int forced = std::atoi(env);
+    if (forced <= t10::cuda::attention::kSmallRowThreads) {
+      return t10::cuda::attention::kSmallRowThreads;
+    }
+    if (forced <= t10::cuda::attention::kMediumRowThreads) {
+      return t10::cuda::attention::kMediumRowThreads;
+    }
+    return t10::cuda::attention::kLargeRowThreads;
+  }
   if (seq_len <= 64 && head_dim <= 64) {
     return t10::cuda::attention::kSmallRowThreads;
   }
   if (seq_len <= 128 && head_dim <= 128) {
+    return t10::cuda::attention::kMediumRowThreads;
+  }
+  if (head_dim <= 128) {
     return t10::cuda::attention::kMediumRowThreads;
   }
   return t10::cuda::attention::kLargeRowThreads;
@@ -479,6 +495,270 @@ __global__ __launch_bounds__(t10::cuda::attention::kSmallRowThreads, 4) void pag
   }
 }
 
+template <typename scalar_t, int Threads, int HeadDim, bool HasMask>
+__global__ __launch_bounds__(Threads, 2) void paged_decode_attention_q1_hdim_sm90_forward_kernel(
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k_pages,
+    const scalar_t* __restrict__ v_pages,
+    const int64_t* __restrict__ block_table,
+    const int64_t* __restrict__ lengths,
+    const void* __restrict__ mask,
+    int mask_kind,
+    scalar_t* __restrict__ out,
+    int64_t batch,
+    int64_t q_heads,
+    int64_t kv_heads,
+    int64_t max_blocks,
+    int64_t page_size,
+    int64_t mask_seq,
+    float scale) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  const int64_t total_rows = batch * q_heads;
+  if (row >= total_rows) {
+    return;
+  }
+
+  __shared__ float reduce_shared[Threads];
+  __shared__ float q_shared[HeadDim];
+  __shared__ float broadcast_shared;
+
+  constexpr int kOutputsPerThread = (HeadDim + Threads - 1) / Threads;
+  float accum[kOutputsPerThread];
+  #pragma unroll
+  for (int idx = 0; idx < kOutputsPerThread; ++idx) {
+    accum[idx] = 0.0f;
+  }
+
+  const int64_t head_idx = row % q_heads;
+  const int64_t batch_idx = row / q_heads;
+  const int64_t row_len = lengths[batch_idx];
+  const int64_t q_base = ((batch_idx * q_heads) + head_idx) * HeadDim;
+  if (row_len <= 0) {
+    for (int d = threadIdx.x; d < HeadDim; d += Threads) {
+      out[q_base + d] = static_cast<scalar_t>(0);
+    }
+    return;
+  }
+
+  for (int d = threadIdx.x; d < HeadDim; d += Threads) {
+    q_shared[d] = static_cast<float>(q[q_base + d]);
+  }
+  __syncthreads();
+
+  const int64_t head_group = q_heads / kv_heads;
+  const int64_t kv_head_idx = head_idx / head_group;
+  const int64_t mask_base = ((batch_idx * q_heads) + head_idx) * mask_seq;
+
+  float row_max = -INFINITY;
+  float denom = 0.0f;
+  for (int64_t s = 0; s < row_len; ++s) {
+    const int64_t block_idx = s / page_size;
+    const int64_t offset = s % page_size;
+    const int64_t page_id = block_table[batch_idx * max_blocks + block_idx];
+    const int64_t page_base = ((((page_id * kv_heads) + kv_head_idx) * page_size) + offset) * HeadDim;
+    float partial = 0.0f;
+    for (int d = threadIdx.x; d < HeadDim; d += Threads) {
+      partial += q_shared[d] * static_cast<float>(k_pages[page_base + d]);
+    }
+    const float dot = t10::cuda::attention::BlockReduceSum<Threads>(partial, reduce_shared);
+    if (threadIdx.x == 0) {
+      float score = dot * scale;
+      if constexpr (HasMask) {
+        if (mask_kind == 1) {
+          if (static_cast<const bool*>(mask)[mask_base + s]) {
+            score = -INFINITY;
+          }
+        } else if (mask_kind == 2) {
+          score += static_cast<float>(static_cast<const scalar_t*>(mask)[mask_base + s]);
+        } else if (mask_kind == 3) {
+          score += static_cast<const float*>(mask)[mask_base + s];
+        }
+      }
+      if (score != -INFINITY) {
+        if (score > row_max) {
+          denom = denom * expf(row_max - score) + 1.0f;
+          row_max = score;
+        } else {
+          denom += expf(score - row_max);
+        }
+      }
+      broadcast_shared = row_max;
+    }
+    __syncthreads();
+    row_max = broadcast_shared;
+  }
+
+  if (row_max == -INFINITY) {
+    for (int d = threadIdx.x; d < HeadDim; d += Threads) {
+      out[q_base + d] = static_cast<scalar_t>(0);
+    }
+    return;
+  }
+
+  if (threadIdx.x == 0) {
+    broadcast_shared = denom;
+  }
+  __syncthreads();
+  denom = broadcast_shared;
+  denom = fmaxf(denom, 1.0e-20f);
+
+  for (int64_t s = 0; s < row_len; ++s) {
+    const int64_t block_idx = s / page_size;
+    const int64_t offset = s % page_size;
+    const int64_t page_id = block_table[batch_idx * max_blocks + block_idx];
+    const int64_t page_base = ((((page_id * kv_heads) + kv_head_idx) * page_size) + offset) * HeadDim;
+    float partial = 0.0f;
+    for (int d = threadIdx.x; d < HeadDim; d += Threads) {
+      partial += q_shared[d] * static_cast<float>(k_pages[page_base + d]);
+    }
+    const float dot = t10::cuda::attention::BlockReduceSum<Threads>(partial, reduce_shared);
+    if (threadIdx.x == 0) {
+      float score = dot * scale;
+      if constexpr (HasMask) {
+        if (mask_kind == 1) {
+          if (static_cast<const bool*>(mask)[mask_base + s]) {
+            score = -INFINITY;
+          }
+        } else if (mask_kind == 2) {
+          score += static_cast<float>(static_cast<const scalar_t*>(mask)[mask_base + s]);
+        } else if (mask_kind == 3) {
+          score += static_cast<const float*>(mask)[mask_base + s];
+        }
+      }
+      broadcast_shared = expf(score - row_max) / denom;
+    }
+    __syncthreads();
+    const float weight = broadcast_shared;
+    #pragma unroll
+    for (int idx = 0; idx < kOutputsPerThread; ++idx) {
+      const int d = threadIdx.x + idx * Threads;
+      if (d < HeadDim) {
+        accum[idx] += weight * static_cast<float>(v_pages[page_base + d]);
+      }
+    }
+    __syncthreads();
+  }
+
+  #pragma unroll
+  for (int idx = 0; idx < kOutputsPerThread; ++idx) {
+    const int d = threadIdx.x + idx * Threads;
+    if (d < HeadDim) {
+      out[q_base + d] = static_cast<scalar_t>(accum[idx]);
+    }
+  }
+}
+
+template <typename scalar_t, int HeadDim, bool HasMask>
+bool TryLaunchPagedDecodeAttentionQ1Sm90Specialized(
+    const torch::Tensor& q_contig,
+    const torch::Tensor& k_pages_contig,
+    const torch::Tensor& v_pages_contig,
+    const torch::Tensor& block_table_contig,
+    const torch::Tensor& lengths_contig,
+    const void* mask_ptr,
+    int mask_kind,
+    const torch::Tensor& out,
+    int threads,
+    int64_t mask_seq,
+    float scale_value,
+    cudaStream_t stream) {
+  if (!t10::cuda::DeviceIsSm90OrLater(q_contig) || mask_seq < 512) {
+    return false;
+  }
+  const dim3 blocks(static_cast<unsigned int>(q_contig.size(0) * q_contig.size(1)));
+  switch (threads) {
+    case t10::cuda::attention::kSmallRowThreads:
+      paged_decode_attention_q1_hdim_sm90_forward_kernel<scalar_t, t10::cuda::attention::kSmallRowThreads, HeadDim, HasMask>
+          <<<blocks, t10::cuda::attention::kSmallRowThreads, 0, stream>>>(
+              q_contig.data_ptr<scalar_t>(),
+              k_pages_contig.data_ptr<scalar_t>(),
+              v_pages_contig.data_ptr<scalar_t>(),
+              block_table_contig.data_ptr<int64_t>(),
+              lengths_contig.data_ptr<int64_t>(),
+              mask_ptr,
+              mask_kind,
+              out.data_ptr<scalar_t>(),
+              q_contig.size(0),
+              q_contig.size(1),
+              k_pages_contig.size(1),
+              block_table_contig.size(1),
+              k_pages_contig.size(2),
+              mask_seq,
+              scale_value);
+      return true;
+    case t10::cuda::attention::kMediumRowThreads:
+      paged_decode_attention_q1_hdim_sm90_forward_kernel<scalar_t, t10::cuda::attention::kMediumRowThreads, HeadDim, HasMask>
+          <<<blocks, t10::cuda::attention::kMediumRowThreads, 0, stream>>>(
+              q_contig.data_ptr<scalar_t>(),
+              k_pages_contig.data_ptr<scalar_t>(),
+              v_pages_contig.data_ptr<scalar_t>(),
+              block_table_contig.data_ptr<int64_t>(),
+              lengths_contig.data_ptr<int64_t>(),
+              mask_ptr,
+              mask_kind,
+              out.data_ptr<scalar_t>(),
+              q_contig.size(0),
+              q_contig.size(1),
+              k_pages_contig.size(1),
+              block_table_contig.size(1),
+              k_pages_contig.size(2),
+              mask_seq,
+              scale_value);
+      return true;
+    default:
+      paged_decode_attention_q1_hdim_sm90_forward_kernel<scalar_t, t10::cuda::attention::kLargeRowThreads, HeadDim, HasMask>
+          <<<blocks, t10::cuda::attention::kLargeRowThreads, 0, stream>>>(
+              q_contig.data_ptr<scalar_t>(),
+              k_pages_contig.data_ptr<scalar_t>(),
+              v_pages_contig.data_ptr<scalar_t>(),
+              block_table_contig.data_ptr<int64_t>(),
+              lengths_contig.data_ptr<int64_t>(),
+              mask_ptr,
+              mask_kind,
+              out.data_ptr<scalar_t>(),
+              q_contig.size(0),
+              q_contig.size(1),
+              k_pages_contig.size(1),
+              block_table_contig.size(1),
+              k_pages_contig.size(2),
+              mask_seq,
+              scale_value);
+      return true;
+  }
+}
+
+template <typename scalar_t, bool HasMask>
+bool TryLaunchPagedDecodeAttentionQ1Sm90SpecializedForHeadDim(
+    const torch::Tensor& q_contig,
+    const torch::Tensor& k_pages_contig,
+    const torch::Tensor& v_pages_contig,
+    const torch::Tensor& block_table_contig,
+    const torch::Tensor& lengths_contig,
+    const void* mask_ptr,
+    int mask_kind,
+    const torch::Tensor& out,
+    int threads,
+    int64_t mask_seq,
+    float scale_value,
+    cudaStream_t stream) {
+  if (q_contig.size(3) == 64) {
+    return TryLaunchPagedDecodeAttentionQ1Sm90Specialized<scalar_t, 64, HasMask>(
+        q_contig, k_pages_contig, v_pages_contig, block_table_contig, lengths_contig,
+        mask_ptr, mask_kind, out, threads, mask_seq, scale_value, stream);
+  }
+  if (q_contig.size(3) == 128) {
+    return TryLaunchPagedDecodeAttentionQ1Sm90Specialized<scalar_t, 128, HasMask>(
+        q_contig, k_pages_contig, v_pages_contig, block_table_contig, lengths_contig,
+        mask_ptr, mask_kind, out, threads, mask_seq, scale_value, stream);
+  }
+  if (q_contig.size(3) == 256) {
+    return TryLaunchPagedDecodeAttentionQ1Sm90Specialized<scalar_t, 256, HasMask>(
+        q_contig, k_pages_contig, v_pages_contig, block_table_contig, lengths_contig,
+        mask_ptr, mask_kind, out, threads, mask_seq, scale_value, stream);
+  }
+  return false;
+}
+
 template <typename scalar_t, bool HasMask>
 void LaunchPagedDecodeAttentionQ1(
     const torch::Tensor& q_contig,
@@ -493,6 +773,22 @@ void LaunchPagedDecodeAttentionQ1(
     int64_t mask_seq,
     float scale_value,
     cudaStream_t stream) {
+  if (TryLaunchPagedDecodeAttentionQ1Sm90SpecializedForHeadDim<scalar_t, HasMask>(
+          q_contig,
+          k_pages_contig,
+          v_pages_contig,
+          block_table_contig,
+          lengths_contig,
+          mask_ptr,
+          mask_kind,
+          out,
+          threads,
+          mask_seq,
+          scale_value,
+          stream)) {
+    return;
+  }
+
   const dim3 blocks(static_cast<unsigned int>(q_contig.size(0) * q_contig.size(1)));
   switch (threads) {
     case t10::cuda::attention::kSmallRowThreads:
@@ -621,7 +917,7 @@ torch::Tensor CudaPagedAttentionDecodeForward(
     mask_ptr = mask_contig.data_ptr();
   }
 
-  auto out = torch::zeros_like(q_contig);
+  auto out = torch::empty_like(q_contig);
   const float scale_value = static_cast<float>(
       scale.has_value() ? scale.value() : (1.0 / std::sqrt(static_cast<double>(q_contig.size(3)))));
   const int threads = SelectPagedDecodeThreads(mask_seq, q_contig.size(3));

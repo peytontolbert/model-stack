@@ -41,8 +41,11 @@ def test_native_sm80_attention_matches_torch_on_long_context_buckets(monkeypatch
     monkeypatch.setenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_PYTORCH_MEMEFF", "1")
     monkeypatch.setenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_CUTLASS", "1")
     monkeypatch.setenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_TENSORCORE", "1")
+    monkeypatch.setenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_FLASH", "1")
     monkeypatch.setenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_INFERENCE", "0")
     monkeypatch.setenv("MODEL_STACK_SM80_INFERENCE_PREFILL_KERNEL", "64x64_rf")
+    monkeypatch.setenv("MODEL_STACK_PREFER_NATIVE_SM80_INFERENCE_ATTENTION", "1")
+    monkeypatch.setenv("MODEL_STACK_SM80_NATIVE_ATTENTION_MIN_SMS", "1")
 
     torch.manual_seed(seq_len)
     dtype = torch.bfloat16
@@ -80,3 +83,40 @@ def test_native_sm80_attention_matches_torch_on_long_context_buckets(monkeypatch
         f"native SM80 attention drifted from torch at seq_len={seq_len}: "
         f"max_abs_diff={max_abs_diff}"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native SM80 split-K attention parity")
+def test_native_sm80_split_kv_attention_matches_torch(monkeypatch) -> None:
+    device = _test_device()
+    _skip_if_sm80_native_attention_unavailable(device)
+
+    monkeypatch.setenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_PYTORCH_MEMEFF", "1")
+    monkeypatch.setenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_CUTLASS", "1")
+    monkeypatch.setenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_TENSORCORE", "1")
+    monkeypatch.setenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_FLASH", "1")
+    monkeypatch.setenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_INFERENCE", "0")
+    monkeypatch.setenv("MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_SPLIT_KV", "1")
+    monkeypatch.setenv("MODEL_STACK_SM80_SPLIT_KV_CHUNK", "512")
+    monkeypatch.setenv("MODEL_STACK_SM80_INFERENCE_PREFILL_KERNEL", "64x64_rf")
+
+    torch.manual_seed(4096)
+    dtype = torch.float16
+    batch = 1
+    heads = 8
+    seq_len = 4096
+    head_dim = 64
+    scale = head_dim ** -0.5
+    module = runtime_ops.native_module()
+    assert module is not None
+
+    q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    k = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    v = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+
+    with torch.no_grad():
+        native_out = module.attention_forward(q, k, v, None, True, scale)
+        torch_out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+        torch.cuda.synchronize(device)
+
+    max_abs_diff = (native_out.float() - torch_out.float()).abs().max().item()
+    assert max_abs_diff <= 0.02

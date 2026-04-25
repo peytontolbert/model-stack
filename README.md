@@ -18,10 +18,17 @@ Build environment notes:
 - `MODEL_STACK_CUDA_ARCH_LIST` is a repo-local alias for `TORCH_CUDA_ARCH_LIST`. If `TORCH_CUDA_ARCH_LIST` is already set, PyTorch's value wins.
 - `MODEL_STACK_MAX_JOBS` is a repo-local alias for PyTorch/Ninja's `MAX_JOBS`.
 - `MODEL_STACK_USE_NINJA=0` disables the Ninja backend if you need the slower setuptools fallback.
+- `MODEL_STACK_CUTLASS_PATH=/path/to/cutlass` enables optional CUTLASS-backed kernels; if omitted, setup also checks CUTLASS copies bundled in the `ai` conda environment.
 - The patched `setup.py` validates CUDA 13.x architecture targets and rejects pre-Turing entries (`< 7.5`), matching NVIDIA's CUDA 13 release notes.
 - On Windows with CUDA 13.1 or newer, install the NVIDIA driver separately; it is no longer bundled with the CUDA Toolkit installer.
 
 If you do not set an architecture list explicitly, PyTorch's extension tooling defaults to building for the visible GPU architectures plus PTX. For reproducible CI or wheel builds, set `MODEL_STACK_CUDA_ARCH_LIST` or `TORCH_CUDA_ARCH_LIST` explicitly.
+
+Runtime dispatch notes:
+
+- Native embedding is enabled by default when the extension is available; use `MODEL_STACK_DISABLE_CUDA_EMBEDDING_NATIVE=1` to force the PyTorch fallback.
+- Native add+LayerNorm is shape-gated by default; tune `MODEL_STACK_CUDA_ADD_LAYER_NORM_NATIVE_MIN_ROWS` or use `MODEL_STACK_DISABLE_CUDA_ADD_LAYER_NORM_NATIVE=1` / `MODEL_STACK_ENABLE_CUDA_ADD_LAYER_NORM_NATIVE=1` for experiments.
+- The SM80/Ada native prefill attention lane is opt-in with `MODEL_STACK_PREFER_NATIVE_SM80_INFERENCE_ATTENTION=1` until its CUDA implementation consistently beats PyTorch SDPA in benchmarks. The experimental local FlashAttention-style lane is separately opt-in with `MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_FLASH=1`.
 
 Current constellation (by plane)
 Foundations (math, shapes, kernels)

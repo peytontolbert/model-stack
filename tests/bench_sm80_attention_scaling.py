@@ -25,8 +25,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, default=64)
     parser.add_argument("--min-seq", type=int, default=64)
     parser.add_argument("--max-seq", type=int, default=131072)
+    parser.add_argument("--seqs", default=None, help="Comma-separated explicit sequence lengths to benchmark.")
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="bf16")
     parser.add_argument("--native-kernel", default="64x64_rf")
+    parser.add_argument("--enable-flash-prefill", action="store_true")
+    parser.add_argument("--disable-flash-prefill", action="store_true")
+    parser.add_argument("--flash-min-seq", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -35,6 +39,32 @@ def _dtype_from_arg(name: str) -> torch.dtype:
     if name == "fp16":
         return torch.float16
     return torch.bfloat16
+
+
+def _parse_seq_list(value: str | None, min_seq: int, max_seq: int) -> list[int]:
+    if value:
+        seqs: list[int] = []
+        for token in value.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            seq = int(token)
+            if seq <= 0:
+                raise ValueError("explicit sequence lengths must be positive")
+            seqs.append(seq)
+        if not seqs:
+            raise ValueError("--seqs did not contain any sequence lengths")
+        return seqs
+    if min_seq <= 0 or max_seq < min_seq:
+        raise ValueError("sequence length bounds must be positive and ordered")
+    if min_seq & (min_seq - 1) or max_seq & (max_seq - 1):
+        raise ValueError("min-seq and max-seq must be powers of two unless --seqs is used")
+    seqs = []
+    seq_len = min_seq
+    while seq_len <= max_seq:
+        seqs.append(seq_len)
+        seq_len *= 2
+    return seqs
 
 
 def _reps_for_seq(seq_len: int) -> int:
@@ -73,18 +103,26 @@ def main() -> None:
     args = _parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for bench_sm80_attention_scaling.py")
-    if args.min_seq <= 0 or args.max_seq < args.min_seq:
-        raise ValueError("sequence length bounds must be positive and ordered")
-    if args.min_seq & (args.min_seq - 1) or args.max_seq & (args.max_seq - 1):
-        raise ValueError("min-seq and max-seq must be powers of two")
+    seqs = _parse_seq_list(args.seqs, args.min_seq, args.max_seq)
 
     os.environ["MODEL_STACK_DISABLE_ATTENTION_PREFILL_PYTORCH_MEMEFF"] = "1"
     os.environ["MODEL_STACK_DISABLE_ATTENTION_PREFILL_CUTLASS"] = "1"
     os.environ["MODEL_STACK_DISABLE_ATTENTION_PREFILL_TENSORCORE"] = "1"
+    if args.disable_flash_prefill:
+        os.environ["MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_FLASH"] = "1"
+    else:
+        os.environ.pop("MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_FLASH", None)
+    if args.enable_flash_prefill:
+        os.environ["MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_FLASH"] = "1"
+    else:
+        os.environ.pop("MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_FLASH", None)
+    if args.flash_min_seq is not None:
+        os.environ["MODEL_STACK_SM80_FLASH_PREFILL_MIN_SEQ"] = str(args.flash_min_seq)
     os.environ["MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_INFERENCE"] = "0"
     os.environ["MODEL_STACK_SM80_INFERENCE_PREFILL_KERNEL"] = args.native_kernel
 
     from runtime import ops as runtime_ops
+    from runtime.native import runtime_info
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -102,13 +140,20 @@ def main() -> None:
             "head_dim": args.head_dim,
             "dtype": args.dtype,
             "native_kernel": args.native_kernel,
-            "min_seq": args.min_seq,
-            "max_seq": args.max_seq,
+            "seqs": seqs,
+            "runtime_info": {
+                key: runtime_info().get(key)
+                for key in (
+                    "attention_sm80_inference_prefill_compiled",
+                    "attention_pytorch_memeff_prefill_compiled",
+                    "attention_cutlass_prefill_compiled",
+                    "attention_sm80_flash_prefill_compiled",
+                )
+            },
         }
     )
 
-    seq_len = args.min_seq
-    while seq_len <= args.max_seq:
+    for seq_len in seqs:
         q = torch.randn(args.batch, args.heads, seq_len, args.head_dim, device=device, dtype=dtype)
         k = torch.randn(args.batch, args.heads, seq_len, args.head_dim, device=device, dtype=dtype)
         v = torch.randn(args.batch, args.heads, seq_len, args.head_dim, device=device, dtype=dtype)
@@ -146,12 +191,15 @@ def main() -> None:
                 "max_abs_diff": (native_out.float() - torch_out.float()).abs().max().item(),
                 "plan_kernel": plan.get("kernel"),
                 "plan_row_threads": plan.get("row_reduce_threads"),
+                "split_kv_splits": plan.get("split_kv_splits"),
+                "split_kv_effective_sms": plan.get("split_kv_effective_sms"),
+                "flash_selected": plan.get("sm80_flash_prefill_selected"),
+                "flash_min_seq": plan.get("sm80_flash_prefill_min_seq"),
             }
         )
 
         del q, k, v, native_out, torch_out
         torch.cuda.empty_cache()
-        seq_len *= 2
 
 
 if __name__ == "__main__":

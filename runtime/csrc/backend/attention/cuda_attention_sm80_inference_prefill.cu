@@ -1,4 +1,6 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
 #include "cuda_attention_sm80_inference_prefill.cuh"
@@ -291,6 +293,9 @@ struct ModelStackSm80CausalPrefillKernel {
     const scalar_t* key_ptr = nullptr;
     const scalar_t* value_ptr = nullptr;
     output_t* output_ptr = nullptr;
+    accum_t* partial_num_ptr = nullptr;
+    accum_t* partial_m_ptr = nullptr;
+    accum_t* partial_s_ptr = nullptr;
 
     accum_t scale = 0.0f;
 
@@ -298,6 +303,7 @@ struct ModelStackSm80CausalPrefillKernel {
     int32_t head_dim_value = 0;
     int32_t num_queries = 0;
     int32_t num_keys = 0;
+    int32_t query_start = 0;
 
     int32_t q_strideM = 0;
     int32_t k_strideM = 0;
@@ -310,10 +316,21 @@ struct ModelStackSm80CausalPrefillKernel {
     int64_t o_strideB = 0;
 
     int32_t num_batches = 0;
+    int32_t split_k_chunk = 0;
+    int32_t split_k_splits = 1;
 
-    CUTLASS_DEVICE bool advance_to_block() {
-      const auto batch_id = blockIdx.z;
-      const auto query_start = blockIdx.x * kQueriesPerBlock;
+    CUTLASS_HOST_DEVICE int32_t num_query_blocks() const {
+      return (num_queries + int32_t(kQueriesPerBlock) - 1) / int32_t(kQueriesPerBlock);
+    }
+
+    CUTLASS_HOST_DEVICE int32_t task_count() const {
+      return num_query_blocks() * num_batches;
+    }
+
+    CUTLASS_DEVICE bool advance_to_work(int32_t batch_id, int32_t query_block_rank) {
+      const int32_t logical_query_block =
+          num_query_blocks() - 1 - query_block_rank;
+      query_start = logical_query_block * int32_t(kQueriesPerBlock);
       if (batch_id >= num_batches || query_start >= num_queries) {
         return false;
       }
@@ -322,6 +339,25 @@ struct ModelStackSm80CausalPrefillKernel {
       key_ptr += batch_id * k_strideB;
       value_ptr += batch_id * v_strideB;
       output_ptr += batch_id * o_strideB + int64_t(query_start) * o_strideM;
+      if (partial_num_ptr != nullptr) {
+        const int64_t split_idx = static_cast<int64_t>(blockIdx.y);
+        const int64_t partial_num_split_stride =
+            int64_t(num_batches) * int64_t(num_queries) * int64_t(kMaxK);
+        const int64_t partial_row_split_stride =
+            int64_t(num_batches) * int64_t(num_queries);
+        partial_num_ptr +=
+            split_idx * partial_num_split_stride +
+            int64_t(batch_id) * int64_t(num_queries) * int64_t(kMaxK) +
+            int64_t(query_start) * int64_t(kMaxK);
+        partial_m_ptr +=
+            split_idx * partial_row_split_stride +
+            int64_t(batch_id) * int64_t(num_queries) +
+            int64_t(query_start);
+        partial_s_ptr +=
+            split_idx * partial_row_split_stride +
+            int64_t(batch_id) * int64_t(num_queries) +
+            int64_t(query_start);
+      }
 
       num_keys = cutlass::fast_min(
           int32_t(query_start + kQueriesPerBlock),
@@ -332,15 +368,35 @@ struct ModelStackSm80CausalPrefillKernel {
       key_ptr = warp_uniform(key_ptr);
       value_ptr = warp_uniform(value_ptr);
       output_ptr = warp_uniform(output_ptr);
+      query_start = warp_uniform(query_start);
       num_queries = warp_uniform(num_queries);
       num_keys = warp_uniform(num_keys);
       return true;
+    }
+
+    CUTLASS_DEVICE bool advance_to_block() {
+      return advance_to_work(
+          static_cast<int32_t>(blockIdx.z),
+          static_cast<int32_t>(blockIdx.x));
+    }
+
+    CUTLASS_DEVICE bool advance_to_task(int32_t task_idx) {
+      const int32_t batch_id = task_idx % num_batches;
+      const int32_t query_block_rank = task_idx / num_batches;
+      return advance_to_work(batch_id, query_block_rank);
     }
 
     __host__ dim3 getBlocksGrid() const {
       return dim3(
           ceil_div(num_queries, int32_t(kQueriesPerBlock)),
           1,
+          num_batches);
+    }
+
+    __host__ dim3 getSplitKvBlocksGrid() const {
+      return dim3(
+          ceil_div(num_queries, int32_t(kQueriesPerBlock)),
+          split_k_splits,
           num_batches);
     }
 
@@ -785,6 +841,9 @@ struct ModelStackSm80CausalPrefillKernel {
           my_lane_id,
           accum_o);
     }
+    // Keep the CUTLASS FMHA shared-memory lifetime rule: P*V must finish
+    // before the next QK tile or epilogue reuses the shared-storage union.
+    __syncthreads();
   }
 
   static void CUTLASS_DEVICE attention_kernel(Params& p) {
@@ -794,8 +853,7 @@ struct ModelStackSm80CausalPrefillKernel {
     auto& s_prime = shared_storage.s_prime;
     auto& mi = shared_storage.mi;
     auto& out_rescale = shared_storage.out_rescale;
-    const int32_t query_start =
-        static_cast<int32_t>(blockIdx.x * kQueriesPerBlock);
+    const int32_t query_start = p.query_start;
 
     static_assert(kQueriesPerBlock < kNumWarpsPerBlock * kWarpSize, "");
     if (thread_id() < kQueriesPerBlock) {
@@ -980,7 +1038,9 @@ struct ModelStackSm80CausalPrefillKernel {
           full_key_tile ? int32_t(kKeysPerBlock) : remaining_keys;
       const int32_t problem_size_1_k = problem_size_0_n;
       const bool full_tile_extent = full_query_tile && full_key_tile;
-      const bool diagonal_tile = iter_key_start == query_start;
+      const bool diagonal_tile =
+          query_start < iter_key_start + int32_t(kKeysPerBlock) &&
+          iter_key_start < query_start + int32_t(kQueriesPerBlock);
 
       auto iterator_a = base_iterator_a;
 
@@ -1235,6 +1295,339 @@ struct ModelStackSm80CausalPrefillKernel {
         my_lane_id);
     epilogue(rescale, dest_iter, accum_o);
   }
+
+  static void CUTLASS_DEVICE attention_split_kv_partial_kernel(Params& p) {
+    extern __shared__ char smem_buffer[];
+    SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
+    auto& m_prime = shared_storage.m_prime;
+    auto& s_prime = shared_storage.s_prime;
+    auto& mi = shared_storage.mi;
+    auto& out_rescale = shared_storage.out_rescale;
+    const int32_t query_start = p.query_start;
+
+    static_assert(kQueriesPerBlock < kNumWarpsPerBlock * kWarpSize, "");
+    if (thread_id() < kQueriesPerBlock) {
+      s_prime[thread_id()] = accum_t(0);
+      out_rescale[thread_id()] = accum_t(1.0);
+      mi[thread_id()] = -cutlass::platform::numeric_limits<accum_t>::infinity();
+      m_prime[thread_id()] = -cutlass::platform::numeric_limits<accum_t>::infinity();
+    }
+
+    typename MM1::Mma::FragmentC accum_o;
+    accum_o.clear();
+
+    const int16_t tid = thread_id();
+    const int8_t my_warp_id = warp_uniform(warp_id());
+    const int8_t my_lane_id = lane_id();
+    const int32_t problem_size_0_m =
+        cutlass::fast_min(int32_t(kQueriesPerBlock), p.num_queries);
+    const bool full_query_tile = problem_size_0_m == kQueriesPerBlock;
+
+    cutlass::gemm::GemmCoord tb_tile_offset = {0, 0, 0};
+    cutlass::MatrixCoord tb_offset_a{
+        tb_tile_offset.m() * MM0::Mma::Shape::kM,
+        tb_tile_offset.k()};
+    cutlass::MatrixCoord tb_offset_b{
+        tb_tile_offset.k(),
+        tb_tile_offset.n() * MM0::Mma::Shape::kN};
+
+    typename MM0::Mma::Operator::IteratorC::TensorCoord iterator_c_tile_offset = {
+        (tb_tile_offset.m() * MM0::Mma::WarpCount::kM) +
+            (my_warp_id % MM0::Mma::WarpCount::kM),
+        (tb_tile_offset.n() * MM0::Mma::WarpCount::kN) +
+            (my_warp_id / MM0::Mma::WarpCount::kM)};
+
+    const int warp_idx_mn_0 = my_warp_id %
+        (MM0::Mma::Base::WarpCount::kM * MM0::Mma::Base::WarpCount::kN);
+    const auto output_tile_coords = cutlass::MatrixCoord{
+        warp_idx_mn_0 % MM0::Mma::Base::WarpCount::kM,
+        warp_idx_mn_0 / MM0::Mma::Base::WarpCount::kM};
+    const typename MM1FullTileIterator::Params full_v_params{
+        MM1::LayoutB(p.v_strideM)};
+    const auto base_iterator_a = full_query_tile
+        ? make_q_iterator<true>(p, tid, tb_offset_a, problem_size_0_m)
+        : make_q_iterator<false>(p, tid, tb_offset_a, problem_size_0_m);
+
+    const int32_t split_start = int32_t(blockIdx.y) * p.split_k_chunk;
+    const int32_t split_end = cutlass::fast_min(p.num_keys, split_start + p.split_k_chunk);
+    bool first_tile = true;
+
+    for (int32_t iter_key_start = split_start; iter_key_start < split_end; iter_key_start += kKeysPerBlock) {
+      const int32_t remaining_keys = split_end - iter_key_start;
+      const bool full_key_tile = remaining_keys >= int32_t(kKeysPerBlock);
+      const int32_t problem_size_0_n =
+          full_key_tile ? int32_t(kKeysPerBlock) : remaining_keys;
+      const int32_t problem_size_1_k = problem_size_0_n;
+      const bool full_tile_extent = full_query_tile && full_key_tile;
+      const bool diagonal_tile =
+          query_start < iter_key_start + int32_t(kKeysPerBlock) &&
+          iter_key_start < query_start + int32_t(kQueriesPerBlock);
+
+      auto iterator_a = base_iterator_a;
+      auto iterator_b = full_key_tile
+          ? make_k_iterator<true>(p, iter_key_start, tid, tb_offset_b, problem_size_0_n)
+          : make_k_iterator<false>(p, iter_key_start, tid, tb_offset_b, problem_size_0_n);
+
+      typename MM0::Mma mma(
+          shared_storage.mm0,
+          tid,
+          my_warp_id,
+          my_lane_id);
+      typename MM0::Mma::FragmentC accum;
+      accum.clear();
+
+      static_assert(
+          kMaxK % MM0::Mma::Shape::kK == 0,
+          "SM80 split-K prefill expects head_dim == 64 to map cleanly onto MM0");
+      constexpr int kQkGemmIterations = kMaxK / MM0::Mma::Shape::kK;
+      mma(kQkGemmIterations, accum, iterator_a, iterator_b, accum);
+      __syncthreads();
+
+      if (full_tile_extent) {
+        if constexpr (kQueriesPerBlock == 64 && kKeysPerBlock == 64 && kMaxK == 64) {
+          if (!diagonal_tile) {
+            prologue_v_tile_full_64x64_rf(
+                shared_storage,
+                full_v_params,
+                p,
+                iter_key_start,
+                tid);
+          } else {
+            prologue_v_tile<true>(
+                shared_storage,
+                p,
+                iter_key_start,
+                tid,
+                problem_size_1_k);
+          }
+        } else {
+          prologue_v_tile<true>(
+              shared_storage,
+              p,
+              iter_key_start,
+              tid,
+              problem_size_1_k);
+        }
+      } else {
+        prologue_v_tile<false>(
+            shared_storage,
+            p,
+            iter_key_start,
+            tid,
+            problem_size_1_k);
+      }
+
+      if (diagonal_tile) {
+        auto lane_offset = MM0::AccumLambdaIterator::get_lane_offset(
+            my_lane_id,
+            my_warp_id,
+            iterator_c_tile_offset);
+        int32_t last_col;
+        MM0::AccumLambdaIterator::iterateRows(
+            lane_offset,
+            [&](int accum_m) {
+              last_col = query_start + accum_m - iter_key_start;
+            },
+            [&](int accum_m, int accum_n, int idx) {
+              if (accum_n > last_col) {
+                accum[idx] = -cutlass::platform::numeric_limits<accum_t>::infinity();
+              }
+            },
+            [&](int accum_m) {});
+      }
+
+      if constexpr (kQueriesPerBlock == 64 && kKeysPerBlock == 64 && kMaxK == 64) {
+        if (!diagonal_tile && problem_size_0_n == kKeysPerBlock) {
+          if (first_tile) {
+            iterative_softmax_64x64_rf<true, true, typename MM0::Mma::Operator::IteratorC>(
+                accum_o,
+                accum,
+                mi,
+                m_prime,
+                s_prime,
+                out_rescale,
+                shared_storage.addition_storage,
+                my_lane_id,
+                tid,
+                my_warp_id,
+                kKeysPerBlock,
+                true,
+                iterator_c_tile_offset,
+                p.scale);
+          } else {
+            iterative_softmax_64x64_rf<true, false, typename MM0::Mma::Operator::IteratorC>(
+                accum_o,
+                accum,
+                mi,
+                m_prime,
+                s_prime,
+                out_rescale,
+                shared_storage.addition_storage,
+                my_lane_id,
+                tid,
+                my_warp_id,
+                kKeysPerBlock,
+                false,
+                iterator_c_tile_offset,
+                p.scale);
+          }
+        } else {
+          if (first_tile) {
+            iterative_softmax_64x64_rf<false, true, typename MM0::Mma::Operator::IteratorC>(
+                accum_o,
+                accum,
+                mi,
+                m_prime,
+                s_prime,
+                out_rescale,
+                shared_storage.addition_storage,
+                my_lane_id,
+                tid,
+                my_warp_id,
+                remaining_keys,
+                true,
+                iterator_c_tile_offset,
+                p.scale);
+          } else {
+            iterative_softmax_64x64_rf<false, false, typename MM0::Mma::Operator::IteratorC>(
+                accum_o,
+                accum,
+                mi,
+                m_prime,
+                s_prime,
+                out_rescale,
+                shared_storage.addition_storage,
+                my_lane_id,
+                tid,
+                my_warp_id,
+                remaining_keys,
+                false,
+                iterator_c_tile_offset,
+                p.scale);
+          }
+        }
+      } else {
+        BaseKernel::template iterative_softmax<typename MM0::Mma::Operator::IteratorC>(
+            accum_o,
+            accum,
+            mi,
+            m_prime,
+            s_prime,
+            out_rescale,
+            shared_storage.addition_storage,
+            my_lane_id,
+            tid,
+            my_warp_id,
+            remaining_keys,
+            first_tile,
+            iterator_c_tile_offset,
+            p.scale);
+      }
+
+      MM0::B2bGemm::accumToSmem(
+          shared_storage.after_mm0.si,
+          accum,
+          my_lane_id,
+          output_tile_coords);
+      __syncthreads();
+
+      if (full_tile_extent) {
+        if constexpr (kQueriesPerBlock == 64 && kKeysPerBlock == 64 && kMaxK == 64) {
+          if (!diagonal_tile) {
+            mma_pv_tile_full_64x64_rf(
+                shared_storage,
+                p,
+                iter_key_start,
+                tid,
+                my_warp_id,
+                my_lane_id,
+                accum_o);
+          } else {
+            mma_pv_tile<true>(
+                shared_storage,
+                p,
+                iter_key_start,
+                tid,
+                my_warp_id,
+                my_lane_id,
+                problem_size_1_k,
+                accum_o);
+          }
+        } else {
+          mma_pv_tile<true>(
+              shared_storage,
+              p,
+              iter_key_start,
+              tid,
+              my_warp_id,
+              my_lane_id,
+              problem_size_1_k,
+              accum_o);
+        }
+      } else {
+        mma_pv_tile<false>(
+            shared_storage,
+            p,
+            iter_key_start,
+            tid,
+            my_warp_id,
+            my_lane_id,
+            problem_size_1_k,
+            accum_o);
+      }
+      first_tile = false;
+      __syncthreads();
+    }
+
+    using DefaultEpilogue = typename MM1::DefaultEpilogue;
+    using DefaultOp = typename MM1::DefaultConfig::EpilogueOutputOp;
+    using ElementCompute = typename DefaultOp::ElementCompute;
+    using EpilogueOutputOp =
+        typename cutlass::epilogue::thread::MemoryEfficientAttentionNormalize<
+            accum_t,
+            accum_t,
+            DefaultOp::kCount,
+            typename DefaultOp::ElementAccumulator,
+            accum_t,
+            true,
+            false,
+            cutlass::Array<ElementCompute, kQueriesPerBlock>>;
+    using Epilogue =
+        typename cutlass::epilogue::threadblock::EpiloguePipelined<
+            typename DefaultEpilogue::Shape,
+            typename MM1::Mma::Operator,
+            DefaultEpilogue::kPartitionsK,
+            typename MM1::OutputTileIteratorAccum,
+            typename DefaultEpilogue::AccumulatorFragmentIterator,
+            typename DefaultEpilogue::WarpTileIterator,
+            typename DefaultEpilogue::SharedLoadIterator,
+            EpilogueOutputOp,
+            typename DefaultEpilogue::Padding,
+            DefaultEpilogue::kFragmentsPerIteration,
+            true,
+            typename MM1::OutputTileIteratorAccum>;
+
+    typename MM1::OutputTileIteratorAccum dest_iter(
+        typename MM1::OutputTileIteratorAccum::Params{int32_t(kMaxK)},
+        p.partial_num_ptr,
+        typename MM1::OutputTileIteratorAccum::TensorCoord{
+            p.num_queries,
+            kMaxK},
+        tid,
+        {0, 0});
+    EpilogueOutputOp rescale(s_prime, out_rescale);
+    Epilogue epilogue(
+        shared_storage.epilogue_shared_storage(),
+        tid,
+        my_warp_id,
+        my_lane_id);
+    epilogue(rescale, dest_iter, accum_o);
+
+    if (tid < problem_size_0_m) {
+      p.partial_m_ptr[tid] = m_prime[tid];
+      p.partial_s_ptr[tid] = s_prime[tid];
+    }
+  }
 };
 
 template <typename Kernel>
@@ -1254,6 +1647,197 @@ ModelStackSm80CausalPrefillForwardKernel(typename Kernel::Params params) {
       "FATAL: model-stack SM80 inference attention kernel was built for sm80-sm121, but was built for sm%d\n",
       int(__CUDA_ARCH__ + 0) / 10);
 #endif
+}
+
+template <typename Kernel>
+__global__ void __launch_bounds__(Kernel::kNumThreads, Kernel::kMinBlocksPerSm)
+ModelStackSm80CausalPrefillSplitKvPartialKernel(typename Kernel::Params params) {
+#ifdef __CUDA_ARCH__
+#if __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ <= 1210
+  if (!params.advance_to_block()) {
+    return;
+  }
+  Kernel::attention_split_kv_partial_kernel(params);
+  return;
+#endif
+#endif
+  printf(
+      "FATAL: model-stack SM80 split-K partial attention kernel was built for sm80-sm121, but was built for sm%d\n",
+      int(__CUDA_ARCH__ + 0) / 10);
+#endif
+}
+
+template <typename Kernel>
+__global__ void ModelStackSm80CausalPrefillSplitKvFinalizeKernel(
+    const typename Kernel::accum_t* partial_num,
+    const typename Kernel::accum_t* partial_m,
+    const typename Kernel::accum_t* partial_s,
+    typename Kernel::output_t* output,
+    int32_t num_batches,
+    int32_t num_queries,
+    int32_t splits) {
+  const int32_t row = static_cast<int32_t>(blockIdx.x);
+  const int32_t dim = static_cast<int32_t>(threadIdx.x);
+  if (row >= num_batches * num_queries || dim >= Kernel::kMaxK) {
+    return;
+  }
+
+  constexpr int32_t kMaxSharedFinalizeSplits = 256;
+  __shared__ float shared_m;
+  __shared__ float shared_denom;
+  __shared__ float shared_weights[kMaxSharedFinalizeSplits];
+  __shared__ float shared_denom_terms[kMaxSharedFinalizeSplits];
+  if (dim == 0) {
+    float m = -cutlass::platform::numeric_limits<float>::infinity();
+    for (int32_t split = 0; split < splits; ++split) {
+      const float local_m =
+          partial_m[int64_t(split) * int64_t(num_batches) * int64_t(num_queries) + row];
+      m = cutlass::fast_max(m, local_m);
+    }
+    shared_m = isfinite(m) ? m : 0.0f;
+  }
+  __syncthreads();
+
+  if (splits <= kMaxSharedFinalizeSplits && dim < splits) {
+    const int64_t state_idx =
+        int64_t(dim) * int64_t(num_batches) * int64_t(num_queries) + row;
+    const float local_m = partial_m[state_idx];
+    const float weight = isfinite(local_m) ? exp2f(local_m - shared_m) : 0.0f;
+    shared_weights[dim] = weight;
+    shared_denom_terms[dim] = partial_s[state_idx] * weight;
+  }
+  __syncthreads();
+
+  if (dim == 0) {
+    float denom = 0.0f;
+    if (splits <= kMaxSharedFinalizeSplits) {
+      for (int32_t split = 0; split < splits; ++split) {
+        denom += shared_denom_terms[split];
+      }
+    } else {
+      for (int32_t split = 0; split < splits; ++split) {
+        const int64_t state_idx =
+            int64_t(split) * int64_t(num_batches) * int64_t(num_queries) + row;
+        const float local_m = partial_m[state_idx];
+        if (isfinite(local_m)) {
+          denom += partial_s[state_idx] * exp2f(local_m - shared_m);
+        }
+      }
+    }
+    shared_denom = denom > 0.0f ? denom : 1.0f;
+  }
+  __syncthreads();
+
+  float numerator = 0.0f;
+  for (int32_t split = 0; split < splits; ++split) {
+    float weight;
+    if (splits <= kMaxSharedFinalizeSplits) {
+      weight = shared_weights[split];
+    } else {
+      const int64_t state_idx =
+          int64_t(split) * int64_t(num_batches) * int64_t(num_queries) + row;
+      const float local_m = partial_m[state_idx];
+      weight = isfinite(local_m) ? exp2f(local_m - shared_m) : 0.0f;
+    }
+    if (weight != 0.0f) {
+      const int64_t num_idx =
+          (int64_t(split) * int64_t(num_batches) * int64_t(num_queries) + row) *
+              int64_t(Kernel::kMaxK) +
+          dim;
+      numerator += partial_num[num_idx] * weight;
+    }
+  }
+  output[int64_t(row) * int64_t(Kernel::kMaxK) + dim] =
+      typename Kernel::output_t(numerator / shared_denom);
+}
+
+template <typename Kernel>
+__global__ void __launch_bounds__(Kernel::kNumThreads, Kernel::kMinBlocksPerSm)
+ModelStackSm80CausalPrefillPersistentForwardKernel(
+    typename Kernel::Params params,
+    int32_t* task_counter,
+    int32_t task_count) {
+#ifdef __CUDA_ARCH__
+#if __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ <= 1210
+  __shared__ int32_t shared_task_idx;
+  while (true) {
+    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+      shared_task_idx = atomicAdd(task_counter, int32_t(1));
+    }
+    __syncthreads();
+
+    const int32_t task_idx = shared_task_idx;
+    if (task_idx >= task_count) {
+      return;
+    }
+
+    auto task_params = params;
+    if (task_params.advance_to_task(task_idx)) {
+      Kernel::attention_kernel(task_params);
+    }
+    __syncthreads();
+  }
+#endif
+#endif
+  printf(
+      "FATAL: model-stack SM80 persistent inference attention kernel was built for sm80-sm121, but was built for sm%d\n",
+      int(__CUDA_ARCH__ + 0) / 10);
+#endif
+}
+
+inline bool ModelStackSm80PersistentPrefillDisabled() {
+  const char* env = std::getenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_PERSISTENT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+inline bool ModelStackSm80SplitKvPrefillDisabled() {
+  const char* env = std::getenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_SPLIT_KV");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+inline bool ModelStackSm80PersistentPrefillEnabled() {
+  const char* env = std::getenv("MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_PERSISTENT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+inline bool ModelStackSm80SplitKvPrefillEnabled() {
+  const char* env = std::getenv("MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_SPLIT_KV");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+inline int32_t ModelStackSm80SplitKvChunk() {
+  const char* env = std::getenv("MODEL_STACK_SM80_SPLIT_KV_CHUNK");
+  if (env == nullptr || env[0] == '\0') {
+    return 1024;
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(env, &end, 10);
+  if (end == env || parsed < 64) {
+    return 1024;
+  }
+  const int32_t chunk = static_cast<int32_t>(parsed);
+  return ((chunk + 63) / 64) * 64;
+}
+
+inline bool PreferModelStackSm80PersistentPrefill(
+    const t10::desc::AttentionDesc& desc,
+    int32_t task_count,
+    int effective_ctas) {
+  return ModelStackSm80PersistentPrefillEnabled() &&
+      !ModelStackSm80PersistentPrefillDisabled() &&
+      desc.q_len >= 2816 &&
+      task_count > effective_ctas;
+}
+
+inline bool PreferModelStackSm80SplitKvPrefill(
+    const t10::desc::AttentionDesc& desc,
+    int32_t splits) {
+  return ModelStackSm80SplitKvPrefillEnabled() &&
+      !ModelStackSm80SplitKvPrefillDisabled() &&
+      desc.q_len >= 2816 &&
+      splits > 1;
 }
 
 template <typename Kernel, typename scalar_t>
@@ -1308,9 +1892,93 @@ inline bool TryLaunchModelStackSm80InferenceAttentionKernel(
   }
 
   constexpr auto kernel_fn = ModelStackSm80CausalPrefillForwardKernel<Kernel>;
+  constexpr auto split_partial_kernel_fn =
+      ModelStackSm80CausalPrefillSplitKvPartialKernel<Kernel>;
+  constexpr auto split_finalize_kernel_fn =
+      ModelStackSm80CausalPrefillSplitKvFinalizeKernel<Kernel>;
+  constexpr auto persistent_kernel_fn =
+      ModelStackSm80CausalPrefillPersistentForwardKernel<Kernel>;
   if (smem_bytes > 0xc000) {
     (void)cudaFuncSetAttribute(
         kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    (void)cudaFuncSetAttribute(
+        split_partial_kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    (void)cudaFuncSetAttribute(
+        persistent_kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+  }
+
+  const int32_t split_chunk = ModelStackSm80SplitKvChunk();
+  const int32_t split_count =
+      static_cast<int32_t>((desc.kv_len + int64_t(split_chunk) - 1) / int64_t(split_chunk));
+  if (PreferModelStackSm80SplitKvPrefill(desc, split_count)) {
+    auto float_options = q_contig.options().dtype(torch::kFloat32);
+    auto partial_num = torch::empty(
+        {split_count, params.num_batches, params.num_queries, int64_t(Kernel::kMaxK)},
+        float_options);
+    auto partial_m = torch::empty(
+        {split_count, params.num_batches, params.num_queries},
+        float_options);
+    auto partial_s = torch::empty(
+        {split_count, params.num_batches, params.num_queries},
+        float_options);
+
+    const auto current_stream = at::cuda::getCurrentCUDAStream(q_contig.get_device());
+    c10::cuda::CUDACachingAllocator::recordStream(
+        partial_num.storage().data_ptr(),
+        current_stream);
+    c10::cuda::CUDACachingAllocator::recordStream(
+        partial_m.storage().data_ptr(),
+        current_stream);
+    c10::cuda::CUDACachingAllocator::recordStream(
+        partial_s.storage().data_ptr(),
+        current_stream);
+
+    auto split_params = params;
+    split_params.partial_num_ptr = partial_num.template data_ptr<float>();
+    split_params.partial_m_ptr = partial_m.template data_ptr<float>();
+    split_params.partial_s_ptr = partial_s.template data_ptr<float>();
+    split_params.split_k_chunk = split_chunk;
+    split_params.split_k_splits = split_count;
+    split_partial_kernel_fn<<<
+        split_params.getSplitKvBlocksGrid(),
+        split_params.getThreadsGrid(),
+        smem_bytes,
+        stream>>>(split_params);
+
+    const int32_t rows = params.num_batches * params.num_queries;
+    split_finalize_kernel_fn<<<rows, Kernel::kMaxK, 0, stream>>>(
+        partial_num.template data_ptr<float>(),
+        partial_m.template data_ptr<float>(),
+        partial_s.template data_ptr<float>(),
+        params.output_ptr,
+        params.num_batches,
+        params.num_queries,
+        split_count);
+    return true;
+  }
+
+  const int effective_ctas = std::max(1, static_cast<int>(props->multiProcessorCount)) * 2;
+  const int32_t task_count = params.task_count();
+  if (PreferModelStackSm80PersistentPrefill(desc, task_count, effective_ctas)) {
+    auto task_counter = torch::empty({1}, q_contig.options().dtype(torch::kInt32));
+    const auto current_stream = at::cuda::getCurrentCUDAStream(q_contig.get_device());
+    c10::cuda::CUDACachingAllocator::recordStream(
+        task_counter.storage().data_ptr(),
+        current_stream);
+    AT_CUDA_CHECK(cudaMemsetAsync(
+        task_counter.data_ptr<int32_t>(),
+        0,
+        sizeof(int32_t),
+        stream));
+    const dim3 persistent_blocks(
+        std::min<int32_t>(task_count, static_cast<int32_t>(effective_ctas)),
+        1,
+        1);
+    persistent_kernel_fn<<<persistent_blocks, params.getThreadsGrid(), smem_bytes, stream>>>(
+        params,
+        task_counter.data_ptr<int32_t>(),
+        task_count);
+    return true;
   }
   kernel_fn<<<blocks, params.getThreadsGrid(), smem_bytes, stream>>>(params);
   return true;

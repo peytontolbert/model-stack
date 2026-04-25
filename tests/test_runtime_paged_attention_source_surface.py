@@ -46,9 +46,17 @@ def test_native_runtime_exposes_paged_attention_decode_kernel_surface() -> None:
     assert "bool HasCudaPagedAttentionDecodeKernel();" in native_source
     assert "bool HasCudaPagedAttentionDecodeKernel() {" in native_source
     assert "NativeCachePagedAttentionDecodeLayer(" in native_source
-    assert "return PagedAttentionDecodeForward(q, k_pages, v_pages, block_table, lengths, attn_mask, scale);" in native_source
+    assert "return PagedAttentionDecodeForward(q, k_pages, v_pages, block_table, lengths, normalized_mask, scale);" in native_source
     assert 'm.def("paged_attention_decode_forward", &PagedAttentionDecodeForward' in native_source
     assert "paged_decode_attention_q1_forward_kernel" in cuda_source
+    assert "paged_decode_attention_q1_hdim_sm90_forward_kernel" in cuda_source
+    assert "MODEL_STACK_PAGED_DECODE_THREADS" in cuda_source
+    assert "SelectPagedDecodeThreads(mask_seq, q_contig.size(3))" in cuda_source
+    assert "if (head_dim <= 128)" in cuda_source
+    assert "denom = denom * expf(row_max - score) + 1.0f" in cuda_source
+    assert "TryLaunchPagedDecodeAttentionQ1Sm90SpecializedForHeadDim" in cuda_source
+    assert "mask_seq < 512" in cuda_source
+    assert "auto out = torch::empty_like(q_contig);" in cuda_source
     assert "LaunchPagedDecodeAttentionQ1" in cuda_source
     assert "bool HasCudaPagedAttentionDecodeKernel()" in cuda_source
     assert "torch::Tensor CudaPagedAttentionDecodeForward(" in cuda_source

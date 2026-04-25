@@ -345,6 +345,42 @@ def test_quantized_bitnet_dynamic_int8_decode_can_use_dense_fallback(monkeypatch
     assert torch.allclose(seen["bias"], expected_bias)
 
 
+def test_quantized_bitnet_dynamic_int8_hopper_prefill_can_use_dense_fallback(monkeypatch):
+    seen = {}
+
+    def fake_dense_linear(x, weight, bias=None):
+        seen["x"] = tuple(x.shape)
+        seen["weight"] = weight.detach().clone()
+        seen["bias"] = None if bias is None else bias.detach().clone()
+        return torch.full((*x.shape[:-1], weight.shape[0]), 10.0, dtype=x.dtype)
+
+    def fail_runtime_bitnet_int8_linear_from_float(*args, **kwargs):
+        raise AssertionError("Hopper dynamic_int8 prefill dense fallback should bypass runtime_bitnet_int8_linear_from_float")
+
+    monkeypatch.setattr(torch.nn.functional, "linear", fake_dense_linear)
+    monkeypatch.setattr(quant_mod, "runtime_bitnet_int8_linear_from_float", fail_runtime_bitnet_int8_linear_from_float)
+
+    layer = quant_mod.QuantizedLinearBitNet(2560, 6912, bias=True).from_float(
+        torch.nn.Linear(2560, 6912, bias=True),
+        activation_quant="dynamic_int8",
+    )
+    x = torch.randn(1, 1024, 2560)
+    dense_weight = torch.randn(6912, 2560)
+    expected_bias = layer.runtime_bias(dtype=x.dtype, device=x.device)
+
+    monkeypatch.setattr(layer, "_prefer_dynamic_int8_dense_decode_fallback", lambda _x: False)
+    monkeypatch.setattr(layer, "_prefer_dynamic_int8_dense_hopper_prefill_fallback", lambda _x: True)
+    monkeypatch.setattr(layer, "_dequantized_int8_backend_weight", lambda dtype, device=None: dense_weight.to(dtype=dtype))
+
+    out = layer.runtime_linear(x)
+
+    assert out.shape == (1, 1024, 6912)
+    assert torch.all(out == 10.0)
+    assert seen["x"] == (1, 1024, 2560)
+    assert torch.allclose(seen["weight"], dense_weight.to(dtype=x.dtype))
+    assert torch.allclose(seen["bias"], expected_bias)
+
+
 def test_quantized_bitnet_dynamic_int8_sub8_decode_does_not_use_dense_fallback(monkeypatch):
     seen = {}
 

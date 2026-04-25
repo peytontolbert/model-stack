@@ -99,6 +99,7 @@ _EXPORTS = {
     "EncoderBlock": "runtime.block_modules",
     "expert_parallel_partition": "runtime.moe",
     "bitnet_linear": "runtime.quant",
+    "bitnet_linear_compute_packed": "runtime.quant",
     "bitnet_linear_from_float": "runtime.quant",
     "fp8_linear": "runtime.quant",
     "nf4_linear": "runtime.quant",

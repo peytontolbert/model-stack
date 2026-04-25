@@ -109,11 +109,14 @@ def test_fp8_quantization_source_threads_through_compression_and_export() -> Non
     assert "def int8_linear(" in runtime_quant_source
     assert "def int8_matmul_qkv(" in runtime_quant_source
     assert "def bitnet_linear(" in runtime_quant_source
+    assert "def bitnet_linear_compute_packed(" in runtime_quant_source
     assert "def bitnet_linear_from_float(" in runtime_quant_source
     assert "prefer_hopper_library_attention" in runtime_quant_source
     assert "prefer_hopper_library_linear" not in runtime_quant_source
     assert "module.int8_linear_forward(" in runtime_quant_source
     assert "has_native_op(\"bitnet_linear_from_float\")" in runtime_quant_source
+    assert "has_native_op(\"bitnet_linear_compute_packed\")" in runtime_quant_source
+    assert "module.bitnet_linear_compute_packed_forward(" in runtime_quant_source
     assert "module.bitnet_linear_from_float_forward(" in runtime_quant_source
     assert "module.int8_attention_forward(" in runtime_quant_source
     assert "native_mask_ok" in runtime_quant_source
@@ -211,14 +214,17 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "bool PyCallableAttr(" in native_source
     assert "struct BitNetModuleState" in native_source
     assert "{\"bitnet_transform_input\", true}" in native_source
+    assert "{\"bitnet_linear_compute_packed\", true}" in native_source
     assert "{\"bitnet_linear_from_float\", true}" in native_source
     assert "{\"bitnet_int8_linear_from_float\", true}" in native_source
     assert "{\"bitnet_int8_fused_qkv_packed_heads_projection\", true}" in native_source
     assert "bool HasCudaBitNetInputFrontendKernel()" in native_source
     assert "cuda_backend_ops.push_back(\"bitnet_transform_input\");" in native_source
+    assert "cuda_backend_ops.push_back(\"bitnet_linear_compute_packed\");" in native_source
     assert "cuda_backend_ops.push_back(\"bitnet_linear_from_float\");" in native_source
     assert "cuda_backend_ops.push_back(\"bitnet_int8_fused_qkv_packed_heads_projection\");" in native_source
     assert "m.def(\"bitnet_transform_input_forward\"" in native_source
+    assert "bitnet_linear_compute_packed_forward" in native_source
     assert "m.def(\"bitnet_linear_from_float_forward\"" in native_source
     assert "bitnet_int8_linear_from_float_forward" in native_source
     assert "bitnet_int8_fused_qkv_packed_heads_projection_forward" in native_source
@@ -295,6 +301,7 @@ def test_native_int4_kernel_is_registered_in_source() -> None:
     setup_source = _read("setup.py")
     native_py_source = _read("runtime/native.py")
     assert "{\"bitnet_linear\", true}" in native_source
+    assert "\"bitnet_linear_compute_packed\"" in native_source
     assert "{\"pack_bitnet_weight\", true}" in native_source
     assert "{\"bitnet_qkv_packed_heads_projection\", true}" in native_source
     assert "info[\"bitnet_linear_dtypes\"]" in native_source
@@ -447,6 +454,7 @@ def test_native_int4_kernel_is_registered_in_source() -> None:
     assert "runtime/csrc/backend/cuda_int8_attention.cu" in setup_source
     assert "runtime/csrc/backend/cuda_int8_linear.cu" in setup_source
     assert "\"bitnet_linear\"" in native_py_source
+    assert "\"bitnet_linear_compute_packed\"" in native_py_source
     assert "\"bitnet_linear_from_float\"" in native_py_source
     assert "\"bitnet_int8_linear_from_float\"" in native_py_source
     assert "\"bitnet_int8_fused_qkv_packed_heads_projection\"" in native_py_source

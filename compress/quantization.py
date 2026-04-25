@@ -18,6 +18,7 @@ from runtime.ops import linear as runtime_linear
 from runtime.ops import bitnet_transform_input as runtime_bitnet_transform_input
 from runtime.ops import pack_bitnet_weight as runtime_pack_bitnet_weight
 from runtime.quant import bitnet_linear as runtime_bitnet_linear
+from runtime.quant import bitnet_linear_compute_packed as runtime_bitnet_linear_compute_packed
 from runtime.quant import bitnet_int8_linear_from_float as runtime_bitnet_int8_linear_from_float
 from runtime.quant import bitnet_linear_from_float as runtime_bitnet_linear_from_float
 from runtime.quant import _dequantize_int8_activation
@@ -2645,6 +2646,26 @@ class QuantizedLinearBitNet(nn.Module):
         # needs separate policy work if we want it to route differently.
         return int(self.in_features) >= 2048 or int(self.out_features) >= 2048
 
+    def _prefer_dynamic_int8_dense_hopper_prefill_fallback(self, x: torch.Tensor) -> bool:
+        if not x.is_cuda or x.ndim < 2:
+            return False
+        rows = int(x.numel() // max(int(x.shape[-1]), 1))
+        if rows <= 8:
+            return False
+        if self._pre_scale_active_runtime():
+            return False
+        try:
+            major, minor = torch.cuda.get_device_capability(x.device)
+        except Exception:
+            return False
+        if (int(major), int(minor)) < (9, 0):
+            return False
+        # Hopper BF16 GEMMs are already strong enough on large prefill tiles
+        # that the dense cached-weight path beats the W2A8 frontend for the
+        # large BitNet projections we care about. Keep this policy narrow and
+        # 8-bit-only rather than mixing it into sub-8-bit dynamic tuning.
+        return int(self.in_features) >= 2048 or int(self.out_features) >= 2048
+
     def runtime_packed_linear_signature(self, backend: str):
         if not self.runtime_supports_packed_backend(backend):
             return None
@@ -2898,9 +2919,26 @@ class QuantizedLinearBitNet(nn.Module):
             spin_enabled = self._spin_enabled_runtime()
             pre_scale_active = self._pre_scale_active_runtime()
             if not spin_enabled and not pre_scale_active:
+                backend_name = str(backend or "auto").strip().lower()
+                if backend_name == "bitnet":
+                    compute_words, compute_scales = self._compute_backend_weight(device=target_device)
+                    decode_nz, decode_sign, decode_scales = self._decode_backend_weight(device=target_device)
+                    return runtime_bitnet_linear_compute_packed(
+                        x_local,
+                        self.packed_weight,
+                        self.scale_values,
+                        self.layout_header,
+                        self.segment_offsets,
+                        compute_words,
+                        compute_scales,
+                        decode_nz,
+                        decode_sign,
+                        decode_scales,
+                        self.runtime_bias(dtype=target_dtype, device=target_device),
+                        out_dtype=target_dtype,
+                    )
                 weight = self._dequantized_weight(target_dtype, device=target_device)
                 bias = None if self.bias is None else self.bias.to(device=target_device, dtype=target_dtype)
-                backend_name = str(backend or "auto").strip().lower()
                 if backend_name in {"", "auto", "aten"}:
                     return torch.nn.functional.linear(x_local, weight, bias)
                 return runtime_linear(x_local, weight, bias, backend=backend)
@@ -2915,14 +2953,14 @@ class QuantizedLinearBitNet(nn.Module):
             if (
                 mode_name == "dynamic_int8"
                 and backend_name in {"", "auto", "aten"}
-                and self._prefer_dynamic_int8_dense_decode_fallback(x)
                 and not self._spin_enabled_runtime()
                 and int(self.act_quant_bits) == 8
             ):
-                x_local = x.to(device=target_device, dtype=target_dtype)
-                weight = self._dequantized_int8_backend_weight(target_dtype, device=target_device)
-                bias = self.runtime_bias(dtype=target_dtype, device=target_device)
-                return torch.nn.functional.linear(x_local, weight, bias)
+                if self._prefer_dynamic_int8_dense_decode_fallback(x) or self._prefer_dynamic_int8_dense_hopper_prefill_fallback(x):
+                    x_local = x.to(device=target_device, dtype=target_dtype)
+                    weight = self._dequantized_int8_backend_weight(target_dtype, device=target_device)
+                    bias = self.runtime_bias(dtype=target_dtype, device=target_device)
+                    return torch.nn.functional.linear(x_local, weight, bias)
             qweight, inv_scale = self._int8_backend_weight(device=target_device)
             pre_scale_active = self._pre_scale_active_runtime()
             pre_scale = self.pre_scale.to(device=target_device) if pre_scale_active else None

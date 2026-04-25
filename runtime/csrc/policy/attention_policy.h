@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 
 #include "../descriptors/attention_desc.h"
@@ -80,6 +81,48 @@ inline int SelectAttentionRowThreads(const t10::desc::AttentionDesc& desc) {
     return 128;
   }
   return 256;
+}
+
+inline bool AttentionSm80FlashPrefillDisabled() {
+  const char* env = std::getenv("MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_FLASH");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+inline bool AttentionSm80FlashPrefillEnabled() {
+  const char* env = std::getenv("MODEL_STACK_ENABLE_ATTENTION_PREFILL_SM80_FLASH");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+inline int64_t AttentionSm80FlashPrefillMinSeq() {
+  const char* env = std::getenv("MODEL_STACK_SM80_FLASH_PREFILL_MIN_SEQ");
+  if (env == nullptr || env[0] == '\0') {
+    return 2688;
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(env, &end, 10);
+  if (end == env || parsed <= 0) {
+    return 2688;
+  }
+  return static_cast<int64_t>(parsed);
+}
+
+inline bool SupportsAttentionSm80FlashPrefill(const t10::desc::AttentionDesc& desc) {
+  return desc.phase == t10::desc::AttentionPhase::kPrefill &&
+      desc.causal &&
+      desc.mask_kind == t10::desc::AttentionMaskKind::kNone &&
+      desc.head_mode == t10::desc::AttentionHeadMode::kMHA &&
+      desc.q_layout == t10::desc::AttentionLayoutKind::kBHSD &&
+      desc.kv_layout == t10::desc::AttentionLayoutKind::kBHSD &&
+      desc.head_dim == 64 &&
+      desc.q_len > 0 &&
+      desc.q_len == desc.kv_len;
+}
+
+inline bool PreferAttentionSm80FlashPrefill(const t10::desc::AttentionDesc& desc) {
+  return AttentionSm80FlashPrefillEnabled() &&
+      !AttentionSm80FlashPrefillDisabled() &&
+      SupportsAttentionSm80FlashPrefill(desc) &&
+      desc.q_len >= AttentionSm80FlashPrefillMinSeq();
 }
 
 inline bool AttentionHasDeadTopLeftCausalKvTail(const t10::desc::AttentionDesc& desc) {

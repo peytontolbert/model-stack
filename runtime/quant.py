@@ -902,6 +902,69 @@ def bitnet_linear(
     return runtime_linear(x_cast, weight, bias_cast)
 
 
+def bitnet_linear_compute_packed(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    scale_values: torch.Tensor,
+    layout_header: torch.Tensor,
+    segment_offsets: torch.Tensor,
+    compute_packed_words: torch.Tensor,
+    compute_row_scales: torch.Tensor,
+    decode_nz_masks: torch.Tensor,
+    decode_sign_masks: torch.Tensor,
+    decode_row_scales: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    compute_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
+    target_device = compute_packed_words.device
+    x_cast = x.to(device=target_device, dtype=compute_dtype)
+    packed_cast, scales_cast, header_cast, offsets_cast, meta = _normalize_bitnet_layout_inputs(
+        packed_weight,
+        scale_values,
+        layout_header,
+        segment_offsets,
+        target_device=target_device,
+    )
+    if int(x_cast.shape[-1]) != meta["logical_in_features"]:
+        raise ValueError(
+            "BitNet input feature mismatch: "
+            f"expected {meta['logical_in_features']}, got {int(x_cast.shape[-1])}"
+        )
+    bias_cast = None if bias is None else bias.to(device=target_device, dtype=compute_dtype)
+    if x_cast.is_cuda and not _should_use_eager_autograd_fallback(x_cast, bias_cast):
+        module = native_module()
+        if (
+            has_native_op("bitnet_linear_compute_packed")
+            and module is not None
+            and hasattr(module, "bitnet_linear_compute_packed_forward")
+        ):
+            return module.bitnet_linear_compute_packed_forward(
+                x_cast,
+                packed_cast,
+                scales_cast,
+                header_cast,
+                offsets_cast,
+                compute_packed_words.to(device=target_device).contiguous(),
+                compute_row_scales.to(device=target_device, dtype=torch.float32).contiguous(),
+                decode_nz_masks.to(device=target_device).contiguous(),
+                decode_sign_masks.to(device=target_device).contiguous(),
+                decode_row_scales.to(device=target_device, dtype=torch.float32).contiguous(),
+                bias_cast,
+                out_dtype,
+            )
+    return bitnet_linear(
+        x_cast,
+        packed_cast,
+        scales_cast,
+        header_cast,
+        offsets_cast,
+        bias_cast,
+        out_dtype=out_dtype,
+    )
+
+
 def bitnet_linear_from_float(
     x: torch.Tensor,
     packed_weight: torch.Tensor,
@@ -1003,6 +1066,7 @@ __all__ = [
     "int8_linear_from_quantized_activation",
     "int8_linear",
     "bitnet_linear",
+    "bitnet_linear_compute_packed",
     "bitnet_linear_from_float",
     "fp8_linear",
     "nf4_linear",

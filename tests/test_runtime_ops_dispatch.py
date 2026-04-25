@@ -28,6 +28,27 @@ class _AttentionNativeModule:
         return self.result
 
 
+class _EmbeddingNativeModule:
+    def __init__(self, result: torch.Tensor):
+        self.result = result
+        self.calls = 0
+
+    def embedding_forward(self, *args, **kwargs) -> torch.Tensor:
+        self.calls += 1
+        return self.result
+
+
+class _AddLayerNormNativeModule:
+    def __init__(self, combined: torch.Tensor, normalized: torch.Tensor):
+        self.combined = combined
+        self.normalized = normalized
+        self.calls = 0
+
+    def add_layer_norm_forward(self, *args, **kwargs):
+        self.calls += 1
+        return self.combined, self.normalized
+
+
 def _force_eager_dispatch(monkeypatch) -> None:
     monkeypatch.setattr(runtime_ops, "has_native_op", lambda name: True)
     monkeypatch.setattr(runtime_ops, "native_module", lambda: _UnexpectedNativeModule())
@@ -117,12 +138,122 @@ def test_add_layer_norm_prefers_eager_reference_when_heuristic_trips(monkeypatch
     assert torch.allclose(normalized, ref_normalized)
 
 
+def test_add_layer_norm_prefers_native_by_default_when_available(monkeypatch) -> None:
+    x = torch.randn(2, 3, 5)
+    update = torch.randn(2, 3, 5)
+    expected_combined = torch.randn_like(x)
+    expected_normalized = torch.randn_like(x)
+    native = _AddLayerNormNativeModule(expected_combined, expected_normalized)
+
+    monkeypatch.setattr(runtime_ops, "_prefer_ampere_eager_cuda_path", lambda tensor: True)
+    monkeypatch.setattr(runtime_ops, "_env_flag", lambda name, default="0": False)
+    monkeypatch.setattr(runtime_ops, "has_native_op", lambda name: name == "add_layer_norm")
+    monkeypatch.setattr(runtime_ops, "native_module", lambda: native)
+
+    combined, normalized = runtime_ops.add_layer_norm(x, update)
+
+    assert native.calls == 1
+    assert torch.equal(combined, expected_combined)
+    assert torch.equal(normalized, expected_normalized)
+
+
+def test_add_layer_norm_disable_env_restores_eager_preference(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_ops, "_prefer_ampere_eager_cuda_path", lambda tensor: True)
+    monkeypatch.setattr(
+        runtime_ops,
+        "_env_flag",
+        lambda name, default="0": name == "MODEL_STACK_DISABLE_CUDA_ADD_LAYER_NORM_NATIVE",
+    )
+
+    x = type("FakeTensor", (), {"is_cuda": True, "device": torch.device("cuda:0")})()
+    update = type("FakeTensor", (), {"is_cuda": True, "device": torch.device("cuda:0")})()
+
+    assert runtime_ops._prefer_eager_cuda_add_layer_norm(x, update) is True
+
+
+def test_add_layer_norm_uses_eager_for_small_ampere_rows_by_default(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_ops, "_prefer_ampere_eager_cuda_path", lambda tensor: True)
+    monkeypatch.setattr(runtime_ops, "_env_flag", lambda name, default="0": False)
+
+    x = type(
+        "FakeTensor",
+        (),
+        {
+            "is_cuda": True,
+            "device": torch.device("cuda:0"),
+            "dtype": torch.float16,
+            "ndim": 3,
+            "shape": (1, 128, 4096),
+            "numel": lambda self: 1 * 128 * 4096,
+        },
+    )()
+    update = type("FakeTensor", (), {"is_cuda": True, "device": torch.device("cuda:0")})()
+
+    assert runtime_ops._prefer_eager_cuda_add_layer_norm(x, update) is True
+
+
+def test_add_layer_norm_uses_native_for_large_ampere_rows_by_default(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_ops, "_prefer_ampere_eager_cuda_path", lambda tensor: True)
+    monkeypatch.setattr(runtime_ops, "_env_flag", lambda name, default="0": False)
+
+    x = type(
+        "FakeTensor",
+        (),
+        {
+            "is_cuda": True,
+            "device": torch.device("cuda:0"),
+            "dtype": torch.float16,
+            "ndim": 3,
+            "shape": (16, 512, 768),
+            "numel": lambda self: 16 * 512 * 768,
+        },
+    )()
+    update = type("FakeTensor", (), {"is_cuda": True, "device": torch.device("cuda:0")})()
+
+    assert runtime_ops._prefer_eager_cuda_add_layer_norm(x, update) is False
+
+
 def test_embedding_prefers_eager_reference_when_heuristic_trips(monkeypatch) -> None:
     _force_eager_dispatch(monkeypatch)
     monkeypatch.setattr(runtime_ops, "_prefer_eager_cuda_embedding", lambda *args, **kwargs: True)
 
     weight = torch.randn(13, 7)
     indices = torch.tensor([[1, 2, 3], [4, 0, 5]], dtype=torch.long)
+
+    out = runtime_ops.embedding(weight, indices, padding_idx=0)
+
+    assert torch.allclose(out, F.embedding(indices, weight, padding_idx=0))
+
+
+def test_embedding_prefers_native_by_default_when_available(monkeypatch) -> None:
+    weight = torch.randn(13, 7)
+    indices = torch.tensor([[1, 2, 3], [4, 0, 5]], dtype=torch.long)
+    expected = torch.randn(2, 3, 7)
+    native = _EmbeddingNativeModule(expected)
+
+    monkeypatch.setattr(runtime_ops, "_prefer_ampere_eager_cuda_path", lambda tensor: True)
+    monkeypatch.setattr(runtime_ops, "_env_flag", lambda name, default="0": False)
+    monkeypatch.setattr(runtime_ops, "has_native_op", lambda name: name == "embedding")
+    monkeypatch.setattr(runtime_ops, "native_module", lambda: native)
+
+    out = runtime_ops.embedding(weight, indices, padding_idx=0)
+
+    assert native.calls == 1
+    assert torch.equal(out, expected)
+
+
+def test_embedding_disable_env_restores_eager_preference(monkeypatch) -> None:
+    weight = torch.randn(13, 7)
+    indices = torch.tensor([[1, 2, 3], [4, 0, 5]], dtype=torch.long)
+
+    monkeypatch.setattr(runtime_ops, "_prefer_ampere_eager_cuda_path", lambda tensor: True)
+    monkeypatch.setattr(
+        runtime_ops,
+        "_env_flag",
+        lambda name, default="0": name == "MODEL_STACK_DISABLE_CUDA_EMBEDDING_NATIVE",
+    )
+    monkeypatch.setattr(runtime_ops, "has_native_op", lambda name: True)
+    monkeypatch.setattr(runtime_ops, "native_module", lambda: _UnexpectedNativeModule())
 
     out = runtime_ops.embedding(weight, indices, padding_idx=0)
 
@@ -165,3 +296,49 @@ def test_attention_uses_torch_library_when_native_sm80_prefill_is_not_preferred(
     out = runtime_ops.attention(q, q, q, is_causal=True)
 
     assert torch.equal(out, expected)
+
+
+def test_sm80_prefill_shape_guard_keeps_marginal_mid_contexts_on_torch(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_ops, "_env_flag", lambda name, default="0": False)
+
+    fp16_batched = torch.empty(2, 8, 3072, 64, dtype=torch.float16)
+    fp16_single_8h = torch.empty(1, 8, 2816, 64, dtype=torch.float16)
+    fp16_single_8h_long = torch.empty(1, 8, 6144, 64, dtype=torch.float16)
+    fp16_single_16h = torch.empty(1, 16, 3072, 64, dtype=torch.float16)
+    bf16_batched_4096 = torch.empty(2, 8, 4096, 64, dtype=torch.bfloat16)
+    bf16_single_3072 = torch.empty(1, 8, 3072, 64, dtype=torch.bfloat16)
+
+    assert runtime_ops._prefer_native_sm80_prefill_shape_over_torch(fp16_batched) is False
+    assert runtime_ops._prefer_native_sm80_prefill_shape_over_torch(fp16_single_8h) is False
+    assert runtime_ops._prefer_native_sm80_prefill_shape_over_torch(fp16_single_8h_long) is False
+    assert runtime_ops._prefer_native_sm80_prefill_shape_over_torch(fp16_single_16h) is False
+    assert runtime_ops._prefer_native_sm80_prefill_shape_over_torch(bf16_batched_4096) is False
+    assert runtime_ops._prefer_native_sm80_prefill_shape_over_torch(bf16_single_3072) is True
+
+
+def test_sm80_prefill_shape_guard_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        runtime_ops,
+        "_env_flag",
+        lambda name, default="0": name == "MODEL_STACK_DISABLE_SM80_NATIVE_ATTENTION_SHAPE_GUARD",
+    )
+
+    fp16_batched = torch.empty(2, 8, 3072, 64, dtype=torch.float16)
+
+    assert runtime_ops._prefer_native_sm80_prefill_shape_over_torch(fp16_batched) is True
+
+
+def test_attention_plan_info_fallback_exposes_flash_prefill_fields(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_ops, "native_module", lambda: None)
+
+    q = torch.randn(2, 4, 8, 64)
+    k = torch.randn(2, 4, 8, 64)
+    v = torch.randn(2, 4, 8, 64)
+
+    info = runtime_ops.attention_plan_info(q, k, v, None, is_causal=True)
+
+    assert info["sm80_flash_prefill_disabled"] is False
+    assert info["sm80_flash_prefill_min_seq"] == 0
+    assert info["sm80_flash_prefill_eligible"] is False
+    assert info["sm80_flash_prefill_device_supported"] is False
+    assert info["sm80_flash_prefill_selected"] is False

@@ -9,8 +9,12 @@
 
 namespace t10::cuda {
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && \
+    defined(MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL) && MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL
 namespace cde = cuda::device::experimental;
+#define MODEL_STACK_HAS_SM90A_EXPERIMENTAL_NS 1
+#else
+#define MODEL_STACK_HAS_SM90A_EXPERIMENTAL_NS 0
 #endif
 
 union WgmmaDescriptor {
@@ -45,7 +49,7 @@ __device__ inline bool ArchHasSm90aFeatures() {
 }
 
 __device__ inline bool ArchHasSm90BulkAsync() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && MODEL_STACK_HAS_SM90A_EXPERIMENTAL_NS
   return true;
 #else
   return false;
@@ -134,7 +138,7 @@ __device__ inline void WgmmaM64N8K32S32U8S8(
 }
 
 __device__ inline void Sm90FenceProxyAsyncSharedCta() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && MODEL_STACK_HAS_SM90A_EXPERIMENTAL_NS
   cde::fence_proxy_async_shared_cta();
 #endif
 }
@@ -145,7 +149,7 @@ __device__ inline void Sm90CpAsyncBulkGlobalToShared(
     GlobalPtr global_src,
     uint32_t bytes,
     Barrier& barrier) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && MODEL_STACK_HAS_SM90A_EXPERIMENTAL_NS
   cde::cp_async_bulk_global_to_shared(shared_dst, global_src, bytes, barrier);
 #else
   (void)shared_dst;
@@ -160,7 +164,7 @@ __device__ inline auto Sm90BarrierArriveTx(
     Barrier& barrier,
     ptrdiff_t arrive_count,
     uint32_t bytes) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && MODEL_STACK_HAS_SM90A_EXPERIMENTAL_NS
   return cuda::device::barrier_arrive_tx(barrier, arrive_count, bytes);
 #else
   (void)arrive_count;

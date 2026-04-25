@@ -7,6 +7,7 @@
 #include "../../policy/attention_policy.h"
 #include "cuda_attention_cutlass_prefill.cuh"
 #include "cuda_attention_pytorch_memeff_prefill.cuh"
+#include "cuda_attention_sm80_flash_prefill.cuh"
 #include "cuda_attention_sm80_inference_prefill.cuh"
 
 #include <cstdlib>
@@ -1068,6 +1069,16 @@ inline void LaunchPrefillAttentionSpecialized(
   const bool prefer_cutlass_for_strided_kv =
       !k_contig.is_contiguous() || !v_contig.is_contiguous();
   if (TryLaunchModelStackSm80InferenceAttentionPrefill<scalar_t, HeadDim>(
+          q_contig,
+          k_contig,
+          v_contig,
+          out,
+          desc,
+          scale_value,
+          stream)) {
+    return;
+  }
+  if (TryLaunchModelStackSm80FlashAttentionPrefill<scalar_t, HeadDim>(
           q_contig,
           k_contig,
           v_contig,

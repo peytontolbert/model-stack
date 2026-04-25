@@ -43,6 +43,35 @@ def installed_torch_has_pytorch_memeff_headers() -> bool:
     return marker.exists()
 
 
+def resolve_cutlass_path() -> Path | None:
+    candidates: list[Path] = []
+    explicit = env_value("MODEL_STACK_CUTLASS_PATH")
+    if explicit is not None:
+        candidates.append(Path(explicit).expanduser())
+    candidates.append(Path("/data/parametergolf/helpful_repos/NVIDIA/cutlass"))
+    try:
+        import torch
+
+        torch_root = Path(torch.__file__).resolve().parent
+        candidates.append(torch_root / "include")
+        candidates.append(torch_root.parent / "tilelang" / "3rdparty" / "cutlass")
+        candidates.append(torch_root.parent / "flashinfer" / "data" / "cutlass")
+    except Exception:
+        pass
+    for root in candidates:
+        if (root / "include" / "cutlass" / "bfloat16.h").exists():
+            return root
+        if (root / "cutlass" / "bfloat16.h").exists():
+            return root.parent
+    return None
+
+
+def cutlass_has_fmha_examples(root: Path | None) -> bool:
+    if root is None:
+        return False
+    return (root / "examples" / "41_fused_multi_head_attention" / "kernel_forward.h").exists()
+
+
 _CUDA_VERSION_RE = re.compile(r"(?P<major>\d+)\.(?P<minor>\d+)(?:\.\d+)?")
 _CUDA_ARCH_RE = re.compile(
     r"^(?P<major>\d+)(?:\.(?P<minor>\d+))?(?P<suffix>[a-z]*)?(?:\+ptx)?$",
@@ -205,6 +234,7 @@ def native_extensions():
         sources.append("runtime/csrc/backend/attention/cuda_attention_prefill_dispatch.cu")
         sources.append("runtime/csrc/backend/attention/cuda_attention_sm80_inference_prefill.cu")
         sources.append("runtime/csrc/backend/attention/cuda_attention_pytorch_memeff_prefill.cu")
+        sources.append("runtime/csrc/backend/attention/cuda_attention_sm80_flash_prefill.cu")
         sources.append("runtime/csrc/backend/cuda_kv_cache.cu")
         sources.append("runtime/csrc/backend/cuda_rope.cu")
         sources.append("runtime/csrc/backend/cuda_activation.cu")
@@ -230,22 +260,28 @@ def native_extensions():
             define_macros.append(("MODEL_STACK_CUDA_VERSION_MINOR", str(cuda_version[1])))
         if env_enabled("MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL", "0"):
             define_macros.append(("MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL", "1"))
-        cutlass_path = env_value("MODEL_STACK_CUTLASS_PATH")
-        if cutlass_path is not None:
-            cutlass_root = Path(cutlass_path)
-            include_dirs.extend(
-                [
-                    str(cutlass_root / "include"),
-                    str(cutlass_root / "tools" / "util" / "include"),
-                    str(cutlass_root / "examples" / "41_fused_multi_head_attention"),
-                ]
-            )
-            define_macros.append(("MODEL_STACK_WITH_CUTLASS_FMHA", "1"))
+        cutlass_root = resolve_cutlass_path()
+        if cutlass_root is not None:
+            include_dirs.append(str(cutlass_root / "include"))
+            if cutlass_has_fmha_examples(cutlass_root):
+                include_dirs.extend(
+                    [
+                        str(cutlass_root / "tools" / "util" / "include"),
+                        str(cutlass_root / "examples" / "41_fused_multi_head_attention"),
+                    ]
+                )
+                define_macros.append(("MODEL_STACK_WITH_CUTLASS_FMHA", "1"))
+                local_flash_style_path = Path("other_repos/flash-attention/csrc/flash_attn/src/flash_fwd_launch_template.h")
+                if local_flash_style_path.exists():
+                    define_macros.append(("MODEL_STACK_WITH_LOCAL_FLASH_STYLE_PREFILL", "1"))
         pytorch_source_path = resolve_pytorch_source_path()
         if pytorch_source_path is not None:
             include_dirs.append(str(pytorch_source_path / "aten" / "src"))
+            source_cutlass = pytorch_source_path / "third_party" / "cutlass" / "include"
+            if (source_cutlass / "cutlass" / "bfloat16.h").exists():
+                include_dirs.append(str(source_cutlass))
             define_macros.append(("MODEL_STACK_WITH_PYTORCH_MEMEFF_FMHA", "1"))
-        elif installed_torch_has_pytorch_memeff_headers():
+        elif installed_torch_has_pytorch_memeff_headers() and cutlass_root is not None:
             define_macros.append(("MODEL_STACK_WITH_PYTORCH_MEMEFF_FMHA", "1"))
         extra_compile_args["nvcc"] = [
             "-O3",

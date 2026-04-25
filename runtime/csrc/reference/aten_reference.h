@@ -25,3 +25,12 @@ torch::Tensor ReferenceAttentionForward(
     const c10::optional<torch::Tensor>& attn_mask,
     bool is_causal,
     const c10::optional<double>& scale);
+
+torch::Tensor ReferenceAttentionPartitionedForward(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    const c10::optional<double>& scale,
+    int64_t kv_chunk_size);

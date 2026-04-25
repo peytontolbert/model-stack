@@ -24,3 +24,11 @@ def test_linear_forward_uses_tensor_aware_backend_resolution() -> None:
 
     assert 'const auto resolved_backend = ResolveLinearBackendForTensor(backend, x);' in source
     assert 'if (resolved_backend == "cublaslt" && x.is_cuda())' in source
+
+
+def test_hopper_bitnet_dense_decode_cache_defaults_to_full() -> None:
+    source = _read("runtime/csrc/model_stack_native.cpp")
+
+    assert "HopperDenseBitNetDecodeCacheMode" in source
+    assert 'if (env_value == nullptr) {\n    return "full";\n  }' in source
+    assert 'if (normalized.empty() || normalized == "qkv" || normalized == "qkv_only")' in source

@@ -55,15 +55,24 @@ def _prefer_ampere_eager_cuda_path(tensor: torch.Tensor) -> bool:
 
 
 def _prefer_eager_cuda_embedding(weight: torch.Tensor, indices: torch.Tensor) -> bool:
+    if _env_flag("MODEL_STACK_DISABLE_CUDA_EMBEDDING_NATIVE", "0"):
+        return _prefer_ampere_eager_cuda_path(weight) and indices.device == weight.device
     if _env_flag("MODEL_STACK_ENABLE_CUDA_EMBEDDING_NATIVE", "0"):
         return False
-    return _prefer_ampere_eager_cuda_path(weight) and indices.device == weight.device
+    return False
 
 
 def _prefer_eager_cuda_add_layer_norm(x: torch.Tensor, update: torch.Tensor) -> bool:
+    if _env_flag("MODEL_STACK_DISABLE_CUDA_ADD_LAYER_NORM_NATIVE", "0"):
+        return _prefer_ampere_eager_cuda_path(x) and update.is_cuda and update.device == x.device
     if _env_flag("MODEL_STACK_ENABLE_CUDA_ADD_LAYER_NORM_NATIVE", "0"):
         return False
-    return _prefer_ampere_eager_cuda_path(x) and update.is_cuda and update.device == x.device
+    if not _prefer_ampere_eager_cuda_path(x) or not update.is_cuda or update.device != x.device:
+        return False
+    rows = _cuda_rows_lastdim(x)
+    default_min_rows = 4096 if x.dtype == torch.float32 else 8192
+    native_min_rows = _env_int("MODEL_STACK_CUDA_ADD_LAYER_NORM_NATIVE_MIN_ROWS", default_min_rows)
+    return rows < max(native_min_rows, 1)
 
 
 def _prefer_eager_cuda_linear(
@@ -140,7 +149,7 @@ def _prefer_native_sm80_inference_attention(
 ) -> bool:
     if op_name != "attention_prefill":
         return False
-    if not _env_flag("MODEL_STACK_PREFER_NATIVE_SM80_INFERENCE_ATTENTION", "1"):
+    if not _env_flag("MODEL_STACK_PREFER_NATIVE_SM80_INFERENCE_ATTENTION", "0"):
         return False
     if _env_flag("MODEL_STACK_DISABLE_ATTENTION_PREFILL_SM80_INFERENCE", "0"):
         return False
@@ -168,7 +177,89 @@ def _prefer_native_sm80_inference_attention(
         return False
     if cuda_arch_family(q.device) not in {"ampere", "ada"}:
         return False
+    min_sms = _env_int("MODEL_STACK_SM80_NATIVE_ATTENTION_MIN_SMS", 64)
+    if min_sms > 0:
+        try:
+            device_index = q.device.index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(device_index)
+            if int(props.multi_processor_count) < min_sms:
+                return False
+        except Exception:
+            return False
+    if not _prefer_native_sm80_prefill_shape_over_torch(q):
+        return False
     return has_native_op(op_name)
+
+
+def _prefer_native_sm80_prefill_shape_over_torch(q: torch.Tensor) -> bool:
+    if _env_flag("MODEL_STACK_DISABLE_SM80_NATIVE_ATTENTION_SHAPE_GUARD", "0"):
+        return True
+    batch = int(q.shape[0])
+    heads = int(q.shape[1])
+    seq_len = int(q.shape[2])
+    if seq_len < 2688:
+        return True
+    # RTX 3090 measurements show these mid-context fp16/bf16 buckets are
+    # within noise or slightly behind torch SDPA. Let the torch-library path
+    # handle them while native covers the clear-win buckets.
+    if q.dtype == torch.float16:
+        if batch == 1 and heads == 8 and seq_len >= 2688:
+            return False
+        if batch == 2 and heads == 8 and seq_len <= 4096:
+            return False
+        if batch == 1 and heads == 16 and seq_len < 3584:
+            return False
+    if q.dtype == torch.bfloat16:
+        if batch == 2 and heads == 8 and 3840 <= seq_len <= 4096:
+            return False
+    return True
+
+
+def _expand_gqa_kv(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if q_in.shape[1] == k_in.shape[1]:
+        return k_in, v_in
+    if q_in.shape[1] % k_in.shape[1] != 0 or k_in.shape[1] != v_in.shape[1]:
+        raise ValueError("attention requires q heads to be a multiple of kv heads")
+    repeat = q_in.shape[1] // k_in.shape[1]
+    return k_in.repeat_interleave(repeat, dim=1), v_in.repeat_interleave(repeat, dim=1)
+
+
+def _torch_library_attention(
+    q_in: torch.Tensor,
+    k_in: torch.Tensor,
+    v_in: torch.Tensor,
+    mask_in: torch.Tensor | None,
+    *,
+    is_causal_in: bool,
+    scale_in: float | None,
+) -> torch.Tensor:
+    if mask_in is None and q_in.shape[1] == k_in.shape[1] == v_in.shape[1]:
+        return F.scaled_dot_product_attention(
+            q_in,
+            k_in,
+            v_in,
+            dropout_p=0.0,
+            is_causal=is_causal_in,
+            scale=scale_in,
+        )
+    k_all, v_all = _expand_gqa_kv(q_in, k_in, v_in)
+    sdpa_mask = mask_in
+    if sdpa_mask is not None:
+        if sdpa_mask.dtype == torch.bool:
+            sdpa_mask = torch.zeros_like(sdpa_mask, dtype=q_in.dtype).masked_fill(sdpa_mask, float("-inf"))
+        elif sdpa_mask.dtype != q_in.dtype:
+            sdpa_mask = sdpa_mask.to(dtype=q_in.dtype)
+    return F.scaled_dot_product_attention(
+        q_in,
+        k_all,
+        v_all,
+        attn_mask=sdpa_mask,
+        dropout_p=0.0,
+        is_causal=is_causal_in,
+        scale=scale_in,
+    )
 
 
 def _to_tuple_dims(dim: int | tuple[int, ...], ndim: int) -> tuple[int, ...]:
@@ -905,40 +996,6 @@ def attention(
     is_causal: bool = False,
     scale: float | None = None,
 ) -> torch.Tensor:
-    def _expand_gqa_kv(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if q_in.shape[1] == k_in.shape[1]:
-            return k_in, v_in
-        if q_in.shape[1] % k_in.shape[1] != 0 or k_in.shape[1] != v_in.shape[1]:
-            raise ValueError("attention requires q heads to be a multiple of kv heads")
-        repeat = q_in.shape[1] // k_in.shape[1]
-        return k_in.repeat_interleave(repeat, dim=1), v_in.repeat_interleave(repeat, dim=1)
-
-    def _torch_library_attention(
-        q_in: torch.Tensor,
-        k_in: torch.Tensor,
-        v_in: torch.Tensor,
-        mask_in: torch.Tensor | None,
-        *,
-        is_causal_in: bool,
-        scale_in: float | None,
-    ) -> torch.Tensor:
-        k_all, v_all = _expand_gqa_kv(q_in, k_in, v_in)
-        sdpa_mask = mask_in
-        if sdpa_mask is not None:
-            if sdpa_mask.dtype == torch.bool:
-                sdpa_mask = torch.zeros_like(sdpa_mask, dtype=q_in.dtype).masked_fill(sdpa_mask, float("-inf"))
-            elif sdpa_mask.dtype != q_in.dtype:
-                sdpa_mask = sdpa_mask.to(dtype=q_in.dtype)
-        return F.scaled_dot_product_attention(
-            q_in,
-            k_all,
-            v_all,
-            attn_mask=sdpa_mask,
-            dropout_p=0.0,
-            is_causal=is_causal_in,
-            scale=scale_in,
-        )
-
     op_name = "attention_decode" if q.shape[2] == 1 else "attention_prefill"
     if _should_use_eager_autograd_fallback(q, k, v, attn_mask):
         op_name = ""
@@ -1030,6 +1087,11 @@ def attention_plan_info(
         "head_dim": int(q.shape[3]),
         "causal": bool(is_causal),
         "trimmed_causal_tail": bool(is_causal and attn_mask is None and q.shape[2] < k.shape[2]),
+        "sm80_flash_prefill_disabled": False,
+        "sm80_flash_prefill_min_seq": 0,
+        "sm80_flash_prefill_eligible": False,
+        "sm80_flash_prefill_device_supported": False,
+        "sm80_flash_prefill_selected": False,
         "split_kv_eligible": False,
         "split_kv_block_n": 0,
         "split_kv_num_m_blocks": 0,
@@ -3437,12 +3499,12 @@ def embedding(
     indices: torch.Tensor,
     padding_idx: int | None = None,
 ) -> torch.Tensor:
-    if _should_use_eager_autograd_fallback(weight):
+    if torch.is_grad_enabled() and weight.requires_grad:
         return F.embedding(indices, weight, padding_idx=padding_idx)
     if _prefer_eager_cuda_embedding(weight, indices):
         return F.embedding(indices, weight, padding_idx=padding_idx)
-    if has_native_op("embedding"):
-        module = native_module()
-        if module is not None and hasattr(module, "embedding_forward"):
-            return module.embedding_forward(weight, indices, -1 if padding_idx is None else int(padding_idx))
+    module = native_module()
+    embedding_forward = None if module is None else getattr(module, "embedding_forward", None)
+    if embedding_forward is not None:
+        return embedding_forward(weight, indices, -1 if padding_idx is None else int(padding_idx))
     return F.embedding(indices, weight, padding_idx=padding_idx)
