@@ -120,7 +120,9 @@ from .windows import window_partition, window_merge, ring_buffer_indices
 from .compile import allow_in_graph, masked_fill_where, infer_attn_shapes, graph_safe_seed, record_stream_guard, cuda_graph_seed_scope, nccl_stream_guard, overlap_copy_compute, cuda_graph_warmup, graph_replay_step, custom_grad, stop_grad
 from .numerics import chunked_softmax, blockwise_logsumexp, masked_softmax_chunked, chunked_norm
 from .optim import (
+    Muon,
     grad_norm_parameters,
+    zeropower_via_newtonschulz5,
     clip_grad_norm_,
     assert_no_nan_grad,
     loss_scaler_step_safe,
@@ -503,6 +505,8 @@ __all__ = [
     "masked_softmax_chunked",
     "chunked_norm",
     "grad_norm_parameters",
+    "zeropower_via_newtonschulz5",
+    "Muon",
     "clip_grad_norm_",
     "assert_no_nan_grad",
     "loss_scaler_step_safe",
@@ -586,4 +590,3 @@ __all__ = [
     "sparsify_topk",
     "magnitude_prune",
 ]
-

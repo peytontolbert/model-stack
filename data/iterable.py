@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterator, List, Optional, Sequence
-import itertools
 import random
 
 import numpy as np
@@ -88,14 +87,28 @@ class StreamingTokenIterable(torch.utils.data.IterableDataset):
     def _iter_shards_for_rank(self) -> Iterator[Path]:
         all_shards = list(self._all_shards)
         r, w = _rank_world_from_env()
-        # partition shards by rank
-        my = all_shards[r::max(1, w)]
-        if self.shuffle:
-            rng = random.Random(self.seed if self.seed is not None else 0)
-            rng.shuffle(my)
-        if self.repeat:
-            return itertools.chain.from_iterable(itertools.repeat(my))  # type: ignore
-        return iter(my)
+        worker = torch.utils.data.get_worker_info()
+        worker_id = int(worker.id) if worker is not None else 0
+        workers = int(worker.num_workers) if worker is not None else 1
+        global_worker = int(r) * max(1, workers) + worker_id
+        global_workers = max(1, int(w) * max(1, workers))
+        my = all_shards[global_worker::global_workers]
+        if not my:
+            return iter(())
+
+        def _loop() -> Iterator[Path]:
+            epoch = 0
+            while True:
+                epoch_shards = list(my)
+                if self.shuffle:
+                    seed = 0 if self.seed is None else int(self.seed)
+                    random.Random(seed + epoch * 1_000_003 + global_worker).shuffle(epoch_shards)
+                yield from epoch_shards
+                if not self.repeat:
+                    break
+                epoch += 1
+
+        return _loop()
 
     def __iter__(self) -> Iterator[torch.Tensor]:  # type: ignore[override]
         for shard in self._iter_shards_for_rank():
@@ -113,8 +126,15 @@ def build_streaming_dataloader(
     num_workers: int = 0,
     pin_memory: bool = True,
     device: Optional[str | torch.device] = None,
+    seed: Optional[int] = None,
 ) -> torch.utils.data.DataLoader:
-    ds = StreamingTokenIterable(shards, seq_len=int(seq_len), shuffle_shards=shuffle_shards, repeat=repeat)
+    ds = StreamingTokenIterable(
+        shards,
+        seq_len=int(seq_len),
+        shuffle_shards=shuffle_shards,
+        repeat=repeat,
+        seed=seed,
+    )
     dev: Optional[torch.device]
     if device is None:
         dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -136,5 +156,3 @@ def build_streaming_dataloader(
 
 
 __all__ = ["StreamingTokenIterable", "build_streaming_dataloader"]
-
-

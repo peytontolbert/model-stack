@@ -4,7 +4,7 @@ import torch.nn as nn
 from runtime.ops import gated_activation as runtime_gated_activation
 from runtime.ops import linear_module as runtime_linear_module
 from runtime.ops import mlp_module as runtime_mlp_module
-from .activations import gelu, leaky_relu_0p5_squared, silu
+from .activations import gelu, leaky_relu_0p5_squared, relu2, silu
 
 
 class MLP(nn.Module):
@@ -36,6 +36,8 @@ class MLP(nn.Module):
             return gelu(x)
         if name in ("silu", "swish"):
             return silu(x)
+        if name in ("relu2", "squared_relu", "squared-relu"):
+            return relu2(x)
         if name in (
             "leaky_relu_0p5_squared",
             "leaky-relu-0p5-squared",

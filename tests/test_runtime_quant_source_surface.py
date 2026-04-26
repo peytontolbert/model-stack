@@ -145,9 +145,13 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     quant_source = _read("compress/quantization.py")
     generation_source = _read("runtime/generation.py")
     bitnet_frontend_source = _read("runtime/csrc/backend/bitnet/bitnet_frontend.cu")
+    cuda_quant_source = _read("runtime/csrc/backend/cuda_quant_int8_frontend.cu")
     assert "def resolve_linear_module_tensors(" in ops_source
     assert "def linear_module(" in ops_source
     assert "def mlp_module(" in ops_source
+    assert "def _try_relu2_dynamic_int8_down_projection(" in ops_source
+    assert "int8_quantize_relu2_activation_forward" in ops_source
+    assert "runtime_linear_from_quantized_input" in ops_source
     assert "def linear_module_signature(" in ops_source
     assert "def packed_linear_module_signature(" in ops_source
     assert "def resolve_packed_linear_module_spec(" in ops_source
@@ -169,12 +173,17 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "def runtime_linear_from_quantized_input(" in quant_source
     assert "runtime_bitnet_int8_linear_from_float(" in quant_source
     assert "def _native_decode_graph_enabled_by_env()" in generation_source
+    assert "def _native_decode_graph_enabled_for_model(" in generation_source
+    assert "MODEL_STACK_ENABLE_BITNET_DYNAMIC_INT8_DECODE_GRAPH" in generation_source
     assert "def _try_build_native_decode_graph_replay(" in generation_source
     assert "MODEL_STACK_DISABLE_NATIVE_DECODE_GRAPH" in generation_source
     assert "def _clear_native_decode_graph(self) -> None:" in generation_source
     assert "def runtime_packed_linear_signature(self, backend: str):" in quant_source
     assert "def runtime_packed_linear_spec(" in quant_source
     assert "def _pre_scale_active_runtime(self) -> bool:" in quant_source
+    assert "def _prefer_dynamic_int8_direct_hopper_prefill(self, x: torch.Tensor) -> bool:" in quant_source
+    assert "MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED" in quant_source
+    assert "shape in {(1024, 3072), (3072, 1024)}" in quant_source
     assert "\"act_quant_percentile\": float(self.act_quant_percentile)" in quant_source
     assert "runtime_mlp_module(" in mlp_source
     assert "runtime_linear_module(x, self.w_in)" in mlp_source
@@ -208,6 +217,7 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "runtime_linear_module(x, self.router)" in block_source
     assert "runtime_supports_packed_backend" in attn_source
     native_source = _read("runtime/csrc/model_stack_native.cpp")
+    native_py_source = _read("runtime/native.py")
     cache_source = _read("runtime/cache.py")
     kv_cache_source = _read("runtime/kv_cache.py")
     setup_source = _read("setup.py")
@@ -218,7 +228,18 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "{\"bitnet_linear_from_float\", true}" in native_source
     assert "{\"bitnet_int8_linear_from_float\", true}" in native_source
     assert "{\"bitnet_int8_fused_qkv_packed_heads_projection\", true}" in native_source
+    assert "{\"int8_quantize_activation\", true}" in native_source
+    assert "{\"int8_quantize_relu2_activation\", true}" in native_source
     assert "bool HasCudaBitNetInputFrontendKernel()" in native_source
+    assert "CudaInt8QuantizeActivationForward(" in native_source
+    assert "CudaInt8QuantizeRelu2ActivationForward(" in native_source
+    assert "Int8QuantizeRelu2ActivationForward" in native_source
+    assert "int8_quantize_relu2_activation_forward" in native_source
+    assert "quantize_relu2_activation_int8_rowwise_wide_cached_kernel" in cuda_quant_source
+    assert "MODEL_STACK_INT8_QUANT_WARP_ROWS_PER_BLOCK" in native_source
+    assert "MODEL_STACK_DISABLE_INT8_QUANT_SHARED_CACHE" in native_source
+    assert "MODEL_STACK_ENABLE_INT8_QUANT_VEC4" in native_source
+    assert "cuda_backend_ops.push_back(\"int8_quantize_activation\");" in native_source
     assert "cuda_backend_ops.push_back(\"bitnet_transform_input\");" in native_source
     assert "cuda_backend_ops.push_back(\"bitnet_linear_compute_packed\");" in native_source
     assert "cuda_backend_ops.push_back(\"bitnet_linear_from_float\");" in native_source
@@ -226,6 +247,8 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "m.def(\"bitnet_transform_input_forward\"" in native_source
     assert "bitnet_linear_compute_packed_forward" in native_source
     assert "m.def(\"bitnet_linear_from_float_forward\"" in native_source
+    assert "m.def(\"int8_quantize_activation_forward\"" in native_source
+    assert "m.def(\"int8_quantize_relu2_activation_forward\"" in native_source
     assert "bitnet_int8_linear_from_float_forward" in native_source
     assert "bitnet_int8_fused_qkv_packed_heads_projection_forward" in native_source
     assert "bool TryLoadBitNetModuleState(" in native_source
@@ -239,6 +262,12 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "torch::Tensor BitNetInt8LinearFromFloatForward(" in native_source
     assert "TryBitNetGatedInt8LinearStateForward(" in native_source
     assert "bool PreferDirectBitNetRuntimeLinear(" in native_source
+    assert "bool CanUseCutlassDirectBitNetPrefillPolicy(" in native_source
+    assert "bool CanUseDenseBitNetPrefillPolicy(" in native_source
+    assert "bool CanUseModuleBitNetRuntimePolicy(" in native_source
+    assert "m.def(\"linear_module_forward\"" in native_source
+    assert "\"linear_module\"" in native_py_source
+    assert "\"int8_quantize_relu2_activation\"" in native_py_source
     assert "return BitNetLinearStateForward(x, bitnet_state);" in native_source
     assert "PyCallableAttr(module, \"_spin_enabled_runtime\")" in native_source
     assert "PyCallableAttr(module, \"_pre_scale_active_runtime\")" in native_source
@@ -476,6 +505,7 @@ def test_native_bitnet_cuda_kernel_sources_are_registered_in_source() -> None:
     decode_source = _read("runtime/csrc/backend/bitnet/bitnet_linear_decode.cu")
     prefill_source = _read("runtime/csrc/backend/bitnet/bitnet_linear_prefill.cu")
     dispatch_source = _read("runtime/csrc/backend/bitnet/bitnet_linear_dispatch.cu")
+    frontend_source = _read("runtime/csrc/backend/bitnet/bitnet_frontend.cu")
     bitnet_attn_decode_source = _read("runtime/csrc/backend/bitnet/bitnet_attention_decode_dispatch.cu")
     bitnet_attn_prefill_source = _read("runtime/csrc/backend/bitnet/bitnet_attention_prefill_dispatch.cu")
     bitnet_attn_dispatch_source = _read("runtime/csrc/backend/bitnet/bitnet_attention_dispatch.cu")
@@ -504,8 +534,13 @@ def test_native_bitnet_cuda_kernel_sources_are_registered_in_source() -> None:
     assert "\"_int8_backend_weight\"" in native_source
     assert "if int(self.out_features) >= 32768:" in compress_source
     assert "CudaBitNetLinearForwardComputePacked(" in native_source
-    assert "CudaBitNetRmsNormLinearForwardRow1(" in native_source
-    assert "CudaBitNetAddRmsNormLinearForwardRow1(" in native_source
+    assert "CudaBitNetRmsNormLinearForwardDecodeRows(" in native_source
+    assert "CudaBitNetAddRmsNormLinearForwardDecodeRows(" in native_source
+    assert "BitNetDecodeFusedNormRowsEnabled(" in native_source
+    assert "MODEL_STACK_ENABLE_BITNET_DECODE_FUSED_NORM_ROWS" in native_source
+    assert "MODEL_STACK_DISABLE_BITNET_DECODE_FUSED_NORM_ROWS" in native_source
+    assert "one row-local scale per token row" in frontend_source
+    assert frontend_source.count("CudaBitNetCalibrateInputScaleForward(") == 1
     assert "compute_packed_words" in native_source
     assert "decode_nz_masks" in native_source
     assert "FusedRmsNormBitNetLinearStateForward(" in native_source
@@ -516,6 +551,8 @@ def test_native_bitnet_cuda_kernel_sources_are_registered_in_source() -> None:
     assert "LaunchBitNetDecodeKernelBitplaneRow1(" in dispatch_source
     assert "LaunchBitNetDecodeKernelBitplaneRow1RmsNorm(" in dispatch_source
     assert "LaunchBitNetDecodeKernelBitplaneRow1AddRmsNorm(" in dispatch_source
+    assert "LaunchBitNetDecodeKernelComputePackedRmsNorm(" in dispatch_source
+    assert "LaunchBitNetDecodeKernelComputePackedAddRmsNorm(" in dispatch_source
     assert "LaunchBitNetPrefillKernelComputePacked(" in dispatch_source
     assert "LaunchBitNetPrefillSplitKKernelComputePacked(" in dispatch_source
     assert "if (plan.kind != KernelKind::kDecodePersistent)" not in dispatch_source

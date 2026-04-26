@@ -238,8 +238,13 @@ def test_decode_fused_dense_qkv_rotary_paged_append_is_guarded() -> None:
     assert "CudaProjectedQkvRotaryPagedWriteForward" in native_source
     assert "AppendProjectedQkvRotary" in native_source
     assert "NativeCacheAppendProjectedQkvRotaryLayer" in native_source
+    assert "TryProjectedQkvRotaryCacheAttention" in native_source
+    assert "BitNetLinearStateForward(" in native_source
+    assert "projected_decode_fast_path" in native_source
     assert "ProjectPreparedAttentionOutput" in native_source
     assert "x.size(0) >= 4" in native_source
+    assert "BitNetProjectedQkvDecodeFusedAppendEnabled()" in native_source
+    assert "MODEL_STACK_DISABLE_BITNET_PROJECTED_QKV_DECODE_FUSED_APPEND" in native_source
     assert "HopperDenseBitNetDecodeFusedAppendMaxCacheLength()" in native_source
     assert "MODEL_STACK_HOPPER_DENSE_DECODE_FUSED_APPEND_MAX_CACHE_LENGTH" in native_source
     assert "bitnet_hopper_dense_decode_fused_append_default_max_cache_length" in native_source

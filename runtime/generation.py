@@ -733,6 +733,34 @@ def _native_decode_graph_enabled_by_env() -> bool:
     }
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _model_uses_dynamic_bitnet_int8(model: torch.nn.Module) -> bool:
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return False
+    for module in modules():
+        if type(module).__name__ != "QuantizedLinearBitNet":
+            continue
+        mode = str(getattr(module, "act_quant_mode", "")).strip().lower()
+        if mode == "dynamic_int8":
+            return True
+    return False
+
+
+def _native_decode_graph_enabled_for_model(model: torch.nn.Module) -> bool:
+    if not _native_decode_graph_enabled_by_env():
+        return False
+    if (
+        _model_uses_dynamic_bitnet_int8(model)
+        and not _env_flag_enabled("MODEL_STACK_ENABLE_BITNET_DYNAMIC_INT8_DECODE_GRAPH")
+    ):
+        return False
+    return True
+
+
 def _try_build_native_decode_graph_replay(native_session) -> tuple[Callable[[], torch.Tensor | None] | None, torch.Tensor | None]:
     if native_session is None or not torch.cuda.is_available():
         return None, None
@@ -1381,7 +1409,7 @@ class RuntimeGenerationSession:
         if self.cache is None:
             return None
         if self._native_session is not None:
-            if self._native_decode_graph_replay is None and _native_decode_graph_enabled_by_env():
+            if self._native_decode_graph_replay is None and _native_decode_graph_enabled_for_model(self.model):
                 replay, warm = _try_build_native_decode_graph_replay(self._native_session)
                 if replay is not None:
                     self._native_decode_graph_replay = replay

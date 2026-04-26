@@ -318,8 +318,10 @@ def quantize_activation_int8_rowwise(
     scale: torch.Tensor | float | None = None,
     method: str = "absmax",
     percentile: float = 0.999,
+    bits: int = 8,
     eps: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    qmax = float(_bitnet_quant_max(int(bits)))
     x_float = x.float()
     flat = x_float.reshape(-1, x_float.shape[-1])
     if flat.numel() == 0:
@@ -346,8 +348,8 @@ def quantize_activation_int8_rowwise(
             losses = []
             for ratio in candidates:
                 clip_candidate = per_row_absmax * ratio
-                scale_candidate = (clip_candidate / 127.0).clamp_min(eps)
-                q_candidate = torch.round(flat / scale_candidate.unsqueeze(-1)).clamp_(-127.0, 127.0)
+                scale_candidate = (clip_candidate / qmax).clamp_min(eps)
+                q_candidate = torch.round(flat / scale_candidate.unsqueeze(-1)).clamp_(-qmax, qmax)
                 recon = q_candidate * scale_candidate.unsqueeze(-1)
                 losses.append(((recon - flat) ** 2).mean(dim=-1))
             loss_tensor = torch.stack(losses, dim=0)
@@ -355,7 +357,7 @@ def quantize_activation_int8_rowwise(
             clip = per_row_absmax * candidates[best]
         else:
             raise ValueError(f"Unknown activation quantization method: {method}")
-        scale_row = (clip.clamp_min(eps) / 127.0).to(dtype=torch.float32)
+        scale_row = (clip.clamp_min(eps) / qmax).to(dtype=torch.float32)
     else:
         scale_row = scale if isinstance(scale, torch.Tensor) else torch.tensor(scale, device=x.device, dtype=torch.float32)
         scale_row = scale_row.to(device=x.device, dtype=torch.float32)
@@ -372,7 +374,7 @@ def quantize_activation_int8_rowwise(
             )
         scale_row = scale_row.clamp_min(eps)
 
-    q_flat = torch.round(flat / scale_row.unsqueeze(-1)).clamp_(-127.0, 127.0).to(dtype=torch.int8)
+    q_flat = torch.round(flat / scale_row.unsqueeze(-1)).clamp_(-qmax, qmax).to(dtype=torch.int8)
     return q_flat.view_as(x), scale_row.contiguous()
 
 
@@ -724,31 +726,20 @@ def bitnet_int8_linear_from_float(
     if pre_scale_cast is not None:
         x_local = x_local / pre_scale_cast.view(*([1] * (x_local.ndim - 1)), -1)
 
-    flat = x_local.reshape(-1, x_local.shape[-1])
-    rows = int(flat.shape[0])
     mode_name = str(act_quant_mode).strip().lower()
-    if mode_name == "dynamic_int8":
-        row_scale = _calibrate_bitnet_activation_scale(
-            x_local,
-            method=act_quant_method,
-            bits=int(act_quant_bits),
-            percentile=float(act_quant_percentile),
-        ).reshape(1).expand(rows).contiguous()
-    elif mode_name == "static_int8":
+    if mode_name == "static_int8":
         if act_scale_cast is None:
             raise ValueError("BitNet static_int8 requires act_scale")
-        if act_scale_cast.numel() == 1:
-            row_scale = act_scale_cast.expand(rows).contiguous()
-        elif act_scale_cast.numel() == rows:
-            row_scale = act_scale_cast.contiguous()
-        else:
-            raise ValueError("BitNet static_int8 act_scale must have 1 or rows elements")
-        row_scale = row_scale.clamp_min_(1e-8)
-    else:
+    elif mode_name != "dynamic_int8":
         raise ValueError("BitNet int8 from-float requires act_quant_mode in {dynamic_int8, static_int8}")
 
-    qmax = float(_bitnet_quant_max(int(act_quant_bits)))
-    qx_cast = torch.round(flat.float() / row_scale.unsqueeze(-1)).clamp_(-qmax, qmax).to(dtype=torch.int8).view_as(x_local)
+    qx_cast, row_scale = quantize_activation_int8_rowwise(
+        x_local,
+        scale=act_scale_cast if mode_name == "static_int8" else None,
+        method=str(act_quant_method),
+        percentile=float(act_quant_percentile),
+        bits=int(act_quant_bits),
+    )
     return int8_linear_from_quantized_activation(
         qx_cast,
         row_scale,

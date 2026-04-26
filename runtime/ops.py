@@ -2216,6 +2216,30 @@ def _calibrate_activation_scale(
     return (clip.clamp_min(1e-8) / qmax).to(dtype=torch.float32)
 
 
+def _calibrate_activation_rowwise_scale(
+    x: torch.Tensor,
+    *,
+    method: str,
+    bits: int,
+    percentile: float,
+) -> torch.Tensor:
+    method_name = str(method).strip().lower()
+    qmax = float(_quant_max(bits))
+    flat = x.detach().float().reshape(-1, x.shape[-1])
+    if flat.numel() == 0:
+        return torch.empty((flat.shape[0],), device=x.device, dtype=torch.float32)
+    if method_name in {"", "absmax", "mse"}:
+        # Keep parity with tensor.numerics.mse_scale(), which is currently an absmax fallback.
+        clip = flat.abs().amax(dim=-1)
+    elif method_name == "percentile":
+        q = float(max(0.0, min(1.0, percentile)))
+        k = max(int(q * (flat.shape[-1] - 1)), 0)
+        clip = flat.abs().kthvalue(k + 1, dim=-1).values
+    else:
+        raise ValueError(f"Unsupported packed activation calibration method: {method}")
+    return (clip.clamp_min(1e-8) / qmax).to(dtype=torch.float32)
+
+
 def _fake_quantize_activation(
     x: torch.Tensor,
     scale: torch.Tensor | float,
@@ -2229,6 +2253,23 @@ def _fake_quantize_activation(
         scale_t = scale_t.unsqueeze(0)
     q = torch.round(x.float() / scale_t).clamp_(-qmax, qmax)
     return (q * scale_t).to(dtype=x.dtype)
+
+
+def _fake_quantize_activation_rowwise(
+    x: torch.Tensor,
+    row_scale: torch.Tensor,
+    *,
+    bits: int,
+) -> torch.Tensor:
+    qmax = float(_quant_max(bits))
+    flat = x.reshape(-1, x.shape[-1]).float()
+    scale_t = row_scale.to(device=x.device, dtype=torch.float32).reshape(-1).clamp_min(1e-8)
+    if scale_t.numel() == 1:
+        scale_t = scale_t.expand(flat.shape[0])
+    if scale_t.numel() != flat.shape[0]:
+        raise ValueError(f"expected 1 or {flat.shape[0]} activation scales, got {scale_t.numel()}")
+    q = torch.round(flat / scale_t.unsqueeze(-1)).clamp_(-qmax, qmax)
+    return (q * scale_t.unsqueeze(-1)).to(dtype=x.dtype).view_as(x)
 
 
 def _power_of_two_segments(size: int) -> tuple[int, ...]:
@@ -2306,12 +2347,12 @@ def _apply_packed_activation_quantization(
     if mode_name in {"", "none", "off"}:
         return x
     if mode_name == "dynamic_int8":
-        scale = _calibrate_activation_scale(x, method=method, bits=bits, percentile=percentile)
-        return _fake_quantize_activation(x, scale, bits=bits)
+        scale = _calibrate_activation_rowwise_scale(x, method=method, bits=bits, percentile=percentile)
+        return _fake_quantize_activation_rowwise(x, scale, bits=bits)
     if mode_name == "static_int8":
         if act_scale is None:
             raise ValueError("Packed static_int8 activation quantization requires act_scale")
-        return _fake_quantize_activation(x, act_scale, bits=bits)
+        return _fake_quantize_activation_rowwise(x, act_scale, bits=bits)
     raise ValueError(f"Unknown packed activation quantization mode: {mode}")
 
 
@@ -2442,13 +2483,12 @@ def _bitnet_int8_quantize_input(
     rows = x_local.reshape(-1, x_local.shape[-1]).shape[0]
     bits = int(spec.get("act_quant_bits", 8))
     if mode == "dynamic_int8":
-        scale = _calibrate_activation_scale(
+        row_scale = _calibrate_activation_rowwise_scale(
             x_local,
             method=str(spec.get("act_quant_method", "absmax")),
             bits=bits,
             percentile=float(spec.get("act_quant_percentile", 0.999)),
-        ).reshape(1)
-        row_scale = scale.expand(rows).contiguous()
+        ).contiguous()
     else:
         act_scale = spec.get("act_scale")
         if not isinstance(act_scale, torch.Tensor):
@@ -3324,6 +3364,9 @@ def activation(
         "swiglu",
         "gated-silu",
         "relu",
+        "relu2",
+        "squared_relu",
+        "squared-relu",
         "reglu",
         *leaky_relu_0p5_squared_aliases,
     }:
@@ -3333,10 +3376,16 @@ def activation(
             return F.gelu(x)
         if act in {"silu", "swish", "swiglu", "gated-silu"}:
             return F.silu(x)
+        if act in {"relu2", "squared_relu", "squared-relu"}:
+            y = F.relu(x)
+            return y * y
         if act in leaky_relu_0p5_squared_aliases:
             y = F.leaky_relu(x, negative_slope=0.5)
             return y * y
         return F.relu(x)
+    if act in {"relu2", "squared_relu", "squared-relu"}:
+        y = F.relu(x)
+        return y * y
     if has_native_op("activation"):
         module = native_module()
         if module is not None and hasattr(module, "activation_forward"):
@@ -3345,6 +3394,9 @@ def activation(
         return F.gelu(x)
     if act in {"silu", "swish", "swiglu", "gated-silu"}:
         return F.silu(x)
+    if act in {"relu2", "squared_relu", "squared-relu"}:
+        y = F.relu(x)
+        return y * y
     if act in leaky_relu_0p5_squared_aliases:
         y = F.leaky_relu(x, negative_slope=0.5)
         return y * y
@@ -3371,6 +3423,9 @@ def gated_activation(
         "swiglu",
         "gated-silu",
         "relu",
+        "relu2",
+        "squared_relu",
+        "squared-relu",
         "reglu",
         *leaky_relu_0p5_squared_aliases,
     }:
@@ -3378,6 +3433,8 @@ def gated_activation(
     if x.shape != gate.shape:
         raise ValueError(f"gated_activation requires x and gate to have the same shape, got {tuple(x.shape)} and {tuple(gate.shape)}")
     if _should_use_eager_autograd_fallback(x, gate):
+        return globals()["activation"](x, act) * gate
+    if act in {"relu2", "squared_relu", "squared-relu"}:
         return globals()["activation"](x, act) * gate
     if has_native_op("gated_activation"):
         module = native_module()
@@ -3407,6 +3464,9 @@ def _apply_mlp_hidden_activation(
             return F.gelu(a) * b
         if act == "reglu":
             return F.relu(a) * b
+        if act in {"relu2", "squared_relu", "squared-relu"}:
+            y = F.relu(a)
+            return (y * y) * b
         if act in leaky_relu_0p5_squared_aliases:
             y = F.leaky_relu(a, negative_slope=0.5)
             return (y * y) * b
@@ -3417,6 +3477,9 @@ def _apply_mlp_hidden_activation(
         return F.silu(hidden)
     if act in ("relu",):
         return F.relu(hidden)
+    if act in {"relu2", "squared_relu", "squared-relu"}:
+        y = F.relu(hidden)
+        return y * y
     if act in leaky_relu_0p5_squared_aliases:
         y = F.leaky_relu(hidden, negative_slope=0.5)
         return y * y
@@ -3460,6 +3523,42 @@ def mlp(
     return linear(hidden, w_out_weight, w_out_bias, backend=backend)
 
 
+def _try_relu2_dynamic_int8_down_projection(
+    hidden: torch.Tensor,
+    w_out_module,
+    *,
+    backend: str | None,
+) -> torch.Tensor | None:
+    if not _is_auto_backend(backend):
+        return None
+    if not isinstance(hidden, torch.Tensor) or not hidden.is_cuda or hidden.ndim < 2:
+        return None
+    if torch.is_grad_enabled() and hidden.requires_grad:
+        return None
+    if str(getattr(w_out_module, "act_quant_mode", "")).strip().lower() != "dynamic_int8":
+        return None
+    if int(getattr(w_out_module, "act_quant_bits", 0)) != 8:
+        return None
+    if str(getattr(w_out_module, "act_quant_method", "absmax")).strip().lower() not in {"", "absmax"}:
+        return None
+    spin_enabled = getattr(w_out_module, "_spin_enabled_runtime", None)
+    if callable(spin_enabled) and bool(spin_enabled()):
+        return None
+    pre_scale_active = getattr(w_out_module, "_pre_scale_active_runtime", None)
+    if callable(pre_scale_active) and bool(pre_scale_active()):
+        return None
+    runtime_from_quantized = getattr(w_out_module, "runtime_linear_from_quantized_input", None)
+    if not callable(runtime_from_quantized):
+        return None
+    if not has_native_op("int8_quantize_relu2_activation"):
+        return None
+    module = native_module()
+    if module is None or not hasattr(module, "int8_quantize_relu2_activation_forward"):
+        return None
+    qx, row_scale = module.int8_quantize_relu2_activation_forward(hidden)
+    return runtime_from_quantized(qx, row_scale, out_dtype=hidden.dtype)
+
+
 def mlp_module(
     x: torch.Tensor,
     w_in_module,
@@ -3474,7 +3573,13 @@ def mlp_module(
     if callable(runtime_linear_in) or callable(runtime_linear_out):
         hidden = linear_module(x, w_in_module, backend=backend)
         act = str(activation).lower()
-        if gated:
+        if not gated and act in {"relu2", "squared_relu", "squared-relu"}:
+            fused_out = _try_relu2_dynamic_int8_down_projection(hidden, w_out_module, backend=backend)
+            if fused_out is not None:
+                return fused_out
+            y = F.relu(hidden)
+            hidden = y * y
+        elif gated:
             a, b = hidden.chunk(2, dim=-1)
             hidden = gated_activation(a, b, act)
         else:

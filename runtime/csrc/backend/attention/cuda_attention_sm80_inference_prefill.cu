@@ -739,21 +739,12 @@ struct ModelStackSm80CausalPrefillKernel {
     mma(kQkGemmIterations, accum, iterator_a, iterator_b, accum);
     __syncthreads();
 
-    if constexpr (kDiagonalTile) {
-      prologue_v_tile<true>(
-          shared_storage,
-          p,
-          iter_key_start,
-          tid,
-          int32_t(kKeysPerBlock));
-    } else {
-      prologue_v_tile_full_64x64_rf(
-          shared_storage,
-          full_v_params,
-          p,
-          iter_key_start,
-          tid);
-    }
+    prologue_v_tile_full_64x64_rf(
+        shared_storage,
+        full_v_params,
+        p,
+        iter_key_start,
+        tid);
 
     if constexpr (kDiagonalTile) {
       auto lane_offset = MM0::AccumLambdaIterator::get_lane_offset(
@@ -774,45 +765,27 @@ struct ModelStackSm80CausalPrefillKernel {
           [&](int accum_m) {});
     }
 
-    if constexpr (kDiagonalTile) {
-      iterative_softmax_64x64_rf<
-          false,
-          kFirstTile,
-          typename MM0::Mma::Operator::IteratorC>(
-          accum_o,
-          accum,
-          mi,
-          m_prime,
-          s_prime,
-          out_rescale,
-          shared_storage.addition_storage,
-          my_lane_id,
-          tid,
-          my_warp_id,
-          int32_t(kKeysPerBlock),
-          kFirstTile,
-          iterator_c_tile_offset,
-          p.scale);
-    } else {
-      iterative_softmax_64x64_rf<
-          true,
-          kFirstTile,
-          typename MM0::Mma::Operator::IteratorC>(
-          accum_o,
-          accum,
-          mi,
-          m_prime,
-          s_prime,
-          out_rescale,
-          shared_storage.addition_storage,
-          my_lane_id,
-          tid,
-          my_warp_id,
-          int32_t(kKeysPerBlock),
-          kFirstTile,
-          iterator_c_tile_offset,
-          p.scale);
-    }
+    // The diagonal full tile is already causally masked to -inf above, so it
+    // can use the same branch-free full-tile softmax path as non-diagonal
+    // tiles.
+    iterative_softmax_64x64_rf<
+        true,
+        kFirstTile,
+        typename MM0::Mma::Operator::IteratorC>(
+        accum_o,
+        accum,
+        mi,
+        m_prime,
+        s_prime,
+        out_rescale,
+        shared_storage.addition_storage,
+        my_lane_id,
+        tid,
+        my_warp_id,
+        int32_t(kKeysPerBlock),
+        kFirstTile,
+        iterator_c_tile_offset,
+        p.scale);
 
     MM0::B2bGemm::accumToSmem(
         shared_storage.after_mm0.si,
@@ -821,26 +794,14 @@ struct ModelStackSm80CausalPrefillKernel {
         output_tile_coords);
     __syncthreads();
 
-    if constexpr (kDiagonalTile) {
-      mma_pv_tile<true>(
-          shared_storage,
-          p,
-          iter_key_start,
-          tid,
-          my_warp_id,
-          my_lane_id,
-          int32_t(kKeysPerBlock),
-          accum_o);
-    } else {
-      mma_pv_tile_full_64x64_rf(
-          shared_storage,
-          p,
-          iter_key_start,
-          tid,
-          my_warp_id,
-          my_lane_id,
-          accum_o);
-    }
+    mma_pv_tile_full_64x64_rf(
+        shared_storage,
+        p,
+        iter_key_start,
+        tid,
+        my_warp_id,
+        my_lane_id,
+        accum_o);
     // Keep the CUTLASS FMHA shared-memory lifetime rule: P*V must finish
     // before the next QK tile or epilogue reuses the shared-storage union.
     __syncthreads();

@@ -253,6 +253,7 @@ def native_extensions():
         sources.append("runtime/csrc/backend/cuda_int8_attention.cu")
         sources.append("runtime/csrc/backend/cuda_int8_linear.cu")
         sources.append("runtime/csrc/backend/cuda_quant_int8_frontend.cu")
+        sources.append("runtime/csrc/backend/cutlass_int8_linear.cu")
         sources.append("runtime/csrc/backend/cublaslt_linear.cu")
         define_macros.append(("MODEL_STACK_WITH_CUDA", "1"))
         if cuda_version is not None:
@@ -263,10 +264,13 @@ def native_extensions():
         cutlass_root = resolve_cutlass_path()
         if cutlass_root is not None:
             include_dirs.append(str(cutlass_root / "include"))
+            cutlass_util_include = cutlass_root / "tools" / "util" / "include"
+            if cutlass_util_include.exists():
+                include_dirs.append(str(cutlass_util_include))
+            define_macros.append(("MODEL_STACK_WITH_CUTLASS_GEMM", "1"))
             if cutlass_has_fmha_examples(cutlass_root):
                 include_dirs.extend(
                     [
-                        str(cutlass_root / "tools" / "util" / "include"),
                         str(cutlass_root / "examples" / "41_fused_multi_head_attention"),
                     ]
                 )

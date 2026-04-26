@@ -6,13 +6,16 @@ Features:
 - NF4 packed codebook quantization for weights
 - Fake-quant FP8/FP4 helpers for experimentation
 - QuantizedLinear* wrappers for weight-only inference
+- Trainable runtime-row BitNet QAT linear with packed runtime export
 """
 
 import math
+import os
 from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from runtime.native import has_native_op, native_module
 from runtime.ops import linear as runtime_linear
 from runtime.ops import bitnet_transform_input as runtime_bitnet_transform_input
@@ -902,6 +905,29 @@ def _bitnet_quantize_dequantize(
         percentile=float(percentile),
     )
     return qweight.to(dtype=torch.float32).mul(row_scales.unsqueeze(-1)).to(dtype=weight.dtype)
+
+
+def _bitnet_runtime_row_codes_and_scale(
+    weight: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if weight.ndim != 2:
+        raise ValueError("runtime-row BitNet quantization expects a rank-2 weight")
+    weight_f = weight.float()
+    row_scale = weight_f.abs().mean(dim=-1, keepdim=True).clamp_min(float(eps))
+    qweight = torch.round(weight_f / row_scale).clamp_(-1, 1).to(dtype=torch.int8)
+    return qweight, row_scale.squeeze(-1).to(dtype=torch.float32)
+
+
+def _bitnet_runtime_row_ste_weight(
+    weight: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    qweight, row_scale = _bitnet_runtime_row_codes_and_scale(weight, eps=eps)
+    quantized = qweight.to(dtype=torch.float32).mul(row_scale.unsqueeze(-1))
+    return weight + (quantized.to(device=weight.device, dtype=weight.dtype) - weight).detach()
 
 
 def _fp8_quantize_dequantize(
@@ -2662,11 +2688,36 @@ class QuantizedLinearBitNet(nn.Module):
             return False
         if (int(major), int(minor)) < (9, 0):
             return False
+        if self._prefer_dynamic_int8_direct_hopper_prefill(x):
+            return False
         # Hopper BF16 GEMMs are already strong enough on large prefill tiles
         # that the dense cached-weight path beats the W2A8 frontend for the
-        # large BitNet projections we care about. Keep this policy narrow and
-        # 8-bit-only rather than mixing it into sub-8-bit dynamic tuning.
-        return int(self.in_features) >= 2048 or int(self.out_features) >= 2048
+        # Parameter Golf BitNet projections we care about, including 1024-wide
+        # attention/output layers. Keep this policy 8-bit-only rather than
+        # mixing it into sub-8-bit dynamic tuning.
+        return int(self.act_quant_bits) == 8
+
+    def _prefer_dynamic_int8_direct_hopper_prefill(self, x: torch.Tensor) -> bool:
+        cutlass_enabled = os.getenv("MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED", "").strip().lower()
+        if cutlass_enabled not in {"1", "true", "yes", "on"}:
+            return False
+        if not x.is_cuda or x.ndim < 2:
+            return False
+        rows = int(x.numel() // max(int(x.shape[-1]), 1))
+        if rows <= 8:
+            return False
+        if self._pre_scale_active_runtime():
+            return False
+        try:
+            major, minor = torch.cuda.get_device_capability(x.device)
+        except Exception:
+            return False
+        if (int(major), int(minor)) < (9, 0):
+            return False
+        if int(self.act_quant_bits) != 8:
+            return False
+        shape = (int(self.in_features), int(self.out_features))
+        return shape in {(1024, 3072), (3072, 1024)}
 
     def runtime_packed_linear_signature(self, backend: str):
         if not self.runtime_supports_packed_backend(backend):
@@ -2834,13 +2885,13 @@ class QuantizedLinearBitNet(nn.Module):
         flat = x_local.reshape(-1, x_local.shape[-1])
         rows = int(flat.shape[0])
         if mode_name == "dynamic_int8":
-            scale = calibrate_activation_scale(
+            qx, row_scale = runtime_quantize_activation_int8_rowwise(
                 x_local,
+                scale=None,
                 method=self.act_quant_method,
+                percentile=float(self.act_quant_percentile),
                 bits=bits,
-                p=float(self.act_quant_percentile),
-            ).reshape(1)
-            row_scale = scale.to(device=target_device, dtype=torch.float32).expand(rows).contiguous()
+            )
         else:
             scale = self.act_scale.to(device=target_device, dtype=torch.float32).reshape(-1)
             if scale.numel() == 1:
@@ -2849,9 +2900,14 @@ class QuantizedLinearBitNet(nn.Module):
                 row_scale = scale.contiguous()
             else:
                 raise ValueError("BitNet static_int8 act_scale must have 1 or rows elements")
+            qx, row_scale = runtime_quantize_activation_int8_rowwise(
+                x_local,
+                scale=row_scale,
+                method=self.act_quant_method,
+                percentile=float(self.act_quant_percentile),
+                bits=bits,
+            )
 
-        qmax = float(_quant_max(bits))
-        qx = torch.round(flat.float() / row_scale.unsqueeze(-1)).clamp_(-qmax, qmax).to(dtype=torch.int8)
         return qx.reshape_as(x_local), row_scale, target_dtype
 
     def runtime_linear_from_quantized_input(
@@ -3006,6 +3062,112 @@ class QuantizedLinearBitNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.runtime_linear(x)
+
+
+class TrainableBitNetLinear(nn.Module):
+    """Trainable runtime-row BitNet linear with a float shadow weight.
+
+    The forward path applies a straight-through ternary projection to the
+    trainable weight. ``to_quantized`` exports the same row scales and ternary
+    codes into ``QuantizedLinearBitNet`` packed runtime state.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        *,
+        scale_layout: str = "runtime_row",
+        group_size: int = 64,
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        layout = str(scale_layout).strip().lower()
+        if layout not in {"runtime_row", "row", "per_row"}:
+            raise ValueError("TrainableBitNetLinear currently supports only runtime_row scaling")
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.scale_layout = "runtime_row"
+        self.group_size = int(group_size)
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
+        self.bias = nn.Parameter(torch.empty(self.out_features)) if bias else None
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    @torch.no_grad()
+    def from_float(self, module: nn.Linear) -> "TrainableBitNetLinear":
+        if module.in_features != self.in_features or module.out_features != self.out_features:
+            raise ValueError(
+                "source Linear shape does not match TrainableBitNetLinear: "
+                f"expected ({self.out_features}, {self.in_features}), got {tuple(module.weight.shape)}"
+            )
+        self.weight.copy_(module.weight.detach().to(device=self.weight.device, dtype=self.weight.dtype))
+        if self.bias is not None:
+            if module.bias is None:
+                self.bias.zero_()
+            else:
+                self.bias.copy_(module.bias.detach().to(device=self.bias.device, dtype=self.bias.dtype))
+        return self
+
+    def ternary_weight(self) -> torch.Tensor:
+        return _bitnet_runtime_row_ste_weight(self.weight, eps=self.eps)
+
+    @torch.no_grad()
+    def quantized_codes_and_scales(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return _bitnet_runtime_row_codes_and_scale(self.weight.detach(), eps=self.eps)
+
+    @torch.no_grad()
+    def to_quantized(
+        self,
+        *,
+        activation_quant: str = "none",
+        activation_quant_bits: int = 8,
+        activation_quant_method: str = "absmax",
+        activation_quant_percentile: float = 0.999,
+    ) -> "QuantizedLinearBitNet":
+        qweight, row_scale = self.quantized_codes_and_scales()
+        packed_weight, scale_values, layout_header, segment_offsets = _pack_bitnet_quantized(
+            qweight,
+            scale_values=row_scale,
+            scale_granularity=2,
+            scale_group_size=1,
+        )
+        layer = QuantizedLinearBitNet(self.in_features, self.out_features, bias=self.bias is not None).to(
+            device=self.weight.device,
+            dtype=self.weight.dtype,
+        )
+        layer.quant_calibration = "runtime_row"
+        layer.act_quant_mode = str(activation_quant)
+        layer.act_quant_bits = int(activation_quant_bits)
+        layer.act_quant_method = str(activation_quant_method)
+        layer.act_quant_percentile = float(activation_quant_percentile)
+        layer._assign_packed_state(
+            packed_weight.to(device=layer.packed_weight.device),
+            scale_values.to(device=layer.scale_values.device),
+            layout_header.to(device=layer.layout_header.device),
+            segment_offsets.to(device=layer.segment_offsets.device),
+            None if self.bias is None else self.bias.detach(),
+        )
+        return layer
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.ternary_weight().to(dtype=x.dtype if x.dtype.is_floating_point else self.weight.dtype)
+        bias = None if self.bias is None else self.bias.to(dtype=weight.dtype)
+        return F.linear(x.to(dtype=weight.dtype), weight, bias)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bias={self.bias is not None}, scale_layout={self.scale_layout!r}"
+        )
 
 
 class QuantizedLinearFP8(nn.Module):
@@ -3300,6 +3462,43 @@ class QuantizedLinearFP8(nn.Module):
         return self.runtime_linear(x)
 
 
+def prepare_bitnet_qat_linear_modules(
+    model: nn.Module,
+    include: Optional[Iterable[str]] = None,
+    exclude: Optional[Iterable[str]] = None,
+    *,
+    scale_layout: str = "runtime_row",
+    group_size: int = 64,
+    eps: float = 1e-8,
+) -> Dict[str, TrainableBitNetLinear]:
+    """Replace ``nn.Linear`` modules with trainable runtime-row BitNet QAT layers."""
+    replacements: Dict[str, TrainableBitNetLinear] = {}
+    include_list = None if include is None else list(include)
+    exclude_list = None if exclude is None else list(exclude)
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        if include_list is not None and len(include_list) > 0 and not any(p in name for p in include_list):
+            continue
+        if exclude_list is not None and any(p in name for p in exclude_list):
+            continue
+        parent_name = name.rsplit(".", 1)[0] if "." in name else ""
+        attr_name = name.split(".")[-1]
+        parent = model.get_submodule(parent_name) if parent_name else model
+        qat = TrainableBitNetLinear(
+            module.in_features,
+            module.out_features,
+            bias=module.bias is not None,
+            scale_layout=scale_layout,
+            group_size=group_size,
+            eps=eps,
+        ).to(device=module.weight.device, dtype=module.weight.dtype)
+        qat.from_float(module)
+        setattr(parent, attr_name, qat)
+        replacements[name] = qat
+    return replacements
+
+
 def quantize_linear_modules(
     model: nn.Module,
     include: Optional[Iterable[str]] = None,
@@ -3370,6 +3569,12 @@ def quantize_linear_modules(
                 spin_random=spin_random,
                 spin_seed=module_spin_seed,
             )
+        elif quant_scheme in {"bitnet_qat", "qat_bitnet", "trainable_bitnet"}:
+            ql = TrainableBitNetLinear(module.in_features, module.out_features, bias=(module.bias is not None)).to(
+                device=module.weight.device,
+                dtype=module.weight.dtype,
+            )
+            ql.from_float(module)
         elif quant_scheme == "int4":
             ql = QuantizedLinearInt4(module.in_features, module.out_features, bias=(module.bias is not None))
             ql.from_float(
@@ -3443,9 +3648,11 @@ __all__ = [
     "calibrate_nf4_scales",
     "QuantizedLinearInt8",
     "QuantizedLinearBitNet",
+    "TrainableBitNetLinear",
     "QuantizedLinearInt4",
     "QuantizedLinearNF4",
     "QuantizedLinearFP8",
+    "prepare_bitnet_qat_linear_modules",
     "quantize_linear_modules",
     "calibrate_int8_scales",
 ]

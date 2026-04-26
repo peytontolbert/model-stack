@@ -11,7 +11,7 @@ namespace t10::cuda {
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && \
     defined(MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL) && MODEL_STACK_ENABLE_SM90A_EXPERIMENTAL
-namespace cde = cuda::device::experimental;
+namespace cde = ::cuda::device::experimental;
 #define MODEL_STACK_HAS_SM90A_EXPERIMENTAL_NS 1
 #else
 #define MODEL_STACK_HAS_SM90A_EXPERIMENTAL_NS 0
@@ -165,7 +165,7 @@ __device__ inline auto Sm90BarrierArriveTx(
     ptrdiff_t arrive_count,
     uint32_t bytes) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && MODEL_STACK_HAS_SM90A_EXPERIMENTAL_NS
-  return cuda::device::barrier_arrive_tx(barrier, arrive_count, bytes);
+  return ::cuda::device::barrier_arrive_tx(barrier, arrive_count, bytes);
 #else
   (void)arrive_count;
   (void)bytes;

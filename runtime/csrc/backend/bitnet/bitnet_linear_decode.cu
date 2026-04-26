@@ -677,6 +677,305 @@ __global__ __launch_bounds__(32 * MaxRows, 2) void bitnet_linear_decode_persiste
 }
 
 template <typename scalar_t, int MaxRows, int TileK, int OutputsPerBlock>
+__global__ __launch_bounds__(32 * MaxRows, 2) void bitnet_linear_decode_persistent_compute_packed_rms_norm_kernel(
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ rms_weight,
+    float eps,
+    const int32_t* __restrict__ compute_packed_words,
+    const float* __restrict__ compute_row_scales,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ out,
+    LayoutInfo layout,
+    int64_t rows,
+    int64_t compute_word_cols,
+    int64_t compute_tile_n,
+    int64_t total_tiles) {
+  constexpr int kWarpSize = 32;
+  constexpr int kColsPerLane = OutputsPerBlock / kWarpSize;
+  constexpr int kThreads = kWarpSize * MaxRows;
+  constexpr int kPackedTileKWords = (TileK + 15) / 16;
+
+  __shared__ scalar_t x_tile[MaxRows][TileK];
+  __shared__ uint32_t w_tile_words[OutputsPerBlock][kPackedTileKWords];
+  __shared__ float row_scales[OutputsPerBlock];
+  __shared__ float inv_rms[MaxRows];
+
+  const int lane = static_cast<int>(threadIdx.x);
+  const int row_slot = static_cast<int>(threadIdx.y);
+  const int thread_linear = row_slot * kWarpSize + lane;
+  const bool row_active = row_slot < rows;
+
+  float thread_sum = 0.0f;
+  if (row_active) {
+    const int64_t row_offset = static_cast<int64_t>(row_slot) * layout.logical_in_features;
+    for (int64_t col = lane; col < layout.logical_in_features; col += kWarpSize) {
+      const float value = static_cast<float>(x[row_offset + col]);
+      thread_sum += value * value;
+    }
+  }
+  thread_sum = WarpReduceSumDevice(thread_sum);
+  if (lane == 0) {
+    inv_rms[row_slot] = row_active
+        ? rsqrtf((thread_sum / static_cast<float>(layout.logical_in_features)) + eps)
+        : 0.0f;
+  }
+  __syncthreads();
+
+  for (int64_t tile_idx = static_cast<int64_t>(blockIdx.x); tile_idx < total_tiles; tile_idx += gridDim.x) {
+    const int64_t col_base = tile_idx * OutputsPerBlock;
+    float accum[kColsPerLane];
+    #pragma unroll
+    for (int idx = 0; idx < kColsPerLane; ++idx) {
+      accum[idx] = 0.0f;
+    }
+
+    for (int idx = thread_linear; idx < OutputsPerBlock; idx += kThreads) {
+      const int64_t global_col = col_base + idx;
+      float scale = 0.0f;
+      if (global_col < layout.logical_out_features) {
+        const int64_t tile_group = global_col / compute_tile_n;
+        const int64_t tile_col = global_col - tile_group * compute_tile_n;
+        scale = compute_row_scales[tile_group * compute_tile_n + tile_col];
+      }
+      row_scales[idx] = scale;
+    }
+    __syncthreads();
+
+    for (int64_t k0 = 0; k0 < layout.logical_in_features; k0 += TileK) {
+      for (int index = thread_linear; index < MaxRows * TileK; index += kThreads) {
+        const int tile_row = index / TileK;
+        const int tile_k = index % TileK;
+        const int64_t global_k = k0 + tile_k;
+        scalar_t value = static_cast<scalar_t>(0);
+        if (tile_row < rows && global_k < layout.logical_in_features) {
+          float normalized =
+              static_cast<float>(x[tile_row * layout.logical_in_features + global_k]) * inv_rms[tile_row];
+          if (rms_weight != nullptr) {
+            normalized *= static_cast<float>(rms_weight[global_k]);
+          }
+          value = static_cast<scalar_t>(normalized);
+        }
+        x_tile[tile_row][tile_k] = value;
+      }
+      for (int index = thread_linear; index < OutputsPerBlock * kPackedTileKWords; index += kThreads) {
+        const int tile_col = index / kPackedTileKWords;
+        const int word_idx = index % kPackedTileKWords;
+        const int64_t global_col = col_base + tile_col;
+        const int64_t global_word_idx = (k0 >> 4) + word_idx;
+        uint32_t packed_word = 0;
+        if (global_col < layout.logical_out_features && global_word_idx < compute_word_cols) {
+          const int64_t tile_group = global_col / compute_tile_n;
+          const int64_t compute_tile_col = global_col - tile_group * compute_tile_n;
+          packed_word = static_cast<uint32_t>(
+              compute_packed_words[(tile_group * compute_word_cols + global_word_idx) * compute_tile_n + compute_tile_col]);
+        }
+        w_tile_words[tile_col][word_idx] = packed_word;
+      }
+      __syncthreads();
+
+      if (row_active) {
+        #pragma unroll
+        for (int col_iter = 0; col_iter < kColsPerLane; ++col_iter) {
+          const int tile_col = lane + col_iter * kWarpSize;
+          const int64_t global_col = col_base + tile_col;
+          if (global_col >= layout.logical_out_features) {
+            continue;
+          }
+          float acc = accum[col_iter];
+          #pragma unroll
+          for (int word_idx = 0; word_idx < kPackedTileKWords; ++word_idx) {
+            const int tile_k0 = word_idx * 16;
+            const int64_t global_k0 = k0 + tile_k0;
+            if (global_k0 >= layout.logical_in_features) {
+              break;
+            }
+            const int valid_values = static_cast<int>(
+                (layout.logical_in_features - global_k0) >= 16 ? 16 : (layout.logical_in_features - global_k0));
+            acc = BitNetDotFloatPackedTernaryWord16Device(
+                &x_tile[row_slot][tile_k0],
+                w_tile_words[tile_col][word_idx],
+                valid_values,
+                acc);
+          }
+          accum[col_iter] = acc;
+        }
+      }
+      __syncthreads();
+    }
+
+    if (row_active) {
+      #pragma unroll
+      for (int col_iter = 0; col_iter < kColsPerLane; ++col_iter) {
+        const int tile_col = lane + col_iter * kWarpSize;
+        const int64_t global_col = col_base + tile_col;
+        if (global_col >= layout.logical_out_features) {
+          continue;
+        }
+        float value = accum[col_iter] * row_scales[tile_col];
+        if (bias != nullptr) {
+          value += static_cast<float>(bias[global_col]);
+        }
+        out[row_slot * layout.logical_out_features + global_col] = CastOutput<scalar_t>(value);
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <typename scalar_t, int MaxRows, int TileK, int OutputsPerBlock>
+__global__ __launch_bounds__(32 * MaxRows, 2) void bitnet_linear_decode_persistent_compute_packed_add_rms_norm_kernel(
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ update,
+    const scalar_t* __restrict__ rms_weight,
+    float residual_scale,
+    float eps,
+    const int32_t* __restrict__ compute_packed_words,
+    const float* __restrict__ compute_row_scales,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ combined,
+    scalar_t* __restrict__ out,
+    LayoutInfo layout,
+    int64_t rows,
+    int64_t compute_word_cols,
+    int64_t compute_tile_n,
+    int64_t total_tiles) {
+  constexpr int kWarpSize = 32;
+  constexpr int kColsPerLane = OutputsPerBlock / kWarpSize;
+  constexpr int kThreads = kWarpSize * MaxRows;
+  constexpr int kPackedTileKWords = (TileK + 15) / 16;
+
+  __shared__ scalar_t x_tile[MaxRows][TileK];
+  __shared__ uint32_t w_tile_words[OutputsPerBlock][kPackedTileKWords];
+  __shared__ float row_scales[OutputsPerBlock];
+  __shared__ float inv_rms[MaxRows];
+
+  const int lane = static_cast<int>(threadIdx.x);
+  const int row_slot = static_cast<int>(threadIdx.y);
+  const int thread_linear = row_slot * kWarpSize + lane;
+  const bool row_active = row_slot < rows;
+
+  float thread_sum = 0.0f;
+  if (row_active) {
+    const int64_t row_offset = static_cast<int64_t>(row_slot) * layout.logical_in_features;
+    for (int64_t col = lane; col < layout.logical_in_features; col += kWarpSize) {
+      const int64_t idx = row_offset + col;
+      const float value = static_cast<float>(x[idx]) + residual_scale * static_cast<float>(update[idx]);
+      const scalar_t combined_value = static_cast<scalar_t>(value);
+      combined[idx] = combined_value;
+      const float rounded = static_cast<float>(combined_value);
+      thread_sum += rounded * rounded;
+    }
+  }
+  thread_sum = WarpReduceSumDevice(thread_sum);
+  if (lane == 0) {
+    inv_rms[row_slot] = row_active
+        ? rsqrtf((thread_sum / static_cast<float>(layout.logical_in_features)) + eps)
+        : 0.0f;
+  }
+  __syncthreads();
+
+  for (int64_t tile_idx = static_cast<int64_t>(blockIdx.x); tile_idx < total_tiles; tile_idx += gridDim.x) {
+    const int64_t col_base = tile_idx * OutputsPerBlock;
+    float accum[kColsPerLane];
+    #pragma unroll
+    for (int idx = 0; idx < kColsPerLane; ++idx) {
+      accum[idx] = 0.0f;
+    }
+
+    for (int idx = thread_linear; idx < OutputsPerBlock; idx += kThreads) {
+      const int64_t global_col = col_base + idx;
+      float scale = 0.0f;
+      if (global_col < layout.logical_out_features) {
+        const int64_t tile_group = global_col / compute_tile_n;
+        const int64_t tile_col = global_col - tile_group * compute_tile_n;
+        scale = compute_row_scales[tile_group * compute_tile_n + tile_col];
+      }
+      row_scales[idx] = scale;
+    }
+    __syncthreads();
+
+    for (int64_t k0 = 0; k0 < layout.logical_in_features; k0 += TileK) {
+      for (int index = thread_linear; index < MaxRows * TileK; index += kThreads) {
+        const int tile_row = index / TileK;
+        const int tile_k = index % TileK;
+        const int64_t global_k = k0 + tile_k;
+        scalar_t value = static_cast<scalar_t>(0);
+        if (tile_row < rows && global_k < layout.logical_in_features) {
+          const int64_t idx = tile_row * layout.logical_in_features + global_k;
+          float normalized = static_cast<float>(combined[idx]) * inv_rms[tile_row];
+          if (rms_weight != nullptr) {
+            normalized *= static_cast<float>(rms_weight[global_k]);
+          }
+          value = static_cast<scalar_t>(normalized);
+        }
+        x_tile[tile_row][tile_k] = value;
+      }
+      for (int index = thread_linear; index < OutputsPerBlock * kPackedTileKWords; index += kThreads) {
+        const int tile_col = index / kPackedTileKWords;
+        const int word_idx = index % kPackedTileKWords;
+        const int64_t global_col = col_base + tile_col;
+        const int64_t global_word_idx = (k0 >> 4) + word_idx;
+        uint32_t packed_word = 0;
+        if (global_col < layout.logical_out_features && global_word_idx < compute_word_cols) {
+          const int64_t tile_group = global_col / compute_tile_n;
+          const int64_t compute_tile_col = global_col - tile_group * compute_tile_n;
+          packed_word = static_cast<uint32_t>(
+              compute_packed_words[(tile_group * compute_word_cols + global_word_idx) * compute_tile_n + compute_tile_col]);
+        }
+        w_tile_words[tile_col][word_idx] = packed_word;
+      }
+      __syncthreads();
+
+      if (row_active) {
+        #pragma unroll
+        for (int col_iter = 0; col_iter < kColsPerLane; ++col_iter) {
+          const int tile_col = lane + col_iter * kWarpSize;
+          const int64_t global_col = col_base + tile_col;
+          if (global_col >= layout.logical_out_features) {
+            continue;
+          }
+          float acc = accum[col_iter];
+          #pragma unroll
+          for (int word_idx = 0; word_idx < kPackedTileKWords; ++word_idx) {
+            const int tile_k0 = word_idx * 16;
+            const int64_t global_k0 = k0 + tile_k0;
+            if (global_k0 >= layout.logical_in_features) {
+              break;
+            }
+            const int valid_values = static_cast<int>(
+                (layout.logical_in_features - global_k0) >= 16 ? 16 : (layout.logical_in_features - global_k0));
+            acc = BitNetDotFloatPackedTernaryWord16Device(
+                &x_tile[row_slot][tile_k0],
+                w_tile_words[tile_col][word_idx],
+                valid_values,
+                acc);
+          }
+          accum[col_iter] = acc;
+        }
+      }
+      __syncthreads();
+    }
+
+    if (row_active) {
+      #pragma unroll
+      for (int col_iter = 0; col_iter < kColsPerLane; ++col_iter) {
+        const int tile_col = lane + col_iter * kWarpSize;
+        const int64_t global_col = col_base + tile_col;
+        if (global_col >= layout.logical_out_features) {
+          continue;
+        }
+        float value = accum[col_iter] * row_scales[tile_col];
+        if (bias != nullptr) {
+          value += static_cast<float>(bias[global_col]);
+        }
+        out[row_slot * layout.logical_out_features + global_col] = CastOutput<scalar_t>(value);
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <typename scalar_t, int MaxRows, int TileK, int OutputsPerBlock>
 __global__ __launch_bounds__(32 * MaxRows, 2) void bitnet_linear_decode_persistent_static_input_kernel(
     const scalar_t* __restrict__ x,
     const scalar_t* __restrict__ pre_scale,
@@ -1127,6 +1426,197 @@ void launch_decode_bucket_compute_packed(
 }
 
 template <typename scalar_t, int MaxRows>
+void launch_decode_bucket_compute_packed_rms_norm(
+    const Plan& plan,
+    const torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const c10::optional<torch::Tensor>& rms_weight,
+    double eps,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
+    const scalar_t* bias_ptr,
+    const LayoutInfo& layout,
+    cudaStream_t stream) {
+  const int64_t rows = x_2d.size(0);
+  const int64_t compute_word_cols = compute_packed_words.size(1);
+  const int64_t compute_tile_n = compute_packed_words.size(2);
+  const int64_t total_tiles = (layout.logical_out_features + plan.outputs_per_block - 1) / plan.outputs_per_block;
+  const dim3 threads(32, MaxRows);
+  const dim3 blocks(static_cast<unsigned int>(std::max<int64_t>(1, plan.persistent_ctas)));
+  const scalar_t* rms_weight_ptr =
+      (rms_weight.has_value() && rms_weight.value().defined()) ? rms_weight.value().data_ptr<scalar_t>() : nullptr;
+
+  if (plan.tile_k >= kPrefillSm80TileK && plan.outputs_per_block >= 128) {
+    bitnet_linear_decode_persistent_compute_packed_rms_norm_kernel<scalar_t, MaxRows, kPrefillSm80TileK, 128>
+        <<<blocks, threads, 0, stream>>>(
+            x_2d.data_ptr<scalar_t>(),
+            rms_weight_ptr,
+            static_cast<float>(eps),
+            compute_packed_words.data_ptr<int32_t>(),
+            compute_row_scales.data_ptr<float>(),
+            bias_ptr,
+            out_2d.data_ptr<scalar_t>(),
+            layout,
+            rows,
+            compute_word_cols,
+            compute_tile_n,
+            total_tiles);
+    return;
+  }
+  if (plan.tile_k >= kPrefillSm80TileK) {
+    bitnet_linear_decode_persistent_compute_packed_rms_norm_kernel<scalar_t, MaxRows, kPrefillSm80TileK, 64>
+        <<<blocks, threads, 0, stream>>>(
+            x_2d.data_ptr<scalar_t>(),
+            rms_weight_ptr,
+            static_cast<float>(eps),
+            compute_packed_words.data_ptr<int32_t>(),
+            compute_row_scales.data_ptr<float>(),
+            bias_ptr,
+            out_2d.data_ptr<scalar_t>(),
+            layout,
+            rows,
+            compute_word_cols,
+            compute_tile_n,
+            total_tiles);
+    return;
+  }
+  if (plan.outputs_per_block >= 128) {
+    bitnet_linear_decode_persistent_compute_packed_rms_norm_kernel<scalar_t, MaxRows, kPrefillGenericTileK, 128>
+        <<<blocks, threads, 0, stream>>>(
+            x_2d.data_ptr<scalar_t>(),
+            rms_weight_ptr,
+            static_cast<float>(eps),
+            compute_packed_words.data_ptr<int32_t>(),
+            compute_row_scales.data_ptr<float>(),
+            bias_ptr,
+            out_2d.data_ptr<scalar_t>(),
+            layout,
+            rows,
+            compute_word_cols,
+            compute_tile_n,
+            total_tiles);
+    return;
+  }
+  bitnet_linear_decode_persistent_compute_packed_rms_norm_kernel<scalar_t, MaxRows, kPrefillGenericTileK, 64>
+      <<<blocks, threads, 0, stream>>>(
+          x_2d.data_ptr<scalar_t>(),
+          rms_weight_ptr,
+          static_cast<float>(eps),
+          compute_packed_words.data_ptr<int32_t>(),
+          compute_row_scales.data_ptr<float>(),
+          bias_ptr,
+          out_2d.data_ptr<scalar_t>(),
+          layout,
+          rows,
+          compute_word_cols,
+          compute_tile_n,
+          total_tiles);
+}
+
+template <typename scalar_t, int MaxRows>
+void launch_decode_bucket_compute_packed_add_rms_norm(
+    const Plan& plan,
+    const torch::Tensor& combined_2d,
+    const torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& update_2d,
+    const c10::optional<torch::Tensor>& rms_weight,
+    double residual_scale,
+    double eps,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
+    const scalar_t* bias_ptr,
+    const LayoutInfo& layout,
+    cudaStream_t stream) {
+  const int64_t rows = x_2d.size(0);
+  const int64_t compute_word_cols = compute_packed_words.size(1);
+  const int64_t compute_tile_n = compute_packed_words.size(2);
+  const int64_t total_tiles = (layout.logical_out_features + plan.outputs_per_block - 1) / plan.outputs_per_block;
+  const dim3 threads(32, MaxRows);
+  const dim3 blocks(static_cast<unsigned int>(std::max<int64_t>(1, plan.persistent_ctas)));
+  const scalar_t* rms_weight_ptr =
+      (rms_weight.has_value() && rms_weight.value().defined()) ? rms_weight.value().data_ptr<scalar_t>() : nullptr;
+
+  if (plan.tile_k >= kPrefillSm80TileK && plan.outputs_per_block >= 128) {
+    bitnet_linear_decode_persistent_compute_packed_add_rms_norm_kernel<scalar_t, MaxRows, kPrefillSm80TileK, 128>
+        <<<blocks, threads, 0, stream>>>(
+            x_2d.data_ptr<scalar_t>(),
+            update_2d.data_ptr<scalar_t>(),
+            rms_weight_ptr,
+            static_cast<float>(residual_scale),
+            static_cast<float>(eps),
+            compute_packed_words.data_ptr<int32_t>(),
+            compute_row_scales.data_ptr<float>(),
+            bias_ptr,
+            combined_2d.data_ptr<scalar_t>(),
+            out_2d.data_ptr<scalar_t>(),
+            layout,
+            rows,
+            compute_word_cols,
+            compute_tile_n,
+            total_tiles);
+    return;
+  }
+  if (plan.tile_k >= kPrefillSm80TileK) {
+    bitnet_linear_decode_persistent_compute_packed_add_rms_norm_kernel<scalar_t, MaxRows, kPrefillSm80TileK, 64>
+        <<<blocks, threads, 0, stream>>>(
+            x_2d.data_ptr<scalar_t>(),
+            update_2d.data_ptr<scalar_t>(),
+            rms_weight_ptr,
+            static_cast<float>(residual_scale),
+            static_cast<float>(eps),
+            compute_packed_words.data_ptr<int32_t>(),
+            compute_row_scales.data_ptr<float>(),
+            bias_ptr,
+            combined_2d.data_ptr<scalar_t>(),
+            out_2d.data_ptr<scalar_t>(),
+            layout,
+            rows,
+            compute_word_cols,
+            compute_tile_n,
+            total_tiles);
+    return;
+  }
+  if (plan.outputs_per_block >= 128) {
+    bitnet_linear_decode_persistent_compute_packed_add_rms_norm_kernel<scalar_t, MaxRows, kPrefillGenericTileK, 128>
+        <<<blocks, threads, 0, stream>>>(
+            x_2d.data_ptr<scalar_t>(),
+            update_2d.data_ptr<scalar_t>(),
+            rms_weight_ptr,
+            static_cast<float>(residual_scale),
+            static_cast<float>(eps),
+            compute_packed_words.data_ptr<int32_t>(),
+            compute_row_scales.data_ptr<float>(),
+            bias_ptr,
+            combined_2d.data_ptr<scalar_t>(),
+            out_2d.data_ptr<scalar_t>(),
+            layout,
+            rows,
+            compute_word_cols,
+            compute_tile_n,
+            total_tiles);
+    return;
+  }
+  bitnet_linear_decode_persistent_compute_packed_add_rms_norm_kernel<scalar_t, MaxRows, kPrefillGenericTileK, 64>
+      <<<blocks, threads, 0, stream>>>(
+          x_2d.data_ptr<scalar_t>(),
+          update_2d.data_ptr<scalar_t>(),
+          rms_weight_ptr,
+          static_cast<float>(residual_scale),
+          static_cast<float>(eps),
+          compute_packed_words.data_ptr<int32_t>(),
+          compute_row_scales.data_ptr<float>(),
+          bias_ptr,
+          combined_2d.data_ptr<scalar_t>(),
+          out_2d.data_ptr<scalar_t>(),
+          layout,
+          rows,
+          compute_word_cols,
+          compute_tile_n,
+          total_tiles);
+}
+
+template <typename scalar_t, int MaxRows>
 void launch_decode_bucket_static_input(
     const Plan& plan,
     const torch::Tensor& out_2d,
@@ -1351,6 +1841,153 @@ void LaunchBitNetDecodeKernelComputePacked(
                 plan,
                 out_2d,
                 x_2d,
+                compute_packed_words,
+                compute_row_scales,
+                bias_ptr,
+                layout,
+                stream.stream());
+            break;
+        }
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void LaunchBitNetDecodeKernelComputePackedRmsNorm(
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const c10::optional<torch::Tensor>& rms_weight,
+    double eps,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan) {
+  TORCH_CHECK(
+      plan.kind == KernelKind::kDecodePersistent,
+      "LaunchBitNetDecodeKernelComputePackedRmsNorm only supports decode-persistent plans");
+  c10::cuda::CUDAGuard device_guard(x_2d.device());
+  auto stream = c10::cuda::getCurrentCUDAStream(x_2d.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      x_2d.scalar_type(),
+      "bitnet_linear_decode_compute_packed_rms_norm_cuda",
+      [&] {
+        const scalar_t* bias_ptr = nullptr;
+        if (bias.has_value() && bias.value().defined()) {
+          bias_ptr = bias.value().data_ptr<scalar_t>();
+        }
+        switch (plan.rows_bucket) {
+          case 1:
+            launch_decode_bucket_compute_packed_rms_norm<scalar_t, 1>(
+                plan, out_2d, x_2d, rms_weight, eps, compute_packed_words, compute_row_scales, bias_ptr, layout, stream.stream());
+            break;
+          case 2:
+            launch_decode_bucket_compute_packed_rms_norm<scalar_t, 2>(
+                plan, out_2d, x_2d, rms_weight, eps, compute_packed_words, compute_row_scales, bias_ptr, layout, stream.stream());
+            break;
+          case 4:
+            launch_decode_bucket_compute_packed_rms_norm<scalar_t, 4>(
+                plan, out_2d, x_2d, rms_weight, eps, compute_packed_words, compute_row_scales, bias_ptr, layout, stream.stream());
+            break;
+          default:
+            launch_decode_bucket_compute_packed_rms_norm<scalar_t, 8>(
+                plan, out_2d, x_2d, rms_weight, eps, compute_packed_words, compute_row_scales, bias_ptr, layout, stream.stream());
+            break;
+        }
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void LaunchBitNetDecodeKernelComputePackedAddRmsNorm(
+    torch::Tensor& combined_2d,
+    torch::Tensor& out_2d,
+    const torch::Tensor& x_2d,
+    const torch::Tensor& update_2d,
+    const c10::optional<torch::Tensor>& rms_weight,
+    double residual_scale,
+    double eps,
+    const torch::Tensor& compute_packed_words,
+    const torch::Tensor& compute_row_scales,
+    const c10::optional<torch::Tensor>& bias,
+    const LayoutInfo& layout,
+    const Plan& plan) {
+  TORCH_CHECK(
+      plan.kind == KernelKind::kDecodePersistent,
+      "LaunchBitNetDecodeKernelComputePackedAddRmsNorm only supports decode-persistent plans");
+  c10::cuda::CUDAGuard device_guard(x_2d.device());
+  auto stream = c10::cuda::getCurrentCUDAStream(x_2d.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      x_2d.scalar_type(),
+      "bitnet_linear_decode_compute_packed_add_rms_norm_cuda",
+      [&] {
+        const scalar_t* bias_ptr = nullptr;
+        if (bias.has_value() && bias.value().defined()) {
+          bias_ptr = bias.value().data_ptr<scalar_t>();
+        }
+        switch (plan.rows_bucket) {
+          case 1:
+            launch_decode_bucket_compute_packed_add_rms_norm<scalar_t, 1>(
+                plan,
+                combined_2d,
+                out_2d,
+                x_2d,
+                update_2d,
+                rms_weight,
+                residual_scale,
+                eps,
+                compute_packed_words,
+                compute_row_scales,
+                bias_ptr,
+                layout,
+                stream.stream());
+            break;
+          case 2:
+            launch_decode_bucket_compute_packed_add_rms_norm<scalar_t, 2>(
+                plan,
+                combined_2d,
+                out_2d,
+                x_2d,
+                update_2d,
+                rms_weight,
+                residual_scale,
+                eps,
+                compute_packed_words,
+                compute_row_scales,
+                bias_ptr,
+                layout,
+                stream.stream());
+            break;
+          case 4:
+            launch_decode_bucket_compute_packed_add_rms_norm<scalar_t, 4>(
+                plan,
+                combined_2d,
+                out_2d,
+                x_2d,
+                update_2d,
+                rms_weight,
+                residual_scale,
+                eps,
+                compute_packed_words,
+                compute_row_scales,
+                bias_ptr,
+                layout,
+                stream.stream());
+            break;
+          default:
+            launch_decode_bucket_compute_packed_add_rms_norm<scalar_t, 8>(
+                plan,
+                combined_2d,
+                out_2d,
+                x_2d,
+                update_2d,
+                rms_weight,
+                residual_scale,
+                eps,
                 compute_packed_words,
                 compute_row_scales,
                 bias_ptr,

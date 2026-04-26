@@ -6,12 +6,14 @@ import torch.nn as nn
 
 from .lora import inject_lora
 from .quantization import (
+    prepare_bitnet_qat_linear_modules,
     quantize_linear_modules,
     QuantizedLinearBitNet,
     QuantizedLinearFP8,
     QuantizedLinearInt4,
     QuantizedLinearInt8,
     QuantizedLinearNF4,
+    TrainableBitNetLinear,
 )
 
 
@@ -33,7 +35,7 @@ def apply_compression(
     }
 
     quant: {
-      "scheme": str = "int8",  # one of: int8, bitnet, int4, nf4, fp8
+      "scheme": str = "int8",  # one of: int8, bitnet, bitnet_qat, int4, nf4, fp8
       "include": Iterable[str] | None,
       "exclude": Iterable[str] | None,
       "calibration": str = "absmax",  # QuantizedLinearInt8.from_float argument
@@ -111,8 +113,10 @@ def apply_compression(
 
 __all__ = [
     "apply_compression",
+    "prepare_bitnet_qat_linear_modules",
     "QuantizedLinearInt8",
     "QuantizedLinearBitNet",
+    "TrainableBitNetLinear",
     "QuantizedLinearInt4",
     "QuantizedLinearNF4",
     "QuantizedLinearFP8",

@@ -32,6 +32,17 @@ def test_runtime_activation_dispatches_to_native_binding(monkeypatch):
     assert seen["activation"] == "silu"
 
 
+def test_runtime_activation_supports_relu2_reference_path(monkeypatch):
+    x = torch.randn(2, 3)
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: False)
+
+    out = runtime_ops_mod.activation(x, "relu2")
+    ref = F.relu(x).square()
+
+    assert torch.allclose(out, ref)
+
+
 def test_runtime_gated_activation_dispatches_to_native_binding(monkeypatch):
     x = torch.randn(2, 3)
     gate = torch.randn(2, 3)
@@ -326,5 +337,30 @@ def test_runtime_mlp_runs_dense_reference_path_with_leaky_relu_half_squared(monk
 
     hidden = F.linear(x, w_in, b_in)
     activated = F.leaky_relu(hidden, negative_slope=0.5).square()
+    ref = F.linear(activated, w_out, b_out)
+    assert torch.allclose(out, ref)
+
+
+def test_runtime_mlp_runs_dense_reference_path_with_relu2(monkeypatch):
+    x = torch.randn(2, 3, 4)
+    w_in = torch.randn(10, 4)
+    b_in = torch.randn(10)
+    w_out = torch.randn(4, 10)
+    b_out = torch.randn(4)
+
+    monkeypatch.setattr(runtime_ops_mod, "has_native_op", lambda name: False)
+
+    out = runtime_ops_mod.mlp(
+        x,
+        w_in,
+        b_in,
+        w_out,
+        b_out,
+        activation="relu2",
+        gated=False,
+    )
+
+    hidden = F.linear(x, w_in, b_in)
+    activated = F.relu(hidden).square()
     ref = F.linear(activated, w_out, b_out)
     assert torch.allclose(out, ref)

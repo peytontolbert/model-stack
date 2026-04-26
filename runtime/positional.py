@@ -5,15 +5,21 @@ import math
 import torch
 
 from runtime.ops import apply_rotary as runtime_apply_rotary
+from runtime.ops import resolve_rotary_embedding as runtime_resolve_rotary_embedding
+
+
+def _rope_inv_freq(head_dim: int, device=None, base_theta: float = 1e6) -> torch.Tensor:
+    return 1.0 / (
+        float(base_theta)
+        ** (torch.arange(0, int(head_dim), 2, dtype=torch.int64, device=device).float() / int(head_dim))
+    )
 
 
 def build_rope_cache(seq_len: int, head_dim: int, device=None, base_theta: float = 1e6):
     if head_dim % 2 != 0:
         raise ValueError("RoPE head_dim must be even")
     t = torch.arange(seq_len, device=device, dtype=torch.float32)
-    inv_freq = 1.0 / (
-        base_theta ** (torch.arange(0, head_dim, 2, dtype=torch.int64, device=device).float() / head_dim)
-    )
+    inv_freq = _rope_inv_freq(head_dim, device=device, base_theta=base_theta)
     freqs = torch.einsum("t,d->td", t, inv_freq)
     emb = torch.cat((freqs, freqs), dim=-1)
     return emb.cos(), emb.sin()
@@ -70,6 +76,116 @@ def rope_yarn_factors(
         return 1.0, 1.0
     attention_factor = 0.1 * math.log(scale) + 1.0
     return float(attention_factor), float(attention_factor)
+
+
+def _effective_yarn_factor(
+    seq_len: int,
+    factor: float | None,
+    original_max_position_embeddings: int | None,
+) -> float:
+    scale = 1.0 if factor is None else float(factor)
+    orig = int(original_max_position_embeddings) if original_max_position_embeddings is not None else 0
+    if orig > 0:
+        scale = max(scale, float(seq_len) / float(orig))
+    return max(float(scale), 1.0)
+
+
+def rope_yarn_inv_freq(
+    *,
+    seq_len: int,
+    head_dim: int,
+    base_theta: float,
+    factor: float | None,
+    original_max_position_embeddings: int | None = None,
+    device=None,
+) -> torch.Tensor:
+    """Return YaRN-style ramped inverse frequencies.
+
+    This follows the compact Parameter Golf convention used in several 10 minute
+    runs: low frequencies are preserved, high frequencies are divided by the
+    effective context-extension factor, and the middle band is linearly ramped.
+    """
+    if int(head_dim) % 2 != 0:
+        raise ValueError("RoPE head_dim must be even")
+    inv_freq = _rope_inv_freq(int(head_dim), device=device, base_theta=float(base_theta))
+    scale = _effective_yarn_factor(int(seq_len), factor, original_max_position_embeddings)
+    if scale <= 1.0:
+        return inv_freq
+    idx = torch.arange(0, int(head_dim), 2, dtype=torch.float32, device=device)
+    ramp = ((idx / float(head_dim)) - 0.25) / 0.75
+    ramp = ramp.clamp(0.0, 1.0)
+    return inv_freq / (1.0 + ramp * (scale - 1.0))
+
+
+def resolve_rope_embedding(
+    *,
+    reference: torch.Tensor,
+    head_dim: int,
+    base_theta: float,
+    attention_scaling: float = 1.0,
+    position_ids: torch.Tensor | None = None,
+    scaling_type: str | None = None,
+    scaling_factor: float | None = None,
+    original_max_position_embeddings: int | None = None,
+    low_freq_factor: float | None = None,
+    high_freq_factor: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rope_seq_len = resolve_rope_seq_len(int(reference.shape[1]), position_ids)
+    base, attn = resolve_rope_parameters(
+        seq_len=int(rope_seq_len),
+        head_dim=int(head_dim),
+        base_theta=float(base_theta),
+        attention_scaling=float(attention_scaling),
+        scaling_type=scaling_type,
+        scaling_factor=scaling_factor,
+        original_max_position_embeddings=original_max_position_embeddings,
+        low_freq_factor=low_freq_factor,
+        high_freq_factor=high_freq_factor,
+    )
+    st = (scaling_type or "").lower() if isinstance(scaling_type, str) else ""
+    if st not in {"yarn", "pg_yarn", "parameter_golf_yarn"}:
+        return runtime_resolve_rotary_embedding(
+            reference=reference,
+            head_dim=int(head_dim),
+            base_theta=float(base),
+            attention_scaling=float(attn),
+            position_ids=position_ids,
+        )
+
+    gather_pos = None
+    needed = int(reference.shape[1])
+    if position_ids is not None:
+        gather_pos = position_ids[0] if position_ids.dim() == 2 else position_ids
+        if gather_pos.numel() > 0:
+            needed = int(gather_pos.max().item()) + 1
+    needed = max(needed, int(rope_seq_len))
+    inv_freq = rope_yarn_inv_freq(
+        seq_len=int(needed),
+        head_dim=int(head_dim),
+        base_theta=float(base_theta),
+        factor=scaling_factor,
+        original_max_position_embeddings=original_max_position_embeddings,
+        device=reference.device,
+    )
+    t = torch.arange(needed, device=reference.device, dtype=torch.float32)
+    freqs = torch.einsum("t,d->td", t, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos()
+    sin = emb.sin()
+    if float(attn) != 1.0:
+        cos = cos * float(attn)
+        sin = sin * float(attn)
+    cos = cos.to(dtype=reference.dtype)
+    sin = sin.to(dtype=reference.dtype)
+    seq_len = int(reference.shape[1])
+    if gather_pos is not None:
+        gather_pos = gather_pos.reshape(-1).to(device=reference.device, dtype=torch.long)
+        cos = cos.index_select(0, gather_pos).view(seq_len, int(head_dim))
+        sin = sin.index_select(0, gather_pos).view(seq_len, int(head_dim))
+    else:
+        cos = cos[:seq_len]
+        sin = sin[:seq_len]
+    return cos, sin
 
 
 def resolve_rope_seq_len(seq_len: int, position_ids: torch.Tensor | None = None) -> int:
@@ -384,8 +500,10 @@ __all__ = [
     "relative_position_bias_from_table",
     "relative_position_bucket",
     "resolve_rope_seq_len",
+    "resolve_rope_embedding",
     "rescale_positions",
     "rope_ntk_scaling",
+    "rope_yarn_inv_freq",
     "resolve_rope_parameters",
     "rope_yarn_factors",
     "rotary_fft",

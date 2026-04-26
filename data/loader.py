@@ -168,6 +168,7 @@ def build_dataloader(
             num_workers=int(num_workers),
             pin_memory=bool(pin_memory),
             device=device,
+            seed=seed,
         )
 
     files = _discover_shards(shards_path)
@@ -229,5 +230,4 @@ __all__ = [
     "ShardedTokenDataset",
     "build_dataloader",
 ]
-
 

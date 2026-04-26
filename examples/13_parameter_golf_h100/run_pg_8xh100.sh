@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 PG_DIR="${PG_DIR:-${ROOT_DIR}/other_repos/parameter-golf}"
-PRESET="${PG_PRESET:-runtime_row_1024}"
+PRESET="${PG_PRESET:-runtime_row_1024x7_relu2_mlp3}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
 cd "${PG_DIR}"
@@ -18,10 +18,15 @@ common_env=(
   VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-0}"
   VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-524288}"
   TRAIN_BATCH_TOKENS="${TRAIN_BATCH_TOKENS:-524288}"
-  TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-200}"
+  TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-50}"
   WARMUP_STEPS="${WARMUP_STEPS:-1}"
   BITNET_GROUP_SIZE="${BITNET_GROUP_SIZE:-64}"
   BITNET_SCALE_LAYOUT="${BITNET_SCALE_LAYOUT:-runtime_row}"
+  MODEL_STACK_ROOT="${MODEL_STACK_ROOT:-${ROOT_DIR}}"
+  MODEL_STACK_BITNET_QAT="${MODEL_STACK_BITNET_QAT:-0}"
+  MODEL_STACK_BITNET_EXPORT="${MODEL_STACK_BITNET_EXPORT:-1}"
+  MODEL_STACK_BITNET_GROUP_SIZE="${MODEL_STACK_BITNET_GROUP_SIZE:-${BITNET_GROUP_SIZE:-64}}"
+  MODEL_STACK_BITNET_SCALE_LAYOUT="${MODEL_STACK_BITNET_SCALE_LAYOUT:-${BITNET_SCALE_LAYOUT:-runtime_row}}"
   FP_STORAGE="${FP_STORAGE:-0}"
   SEQ_SCHEDULE_FRACTION="${SEQ_SCHEDULE_FRACTION:-0.33}"
   BATCH_SCHEDULE_FRACTION="${BATCH_SCHEDULE_FRACTION:-0.33}"
@@ -35,6 +40,23 @@ common_env=(
 )
 
 case "${PRESET}" in
+  runtime_row_1024x7_relu2_mlp3)
+    preset_env=(
+      RUN_ID="${RUN_ID:-ternary_runtime_row_sp1024_ctx4096_8xh100_relu2_mlp3_1024x7}"
+      MODEL_DIM="${MODEL_DIM:-1024}"
+      NUM_LAYERS="${NUM_LAYERS:-7}"
+      NUM_HEADS="${NUM_HEADS:-16}"
+      NUM_KV_HEADS="${NUM_KV_HEADS:-4}"
+      MLP_MULT="${MLP_MULT:-3}"
+      ACTIVATION="${ACTIVATION:-relu2}"
+      TRAINING_DEPTH_RECURRENCE="${TRAINING_DEPTH_RECURRENCE:-1}"
+      EVAL_DEPTH_RECURRENCE="${EVAL_DEPTH_RECURRENCE:-1}"
+      ROPE_TYPE="${ROPE_TYPE:-yarn}"
+      SLIDING_EVAL="${SLIDING_EVAL:-1}"
+      SLIDING_EVAL_STRIDE="${SLIDING_EVAL_STRIDE:-64}"
+      SLIDING_BATCH_SIZE="${SLIDING_BATCH_SIZE:-64}"
+    )
+    ;;
   runtime_row_512)
     preset_env=(
       RUN_ID="${RUN_ID:-ternary_runtime_row_sp1024_ctx4096_8xh100_512}"
@@ -59,11 +81,10 @@ case "${PRESET}" in
     )
     ;;
   *)
-    echo "Unknown PG_PRESET=${PRESET}; expected runtime_row_512 or runtime_row_1024" >&2
+    echo "Unknown PG_PRESET=${PRESET}; expected runtime_row_1024x7_relu2_mlp3, runtime_row_512, or runtime_row_1024" >&2
     exit 2
     ;;
 esac
 
 env "${common_env[@]}" "${preset_env[@]}" \
   torchrun --nproc_per_node="${NPROC_PER_NODE}" train_gpt.py
-

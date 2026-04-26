@@ -216,25 +216,41 @@ def test_quantized_int4_spin_transforms_input_before_runtime_kernel(monkeypatch)
     assert torch.allclose(seen["x"], quant_mod.apply_spin_transform(x, layer.spin_signs))
 
 
-def test_quantized_bitnet_linear_uses_runtime_bitnet_linear(monkeypatch):
+def test_quantized_bitnet_linear_uses_compute_packed_backend_when_requested(monkeypatch):
     seen = {}
 
-    def fake_runtime_bitnet_linear(x, packed_weight, scale_values, layout_header, segment_offsets, bias=None):
+    def fake_runtime_bitnet_linear_compute_packed(
+        x,
+        packed_weight,
+        scale_values,
+        layout_header,
+        segment_offsets,
+        compute_packed_words,
+        compute_row_scales,
+        decode_nz_masks,
+        decode_sign_masks,
+        decode_row_scales,
+        bias=None,
+        *,
+        out_dtype=None,
+    ):
+        del compute_packed_words, compute_row_scales, decode_nz_masks, decode_sign_masks, decode_row_scales
         seen["x"] = tuple(x.shape)
         seen["packed_weight"] = tuple(packed_weight.shape)
         seen["scale_values"] = tuple(scale_values.shape)
         seen["layout_header"] = tuple(layout_header.shape)
         seen["segment_offsets"] = tuple(segment_offsets.shape)
         seen["bias"] = bias is not None
-        return torch.full((*x.shape[:-1], int(layout_header[3].item())), 6.0, dtype=x.dtype)
+        dtype = x.dtype if out_dtype is None else out_dtype
+        return torch.full((*x.shape[:-1], int(layout_header[3].item())), 6.0, dtype=dtype)
 
-    monkeypatch.setattr(quant_mod, "runtime_bitnet_linear", fake_runtime_bitnet_linear)
+    monkeypatch.setattr(quant_mod, "runtime_bitnet_linear_compute_packed", fake_runtime_bitnet_linear_compute_packed)
 
     layer = quant_mod.QuantizedLinearBitNet(4, 3, bias=True)
     linear = torch.nn.Linear(4, 3, bias=True)
     layer.from_float(linear)
     x = torch.randn(2, 4)
-    out = layer(x)
+    out = layer.runtime_linear(x, backend="bitnet")
 
     assert out.shape == (2, 3)
     assert torch.all(out == 6.0)
@@ -379,6 +395,25 @@ def test_quantized_bitnet_dynamic_int8_hopper_prefill_can_use_dense_fallback(mon
     assert seen["x"] == (1, 1024, 2560)
     assert torch.allclose(seen["weight"], dense_weight.to(dtype=x.dtype))
     assert torch.allclose(seen["bias"], expected_bias)
+
+
+def test_quantized_bitnet_dynamic_int8_hopper_prefill_policy_covers_1024_width(monkeypatch):
+    class FakeCudaTensor:
+        is_cuda = True
+        ndim = 2
+        shape = (4096, 1024)
+        device = torch.device("cuda", 0)
+
+        def numel(self):
+            return self.shape[0] * self.shape[1]
+
+    layer = quant_mod.QuantizedLinearBitNet(1024, 1024, bias=False)
+    layer.act_quant_mode = "dynamic_int8"
+    layer.act_quant_bits = 8
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+
+    assert layer._prefer_dynamic_int8_dense_hopper_prefill_fallback(FakeCudaTensor())
 
 
 def test_quantized_bitnet_dynamic_int8_sub8_decode_does_not_use_dense_fallback(monkeypatch):
@@ -693,10 +728,15 @@ def test_packed_bitnet_linear_spec_supports_percentile_and_mse_activation_quanti
     percentile_spec = layer.runtime_packed_linear_spec(backend="bitnet", dtype=torch.float32, device="cpu")
     runtime_ops_mod.linear_from_packed_spec(x, percentile_spec, backend="bitnet")
 
-    expected_percentile_scale = quant_mod.calibrate_activation_scale(x, method="percentile", bits=6, p=0.9)
-    expected_percentile_qx = torch.round(x / expected_percentile_scale).clamp_(-31.0, 31.0).to(torch.int8)
+    expected_percentile_scale = runtime_ops_mod._calibrate_activation_rowwise_scale(
+        x,
+        method="percentile",
+        bits=6,
+        percentile=0.9,
+    )
+    expected_percentile_qx = torch.round(x / expected_percentile_scale.unsqueeze(-1)).clamp_(-31.0, 31.0).to(torch.int8)
     assert torch.equal(seen["qxs"][0], expected_percentile_qx)
-    assert torch.allclose(seen["row_scales"][0], expected_percentile_scale.reshape(1).expand(x.shape[0]))
+    assert torch.allclose(seen["row_scales"][0], expected_percentile_scale)
 
     layer.act_quant_mode = "static_int8"
     layer.act_quant_method = "mse"
@@ -1063,6 +1103,72 @@ def test_public_pack_bitnet_weight_supports_percentile_calibration():
     assert int(layout_header[7].item()) == 2
     assert int(layout_header[8].item()) == 1
     assert torch.equal(segment_offsets.cpu(), torch.tensor([0, 3], dtype=torch.int32))
+
+
+def test_trainable_bitnet_linear_uses_runtime_row_ste_and_gradients():
+    layer = quant_mod.TrainableBitNetLinear(4, 2, bias=True)
+    with torch.no_grad():
+        layer.weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, -0.5, 0.1, 0.0],
+                    [0.2, 0.4, -0.6, 0.8],
+                ],
+                dtype=torch.float32,
+            )
+        )
+        layer.bias.copy_(torch.tensor([0.25, -0.5], dtype=torch.float32))
+    x = torch.tensor([[1.0, 2.0, -1.0, 0.5]], dtype=torch.float32)
+
+    row_scale = layer.weight.detach().abs().mean(dim=-1, keepdim=True).clamp_min(1e-8)
+    expected_weight = torch.round(layer.weight.detach() / row_scale).clamp(-1, 1) * row_scale
+    out = layer(x)
+
+    assert "packed_weight" not in dict(layer.named_buffers())
+    assert torch.allclose(out, torch.nn.functional.linear(x, expected_weight, layer.bias.detach()))
+    out.sum().backward()
+    assert layer.weight.grad is not None
+    assert layer.weight.grad.shape == layer.weight.shape
+    assert torch.count_nonzero(layer.weight.grad).item() > 0
+
+
+def test_trainable_bitnet_linear_exports_exact_runtime_row_quantized_layer():
+    layer = quant_mod.TrainableBitNetLinear(4, 2, bias=True)
+    with torch.no_grad():
+        layer.weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, -0.5, 0.1, 0.0],
+                    [0.2, 0.4, -0.6, 0.8],
+                ],
+                dtype=torch.float32,
+            )
+        )
+        layer.bias.copy_(torch.tensor([0.25, -0.5], dtype=torch.float32))
+    row_scale = layer.weight.detach().abs().mean(dim=-1, keepdim=True).clamp_min(1e-8)
+    expected_weight = torch.round(layer.weight.detach() / row_scale).clamp(-1, 1) * row_scale
+
+    quantized = layer.to_quantized()
+
+    assert isinstance(quantized, quant_mod.QuantizedLinearBitNet)
+    assert int(quantized.layout_header[7].item()) == 2
+    assert int(quantized.layout_header[8].item()) == 1
+    assert torch.allclose(quantized.scale_values.cpu(), row_scale.squeeze(-1))
+    assert torch.allclose(quantized.runtime_weight(dtype=torch.float32, device="cpu"), expected_weight)
+    assert torch.allclose(quantized.runtime_bias(dtype=torch.float32, device="cpu"), layer.bias.detach())
+
+
+def test_prepare_bitnet_qat_linear_modules_replaces_linear_with_trainable_layer():
+    model = torch.nn.Sequential(torch.nn.Linear(4, 3), torch.nn.ReLU(), torch.nn.Linear(3, 2))
+    original = model[0].weight.detach().clone()
+
+    replacements = quant_mod.prepare_bitnet_qat_linear_modules(model, include=["0"])
+
+    assert list(replacements) == ["0"]
+    assert isinstance(model[0], quant_mod.TrainableBitNetLinear)
+    assert isinstance(model[2], torch.nn.Linear)
+    assert model[0].weight.requires_grad
+    assert torch.allclose(model[0].weight.detach(), original)
 
 
 def test_quantized_bitnet_gptq_delegates_to_public_pack_helper(monkeypatch):

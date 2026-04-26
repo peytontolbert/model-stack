@@ -61,6 +61,7 @@ enum class GatedActivationKind : int {
   kGELU = 1,
   kReLU = 2,
   kLeakyRelu0p5Squared = 3,
+  kReLU2 = 4,
 };
 
 GatedActivationKind ParseGatedActivation(const std::string& activation) {
@@ -72,6 +73,9 @@ GatedActivationKind ParseGatedActivation(const std::string& activation) {
   }
   if (activation == "reglu" || activation == "relu") {
     return GatedActivationKind::kReLU;
+  }
+  if (activation == "relu2" || activation == "squared_relu" || activation == "squared-relu") {
+    return GatedActivationKind::kReLU2;
   }
   if (activation == "leaky_relu_0p5_squared" || activation == "leaky-relu-0p5-squared" ||
       activation == "leaky_relu_0.5_squared" || activation == "leaky-relu-0.5-squared") {
@@ -93,6 +97,10 @@ __device__ inline float ApplyGatedActivationValue(float x, GatedActivationKind a
       return GatedActivationGeluExact(x);
     case GatedActivationKind::kReLU:
       return x > 0.0f ? x : 0.0f;
+    case GatedActivationKind::kReLU2: {
+      const float y = x > 0.0f ? x : 0.0f;
+      return y * y;
+    }
     case GatedActivationKind::kLeakyRelu0p5Squared: {
       const float y = x > 0.0f ? x : (0.5f * x);
       return y * y;
@@ -526,7 +534,8 @@ torch::Tensor CudaBitNetTransformInputForward(
                   "CudaBitNetTransformInputForward: unsupported activation quant mode");
       TORCH_CHECK(act_quant_method == "absmax" || act_quant_method == "mse" || act_quant_method.empty(),
                   "CudaBitNetTransformInputForward: unsupported dynamic activation calibration method");
-      provided_scale = CudaBitNetCalibrateInputScaleForward(x_2d, pre_scale_cast, act_quant_bits);
+      // Leave provided_scale unset for dynamic quantization. The transform kernel computes
+      // one row-local scale per token row, avoiding a separate calibration launch.
     }
   }
 
@@ -617,11 +626,8 @@ std::tuple<torch::Tensor, torch::Tensor> CudaBitNetQuantizeActivationInt8CodesFo
     TORCH_CHECK(
         act_quant_method == "absmax" || act_quant_method == "mse" || act_quant_method.empty(),
         "CudaBitNetQuantizeActivationInt8CodesForward: unsupported dynamic activation calibration method");
-    // For single-row decode, the global and row-local scales are identical. Let the quantize kernel
-    // compute that scale directly so we avoid a separate calibration launch on the hot path.
-    if (rows != 1) {
-      provided_scale = CudaBitNetCalibrateInputScaleForward(x_2d, pre_scale_cast, act_quant_bits);
-    }
+    // Leave provided_scale unset for dynamic quantization. The quantize kernel computes
+    // one row-local scale per token row, avoiding a separate calibration launch.
   }
 
   if (rows == 0 || cols == 0) {

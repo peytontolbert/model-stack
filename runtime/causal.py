@@ -15,8 +15,7 @@ from runtime.ops import create_causal_mask as runtime_create_causal_mask
 from runtime.ops import embedding as runtime_embedding
 from runtime.ops import linear_module as runtime_linear_module
 from runtime.ops import resolve_position_ids as runtime_resolve_position_ids
-from runtime.ops import resolve_rotary_embedding as runtime_resolve_rotary_embedding
-from runtime.positional import resolve_rope_parameters, resolve_rope_seq_len
+from runtime.positional import resolve_rope_embedding
 from serve.engine import generate as engine_generate
 from specs.config import ModelConfig
 from tensor.norms import RMSNorm
@@ -121,10 +120,9 @@ class CausalLM(nn.Module):
                 position_ids=position_ids,
             )
         head_dim = getattr(self.cfg, "head_dim", None) or int(self.cfg.d_model // self.cfg.n_heads)
-        rope_seq_len = resolve_rope_seq_len(int(T), position_ids)
-        rope_theta, attn_scale = resolve_rope_parameters(
-            seq_len=int(rope_seq_len),
-            head_dim=int(head_dim),
+        cos, sin = resolve_rope_embedding(
+            reference=x,
+            head_dim=head_dim,
             base_theta=float(getattr(self.cfg, "rope_theta", 1e6)),
             attention_scaling=float(getattr(self.cfg, "rope_attention_scaling", 1.0) or 1.0),
             scaling_type=getattr(self.cfg, "rope_scaling_type", None),
@@ -133,12 +131,6 @@ class CausalLM(nn.Module):
             or getattr(self.cfg, "max_position_embeddings", None),
             low_freq_factor=getattr(self.cfg, "rope_scaling_low_freq_factor", None),
             high_freq_factor=getattr(self.cfg, "rope_scaling_high_freq_factor", None),
-        )
-        cos, sin = runtime_resolve_rotary_embedding(
-            reference=x,
-            head_dim=head_dim,
-            base_theta=rope_theta,
-            attention_scaling=attn_scale,
             position_ids=position_ids,
         )
         x = execute_block_stack(

@@ -23,6 +23,14 @@ torch::Tensor CublasLtInt8LinearForward(
     const c10::optional<torch::Tensor>& bias,
     const c10::optional<torch::ScalarType>& out_dtype);
 
+torch::Tensor CutlassInt8LinearFusedForward(
+    const torch::Tensor& qx,
+    const torch::Tensor& x_scale,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::ScalarType>& out_dtype);
+
 namespace {
 
 using namespace nvcuda;
@@ -62,6 +70,16 @@ bool Int8LinearWgmmaDisabled() {
 
 bool Int8LinearWgmmaEnabled() {
   const char* env = std::getenv("MODEL_STACK_ENABLE_INT8_LINEAR_WGMMA");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+bool Int8LinearCublasLtDisabled() {
+  const char* env = std::getenv("MODEL_STACK_DISABLE_INT8_LINEAR_CUBLASLT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+bool Int8LinearCutlassFusedEnabled() {
+  const char* env = std::getenv("MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
@@ -531,7 +549,7 @@ inline bool UseSm90aInt8WgmmaKernel(
   if (!t10::cuda::DeviceIsSm90OrLater(reference)) {
     return false;
   }
-  if (rows <= 0 || out_features <= 0 || in_features < kWgmmaTileK) {
+  if (rows < kWgmmaTileM || out_features <= 0 || in_features < kWgmmaTileK) {
     return false;
   }
   if (out_features < kWgmmaTileN) {
@@ -620,7 +638,8 @@ torch::Tensor CudaInt8LinearForward(
   auto stream = c10::cuda::getCurrentCUDAStream(qx.get_device());
   const bool use_tiled = UseTiledInt8Kernel(rows, out_features, in_features);
   const bool use_row1 = UseRow1Int8Kernel(rows, out_features, in_features);
-  const bool use_cublaslt = UseCublasLtInt8Backend(qx_contig, rows, out_features, in_features);
+  const bool use_cublaslt =
+      !Int8LinearCublasLtDisabled() && UseCublasLtInt8Backend(qx_contig, rows, out_features, in_features);
   const bool use_sm90a_wgmma =
       !use_row1 && !use_cublaslt && UseSm90aInt8WgmmaKernel(qx_contig, rows, out_features, in_features);
   const bool use_sm90_tensorcore =
@@ -629,6 +648,19 @@ torch::Tensor CudaInt8LinearForward(
   const bool use_sm90 = !use_row1 && !use_sm90_tensorcore && use_tiled && t10::cuda::DeviceIsSm90OrLater(qx_contig) &&
       in_features >= kSm90TileK;
   const dim3 tile_threads(kThreadCols, kThreadRows);
+
+  if (Int8LinearCutlassFusedEnabled() && !use_row1) {
+    auto out = CutlassInt8LinearFusedForward(
+        qx_contig,
+        x_scale_contig,
+        qweight_contig,
+        inv_scale_contig,
+        bias_cast,
+        c10::optional<torch::ScalarType>(output_dtype));
+    if (out.defined()) {
+      return out;
+    }
+  }
 
   if (use_cublaslt) {
     auto out = CublasLtInt8LinearForward(

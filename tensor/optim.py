@@ -38,6 +38,117 @@ def loss_scaler_step_safe(loss: torch.Tensor, scale: float) -> torch.Tensor:
     return loss * float(scale)
 
 
+def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Orthogonalize a 2D update matrix with Muon's Newton-Schulz iteration."""
+    if G.ndim != 2:
+        raise ValueError("Muon Newton-Schulz update expects a 2D tensor")
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X = X / (X.norm() + float(eps))
+    transposed = G.size(0) > G.size(1)
+    if transposed:
+        X = X.T
+    for _ in range(int(steps)):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    return X.T if transposed else X
+
+
+class Muon(torch.optim.Optimizer):
+    """Distributed-aware Muon optimizer for matrix parameters.
+
+    Work is sharded across initialized distributed ranks by parameter index,
+    then the flat update buffer is all-reduced. This mirrors the Parameter Golf
+    training recipe while keeping the optimizer reusable inside model-stack.
+    """
+
+    def __init__(
+        self,
+        params,
+        *,
+        lr: float,
+        momentum: float = 0.95,
+        backend_steps: int = 5,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+    ) -> None:
+        super().__init__(
+            params,
+            dict(
+                lr=float(lr),
+                momentum=float(momentum),
+                backend_steps=int(backend_steps),
+                nesterov=bool(nesterov),
+                weight_decay=float(weight_decay),
+            ),
+        )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        try:
+            import torch.distributed as dist
+
+            distributed = dist.is_available() and dist.is_initialized()
+            world_size = dist.get_world_size() if distributed else 1
+            rank = dist.get_rank() if distributed else 0
+        except Exception:
+            dist = None  # type: ignore[assignment]
+            distributed = False
+            world_size = 1
+            rank = 0
+
+        for group in self.param_groups:
+            params = list(group["params"])
+            if not params:
+                continue
+            lr = float(group["lr"])
+            momentum = float(group["momentum"])
+            backend_steps = int(group["backend_steps"])
+            nesterov = bool(group["nesterov"])
+            weight_decay = float(group["weight_decay"])
+
+            total_params = sum(int(p.numel()) for p in params)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+
+            curr = 0
+            for i, p in enumerate(params):
+                if p.ndim != 2 or p.grad is None:
+                    curr += p.numel()
+                    continue
+                if i % max(1, world_size) == rank:
+                    g = p.grad
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    update = g.add(buf, alpha=momentum) if nesterov else buf
+                    update = zeropower_via_newtonschulz5(update, steps=backend_steps)
+                    update = update * (max(1.0, float(update.size(0)) / float(update.size(1))) ** 0.5)
+                    updates_flat[curr : curr + p.numel()] = update.reshape(-1)
+                curr += p.numel()
+
+            if distributed and dist is not None:
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            curr = 0
+            for p in params:
+                update = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                if weight_decay != 0.0 and p.grad is not None:
+                    p.mul_(1.0 - lr * weight_decay)
+                if p.ndim == 2 and p.grad is not None:
+                    p.add_(update, alpha=-lr)
+                curr += p.numel()
+
+        return loss
+
+
 # -------------------------
 # Additions: Norms & Clipping
 # -------------------------
@@ -745,4 +856,3 @@ def schedule_linear_floor(t: int, warmup: int, floor: float) -> float:
     if warmup > 0 and t < warmup:
         return float(t) / float(max(1, warmup))
     return float(max(floor, 1.0 - max(0, t - max(0, warmup))))
-

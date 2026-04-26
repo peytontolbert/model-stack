@@ -10,7 +10,7 @@ from runtime.attention import _read_backend_from_env_or_file, scaled_dot_product
 from runtime.hardware import prefer_hopper_library_attention
 from runtime.attention_interfaces import Attention, KVCache
 from runtime.native import has_native_op, native_module, resolve_linear_backend
-from runtime.positional import resolve_rope_parameters, resolve_rope_seq_len
+from runtime.positional import resolve_rope_embedding, resolve_rope_seq_len
 from runtime.quant import int8_attention as runtime_int8_attention
 from runtime.ops import (
     attention as runtime_attention,
@@ -27,7 +27,6 @@ from runtime.ops import (
     resolve_packed_qkv_module_spec as runtime_resolve_packed_qkv_module_spec,
     resolve_packed_linear_module_spec as runtime_resolve_packed_linear_module_spec,
     resolve_linear_module_tensors as runtime_resolve_linear_module_tensors,
-    resolve_rotary_embedding as runtime_resolve_rotary_embedding,
     split_heads as runtime_split_heads,
 )
 from specs.config import ModelConfig
@@ -247,9 +246,10 @@ class EagerAttention(nn.Module):
             or self._rope_cos.device != reference.device
             or self._rope_cos.dtype != reference.dtype
         ):
-            base_theta, attn_scale = resolve_rope_parameters(
-                seq_len=int(rope_seq_len),
-                head_dim=int(self.head_dim),
+            rope_reference = reference.new_empty((1, int(rope_seq_len), 1))
+            cos, sin = resolve_rope_embedding(
+                reference=rope_reference,
+                head_dim=self.head_dim,
                 base_theta=float(self.rope_theta),
                 attention_scaling=float(self.rope_attention_scaling),
                 scaling_type=self.rope_scaling_type,
@@ -258,13 +258,6 @@ class EagerAttention(nn.Module):
                 or self.max_position_embeddings,
                 low_freq_factor=self.rope_scaling_low_freq_factor,
                 high_freq_factor=self.rope_scaling_high_freq_factor,
-            )
-            rope_reference = reference.new_empty((1, int(rope_seq_len), 1))
-            cos, sin = runtime_resolve_rotary_embedding(
-                reference=rope_reference,
-                head_dim=self.head_dim,
-                base_theta=float(base_theta),
-                attention_scaling=float(attn_scale),
             )
             self._rope_cos = cos
             self._rope_sin = sin
