@@ -40,11 +40,10 @@ def test_mlp_no_dropout_uses_runtime_mlp_module(monkeypatch):
 
 
 def test_mlp_no_dropout_threads_leaky_relu_half_squared_activation(monkeypatch):
-    seen = {}
+    seen = []
 
     def fake_runtime_mlp_module(x, w_in_module, w_out_module, *, activation, gated, backend=None):
-        seen["activation"] = activation
-        seen["gated"] = gated
+        seen.append((activation, gated))
         del w_in_module, w_out_module, backend
         return torch.zeros(x.shape[:-1] + (x.shape[-1],), dtype=x.dtype, device=x.device)
 
@@ -55,8 +54,12 @@ def test_mlp_no_dropout_threads_leaky_relu_half_squared_activation(monkeypatch):
     out = mlp(x)
 
     assert out.shape == (2, 3, 4)
-    assert seen["activation"] == "leaky_relu_0p5_squared"
-    assert seen["gated"] is False
+    assert seen[-1] == ("leaky_relu_0p5_squared", False)
+
+    out = tensor_mlp_mod.MLP(4, 8, activation="leaky_relu2", dropout_p=0.0)(x)
+
+    assert out.shape == (2, 3, 4)
+    assert seen[-1] == ("leaky_relu2", False)
 
 
 def test_mlp_no_dropout_threads_relu2_activation(monkeypatch):

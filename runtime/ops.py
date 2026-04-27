@@ -1890,6 +1890,65 @@ def pack_linear_weight(
     return weight.contiguous(), None if bias is None else bias.contiguous()
 
 
+def _register_bitnet_runtime_row_quantize_compile_op():
+    custom_op = getattr(torch.library, "custom_op", None)
+    if custom_op is None:
+        return None
+    try:
+        @custom_op("model_stack::bitnet_runtime_row_quantize", mutates_args=())
+        def op(weight: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+            module = native_module()
+            if module is None or not hasattr(module, "bitnet_runtime_row_quantize_forward"):
+                raise RuntimeError("bitnet_runtime_row_quantize compile op requires the native backend")
+            return module.bitnet_runtime_row_quantize_forward(weight, float(eps))
+
+        @op.register_fake
+        def _(weight: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+            return (
+                weight.new_empty(weight.shape, dtype=torch.int8),
+                weight.new_empty((weight.shape[0],), dtype=torch.float32),
+            )
+
+        return op
+    except Exception:
+        try:
+            return torch.ops.model_stack.bitnet_runtime_row_quantize
+        except Exception:
+            return None
+
+
+_BITNET_RUNTIME_ROW_QUANTIZE_COMPILE_OP = _register_bitnet_runtime_row_quantize_compile_op()
+
+
+def _torch_compiler_is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = getattr(compiler, "is_compiling", None)
+    return bool(callable(is_compiling) and is_compiling())
+
+
+def bitnet_runtime_row_quantize(
+    weight: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        weight.is_cuda
+        and _torch_compiler_is_compiling()
+        and _BITNET_RUNTIME_ROW_QUANTIZE_COMPILE_OP is not None
+    ):
+        return _BITNET_RUNTIME_ROW_QUANTIZE_COMPILE_OP(weight, float(eps))
+    if weight.is_cuda and has_native_op("bitnet_runtime_row_quantize"):
+        module = native_module()
+        if module is not None and hasattr(module, "bitnet_runtime_row_quantize_forward"):
+            return module.bitnet_runtime_row_quantize_forward(weight, float(eps))
+    if weight.ndim != 2:
+        raise ValueError("bitnet_runtime_row_quantize expects a rank-2 weight")
+    weight_f = weight.float()
+    row_scale = weight_f.abs().mean(dim=-1, keepdim=True).clamp_min(float(eps))
+    qweight = torch.round(weight_f / row_scale).clamp_(-1, 1).to(dtype=torch.int8)
+    return qweight, row_scale.squeeze(-1).to(dtype=torch.float32)
+
+
 def pack_bitnet_weight(
     weight: torch.Tensor,
     scale_values: torch.Tensor | None = None,
@@ -3352,6 +3411,8 @@ def activation(
     act = str(activation).lower()
     leaky_relu_0p5_squared_aliases = {
         "leaky_relu_0p5_squared",
+        "leaky_relu2",
+        "leaky-relu2",
         "leaky-relu-0p5-squared",
         "leaky_relu_0.5_squared",
         "leaky-relu-0.5-squared",
@@ -3411,6 +3472,8 @@ def gated_activation(
     act = str(activation).lower()
     leaky_relu_0p5_squared_aliases = {
         "leaky_relu_0p5_squared",
+        "leaky_relu2",
+        "leaky-relu2",
         "leaky-relu-0p5-squared",
         "leaky_relu_0.5_squared",
         "leaky-relu-0.5-squared",
@@ -3452,6 +3515,8 @@ def _apply_mlp_hidden_activation(
     act = str(activation).lower()
     leaky_relu_0p5_squared_aliases = {
         "leaky_relu_0p5_squared",
+        "leaky_relu2",
+        "leaky-relu2",
         "leaky-relu-0p5-squared",
         "leaky_relu_0.5_squared",
         "leaky-relu-0.5-squared",

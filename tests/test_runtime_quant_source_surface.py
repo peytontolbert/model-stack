@@ -126,6 +126,7 @@ def test_fp8_quantization_source_threads_through_compression_and_export() -> Non
     assert "\"bitnet_linear_from_float\": \"runtime.quant\"" in runtime_init_source
     assert "\"int4_linear\": \"runtime.quant\"" in runtime_init_source
     assert "\"int8_linear\": \"runtime.quant\"" in runtime_init_source
+    assert "\"int8_linear_grad_weight_from_float\": \"runtime.quant\"" in runtime_init_source
     assert "\"type\": \"nf4_codebook_packed\"" in delta_source
     assert "\"type\": \"bitnet_w2a8\"" in delta_source
     assert "\"type\": \"int4_pc_packed\"" in delta_source
@@ -143,9 +144,13 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     adapters_source = _read("runtime/block_adapters.py")
     block_source = _read("runtime/block_modules.py")
     quant_source = _read("compress/quantization.py")
+    runtime_quant_source = _read("runtime/quant.py")
+    backward_bench_source = _read("examples/13_parameter_golf_h100/bench_pg_bitnet_backward.py")
     generation_source = _read("runtime/generation.py")
     bitnet_frontend_source = _read("runtime/csrc/backend/bitnet/bitnet_frontend.cu")
+    cuda_int8_linear_source = _read("runtime/csrc/backend/cuda_int8_linear.cu")
     cuda_quant_source = _read("runtime/csrc/backend/cuda_quant_int8_frontend.cu")
+    pg_run_source = _read("examples/13_parameter_golf_h100/run_pg_8xh100.sh")
     assert "def resolve_linear_module_tensors(" in ops_source
     assert "def linear_module(" in ops_source
     assert "def mlp_module(" in ops_source
@@ -183,7 +188,97 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "def _pre_scale_active_runtime(self) -> bool:" in quant_source
     assert "def _prefer_dynamic_int8_direct_hopper_prefill(self, x: torch.Tensor) -> bool:" in quant_source
     assert "MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED" in quant_source
-    assert "shape in {(1024, 3072), (3072, 1024)}" in quant_source
+    assert "(1024, 3072),  # Parameter Golf relu2 MLP up projection." in quant_source
+    assert "(3072, 1024),  # Parameter Golf relu2 MLP down projection." in quant_source
+    assert "(1024, 4096),  # Parameter Golf swiglu fused gate/up projection." in quant_source
+    assert "model_stack::bitnet_runtime_row_quantize" in ops_source
+    assert "_BITNET_RUNTIME_ROW_QUANTIZE_COMPILE_OP" in ops_source
+    assert "model_stack::bitnet_int8_linear_from_float" in runtime_quant_source
+    assert "_BITNET_INT8_LINEAR_FROM_FLOAT_COMPILE_OP" in runtime_quant_source
+    assert "model_stack::int8_quantize_activation_transpose" in runtime_quant_source
+    assert "_INT8_QUANTIZE_ACTIVATION_TRANSPOSE_COMPILE_OP" in runtime_quant_source
+    assert "model_stack::int8_linear" in runtime_quant_source
+    assert "_INT8_LINEAR_COMPILE_OP" in runtime_quant_source
+    assert "model_stack::int8_linear_grad_weight_from_float" in runtime_quant_source
+    assert "_INT8_LINEAR_GRAD_WEIGHT_FROM_FLOAT_COMPILE_OP" in runtime_quant_source
+    assert "runtime_int8_linear_grad_weight_from_float(" in quant_source
+    assert "model_stack::trainable_bitnet_int8_ste" in quant_source
+    assert "_TRAINABLE_BITNET_INT8_STE_COMPILE_OP" in quant_source
+    assert "model_stack::trainable_bitnet_int8_ste_output" in quant_source
+    assert "_TRAINABLE_BITNET_INT8_STE_OUTPUT_COMPILE_OP" in quant_source
+    assert "MODEL_STACK_TRAINABLE_BITNET_OUTPUT_COMPILE_OP" in quant_source
+    assert "MODEL_STACK_TRAINABLE_BITNET_DISABLE_COMPILED_AUTOGRAD_FUNCTION" in quant_source
+    assert "op.register_autograd(backward, setup_context=setup_context)" in quant_source
+    assert "MODEL_STACK_TRAINABLE_BITNET_COMPILED_INT8_STE" in quant_source
+    assert "MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE" in quant_source
+    assert "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT" in quant_source
+    assert "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT" in quant_source
+    assert "def _trainable_bitnet_save_backward_context(" in quant_source
+    assert "pg_h100_expansion" in quant_source
+    assert "(1024, 2048),  # Parameter Golf relu2 MLP up projection, MLP_MULT=2." in quant_source
+    training_bench_source = _read("examples/13_parameter_golf_h100/bench_pg_bitnet_training_step.py")
+    assert "def _reset_torch_compile_cache" in training_bench_source
+    assert "--include-relu2-mlp-pair" in training_bench_source
+    assert "--include-pg-block" in training_bench_source
+    assert "--block-fused-qkv" in training_bench_source
+    assert "\"MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED\": os.environ.get(" in training_bench_source
+    assert "MODEL_STACK_ATTENTION_REPEAT_KV" in training_bench_source
+    assert "def _maybe_repeat_kv_heads(" in training_bench_source
+    assert "relu2_mlp_pair_1024_3072_1024" in training_bench_source
+    assert "MODEL_STACK_BITNET_QAT=\"${MODEL_STACK_BITNET_QAT:-1}\"" in pg_run_source
+    assert "MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE=\"${MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE:-pg_h100_mlp}\"" in pg_run_source
+    assert (
+        "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT="
+        "\"${MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT:-dynamic_int8_explicit_scale}\""
+        in pg_run_source
+    )
+    assert (
+        "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT="
+        "\"${MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT:-dynamic_int8_transpose}\""
+        in pg_run_source
+    )
+    assert "MODEL_STACK_ATTENTION_REPEAT_KV=\"${MODEL_STACK_ATTENTION_REPEAT_KV:-}\"" in pg_run_source
+    assert "MODEL_STACK_MUON_DISTRIBUTED_EXCHANGE=\"${MODEL_STACK_MUON_DISTRIBUTED_EXCHANGE:-all_gather}\"" in pg_run_source
+    assert "MODEL_STACK_MUON_DISTRIBUTED_SHARDING=\"${MODEL_STACK_MUON_DISTRIBUTED_SHARDING:-shape_bucket}\"" in pg_run_source
+    assert "MODEL_STACK_INT8_QUANT_WARP_ROWS_PER_BLOCK=\"${MODEL_STACK_INT8_QUANT_WARP_ROWS_PER_BLOCK:-4}\"" in pg_run_source
+    assert "MODEL_STACK_INT8_COLUMN_QUANT_THREADS_X=\"${MODEL_STACK_INT8_COLUMN_QUANT_THREADS_X:-32}\"" in pg_run_source
+    assert "MODEL_STACK_INT8_COLUMN_QUANT_ROWS_PER_BLOCK=\"${MODEL_STACK_INT8_COLUMN_QUANT_ROWS_PER_BLOCK:-128}\"" in pg_run_source
+    assert (
+        "Int8LinearCutlassFusedEnabled() && !use_row1 && t10::cuda::DeviceIsSm90OrLater(qx_contig)"
+        in cuda_int8_linear_source
+    )
+    assert "int8_grad_input_explicit_scale_speedup_vs_dense" in backward_bench_source
+    assert "dense_grad_weight_ms" in backward_bench_source
+    assert "--include-packed-bitnet" in backward_bench_source
+    assert "--include-int8-grad-weight" in backward_bench_source
+    assert "--include-int8-grad-weight-upper-bound" in backward_bench_source
+    assert "int8_grad_weight_full_speedup_vs_dense" in backward_bench_source
+    assert "int8_quantize_activation_transpose_forward" in backward_bench_source
+    assert "int8_grad_weight_fused_full_speedup_vs_dense" in backward_bench_source
+    assert "int8_grad_weight_native_composed_speedup_vs_dense" in backward_bench_source
+    assert "int8_grad_weight_fused_delayed_scale_full_speedup_vs_dense" in backward_bench_source
+    assert "raw_original_rowwise_int_mm_scale_correct" in backward_bench_source
+    assert "original row-wise activation scales multiply inside the reduction" in backward_bench_source
+    component_bench_source = _read("examples/13_parameter_golf_h100/bench_pg_training_components.py")
+    assert "bench_pg_bitnet_training_step.py" in component_bench_source
+    assert "muon_matrix_optimizer" in component_bench_source
+    assert "backward_plus_overhead_ms" in component_bench_source
+    assert "attention_repeat_kv" in component_bench_source
+    assert "current_flat_alloc" in component_bench_source
+    assert "cached_flat" in component_bench_source
+    assert "direct_single_rank" in component_bench_source
+    attention_variants_source = _read("examples/13_parameter_golf_h100/bench_pg_attention_variants.py")
+    assert "enable_gqa=True" in attention_variants_source
+    assert "repeat_contiguous" in attention_variants_source
+    assert "expand_reshape" in attention_variants_source
+    assert "speedup_vs_gqa" in attention_variants_source
+    train_gpt_source = _read("other_repos/parameter-golf/train_gpt.py")
+    assert "MODEL_STACK_ATTENTION_REPEAT_KV" in train_gpt_source
+    assert "def maybe_repeat_kv_heads(" in train_gpt_source
+    assert "k, v, enable_gqa = maybe_repeat_kv_heads(" in train_gpt_source
+    assert "self._updates_flat_cache" in train_gpt_source
+    assert "if not distributed:" in train_gpt_source
+    assert "updates_flat.zero_()" in train_gpt_source
     assert "\"act_quant_percentile\": float(self.act_quant_percentile)" in quant_source
     assert "runtime_mlp_module(" in mlp_source
     assert "runtime_linear_module(x, self.w_in)" in mlp_source
@@ -228,26 +323,39 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "{\"bitnet_linear_from_float\", true}" in native_source
     assert "{\"bitnet_int8_linear_from_float\", true}" in native_source
     assert "{\"bitnet_int8_fused_qkv_packed_heads_projection\", true}" in native_source
+    assert "{\"bitnet_runtime_row_quantize\", true}" in native_source
     assert "{\"int8_quantize_activation\", true}" in native_source
+    assert "{\"int8_quantize_activation_transpose\", true}" in native_source
+    assert "{\"int8_linear_grad_weight_from_float\", true}" in native_source
     assert "{\"int8_quantize_relu2_activation\", true}" in native_source
     assert "bool HasCudaBitNetInputFrontendKernel()" in native_source
     assert "CudaInt8QuantizeActivationForward(" in native_source
     assert "CudaInt8QuantizeRelu2ActivationForward(" in native_source
+    assert "CudaInt8LinearFromFloatPreScaleForward(" in native_source
     assert "Int8QuantizeRelu2ActivationForward" in native_source
     assert "int8_quantize_relu2_activation_forward" in native_source
     assert "quantize_relu2_activation_int8_rowwise_wide_cached_kernel" in cuda_quant_source
+    assert "quantize_activation_int8_rowwise_warp_pre_scale_kernel" in cuda_quant_source
+    assert "QuantizeActivationInt8RowwisePreScaleCuda" in cuda_quant_source
     assert "MODEL_STACK_INT8_QUANT_WARP_ROWS_PER_BLOCK" in native_source
     assert "MODEL_STACK_DISABLE_INT8_QUANT_SHARED_CACHE" in native_source
     assert "MODEL_STACK_ENABLE_INT8_QUANT_VEC4" in native_source
+    assert "MODEL_STACK_INT8_COLUMN_QUANT_ROWS_PER_BLOCK" in cuda_quant_source
+    assert "MODEL_STACK_INT8_COLUMN_QUANT_THREADS_X" in cuda_quant_source
     assert "cuda_backend_ops.push_back(\"int8_quantize_activation\");" in native_source
+    assert "cuda_backend_ops.push_back(\"int8_quantize_activation_transpose\");" in native_source
     assert "cuda_backend_ops.push_back(\"bitnet_transform_input\");" in native_source
     assert "cuda_backend_ops.push_back(\"bitnet_linear_compute_packed\");" in native_source
+    assert "cuda_backend_ops.push_back(\"bitnet_runtime_row_quantize\");" in native_source
     assert "cuda_backend_ops.push_back(\"bitnet_linear_from_float\");" in native_source
     assert "cuda_backend_ops.push_back(\"bitnet_int8_fused_qkv_packed_heads_projection\");" in native_source
     assert "m.def(\"bitnet_transform_input_forward\"" in native_source
     assert "bitnet_linear_compute_packed_forward" in native_source
     assert "m.def(\"bitnet_linear_from_float_forward\"" in native_source
+    assert "bitnet_runtime_row_quantize_forward" in native_source
     assert "m.def(\"int8_quantize_activation_forward\"" in native_source
+    assert "m.def(\"int8_quantize_activation_transpose_forward\"" in native_source
+    assert "m.def(\"int8_linear_grad_weight_from_float_forward\"" in native_source
     assert "m.def(\"int8_quantize_relu2_activation_forward\"" in native_source
     assert "bitnet_int8_linear_from_float_forward" in native_source
     assert "bitnet_int8_fused_qkv_packed_heads_projection_forward" in native_source
@@ -267,6 +375,8 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "bool CanUseModuleBitNetRuntimePolicy(" in native_source
     assert "m.def(\"linear_module_forward\"" in native_source
     assert "\"linear_module\"" in native_py_source
+    assert "\"bitnet_runtime_row_quantize\"" in native_py_source
+    assert "\"int8_quantize_activation_transpose\"" in native_py_source
     assert "\"int8_quantize_relu2_activation\"" in native_py_source
     assert "return BitNetLinearStateForward(x, bitnet_state);" in native_source
     assert "PyCallableAttr(module, \"_spin_enabled_runtime\")" in native_source
@@ -332,10 +442,12 @@ def test_native_int4_kernel_is_registered_in_source() -> None:
     assert "{\"bitnet_linear\", true}" in native_source
     assert "\"bitnet_linear_compute_packed\"" in native_source
     assert "{\"pack_bitnet_weight\", true}" in native_source
+    assert "{\"bitnet_runtime_row_quantize\", true}" in native_source
     assert "{\"bitnet_qkv_packed_heads_projection\", true}" in native_source
     assert "info[\"bitnet_linear_dtypes\"]" in native_source
     assert "m.def(\"bitnet_linear_forward\"" in native_source
     assert "m.def(\"pack_bitnet_weight_forward\"" in native_source
+    assert "bitnet_runtime_row_quantize_forward" in native_source
     assert "m.def(\"bitnet_qkv_packed_heads_projection_forward\"" in native_source
     assert "{\"int4_linear\", true}" in native_source
     assert "info[\"int4_linear_dtypes\"]" in native_source
@@ -489,10 +601,13 @@ def test_native_int4_kernel_is_registered_in_source() -> None:
     assert "\"bitnet_int8_fused_qkv_packed_heads_projection\"" in native_py_source
     assert "\"bitnet_transform_input\"" in native_py_source
     assert "\"pack_bitnet_weight\"" in native_py_source
+    assert "\"bitnet_runtime_row_quantize\"" in native_py_source
     assert "\"bitnet_qkv_packed_heads_projection\"" in native_py_source
     assert "\"bitnet_fused_qkv_packed_heads_projection\"" in native_py_source
     assert "\"int4_linear\"" in native_py_source
     assert "\"int8_linear\"" in native_py_source
+    assert "\"int8_quantize_activation_transpose\"" in native_py_source
+    assert "\"int8_linear_grad_weight_from_float\"" in native_py_source
     assert "\"int8_attention\"" in native_py_source
 
 
@@ -519,6 +634,7 @@ def test_native_bitnet_cuda_kernel_sources_are_registered_in_source() -> None:
     assert "#include \"backend/bitnet/bitnet_formats.h\"" in native_source
     assert "t10::bitnet::CudaBitNetLinearForward(" in native_source
     assert "t10::bitnet::CudaPackBitNetWeightForward(weight)" in native_source
+    assert "t10::bitnet::CudaBitNetRuntimeRowQuantizeForward(weight, eps)" in native_source
     assert "t10::bitnet::HasCudaBitNetLinearKernel()" in native_source
     assert "bitnet_kernel_family" in native_source
     assert "decode_persistent_prefill_tiled_splitk" in native_source
@@ -585,6 +701,7 @@ def test_native_bitnet_cuda_kernel_sources_are_registered_in_source() -> None:
     assert "runtime/csrc/backend/bitnet/bitnet_attention_prefill_dispatch.cu" in setup_source
     assert "runtime/csrc/backend/bitnet/bitnet_attention_dispatch.cu" in setup_source
     assert "bitnet_pack_weight_kernel" in pack_source
+    assert "bitnet_runtime_row_quantize_kernel" in pack_source
     assert "bitnet_linear_decode_scalar_kernel" in decode_source
     assert "bitnet_linear_decode_persistent_kernel" in decode_source
     assert "bitnet_linear_prefill_tiled_kernel" in prefill_source

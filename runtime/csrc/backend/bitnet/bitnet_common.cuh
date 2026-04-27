@@ -532,6 +532,10 @@ void LaunchBitNetPrefillSplitKKernelStaticInput(
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> CudaPackBitNetWeightForward(
     const torch::Tensor& weight);
 
+std::tuple<torch::Tensor, torch::Tensor> CudaBitNetRuntimeRowQuantizeForward(
+    const torch::Tensor& weight,
+    double eps);
+
 torch::Tensor CudaBitNetLinearForward(
     const torch::Tensor& x,
     const torch::Tensor& packed_weight,

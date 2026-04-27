@@ -34,6 +34,7 @@ ActivationKind ParseActivation(const std::string& activation) {
     return ActivationKind::kReLU2;
   }
   if (activation == "leaky_relu_0p5_squared" || activation == "leaky-relu-0p5-squared" ||
+      activation == "leaky_relu2" || activation == "leaky-relu2" ||
       activation == "leaky_relu_0.5_squared" || activation == "leaky-relu-0.5-squared") {
     return ActivationKind::kLeakyRelu0p5Squared;
   }

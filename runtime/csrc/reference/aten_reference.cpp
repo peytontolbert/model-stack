@@ -36,6 +36,7 @@ torch::Tensor ApplyActivationReference(
     return at::relu(x);
   }
   if (act == "leaky_relu_0p5_squared" || act == "leaky-relu-0p5-squared" ||
+      act == "leaky_relu2" || act == "leaky-relu2" ||
       act == "leaky_relu_0.5_squared" || act == "leaky-relu-0.5-squared") {
     auto y = at::leaky_relu(x, 0.5);
     return y * y;

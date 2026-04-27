@@ -50,6 +50,50 @@ __global__ void bitnet_pack_weight_kernel(
   packed_weight[idx] = packed;
 }
 
+template <typename scalar_t>
+__global__ void bitnet_runtime_row_quantize_kernel(
+    const scalar_t* __restrict__ weight,
+    int8_t* __restrict__ qweight,
+    float* __restrict__ row_scale,
+    int64_t rows,
+    int64_t cols,
+    float eps) {
+  extern __shared__ float scratch[];
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  const int thread = static_cast<int>(threadIdx.x);
+  if (row >= rows) {
+    return;
+  }
+
+  float local_sum = 0.0f;
+  const int64_t row_offset = row * cols;
+  for (int64_t col = thread; col < cols; col += blockDim.x) {
+    local_sum += fabsf(static_cast<float>(weight[row_offset + col]));
+  }
+  scratch[thread] = local_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (thread < stride) {
+      scratch[thread] += scratch[thread + stride];
+    }
+    __syncthreads();
+  }
+
+  const float scale = fmaxf(scratch[0] / static_cast<float>(cols), eps);
+  if (thread == 0) {
+    row_scale[row] = scale;
+  }
+  __syncthreads();
+
+  for (int64_t col = thread; col < cols; col += blockDim.x) {
+    const float normalized = static_cast<float>(weight[row_offset + col]) / scale;
+    const int rounded = static_cast<int>(nearbyintf(normalized));
+    const int clamped = max(-1, min(1, rounded));
+    qweight[row_offset + col] = static_cast<int8_t>(clamped);
+  }
+}
+
 }  // namespace
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> CudaPackBitNetWeightForward(
@@ -126,6 +170,54 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> CudaPackB
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return std::make_tuple(packed_weight, scale_values, layout_header, segment_offsets);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> CudaBitNetRuntimeRowQuantizeForward(
+    const torch::Tensor& weight,
+    double eps) {
+  TORCH_CHECK(weight.defined(), "CudaBitNetRuntimeRowQuantizeForward: weight must be defined");
+  TORCH_CHECK(weight.is_cuda(), "CudaBitNetRuntimeRowQuantizeForward: weight must be CUDA");
+  TORCH_CHECK(weight.dim() == 2, "CudaBitNetRuntimeRowQuantizeForward: weight must be rank-2");
+  TORCH_CHECK(weight.size(1) > 0, "CudaBitNetRuntimeRowQuantizeForward: weight input dimension must be positive");
+  TORCH_CHECK(IsSupportedLinearDtype(weight.scalar_type()),
+              "CudaBitNetRuntimeRowQuantizeForward: unsupported weight dtype");
+
+  c10::cuda::CUDAGuard device_guard(weight.device());
+  auto weight_contig = weight.contiguous();
+  const auto rows = weight_contig.size(0);
+  const auto cols = weight_contig.size(1);
+  auto qweight = torch::empty(
+      {rows, cols},
+      torch::TensorOptions().device(weight.device()).dtype(torch::kInt8));
+  auto row_scale = torch::empty(
+      {rows},
+      torch::TensorOptions().device(weight.device()).dtype(torch::kFloat32));
+  if (rows == 0) {
+    return std::make_tuple(qweight, row_scale);
+  }
+
+  const dim3 blocks(static_cast<unsigned int>(rows));
+  const dim3 threads(kPackThreads);
+  const size_t shared_bytes = static_cast<size_t>(kPackThreads) * sizeof(float);
+  auto stream = c10::cuda::getCurrentCUDAStream(weight.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      weight_contig.scalar_type(),
+      "bitnet_runtime_row_quantize_cuda",
+      [&] {
+        bitnet_runtime_row_quantize_kernel<scalar_t><<<blocks, threads, shared_bytes, stream.stream()>>>(
+            weight_contig.data_ptr<scalar_t>(),
+            qweight.data_ptr<int8_t>(),
+            row_scale.data_ptr<float>(),
+            rows,
+            cols,
+            static_cast<float>(eps));
+      });
+
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return std::make_tuple(qweight, row_scale);
 }
 
 }  // namespace t10::bitnet

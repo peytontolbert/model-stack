@@ -649,7 +649,7 @@ torch::Tensor CudaInt8LinearForward(
       in_features >= kSm90TileK;
   const dim3 tile_threads(kThreadCols, kThreadRows);
 
-  if (Int8LinearCutlassFusedEnabled() && !use_row1) {
+  if (Int8LinearCutlassFusedEnabled() && !use_row1 && t10::cuda::DeviceIsSm90OrLater(qx_contig)) {
     auto out = CutlassInt8LinearFusedForward(
         qx_contig,
         x_scale_contig,

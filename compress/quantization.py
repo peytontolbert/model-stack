@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from runtime.native import has_native_op, native_module
 from runtime.ops import linear as runtime_linear
 from runtime.ops import bitnet_transform_input as runtime_bitnet_transform_input
+from runtime.ops import bitnet_runtime_row_quantize as runtime_bitnet_runtime_row_quantize
 from runtime.ops import pack_bitnet_weight as runtime_pack_bitnet_weight
 from runtime.quant import bitnet_linear as runtime_bitnet_linear
 from runtime.quant import bitnet_linear_compute_packed as runtime_bitnet_linear_compute_packed
@@ -32,6 +33,7 @@ from runtime.quant import nf4_linear as runtime_nf4_linear
 from runtime.quant import nf4_quantize as runtime_nf4_quantize
 from runtime.quant import int4_linear as runtime_int4_linear
 from runtime.quant import int8_linear as runtime_int8_linear
+from runtime.quant import int8_linear_grad_weight_from_float as runtime_int8_linear_grad_weight_from_float
 from runtime.quant import int8_linear_from_quantized_activation as runtime_int8_linear_from_quantized_activation
 from runtime.quant import quantize_activation_int8_rowwise as runtime_quantize_activation_int8_rowwise
 from runtime.quant import fp8_linear as runtime_fp8_linear
@@ -914,10 +916,7 @@ def _bitnet_runtime_row_codes_and_scale(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if weight.ndim != 2:
         raise ValueError("runtime-row BitNet quantization expects a rank-2 weight")
-    weight_f = weight.float()
-    row_scale = weight_f.abs().mean(dim=-1, keepdim=True).clamp_min(float(eps))
-    qweight = torch.round(weight_f / row_scale).clamp_(-1, 1).to(dtype=torch.int8)
-    return qweight, row_scale.squeeze(-1).to(dtype=torch.float32)
+    return runtime_bitnet_runtime_row_quantize(weight, eps=float(eps))
 
 
 def _bitnet_runtime_row_ste_weight(
@@ -2717,7 +2716,11 @@ class QuantizedLinearBitNet(nn.Module):
         if int(self.act_quant_bits) != 8:
             return False
         shape = (int(self.in_features), int(self.out_features))
-        return shape in {(1024, 3072), (3072, 1024)}
+        return shape in {
+            (1024, 3072),  # Parameter Golf relu2 MLP up projection.
+            (3072, 1024),  # Parameter Golf relu2 MLP down projection.
+            (1024, 4096),  # Parameter Golf swiglu fused gate/up projection.
+        }
 
     def runtime_packed_linear_signature(self, backend: str):
         if not self.runtime_supports_packed_backend(backend):
@@ -3064,6 +3067,396 @@ class QuantizedLinearBitNet(nn.Module):
         return self.runtime_linear(x)
 
 
+def _trainable_bitnet_training_forward_mode() -> str:
+    return os.getenv("MODEL_STACK_TRAINABLE_BITNET_TRAINING_FORWARD", "dense_ste").strip().lower()
+
+
+def _trainable_bitnet_backward_grad_input_mode() -> str:
+    return os.getenv("MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT", "").strip().lower()
+
+
+def _trainable_bitnet_backward_grad_weight_mode() -> str:
+    return os.getenv("MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT", "").strip().lower()
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _trainable_bitnet_int8_shape_gate_allows(
+    x: torch.Tensor,
+    *,
+    in_features: int,
+    out_features: int,
+) -> bool:
+    policy = os.getenv("MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE", "").strip().lower()
+    if policy in {"", "0", "false", "off", "none"}:
+        return True
+    if policy not in {"expansion_only", "pg_h100_expansion", "pg_h100_mlp", "h100_pg_v1", "h100_pg_v2"}:
+        return True
+    min_rows = int(os.getenv("MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE_MIN_ROWS", "32768"))
+    min_ratio = float(os.getenv("MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE_MIN_OUT_IN_RATIO", "2.0"))
+    try:
+        rows = int(x.numel() // max(int(x.shape[-1]), 1))
+    except Exception:
+        rows = min_rows
+    if policy in {"pg_h100_mlp", "h100_pg_v2"}:
+        mlp_shapes = {
+            (1024, 2048),  # Parameter Golf relu2 MLP up projection, MLP_MULT=2.
+            (2048, 1024),  # Parameter Golf relu2 MLP down projection, MLP_MULT=2.
+            (1024, 3072),  # Parameter Golf relu2 MLP up projection, MLP_MULT=3.
+            (3072, 1024),  # Parameter Golf relu2 MLP down projection, MLP_MULT=3.
+        }
+        return rows >= min_rows and (int(in_features), int(out_features)) in mlp_shapes
+    return rows >= min_rows and int(out_features) >= int(math.ceil(float(in_features) * min_ratio))
+
+
+def _torch_compiler_is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = getattr(compiler, "is_compiling", None)
+    return bool(callable(is_compiling) and is_compiling())
+
+
+def _trainable_bitnet_backward_mode_enabled(mode: str) -> bool:
+    return bool(mode) and mode not in {"0", "false", "off", "none", "dense"}
+
+
+def _trainable_bitnet_int8_ste_backward(
+    ctx,
+    grad_output: torch.Tensor,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    saved = ctx.saved_tensors
+    x = saved[0]
+    saved_offset = 1
+    qweight_t = None
+    grad_input_row_scale = None
+    if getattr(ctx, "has_int8_grad_input_weight", False):
+        qweight_t = saved[saved_offset]
+        grad_input_row_scale = saved[saved_offset + 1]
+        saved_offset += 2
+    dequant_weight = saved[saved_offset] if getattr(ctx, "has_dequant_weight", False) else None
+    grad_out_2d = grad_output.reshape(-1, grad_output.shape[-1])
+    x_2d = x.reshape(-1, x.shape[-1])
+
+    grad_input = None
+    if ctx.needs_input_grad[0]:
+        if qweight_t is not None and grad_input_row_scale is not None:
+            ones_scale = torch.ones(qweight_t.shape[0], device=qweight_t.device, dtype=torch.float32)
+            grad_out_local = grad_out_2d.to(dtype=x.dtype if x.dtype.is_floating_point else ctx.weight_dtype)
+            mode = getattr(ctx, "int8_grad_input_mode", "dynamic_int8_pre_scale")
+            if mode in {"dynamic_int8_explicit_scale", "explicit_scale"}:
+                grad_out_local = grad_out_local.mul(grad_input_row_scale.to(dtype=grad_out_local.dtype).view(1, -1))
+                pre_scale = None
+            else:
+                pre_scale = grad_input_row_scale.clamp_min(1.0e-8).reciprocal()
+            grad_input = runtime_bitnet_int8_linear_from_float(
+                grad_out_local,
+                qweight_t,
+                ones_scale,
+                None,
+                pre_scale=pre_scale,
+                act_quant_mode="dynamic_int8",
+                act_scale=None,
+                act_quant_bits=8,
+                act_quant_method="absmax",
+                act_quant_percentile=float(getattr(ctx, "act_quant_percentile", 0.999)),
+            )
+            grad_input = grad_input.reshape(ctx.input_shape).to(dtype=x.dtype)
+        elif dequant_weight is not None:
+            grad_input = grad_out_2d.to(dtype=dequant_weight.dtype).matmul(dequant_weight)
+            grad_input = grad_input.reshape(ctx.input_shape).to(dtype=x.dtype)
+        else:
+            raise RuntimeError("TrainableBitNetLinear int8 STE backward missing dequantized weight")
+
+    grad_weight = None
+    if ctx.needs_input_grad[1]:
+        grad_weight_mode = getattr(ctx, "int8_grad_weight_mode", "dense")
+        if grad_weight_mode != "dense":
+            grad_weight = runtime_int8_linear_grad_weight_from_float(
+                grad_out_2d.to(dtype=x.dtype if x.dtype.is_floating_point else ctx.weight_dtype),
+                x_2d,
+                out_dtype=x.dtype,
+            )
+        else:
+            grad_weight = grad_out_2d.to(dtype=x.dtype).t().matmul(x_2d)
+        grad_weight = grad_weight.to(dtype=ctx.weight_dtype)
+
+    grad_bias = None
+    if ctx.needs_input_grad[2] and ctx.bias_dtype is not None:
+        grad_bias = grad_out_2d.sum(dim=0).to(dtype=ctx.bias_dtype)
+
+    return grad_input, grad_weight, grad_bias
+
+
+def _register_trainable_bitnet_int8_ste_compile_op():
+    custom_op = getattr(torch.library, "custom_op", None)
+    if custom_op is None:
+        return None
+    try:
+        @custom_op("model_stack::trainable_bitnet_int8_ste", mutates_args=())
+        def op(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: Optional[torch.Tensor],
+            eps: float,
+            act_quant_percentile: float,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            if not x.is_cuda:
+                raise RuntimeError("trainable_bitnet_int8_ste compile op requires CUDA")
+            target_dtype = x.dtype if x.dtype.is_floating_point else weight.dtype
+            x_local = x.to(dtype=target_dtype)
+            qweight, row_scale = _bitnet_runtime_row_codes_and_scale(weight.detach(), eps=float(eps))
+            qweight = qweight.to(device=x_local.device, dtype=torch.int8).contiguous()
+            row_scale = row_scale.to(device=x_local.device, dtype=torch.float32).contiguous()
+            bias_local = None if bias is None else bias.to(device=x_local.device, dtype=target_dtype)
+            out = runtime_bitnet_int8_linear_from_float(
+                x_local,
+                qweight,
+                row_scale,
+                bias_local,
+                pre_scale=None,
+                act_quant_mode="dynamic_int8",
+                act_scale=None,
+                act_quant_bits=8,
+                act_quant_method="absmax",
+                act_quant_percentile=float(act_quant_percentile),
+            )
+            return out, qweight, row_scale
+
+        @op.register_fake
+        def _(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: Optional[torch.Tensor],
+            eps: float,
+            act_quant_percentile: float,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            target_dtype = x.dtype if x.dtype.is_floating_point else weight.dtype
+            return (
+                x.new_empty((*x.shape[:-1], weight.shape[0]), dtype=target_dtype),
+                weight.new_empty(weight.shape, dtype=torch.int8),
+                weight.new_empty((weight.shape[0],), dtype=torch.float32),
+            )
+
+        def setup_context(ctx, inputs, output) -> None:
+            x, weight, bias, _eps, _act_quant_percentile = inputs
+            _out, qweight, row_scale = output
+            _trainable_bitnet_save_backward_context(
+                ctx,
+                x=x,
+                weight=weight,
+                bias=bias,
+                qweight=qweight,
+                row_scale=row_scale,
+                eps=float(_eps),
+                act_quant_percentile=float(_act_quant_percentile),
+            )
+
+        def backward(ctx, grad_out, _grad_qweight, _grad_row_scale):
+            grad_input, grad_weight, grad_bias = _trainable_bitnet_int8_ste_backward(ctx, grad_out)
+            return grad_input, grad_weight, grad_bias, None, None
+
+        op.register_autograd(backward, setup_context=setup_context)
+        return op
+    except Exception:
+        try:
+            return torch.ops.model_stack.trainable_bitnet_int8_ste
+        except Exception:
+            return None
+
+
+_TRAINABLE_BITNET_INT8_STE_COMPILE_OP = _register_trainable_bitnet_int8_ste_compile_op()
+
+
+def _trainable_bitnet_save_backward_context(
+    ctx,
+    *,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    qweight: torch.Tensor,
+    row_scale: torch.Tensor,
+    eps: float,
+    act_quant_percentile: float,
+) -> None:
+    target_dtype = x.dtype if x.dtype.is_floating_point else weight.dtype
+    x_local = x.to(dtype=target_dtype)
+    saved_tensors: list[torch.Tensor] = [x_local]
+    grad_input_mode = _trainable_bitnet_backward_grad_input_mode()
+    use_int8_grad_input = (
+        ctx.needs_input_grad[0]
+        and x.is_cuda
+        and _trainable_bitnet_backward_mode_enabled(grad_input_mode)
+        and _trainable_bitnet_int8_shape_gate_allows(
+            x,
+            in_features=int(weight.shape[1]),
+            out_features=int(weight.shape[0]),
+        )
+    )
+    grad_weight_mode = _trainable_bitnet_backward_grad_weight_mode()
+    use_int8_grad_weight = (
+        ctx.needs_input_grad[1]
+        and x.is_cuda
+        and _trainable_bitnet_backward_mode_enabled(grad_weight_mode)
+        and _trainable_bitnet_int8_shape_gate_allows(
+            x,
+            in_features=int(weight.shape[1]),
+            out_features=int(weight.shape[0]),
+        )
+    )
+    if use_int8_grad_input:
+        saved_tensors.append(qweight.t().contiguous())
+        saved_tensors.append(row_scale.to(device=x_local.device, dtype=torch.float32).contiguous())
+        ctx.has_int8_grad_input_weight = True
+        ctx.has_dequant_weight = False
+        ctx.int8_grad_input_mode = (
+            "dynamic_int8_explicit_scale"
+            if grad_input_mode in {"dynamic_int8_explicit_scale", "explicit_scale"}
+            else "dynamic_int8_pre_scale"
+        )
+    elif ctx.needs_input_grad[0]:
+        dequant_weight = qweight.to(dtype=target_dtype).mul(row_scale.to(dtype=target_dtype).unsqueeze(-1))
+        saved_tensors.append(dequant_weight)
+        ctx.has_int8_grad_input_weight = False
+        ctx.has_dequant_weight = True
+        ctx.int8_grad_input_mode = "dense"
+    else:
+        ctx.has_int8_grad_input_weight = False
+        ctx.has_dequant_weight = False
+        ctx.int8_grad_input_mode = "none"
+    ctx.int8_grad_weight_mode = "dynamic_int8_transpose" if use_int8_grad_weight else "dense"
+    ctx.save_for_backward(*saved_tensors)
+    ctx.input_shape = tuple(x.shape)
+    ctx.weight_dtype = weight.dtype
+    ctx.bias_dtype = None if bias is None else bias.dtype
+    ctx.act_quant_percentile = float(act_quant_percentile)
+
+
+def _register_trainable_bitnet_int8_ste_output_compile_op():
+    custom_op = getattr(torch.library, "custom_op", None)
+    if custom_op is None:
+        return None
+    try:
+        @custom_op("model_stack::trainable_bitnet_int8_ste_output", mutates_args=())
+        def op(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: Optional[torch.Tensor],
+            eps: float,
+            act_quant_percentile: float,
+        ) -> torch.Tensor:
+            if not x.is_cuda:
+                raise RuntimeError("trainable_bitnet_int8_ste_output compile op requires CUDA")
+            target_dtype = x.dtype if x.dtype.is_floating_point else weight.dtype
+            x_local = x.to(dtype=target_dtype)
+            qweight, row_scale = _bitnet_runtime_row_codes_and_scale(weight.detach(), eps=float(eps))
+            qweight = qweight.to(device=x_local.device, dtype=torch.int8).contiguous()
+            row_scale = row_scale.to(device=x_local.device, dtype=torch.float32).contiguous()
+            bias_local = None if bias is None else bias.to(device=x_local.device, dtype=target_dtype)
+            return runtime_bitnet_int8_linear_from_float(
+                x_local,
+                qweight,
+                row_scale,
+                bias_local,
+                pre_scale=None,
+                act_quant_mode="dynamic_int8",
+                act_scale=None,
+                act_quant_bits=8,
+                act_quant_method="absmax",
+                act_quant_percentile=float(act_quant_percentile),
+            )
+
+        @op.register_fake
+        def _(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: Optional[torch.Tensor],
+            eps: float,
+            act_quant_percentile: float,
+        ) -> torch.Tensor:
+            target_dtype = x.dtype if x.dtype.is_floating_point else weight.dtype
+            return x.new_empty((*x.shape[:-1], weight.shape[0]), dtype=target_dtype)
+
+        def setup_context(ctx, inputs, output) -> None:
+            x, weight, bias, eps, _act_quant_percentile = inputs
+            qweight, row_scale = _bitnet_runtime_row_codes_and_scale(weight.detach(), eps=float(eps))
+            qweight = qweight.to(device=x.device, dtype=torch.int8).contiguous()
+            row_scale = row_scale.to(device=x.device, dtype=torch.float32).contiguous()
+            _trainable_bitnet_save_backward_context(
+                ctx,
+                x=x,
+                weight=weight,
+                bias=bias,
+                qweight=qweight,
+                row_scale=row_scale,
+                eps=float(eps),
+                act_quant_percentile=float(_act_quant_percentile),
+            )
+
+        def backward(ctx, grad_out):
+            grad_input, grad_weight, grad_bias = _trainable_bitnet_int8_ste_backward(ctx, grad_out)
+            return grad_input, grad_weight, grad_bias, None, None
+
+        op.register_autograd(backward, setup_context=setup_context)
+        return op
+    except Exception:
+        try:
+            return torch.ops.model_stack.trainable_bitnet_int8_ste_output
+        except Exception:
+            return None
+
+
+_TRAINABLE_BITNET_INT8_STE_OUTPUT_COMPILE_OP = _register_trainable_bitnet_int8_ste_output_compile_op()
+
+
+class _TrainableBitNetInt8STEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        eps: float,
+        act_quant_percentile: float,
+    ) -> torch.Tensor:
+        if not x.is_cuda:
+            raise RuntimeError("TrainableBitNetLinear int8 STE forward requires CUDA")
+        target_dtype = x.dtype if x.dtype.is_floating_point else weight.dtype
+        x_local = x.to(dtype=target_dtype)
+        qweight, row_scale = _bitnet_runtime_row_codes_and_scale(weight.detach(), eps=float(eps))
+        qweight = qweight.to(device=x_local.device, dtype=torch.int8).contiguous()
+        row_scale = row_scale.to(device=x_local.device, dtype=torch.float32).contiguous()
+        bias_local = None if bias is None else bias.to(device=x_local.device, dtype=target_dtype)
+        out = runtime_bitnet_int8_linear_from_float(
+            x_local,
+            qweight,
+            row_scale,
+            bias_local,
+            pre_scale=None,
+            act_quant_mode="dynamic_int8",
+            act_scale=None,
+            act_quant_bits=8,
+            act_quant_method="absmax",
+            act_quant_percentile=float(act_quant_percentile),
+        )
+        _trainable_bitnet_save_backward_context(
+            ctx,
+            x=x,
+            weight=weight,
+            bias=bias,
+            qweight=qweight,
+            row_scale=row_scale,
+            eps=float(eps),
+            act_quant_percentile=float(act_quant_percentile),
+        )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input, grad_weight, grad_bias = _trainable_bitnet_int8_ste_backward(ctx, grad_output)
+        return grad_input, grad_weight, grad_bias, None, None
+
+
 class TrainableBitNetLinear(nn.Module):
     """Trainable runtime-row BitNet linear with a float shadow weight.
 
@@ -3158,7 +3551,60 @@ class TrainableBitNetLinear(nn.Module):
         )
         return layer
 
+    def _int8_ste_forward_enabled(self, x: torch.Tensor) -> bool:
+        mode = _trainable_bitnet_training_forward_mode()
+        if mode not in {"int8_ste", "dynamic_int8_ste", "w2a8_ste"}:
+            return False
+        if _torch_compiler_is_compiling() and not _env_flag_enabled("MODEL_STACK_TRAINABLE_BITNET_COMPILED_INT8_STE"):
+            return False
+        if not _trainable_bitnet_int8_shape_gate_allows(
+            x,
+            in_features=self.in_features,
+            out_features=self.out_features,
+        ):
+            return False
+        return x.is_cuda
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._int8_ste_forward_enabled(x):
+            if _torch_compiler_is_compiling() and not _env_flag_enabled(
+                "MODEL_STACK_TRAINABLE_BITNET_DISABLE_COMPILED_AUTOGRAD_FUNCTION"
+            ):
+                return _TrainableBitNetInt8STEFunction.apply(
+                    x,
+                    self.weight,
+                    self.bias,
+                    float(self.eps),
+                    float(os.getenv("MODEL_STACK_TRAINABLE_BITNET_ACT_QUANT_PERCENTILE", "0.999")),
+                )
+            if (
+                _torch_compiler_is_compiling()
+                and _env_flag_enabled("MODEL_STACK_TRAINABLE_BITNET_OUTPUT_COMPILE_OP")
+                and _TRAINABLE_BITNET_INT8_STE_OUTPUT_COMPILE_OP is not None
+            ):
+                return _TRAINABLE_BITNET_INT8_STE_OUTPUT_COMPILE_OP(
+                    x,
+                    self.weight,
+                    self.bias,
+                    float(self.eps),
+                    float(os.getenv("MODEL_STACK_TRAINABLE_BITNET_ACT_QUANT_PERCENTILE", "0.999")),
+                )
+            if _torch_compiler_is_compiling() and _TRAINABLE_BITNET_INT8_STE_COMPILE_OP is not None:
+                out, _qweight, _row_scale = _TRAINABLE_BITNET_INT8_STE_COMPILE_OP(
+                    x,
+                    self.weight,
+                    self.bias,
+                    float(self.eps),
+                    float(os.getenv("MODEL_STACK_TRAINABLE_BITNET_ACT_QUANT_PERCENTILE", "0.999")),
+                )
+                return out
+            return _TrainableBitNetInt8STEFunction.apply(
+                x,
+                self.weight,
+                self.bias,
+                float(self.eps),
+                float(os.getenv("MODEL_STACK_TRAINABLE_BITNET_ACT_QUANT_PERCENTILE", "0.999")),
+            )
         weight = self.ternary_weight().to(dtype=x.dtype if x.dtype.is_floating_point else self.weight.dtype)
         bias = None if self.bias is None else self.bias.to(dtype=weight.dtype)
         return F.linear(x.to(dtype=weight.dtype), weight, bias)

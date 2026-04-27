@@ -143,6 +143,7 @@ def test_runtime_activation_leaky_relu_half_squared_matches_reference_without_na
     ref = F.leaky_relu(x, negative_slope=0.5).square()
 
     assert torch.allclose(out, ref)
+    assert torch.allclose(runtime_ops_mod.activation(x, "leaky_relu2"), ref)
 
 
 def test_runtime_gated_activation_leaky_relu_half_squared_matches_reference_without_native(monkeypatch):
@@ -155,6 +156,7 @@ def test_runtime_gated_activation_leaky_relu_half_squared_matches_reference_with
     ref = F.leaky_relu(x, negative_slope=0.5).square() * gate
 
     assert torch.allclose(out, ref)
+    assert torch.allclose(runtime_ops_mod.gated_activation(x, gate, "leaky_relu2"), ref)
 
 
 def test_tensor_with_bias_act_leaky_relu_half_squared_gated_prefers_runtime_gated_activation(monkeypatch):

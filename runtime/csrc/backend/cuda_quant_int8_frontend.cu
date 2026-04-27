@@ -45,6 +45,15 @@ constexpr int kQuantWarp16Threads = kQuantWarp16RowsPerBlock * kQuantWarpSize;
 constexpr int kQuantWideWarpsPerRow = 2;
 constexpr int kQuantWideGroupSize = kQuantWideWarpsPerRow * kQuantWarpSize;
 constexpr int kQuantWideRowsPerBlock = kQuantThreads / kQuantWideGroupSize;
+constexpr int kColumnQuantColsPerBlock = 16;
+constexpr int kColumnQuantRowsPerBlock = 128;
+constexpr int kColumnQuantThreadsX = 16;
+constexpr int kColumnQuantThreadsY = 16;
+constexpr int kColumnQuantWideColsPerBlock = 32;
+constexpr int kColumnQuantWideThreadsX = 32;
+constexpr int kColumnQuantWideThreadsY = 8;
+constexpr int kTransposeTileDim = 32;
+constexpr int kTransposeBlockRows = 8;
 
 bool Int8QuantWarpRowEnabled(int64_t cols) {
   const char* disable = std::getenv("MODEL_STACK_DISABLE_INT8_QUANT_WARP_ROW");
@@ -70,15 +79,36 @@ int Int8QuantWarpRowsPerBlock() {
   return kQuantWarpRowsPerBlock;
 }
 
+int Int8ColumnQuantRowsPerBlock() {
+  const char* env = std::getenv("MODEL_STACK_INT8_COLUMN_QUANT_ROWS_PER_BLOCK");
+  if (env == nullptr || env[0] == '\0') {
+    return kColumnQuantRowsPerBlock;
+  }
+  const int value = std::atoi(env);
+  if (value == 64 || value == 128 || value == 256 || value == 512 || value == 1024) {
+    return value;
+  }
+  return kColumnQuantRowsPerBlock;
+}
+
+bool Int8ColumnQuantWideColsEnabled() {
+  const char* env = std::getenv("MODEL_STACK_INT8_COLUMN_QUANT_THREADS_X");
+  if (env == nullptr || env[0] == '\0') {
+    return false;
+  }
+  return std::atoi(env) == kColumnQuantWideThreadsX;
+}
+
 bool Int8QuantSharedCacheEnabled(int64_t cols, int rows_per_block, size_t element_size) {
   const char* disable = std::getenv("MODEL_STACK_DISABLE_INT8_QUANT_SHARED_CACHE");
   if (disable != nullptr && disable[0] != '\0' && disable[0] != '0') {
     return false;
   }
   constexpr size_t kMaxDefaultDynamicSharedBytes = 48 * 1024;
+  constexpr size_t kStaticSharedReserveBytes = 1024;
   const size_t bytes =
       static_cast<size_t>(rows_per_block) * static_cast<size_t>(cols) * element_size;
-  return bytes <= kMaxDefaultDynamicSharedBytes;
+  return bytes + kStaticSharedReserveBytes <= kMaxDefaultDynamicSharedBytes;
 }
 
 bool Int8QuantVec4Enabled(int64_t cols) {
@@ -159,6 +189,106 @@ __global__ void quantize_activation_int8_rowwise_kernel(
   for (int64_t col = threadIdx.x; col < cols; col += blockDim.x) {
     const float scaled = static_cast<float>(x[row * cols + col]) / scale;
     qx[row * cols + col] = QuantizeScaledToInt8(scaled);
+  }
+}
+
+template <typename scalar_t, int ThreadsX, int ThreadsY>
+__global__ void quantize_activation_int8_columnwise_transpose_partial_amax_kernel(
+    const scalar_t* __restrict__ x,
+    float* __restrict__ partial_amax,
+    int64_t rows,
+    int64_t cols,
+    int64_t row_tiles,
+    int64_t rows_per_tile) {
+  const int64_t col = static_cast<int64_t>(blockIdx.x) * ThreadsX + threadIdx.x;
+  const int64_t row_tile = static_cast<int64_t>(blockIdx.y);
+  if (row_tile >= row_tiles) {
+    return;
+  }
+
+  __shared__ float shared[ThreadsY][ThreadsX];
+  float local_max = 0.0f;
+  const int64_t row_begin = row_tile * rows_per_tile;
+  const int64_t row_end = (row_begin + rows_per_tile) < rows ? (row_begin + rows_per_tile) : rows;
+  if (col < cols) {
+    for (int64_t row = row_begin + threadIdx.y; row < row_end; row += ThreadsY) {
+      local_max = fmaxf(local_max, fabsf(static_cast<float>(x[row * cols + col])));
+    }
+  }
+  shared[threadIdx.y][threadIdx.x] = local_max;
+  __syncthreads();
+
+  for (int stride = ThreadsY / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.y < stride) {
+      shared[threadIdx.y][threadIdx.x] =
+          fmaxf(shared[threadIdx.y][threadIdx.x], shared[threadIdx.y + stride][threadIdx.x]);
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.y == 0 && col < cols) {
+    partial_amax[row_tile * cols + col] = shared[0][threadIdx.x];
+  }
+}
+
+__global__ void quantize_activation_int8_columnwise_transpose_finalize_scale_kernel(
+    const float* __restrict__ partial_amax,
+    float* __restrict__ col_scale,
+    int64_t row_tiles,
+    int64_t cols) {
+  const int64_t col = static_cast<int64_t>(blockIdx.x);
+  if (col >= cols) {
+    return;
+  }
+  __shared__ float shared[kQuantThreads];
+  float local_max = 0.0f;
+  for (int64_t tile = threadIdx.x; tile < row_tiles; tile += blockDim.x) {
+    local_max = fmaxf(local_max, partial_amax[tile * cols + col]);
+  }
+  shared[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    col_scale[col] = shared[0] > 0.0f ? (shared[0] / 127.0f) : 1.0f;
+  }
+}
+
+template <typename scalar_t>
+__global__ void quantize_activation_int8_columnwise_transpose_kernel(
+    const scalar_t* __restrict__ x,
+    const float* __restrict__ col_scale,
+    int8_t* __restrict__ qx_t,
+    int64_t rows,
+    int64_t cols) {
+  __shared__ int8_t tile[kTransposeTileDim][kTransposeTileDim + 1];
+
+  const int64_t in_col = static_cast<int64_t>(blockIdx.x) * kTransposeTileDim + threadIdx.x;
+  const int64_t in_row_base = static_cast<int64_t>(blockIdx.y) * kTransposeTileDim + threadIdx.y;
+
+  if (in_col < cols) {
+    const float inv_scale = 1.0f / col_scale[in_col];
+    for (int j = 0; j < kTransposeTileDim; j += kTransposeBlockRows) {
+      const int64_t in_row = in_row_base + j;
+      if (in_row < rows) {
+        const float scaled = static_cast<float>(x[in_row * cols + in_col]) * inv_scale;
+        tile[threadIdx.y + j][threadIdx.x] = QuantizeScaledToInt8(scaled);
+      }
+    }
+  }
+  __syncthreads();
+
+  const int64_t out_col = static_cast<int64_t>(blockIdx.y) * kTransposeTileDim + threadIdx.x;
+  const int64_t out_row_base = static_cast<int64_t>(blockIdx.x) * kTransposeTileDim + threadIdx.y;
+  for (int j = 0; j < kTransposeTileDim; j += kTransposeBlockRows) {
+    const int64_t out_row = out_row_base + j;
+    if (out_row < cols && out_col < rows) {
+      qx_t[out_row * rows + out_col] = tile[threadIdx.x][threadIdx.y + j];
+    }
   }
 }
 
@@ -246,6 +376,102 @@ __global__ void quantize_activation_int8_rowwise_warp_kernel(
 
   for (int64_t col = lane; col < cols; col += kQuantWarpSize) {
     const float scaled = static_cast<float>(x[row_offset + col]) * inv_scale;
+    qx[row_offset + col] = QuantizeScaledToInt8(scaled);
+  }
+}
+
+template <typename scalar_t>
+__global__ void quantize_activation_int8_rowwise_pre_scale_kernel(
+    const scalar_t* __restrict__ x,
+    const float* __restrict__ pre_scale,
+    int8_t* __restrict__ qx,
+    float* __restrict__ row_scale,
+    int64_t rows,
+    int64_t cols) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  if (row >= rows) {
+    return;
+  }
+  __shared__ float shared_max[kQuantThreads];
+  float local_max = 0.0f;
+  const int64_t row_offset = row * cols;
+  for (int64_t col = threadIdx.x; col < cols; col += blockDim.x) {
+    float scale = pre_scale[col];
+    if (!(scale > 0.0f)) {
+      scale = 1.0f;
+    }
+    const float value = fabsf(static_cast<float>(x[row_offset + col]) / scale);
+    local_max = fmaxf(local_max, value);
+  }
+  shared_max[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared_max[threadIdx.x] = fmaxf(shared_max[threadIdx.x], shared_max[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+
+  const float scale = shared_max[0] > 0.0f ? (shared_max[0] / 127.0f) : 1.0f;
+  if (threadIdx.x == 0) {
+    row_scale[row] = scale;
+  }
+  __syncthreads();
+  const float inv_scale = 1.0f / scale;
+
+  for (int64_t col = threadIdx.x; col < cols; col += blockDim.x) {
+    float col_scale = pre_scale[col];
+    if (!(col_scale > 0.0f)) {
+      col_scale = 1.0f;
+    }
+    const float scaled = (static_cast<float>(x[row_offset + col]) / col_scale) * inv_scale;
+    qx[row_offset + col] = QuantizeScaledToInt8(scaled);
+  }
+}
+
+template <typename scalar_t, int RowsPerBlock>
+__global__ void quantize_activation_int8_rowwise_warp_pre_scale_kernel(
+    const scalar_t* __restrict__ x,
+    const float* __restrict__ pre_scale,
+    int8_t* __restrict__ qx,
+    float* __restrict__ row_scale,
+    int64_t rows,
+    int64_t cols) {
+  const int warp_id = threadIdx.x / kQuantWarpSize;
+  const int lane = threadIdx.x & (kQuantWarpSize - 1);
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * RowsPerBlock + warp_id;
+  if (row >= rows) {
+    return;
+  }
+
+  float local_max = 0.0f;
+  const int64_t row_offset = row * cols;
+  for (int64_t col = lane; col < cols; col += kQuantWarpSize) {
+    float scale = pre_scale[col];
+    if (!(scale > 0.0f)) {
+      scale = 1.0f;
+    }
+    const float value = fabsf(static_cast<float>(x[row_offset + col]) / scale);
+    local_max = fmaxf(local_max, value);
+  }
+  unsigned int mask = 0xffffffffu;
+  for (int offset = kQuantWarpSize / 2; offset > 0; offset >>= 1) {
+    local_max = fmaxf(local_max, __shfl_down_sync(mask, local_max, offset));
+  }
+
+  const float scale = local_max > 0.0f ? (local_max / 127.0f) : 1.0f;
+  if (lane == 0) {
+    row_scale[row] = scale;
+  }
+  const float broadcast_scale = __shfl_sync(mask, scale, 0);
+  const float inv_scale = 1.0f / broadcast_scale;
+
+  for (int64_t col = lane; col < cols; col += kQuantWarpSize) {
+    float col_scale = pre_scale[col];
+    if (!(col_scale > 0.0f)) {
+      col_scale = 1.0f;
+    }
+    const float scaled = (static_cast<float>(x[row_offset + col]) / col_scale) * inv_scale;
     qx[row_offset + col] = QuantizeScaledToInt8(scaled);
   }
 }
@@ -874,6 +1100,182 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeActivationInt8RowwiseCuda(
   return {qx_2d.view(out_sizes), row_scale};
 }
 
+std::tuple<torch::Tensor, torch::Tensor> QuantizeActivationInt8RowwisePreScaleCuda(
+    const torch::Tensor& x,
+    const torch::Tensor& pre_scale) {
+  TORCH_CHECK(x.is_cuda(), "QuantizeActivationInt8RowwisePreScaleCuda: x must be a CUDA tensor");
+  TORCH_CHECK(IsSupportedInt8FrontendDtype(x.scalar_type()),
+              "QuantizeActivationInt8RowwisePreScaleCuda: unsupported input dtype");
+  TORCH_CHECK(x.dim() >= 2, "QuantizeActivationInt8RowwisePreScaleCuda: x must have rank >= 2");
+
+  c10::cuda::CUDAGuard device_guard{x.device()};
+  const auto cols = x.size(-1);
+  const auto rows = x.numel() / cols;
+  auto x_2d = x.reshape({rows, cols}).contiguous();
+  auto pre_scale_value = pre_scale.to(x.device(), torch::kFloat32).reshape({-1}).contiguous();
+  TORCH_CHECK(
+      pre_scale_value.numel() == cols,
+      "QuantizeActivationInt8RowwisePreScaleCuda: pre_scale must have cols elements");
+  auto qx_2d = torch::empty({rows, cols}, x.options().dtype(torch::kInt8));
+  auto row_scale = torch::empty({rows}, x.options().dtype(torch::kFloat32));
+  if (rows == 0 || cols == 0) {
+    std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
+    return {qx_2d.view(out_sizes), row_scale};
+  }
+
+  auto stream = c10::cuda::getCurrentCUDAStream(x.get_device());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      x_2d.scalar_type(),
+      "model_stack_cuda_quantize_activation_int8_rowwise_pre_scale",
+      [&] {
+        if (Int8QuantWarpRowEnabled(cols)) {
+          const auto launch_warp_rows = [&](auto rows_constant, int threads) {
+            constexpr int rows_per_block = decltype(rows_constant)::value;
+            const auto blocks = static_cast<unsigned int>((rows + rows_per_block - 1) / rows_per_block);
+            quantize_activation_int8_rowwise_warp_pre_scale_kernel<scalar_t, rows_per_block><<<
+                blocks,
+                threads,
+                0,
+                stream.stream()>>>(
+                x_2d.data_ptr<scalar_t>(),
+                pre_scale_value.data_ptr<float>(),
+                qx_2d.data_ptr<int8_t>(),
+                row_scale.data_ptr<float>(),
+                rows,
+                cols);
+          };
+          switch (Int8QuantWarpRowsPerBlock()) {
+            case kQuantWarp4RowsPerBlock:
+              launch_warp_rows(std::integral_constant<int, kQuantWarp4RowsPerBlock>{}, kQuantWarp4Threads);
+              break;
+            case kQuantWarp16RowsPerBlock:
+              launch_warp_rows(std::integral_constant<int, kQuantWarp16RowsPerBlock>{}, kQuantWarp16Threads);
+              break;
+            default:
+              launch_warp_rows(std::integral_constant<int, kQuantWarpRowsPerBlock>{}, kQuantWarpThreads);
+              break;
+          }
+        } else {
+          quantize_activation_int8_rowwise_pre_scale_kernel<scalar_t><<<
+              static_cast<unsigned int>(rows),
+              kQuantThreads,
+              0,
+              stream.stream()>>>(
+              x_2d.data_ptr<scalar_t>(),
+              pre_scale_value.data_ptr<float>(),
+              qx_2d.data_ptr<int8_t>(),
+              row_scale.data_ptr<float>(),
+              rows,
+              cols);
+        }
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
+  return {qx_2d.view(out_sizes), row_scale};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> QuantizeActivationInt8ColumnwiseTransposeCuda(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& provided_scale) {
+  TORCH_CHECK(x.is_cuda(), "QuantizeActivationInt8ColumnwiseTransposeCuda: x must be a CUDA tensor");
+  TORCH_CHECK(IsSupportedInt8FrontendDtype(x.scalar_type()),
+              "QuantizeActivationInt8ColumnwiseTransposeCuda: unsupported input dtype");
+  TORCH_CHECK(x.dim() >= 2, "QuantizeActivationInt8ColumnwiseTransposeCuda: x must have rank >= 2");
+
+  c10::cuda::CUDAGuard device_guard{x.device()};
+  const auto cols = x.size(-1);
+  const auto rows = x.numel() / cols;
+  auto x_2d = x.reshape({rows, cols}).contiguous();
+  auto qx_t = torch::empty({cols, rows}, x.options().dtype(torch::kInt8));
+  auto col_scale = torch::empty({cols}, x.options().dtype(torch::kFloat32));
+  if (provided_scale.has_value() && provided_scale.value().defined()) {
+    auto scale_value = provided_scale.value().to(x.device(), torch::kFloat32).reshape({-1}).contiguous();
+    TORCH_CHECK(
+        scale_value.numel() == cols,
+        "QuantizeActivationInt8ColumnwiseTransposeCuda: provided_scale must have cols elements");
+    col_scale = scale_value;
+  }
+  if (rows == 0 || cols == 0) {
+    return {qx_t, col_scale};
+  }
+
+  const int rows_per_tile = Int8ColumnQuantRowsPerBlock();
+  const bool wide_column_amax = Int8ColumnQuantWideColsEnabled();
+  const int amax_cols_per_block = wide_column_amax ? kColumnQuantWideColsPerBlock : kColumnQuantColsPerBlock;
+  const int64_t row_tiles = (rows + rows_per_tile - 1) / rows_per_tile;
+  auto partial_amax = provided_scale.has_value() && provided_scale.value().defined()
+      ? torch::Tensor()
+      : torch::empty({row_tiles, cols}, x.options().dtype(torch::kFloat32));
+  auto stream = c10::cuda::getCurrentCUDAStream(x.get_device());
+  const dim3 amax_threads(
+      static_cast<unsigned int>(wide_column_amax ? kColumnQuantWideThreadsX : kColumnQuantThreadsX),
+      static_cast<unsigned int>(wide_column_amax ? kColumnQuantWideThreadsY : kColumnQuantThreadsY));
+  const dim3 amax_blocks(
+      static_cast<unsigned int>((cols + amax_cols_per_block - 1) / amax_cols_per_block),
+      static_cast<unsigned int>(row_tiles));
+  const dim3 transpose_threads(kTransposeTileDim, kTransposeBlockRows);
+  const dim3 transpose_blocks(
+      static_cast<unsigned int>((cols + kTransposeTileDim - 1) / kTransposeTileDim),
+      static_cast<unsigned int>((rows + kTransposeTileDim - 1) / kTransposeTileDim));
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      x_2d.scalar_type(),
+      "model_stack_cuda_quantize_activation_int8_columnwise_transpose",
+      [&] {
+        if (partial_amax.defined()) {
+          if (wide_column_amax) {
+            quantize_activation_int8_columnwise_transpose_partial_amax_kernel<
+                scalar_t,
+                kColumnQuantWideThreadsX,
+                kColumnQuantWideThreadsY><<<amax_blocks, amax_threads, 0, stream.stream()>>>(
+                x_2d.data_ptr<scalar_t>(),
+                partial_amax.data_ptr<float>(),
+                rows,
+                cols,
+                row_tiles,
+                rows_per_tile);
+          } else {
+            quantize_activation_int8_columnwise_transpose_partial_amax_kernel<
+                scalar_t,
+                kColumnQuantThreadsX,
+                kColumnQuantThreadsY><<<amax_blocks, amax_threads, 0, stream.stream()>>>(
+                x_2d.data_ptr<scalar_t>(),
+                partial_amax.data_ptr<float>(),
+                rows,
+                cols,
+                row_tiles,
+                rows_per_tile);
+          }
+          quantize_activation_int8_columnwise_transpose_finalize_scale_kernel<<<
+              static_cast<unsigned int>(cols),
+              kQuantThreads,
+              0,
+              stream.stream()>>>(
+              partial_amax.data_ptr<float>(),
+              col_scale.data_ptr<float>(),
+              row_tiles,
+              cols);
+        }
+        quantize_activation_int8_columnwise_transpose_kernel<scalar_t><<<
+            transpose_blocks,
+            transpose_threads,
+            0,
+            stream.stream()>>>(
+            x_2d.data_ptr<scalar_t>(),
+            col_scale.data_ptr<float>(),
+            qx_t.data_ptr<int8_t>(),
+            rows,
+            cols);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {qx_t, col_scale};
+}
+
 std::tuple<torch::Tensor, torch::Tensor> QuantizeRelu2ActivationInt8RowwiseCuda(
     const torch::Tensor& x) {
   TORCH_CHECK(x.is_cuda(), "QuantizeRelu2ActivationInt8RowwiseCuda: x must be a CUDA tensor");
@@ -984,6 +1386,13 @@ std::vector<torch::Tensor> CudaInt8QuantizeActivationForward(
   return {std::get<0>(quantized), std::get<1>(quantized)};
 }
 
+std::vector<torch::Tensor> CudaInt8QuantizeActivationTransposeForward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& provided_scale) {
+  auto quantized = QuantizeActivationInt8ColumnwiseTransposeCuda(x, provided_scale);
+  return {std::get<0>(quantized), std::get<1>(quantized)};
+}
+
 std::vector<torch::Tensor> CudaInt8QuantizeRelu2ActivationForward(
     const torch::Tensor& x) {
   auto quantized = QuantizeRelu2ActivationInt8RowwiseCuda(x);
@@ -998,6 +1407,17 @@ torch::Tensor CudaInt8LinearFromFloatForward(
     const c10::optional<torch::Tensor>& provided_scale,
     const c10::optional<torch::ScalarType>& out_dtype) {
   auto quantized = QuantizeActivationInt8RowwiseCuda(x, provided_scale);
+  return CudaInt8LinearForward(std::get<0>(quantized), std::get<1>(quantized), qweight, inv_scale, bias, out_dtype);
+}
+
+torch::Tensor CudaInt8LinearFromFloatPreScaleForward(
+    const torch::Tensor& x,
+    const torch::Tensor& qweight,
+    const torch::Tensor& inv_scale,
+    const c10::optional<torch::Tensor>& bias,
+    const torch::Tensor& pre_scale,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  auto quantized = QuantizeActivationInt8RowwisePreScaleCuda(x, pre_scale);
   return CudaInt8LinearForward(std::get<0>(quantized), std::get<1>(quantized), qweight, inv_scale, bias, out_dtype);
 }
 

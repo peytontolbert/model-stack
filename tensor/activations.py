@@ -48,6 +48,8 @@ def _apply_act(x: torch.Tensor, act: str, gelu_approx: str | None = None) -> tor
         return relu2(x)
     if a in (
         "leaky_relu_0p5_squared",
+        "leaky_relu2",
+        "leaky-relu2",
         "leaky-relu-0p5-squared",
         "leaky_relu_0.5_squared",
         "leaky-relu-0.5-squared",
@@ -84,6 +86,8 @@ def with_bias_act(
                     "swish",
                     "gelu",
                     "leaky_relu_0p5_squared",
+                    "leaky_relu2",
+                    "leaky-relu2",
                     "leaky-relu-0p5-squared",
                     "leaky_relu_0.5_squared",
                     "leaky-relu-0.5-squared",

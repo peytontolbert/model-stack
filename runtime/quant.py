@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 
 from runtime.attention import scaled_dot_product_attention as runtime_scaled_dot_product_attention
@@ -39,6 +41,187 @@ def _should_use_eager_autograd_fallback(*tensors: torch.Tensor | None) -> bool:
         if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
             return True
     return False
+
+
+def _torch_compiler_is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = getattr(compiler, "is_compiling", None)
+    return bool(callable(is_compiling) and is_compiling())
+
+
+def _register_bitnet_int8_linear_from_float_compile_op():
+    custom_op = getattr(torch.library, "custom_op", None)
+    if custom_op is None:
+        return None
+    try:
+        @custom_op("model_stack::bitnet_int8_linear_from_float", mutates_args=())
+        def op(
+            x: torch.Tensor,
+            qweight: torch.Tensor,
+            inv_scale: torch.Tensor,
+            bias: Optional[torch.Tensor],
+            pre_scale: Optional[torch.Tensor],
+            act_quant_mode: str,
+            act_quant_method: str,
+            act_quant_bits: int,
+            act_quant_percentile: float,
+            act_scale: Optional[torch.Tensor],
+            out_dtype: torch.dtype,
+        ) -> torch.Tensor:
+            module = native_module()
+            if module is None or not hasattr(module, "bitnet_int8_linear_from_float_forward"):
+                raise RuntimeError("bitnet_int8_linear_from_float compile op requires the native backend")
+            return module.bitnet_int8_linear_from_float_forward(
+                x,
+                qweight,
+                inv_scale,
+                bias,
+                pre_scale,
+                act_quant_mode,
+                act_quant_method,
+                int(act_quant_bits),
+                float(act_quant_percentile),
+                act_scale,
+                out_dtype,
+            )
+
+        @op.register_fake
+        def _(
+            x: torch.Tensor,
+            qweight: torch.Tensor,
+            inv_scale: torch.Tensor,
+            bias: Optional[torch.Tensor],
+            pre_scale: Optional[torch.Tensor],
+            act_quant_mode: str,
+            act_quant_method: str,
+            act_quant_bits: int,
+            act_quant_percentile: float,
+            act_scale: Optional[torch.Tensor],
+            out_dtype: torch.dtype,
+        ) -> torch.Tensor:
+            return x.new_empty((*x.shape[:-1], qweight.shape[0]), dtype=out_dtype)
+
+        return op
+    except Exception:
+        try:
+            return torch.ops.model_stack.bitnet_int8_linear_from_float
+        except Exception:
+            return None
+
+
+_BITNET_INT8_LINEAR_FROM_FLOAT_COMPILE_OP = _register_bitnet_int8_linear_from_float_compile_op()
+
+
+def _register_int8_quantize_activation_transpose_compile_op():
+    custom_op = getattr(torch.library, "custom_op", None)
+    if custom_op is None:
+        return None
+    try:
+        @custom_op("model_stack::int8_quantize_activation_transpose", mutates_args=())
+        def op(
+            x: torch.Tensor,
+            provided_scale: Optional[torch.Tensor],
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            module = native_module()
+            if module is None or not hasattr(module, "int8_quantize_activation_transpose_forward"):
+                raise RuntimeError("int8_quantize_activation_transpose compile op requires the native backend")
+            return module.int8_quantize_activation_transpose_forward(x, provided_scale)
+
+        @op.register_fake
+        def _(
+            x: torch.Tensor,
+            provided_scale: Optional[torch.Tensor],
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del provided_scale
+            cols = x.shape[-1]
+            rows = x.numel() // cols
+            return (
+                x.new_empty((cols, rows), dtype=torch.int8),
+                x.new_empty((cols,), dtype=torch.float32),
+            )
+
+        return op
+    except Exception:
+        try:
+            return torch.ops.model_stack.int8_quantize_activation_transpose
+        except Exception:
+            return None
+
+
+def _register_int8_linear_compile_op():
+    custom_op = getattr(torch.library, "custom_op", None)
+    if custom_op is None:
+        return None
+    try:
+        @custom_op("model_stack::int8_linear", mutates_args=())
+        def op(
+            qx: torch.Tensor,
+            x_scale: torch.Tensor,
+            qweight: torch.Tensor,
+            inv_scale: torch.Tensor,
+            bias: Optional[torch.Tensor],
+            out_dtype: torch.dtype,
+        ) -> torch.Tensor:
+            module = native_module()
+            if module is None or not hasattr(module, "int8_linear_forward"):
+                raise RuntimeError("int8_linear compile op requires the native backend")
+            return module.int8_linear_forward(qx, x_scale, qweight, inv_scale, bias, out_dtype)
+
+        @op.register_fake
+        def _(
+            qx: torch.Tensor,
+            x_scale: torch.Tensor,
+            qweight: torch.Tensor,
+            inv_scale: torch.Tensor,
+            bias: Optional[torch.Tensor],
+            out_dtype: torch.dtype,
+        ) -> torch.Tensor:
+            del x_scale, inv_scale, bias
+            return qx.new_empty((*qx.shape[:-1], qweight.shape[0]), dtype=out_dtype)
+
+        return op
+    except Exception:
+        try:
+            return torch.ops.model_stack.int8_linear
+        except Exception:
+            return None
+
+
+def _register_int8_linear_grad_weight_from_float_compile_op():
+    custom_op = getattr(torch.library, "custom_op", None)
+    if custom_op is None:
+        return None
+    try:
+        @custom_op("model_stack::int8_linear_grad_weight_from_float", mutates_args=())
+        def op(
+            grad_out: torch.Tensor,
+            x: torch.Tensor,
+            out_dtype: torch.dtype,
+        ) -> torch.Tensor:
+            module = native_module()
+            if module is None or not hasattr(module, "int8_linear_grad_weight_from_float_forward"):
+                raise RuntimeError("int8_linear_grad_weight_from_float compile op requires the native backend")
+            return module.int8_linear_grad_weight_from_float_forward(grad_out, x, out_dtype)
+
+        @op.register_fake
+        def _(
+            grad_out: torch.Tensor,
+            x: torch.Tensor,
+            out_dtype: torch.dtype,
+        ) -> torch.Tensor:
+            return x.new_empty((grad_out.shape[-1], x.shape[-1]), dtype=out_dtype)
+
+        return op
+    except Exception:
+        try:
+            return torch.ops.model_stack.int8_linear_grad_weight_from_float
+        except Exception:
+            return None
+
+
+_INT8_QUANTIZE_ACTIVATION_TRANSPOSE_COMPILE_OP = _register_int8_quantize_activation_transpose_compile_op()
+_INT8_LINEAR_COMPILE_OP = _register_int8_linear_compile_op()
+_INT8_LINEAR_GRAD_WEIGHT_FROM_FLOAT_COMPILE_OP = _register_int8_linear_grad_weight_from_float_compile_op()
 
 
 def _linear_shape_signature(x: torch.Tensor, out_features: int) -> tuple[int, int, int]:
@@ -454,6 +637,15 @@ def int8_linear_from_quantized_activation(
     qweight_cast = qweight.to(device=target_device, dtype=torch.int8).contiguous()
     scale_cast = inv_scale.to(device=target_device, dtype=torch.float32).contiguous()
     bias_cast = None if bias is None else bias.to(device=target_device, dtype=target_dtype)
+    if qx_cast.is_cuda and _torch_compiler_is_compiling() and _INT8_LINEAR_COMPILE_OP is not None:
+        return _INT8_LINEAR_COMPILE_OP(
+            qx_cast,
+            row_scale_cast,
+            qweight_cast,
+            scale_cast,
+            bias_cast,
+            target_dtype,
+        )
     if qx_cast.is_cuda and not _should_use_eager_autograd_fallback(bias_cast):
         module = native_module()
         if (
@@ -473,6 +665,68 @@ def int8_linear_from_quantized_activation(
     x_dequant = _dequantize_int8_activation(qx_cast, row_scale_cast, dtype=target_dtype)
     weight = _dequantize_int8_weight(qweight_cast, scale_cast, dtype=target_dtype)
     return runtime_linear(x_dequant, weight, bias_cast)
+
+
+def int8_quantize_activation_transpose(
+    x: torch.Tensor,
+    scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x_cast = x if x.dtype.is_floating_point else x.float()
+    scale_cast = None if scale is None else scale.to(device=x_cast.device, dtype=torch.float32).reshape(-1).contiguous()
+    if (
+        x_cast.is_cuda
+        and _torch_compiler_is_compiling()
+        and _INT8_QUANTIZE_ACTIVATION_TRANSPOSE_COMPILE_OP is not None
+    ):
+        return _INT8_QUANTIZE_ACTIVATION_TRANSPOSE_COMPILE_OP(x_cast, scale_cast)
+    if x_cast.is_cuda:
+        module = native_module()
+        if (
+            has_native_op("int8_quantize_activation_transpose")
+            and module is not None
+            and hasattr(module, "int8_quantize_activation_transpose_forward")
+        ):
+            return module.int8_quantize_activation_transpose_forward(x_cast, scale_cast)
+    rows = x_cast.numel() // max(int(x_cast.shape[-1]), 1)
+    x_2d = x_cast.reshape(rows, x_cast.shape[-1])
+    qx, row_scale = quantize_activation_int8_rowwise(x_2d.t().contiguous(), scale=scale_cast)
+    return qx.contiguous(), row_scale.contiguous()
+
+
+def int8_linear_grad_weight_from_float(
+    grad_out: torch.Tensor,
+    x: torch.Tensor,
+    *,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    target_dtype = x.dtype if out_dtype is None else out_dtype
+    go_cast = grad_out if grad_out.dtype.is_floating_point else grad_out.float()
+    x_cast = x if x.dtype.is_floating_point else x.float()
+    if (
+        go_cast.is_cuda
+        and x_cast.is_cuda
+        and _torch_compiler_is_compiling()
+        and _INT8_LINEAR_GRAD_WEIGHT_FROM_FLOAT_COMPILE_OP is not None
+    ):
+        return _INT8_LINEAR_GRAD_WEIGHT_FROM_FLOAT_COMPILE_OP(go_cast, x_cast, target_dtype)
+    if go_cast.is_cuda and x_cast.is_cuda:
+        module = native_module()
+        if (
+            has_native_op("int8_linear_grad_weight_from_float")
+            and module is not None
+            and hasattr(module, "int8_linear_grad_weight_from_float_forward")
+        ):
+            return module.int8_linear_grad_weight_from_float_forward(go_cast, x_cast, target_dtype)
+    qx_t, x_t_scale = int8_quantize_activation_transpose(x_cast)
+    qgo_t, go_t_scale = int8_quantize_activation_transpose(go_cast)
+    return int8_linear_from_quantized_activation(
+        qgo_t,
+        go_t_scale,
+        qx_t,
+        x_t_scale,
+        None,
+        out_dtype=target_dtype,
+    )
 
 
 def int8_matmul_qkv(
@@ -699,6 +953,25 @@ def bitnet_int8_linear_from_float(
     if pre_scale is not None:
         pre_scale_cast = pre_scale.to(device=target_device, dtype=compute_dtype).reshape(-1).contiguous()
     act_scale_cast = _coerce_optional_row_scale(act_scale, device=target_device)
+
+    if (
+        x_cast.is_cuda
+        and _torch_compiler_is_compiling()
+        and _BITNET_INT8_LINEAR_FROM_FLOAT_COMPILE_OP is not None
+    ):
+        return _BITNET_INT8_LINEAR_FROM_FLOAT_COMPILE_OP(
+            x_cast,
+            qweight_cast,
+            inv_scale_cast,
+            bias_cast,
+            pre_scale_cast,
+            str(act_quant_mode),
+            str(act_quant_method),
+            int(act_quant_bits),
+            float(act_quant_percentile),
+            act_scale_cast,
+            compute_dtype,
+        )
 
     if not _should_use_eager_autograd_fallback(x_cast, bias_cast):
         if x_cast.is_cuda:
@@ -1052,9 +1325,11 @@ __all__ = [
     "nf4_quantize",
     "nf4_dequantize",
     "quantize_activation_int8_rowwise",
+    "int8_quantize_activation_transpose",
     "int8_attention",
     "int8_matmul_qkv",
     "int8_linear_from_quantized_activation",
+    "int8_linear_grad_weight_from_float",
     "int8_linear",
     "bitnet_linear",
     "bitnet_linear_compute_packed",

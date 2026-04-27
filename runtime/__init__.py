@@ -107,6 +107,7 @@ _EXPORTS = {
     "GPTBlock": "runtime.block_modules",
     "int4_linear": "runtime.quant",
     "int8_attention": "runtime.quant",
+    "int8_linear_grad_weight_from_float": "runtime.quant",
     "int8_linear": "runtime.quant",
     "int8_matmul_qkv": "runtime.quant",
     "KVCache": "runtime.attention_interfaces",

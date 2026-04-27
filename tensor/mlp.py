@@ -40,6 +40,8 @@ class MLP(nn.Module):
             return relu2(x)
         if name in (
             "leaky_relu_0p5_squared",
+            "leaky_relu2",
+            "leaky-relu2",
             "leaky-relu-0p5-squared",
             "leaky_relu_0.5_squared",
             "leaky-relu-0.5-squared",
@@ -75,6 +77,8 @@ class MLP(nn.Module):
                 x = runtime_gated_activation(a, b, "relu")
             elif name in (
                 "leaky_relu_0p5_squared",
+                "leaky_relu2",
+                "leaky-relu2",
                 "leaky-relu-0p5-squared",
                 "leaky_relu_0.5_squared",
                 "leaky-relu-0.5-squared",
