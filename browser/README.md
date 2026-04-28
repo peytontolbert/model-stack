@@ -27,6 +27,13 @@ element per invocation and supports prefill/decode shapes through the same
 split-K kernels can be added behind the same JavaScript API once the export
 bundle and numerics are stable.
 
+`browser/bitnet/encdec_runtime.js` provides a correctness-first encoder-decoder
+runner for batch size 1. It executes BitNet linear projections through WebGPU and
+keeps orchestration, embeddings, norms, softmax attention, and activations in
+JavaScript typed arrays. This is intended to prove Safari compatibility and
+numerics before replacing attention/norm/MLP orchestration with faster WebGPU
+kernels.
+
 Safari deployment notes:
 
 - serve over HTTPS for WebGPU availability in production

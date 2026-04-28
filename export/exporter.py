@@ -125,6 +125,13 @@ def _maybe_apply_quantization(model: torch.nn.Module, cfg: ExportConfig) -> None
         apply_compression(model, quant={**quant_cfg, "scheme": "bitnet"})
 
 
+def _materialize_lazy_modules(model: torch.nn.Module) -> None:
+    for module in model.modules():
+        ensure_self_attn = getattr(module, "_ensure_self_attn", None)
+        if callable(ensure_self_attn):
+            ensure_self_attn()
+
+
 class _ExportWrapper(nn.Module):
     def __init__(self, model: torch.nn.Module) -> None:
         super().__init__()
@@ -140,6 +147,7 @@ def export_model(model: torch.nn.Module, cfg: ExportConfig, *, model_cfg: Option
     model = model.to(device).eval()
     export_model_wrapper = _ExportWrapper(model).to(device).eval()
 
+    _materialize_lazy_modules(model)
     _maybe_apply_quantization(model, cfg)
 
     if cfg.target == "browser-bitnet":

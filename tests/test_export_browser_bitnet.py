@@ -56,8 +56,10 @@ def test_browser_bitnet_export_writes_manifest_runtime_and_layer_bins(tmp_path: 
     assert manifest["runtime"]["primary"] == "webgpu"
     assert manifest["runtime"]["files"]["webgpu_js"] == "runtime/bitnet_webgpu.js"
     assert manifest["runtime"]["files"]["wgsl"] == "runtime/bitnet_linear.wgsl"
+    assert manifest["runtime"]["files"]["encdec_js"] == "runtime/encdec_runtime.js"
     assert (tmp_path / "runtime" / "bitnet_webgpu.js").exists()
     assert (tmp_path / "runtime" / "bitnet_linear.wgsl").exists()
+    assert (tmp_path / "runtime" / "encdec_runtime.js").exists()
 
     assert len(manifest["layers"]) == 1
     layer = manifest["layers"][0]

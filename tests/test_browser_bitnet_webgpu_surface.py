@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WGSL = ROOT / "browser" / "bitnet" / "bitnet_linear.wgsl"
 JS = ROOT / "browser" / "bitnet" / "bitnet_webgpu.js"
+ENCDEC_JS = ROOT / "browser" / "bitnet" / "encdec_runtime.js"
 
 
 def test_bitnet_wgsl_documents_model_stack_ternary_decode() -> None:
@@ -43,3 +44,17 @@ def test_bitnet_webgpu_wrapper_is_plain_browser_module() -> None:
     assert "?raw" not in source
     assert "fromManifestUrl" in source
     assert "fetchText" in source
+
+
+def test_encoder_decoder_browser_runtime_has_required_execution_surface() -> None:
+    source = ENCDEC_JS.read_text()
+
+    assert "class BitNetEncoderDecoderWebGPU" in source
+    assert "async encode" in source
+    assert "async decode" in source
+    assert "async forward" in source
+    assert "cross_block.cross" in source
+    assert "self_attn_block.attn" in source
+    assert "w_in" in source
+    assert "w_out" in source
+    assert "gatedActivation" in source
