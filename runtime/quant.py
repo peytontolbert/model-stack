@@ -148,6 +148,41 @@ def _register_int8_quantize_activation_transpose_compile_op():
             return None
 
 
+def _register_int8_quantize_activation_columnwise_compile_op():
+    custom_op = getattr(torch.library, "custom_op", None)
+    if custom_op is None:
+        return None
+    try:
+        @custom_op("model_stack::int8_quantize_activation_columnwise", mutates_args=())
+        def op(
+            x: torch.Tensor,
+            provided_scale: Optional[torch.Tensor],
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            module = native_module()
+            if module is None or not hasattr(module, "int8_quantize_activation_columnwise_forward"):
+                raise RuntimeError("int8_quantize_activation_columnwise compile op requires the native backend")
+            return module.int8_quantize_activation_columnwise_forward(x, provided_scale)
+
+        @op.register_fake
+        def _(
+            x: torch.Tensor,
+            provided_scale: Optional[torch.Tensor],
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del provided_scale
+            cols = x.shape[-1]
+            return (
+                x.new_empty(x.shape, dtype=torch.int8),
+                x.new_empty((cols,), dtype=torch.float32),
+            )
+
+        return op
+    except Exception:
+        try:
+            return torch.ops.model_stack.int8_quantize_activation_columnwise
+        except Exception:
+            return None
+
+
 def _register_int8_linear_compile_op():
     custom_op = getattr(torch.library, "custom_op", None)
     if custom_op is None:
@@ -220,6 +255,7 @@ def _register_int8_linear_grad_weight_from_float_compile_op():
 
 
 _INT8_QUANTIZE_ACTIVATION_TRANSPOSE_COMPILE_OP = _register_int8_quantize_activation_transpose_compile_op()
+_INT8_QUANTIZE_ACTIVATION_COLUMNWISE_COMPILE_OP = _register_int8_quantize_activation_columnwise_compile_op()
 _INT8_LINEAR_COMPILE_OP = _register_int8_linear_compile_op()
 _INT8_LINEAR_GRAD_WEIGHT_FROM_FLOAT_COMPILE_OP = _register_int8_linear_grad_weight_from_float_compile_op()
 
@@ -691,6 +727,34 @@ def int8_quantize_activation_transpose(
     x_2d = x_cast.reshape(rows, x_cast.shape[-1])
     qx, row_scale = quantize_activation_int8_rowwise(x_2d.t().contiguous(), scale=scale_cast)
     return qx.contiguous(), row_scale.contiguous()
+
+
+def int8_quantize_activation_columnwise(
+    x: torch.Tensor,
+    scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x_cast = x if x.dtype.is_floating_point else x.float()
+    scale_cast = None if scale is None else scale.to(device=x_cast.device, dtype=torch.float32).reshape(-1).contiguous()
+    if (
+        x_cast.is_cuda
+        and _torch_compiler_is_compiling()
+        and _INT8_QUANTIZE_ACTIVATION_COLUMNWISE_COMPILE_OP is not None
+    ):
+        return _INT8_QUANTIZE_ACTIVATION_COLUMNWISE_COMPILE_OP(x_cast, scale_cast)
+    if x_cast.is_cuda:
+        module = native_module()
+        if (
+            has_native_op("int8_quantize_activation_columnwise")
+            and module is not None
+            and hasattr(module, "int8_quantize_activation_columnwise_forward")
+        ):
+            return module.int8_quantize_activation_columnwise_forward(x_cast, scale_cast)
+    cols = x_cast.shape[-1]
+    x_2d = x_cast.reshape(-1, cols)
+    if scale_cast is None:
+        scale_cast = x_2d.abs().amax(dim=0).clamp_min(1e-8).div(127.0)
+    qx = torch.round(x_2d.float() / scale_cast).clamp(-127, 127).to(torch.int8)
+    return qx.view_as(x_cast).contiguous(), scale_cast.contiguous()
 
 
 def int8_linear_grad_weight_from_float(
@@ -1326,6 +1390,7 @@ __all__ = [
     "nf4_dequantize",
     "quantize_activation_int8_rowwise",
     "int8_quantize_activation_transpose",
+    "int8_quantize_activation_columnwise",
     "int8_attention",
     "int8_matmul_qkv",
     "int8_linear_from_quantized_activation",

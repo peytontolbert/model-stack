@@ -408,6 +408,51 @@ def _bench_shape(
                 dense_gw_ms / fused_delayed_scale_full_ms
             )
             result["int8_grad_weight_fused_prequant_max_abs_err"] = float((int8_gw_fused - dense_gw).abs().max().item())
+        if hasattr(module, "int8_quantize_activation_columnwise_forward"):
+
+            def quantize_x_columnwise() -> tuple[torch.Tensor, torch.Tensor]:
+                return module.int8_quantize_activation_columnwise_forward(x, None)
+
+            def quantize_grad_out_columnwise() -> tuple[torch.Tensor, torch.Tensor]:
+                return module.int8_quantize_activation_columnwise_forward(grad_out, None)
+
+            qx_col, x_col_scale = quantize_x_columnwise()
+            qgo_col, go_col_scale = quantize_grad_out_columnwise()
+
+            def quantize_x_columnwise_provided_scale() -> tuple[torch.Tensor, torch.Tensor]:
+                return module.int8_quantize_activation_columnwise_forward(x, x_col_scale)
+
+            def quantize_grad_out_columnwise_provided_scale() -> tuple[torch.Tensor, torch.Tensor]:
+                return module.int8_quantize_activation_columnwise_forward(grad_out, go_col_scale)
+
+            def quantize_x_columnwise_tensor() -> torch.Tensor:
+                return quantize_x_columnwise()[0]
+
+            def quantize_grad_out_columnwise_tensor() -> torch.Tensor:
+                return quantize_grad_out_columnwise()[0]
+
+            def quantize_x_columnwise_provided_scale_tensor() -> torch.Tensor:
+                return quantize_x_columnwise_provided_scale()[0]
+
+            def quantize_grad_out_columnwise_provided_scale_tensor() -> torch.Tensor:
+                return quantize_grad_out_columnwise_provided_scale()[0]
+
+            columnwise_quant_x_ms = _time_median(quantize_x_columnwise_tensor, **timer_kwargs)
+            columnwise_quant_go_ms = _time_median(quantize_grad_out_columnwise_tensor, **timer_kwargs)
+            columnwise_quant_x_provided_ms = _time_median(
+                quantize_x_columnwise_provided_scale_tensor,
+                **timer_kwargs,
+            )
+            columnwise_quant_go_provided_ms = _time_median(
+                quantize_grad_out_columnwise_provided_scale_tensor,
+                **timer_kwargs,
+            )
+            result["int8_quantize_x_columnwise_ms"] = columnwise_quant_x_ms
+            result["int8_quantize_grad_out_columnwise_ms"] = columnwise_quant_go_ms
+            result["int8_quantize_x_columnwise_provided_scale_ms"] = columnwise_quant_x_provided_ms
+            result["int8_quantize_grad_out_columnwise_provided_scale_ms"] = columnwise_quant_go_provided_ms
+            result["int8_quantize_x_columnwise_shape"] = list(qx_col.shape)
+            result["int8_quantize_grad_out_columnwise_shape"] = list(qgo_col.shape)
     if include_int8_grad_weight_upper_bound:
         module = native_module()
         if module is None or not hasattr(module, "int8_quantize_activation_forward") or not hasattr(torch, "_int_mm"):

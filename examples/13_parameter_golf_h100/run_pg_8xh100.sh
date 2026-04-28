@@ -72,7 +72,7 @@ case "${PRESET}" in
       ROPE_TYPE="${ROPE_TYPE:-yarn}"
       SLIDING_EVAL="${SLIDING_EVAL:-1}"
       SLIDING_EVAL_STRIDE="${SLIDING_EVAL_STRIDE:-64}"
-      SLIDING_BATCH_SIZE="${SLIDING_BATCH_SIZE:-64}"
+      SLIDING_BATCH_SIZE="${SLIDING_BATCH_SIZE:-32}"
     )
     ;;
   runtime_row_512)

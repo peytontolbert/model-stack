@@ -6,7 +6,7 @@ from compress.export import build_delta, export_delta
 
 @dataclass
 class ExportConfig:
-    target: Literal["torchscript","onnx","tensorrt"] = "onnx"
+    target: Literal["torchscript","onnx","tensorrt","browser-bitnet"] = "onnx"
     opset: int = 19
     quantize: Optional[Literal["int8","int4","nf4","fp8","bitnet"]] = None
     quant_spin: bool = False

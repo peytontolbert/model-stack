@@ -11,7 +11,7 @@ from .exporter import export_from_dir, export_model
 def main(argv: Optional[list[str]] = None) -> None:
     p = argparse.ArgumentParser(prog="export", description="Model export utilities")
     p.add_argument("--model-dir", type=str, help="Path to model directory with config and weights")
-    p.add_argument("--target", type=str, default="onnx", choices=["onnx", "torchscript", "tensorrt"])
+    p.add_argument("--target", type=str, default="onnx", choices=["onnx", "torchscript", "tensorrt", "browser-bitnet"])
     p.add_argument("--opset", type=int, default=19)
     p.add_argument("--quantize", type=str, default=None, choices=["int8", "int4", "nf4", "fp8", "bitnet"])
     p.add_argument("--quant-spin", action="store_true", default=False)

@@ -191,6 +191,9 @@ std::vector<torch::Tensor> CudaInt8QuantizeActivationForward(
 std::vector<torch::Tensor> CudaInt8QuantizeActivationTransposeForward(
     const torch::Tensor& x,
     const c10::optional<torch::Tensor>& provided_scale);
+std::vector<torch::Tensor> CudaInt8QuantizeActivationColumnwiseForward(
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& provided_scale);
 std::vector<torch::Tensor> CudaInt8QuantizeRelu2ActivationForward(
     const torch::Tensor& x);
 torch::Tensor CudaInt8LinearFromFloatForward(
@@ -703,6 +706,7 @@ std::map<std::string, bool> NativeOpMap() {
       {"fp8_linear", true},
       {"int8_quantize_activation", true},
       {"int8_quantize_activation_transpose", true},
+      {"int8_quantize_activation_columnwise", true},
       {"int8_quantize_relu2_activation", true},
       {"int8_linear", true},
       {"int8_linear_from_float", true},
@@ -10201,6 +10205,8 @@ PYBIND11_MODULE(_model_stack_native, m) {
   m.def("int8_quantize_activation_forward", &Int8QuantizeActivationForward, py::arg("x"),
         py::arg("provided_scale") = py::none());
   m.def("int8_quantize_activation_transpose_forward", &Int8QuantizeActivationTransposeForward, py::arg("x"),
+        py::arg("provided_scale") = py::none());
+  m.def("int8_quantize_activation_columnwise_forward", &CudaInt8QuantizeActivationColumnwiseForward, py::arg("x"),
         py::arg("provided_scale") = py::none());
   m.def("int8_quantize_relu2_activation_forward", &Int8QuantizeRelu2ActivationForward, py::arg("x"));
   m.def(

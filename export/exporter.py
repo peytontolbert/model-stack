@@ -9,6 +9,7 @@ import torch.nn as nn
 from specs.export import ExportConfig, export_model_delta
 from specs.config import ModelConfig
 from compress.apply import apply_compression
+from export.browser_bitnet import export_browser_bitnet_bundle
 from runtime.factory import build_model as runtime_build_model
 from runtime.checkpoint import load_config as runtime_load_config, load_pretrained as runtime_load_pretrained
 
@@ -140,6 +141,14 @@ def export_model(model: torch.nn.Module, cfg: ExportConfig, *, model_cfg: Option
     export_model_wrapper = _ExportWrapper(model).to(device).eval()
 
     _maybe_apply_quantization(model, cfg)
+
+    if cfg.target == "browser-bitnet":
+        return export_browser_bitnet_bundle(
+            model,
+            outdir,
+            model_cfg=model_cfg,
+            max_seq_len=getattr(cfg, "max_seq_len", None),
+        )
 
     if cfg.target == "torchscript":
         ids, mask = _prepare_io_examples(model_cfg or ModelConfig(d_model=1, n_heads=1, n_layers=1, d_ff=1, vocab_size=2), device)

@@ -924,7 +924,7 @@ def _bitnet_runtime_row_ste_weight(
     *,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    qweight, row_scale = _bitnet_runtime_row_codes_and_scale(weight, eps=eps)
+    qweight, row_scale = _bitnet_runtime_row_codes_and_scale(weight.detach(), eps=eps)
     quantized = qweight.to(dtype=torch.float32).mul(row_scale.unsqueeze(-1))
     return weight + (quantized.to(device=weight.device, dtype=weight.dtype) - weight).detach()
 

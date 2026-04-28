@@ -21,6 +21,30 @@ Outputs:
 - artifacts/modelcard.json (format, sha256, etc.)
 - artifacts/delta.pt (compression delta if available)
 
+## Browser BitNet
+
+```bash
+python -m export.cli \
+  --model-dir ckpts/my_model \
+  --target browser-bitnet \
+  --quantize bitnet \
+  --quant-weight-opt none \
+  --outdir artifacts/browser-bitnet/
+```
+
+Outputs:
+
+- `manifest.json`
+- `layers/*.bin` packed ternary weights, scales, layout headers, offsets, and bias tensors
+- `runtime/bitnet_webgpu.js`
+- `runtime/bitnet_linear.wgsl`
+- `modelcard.json`
+
+This target is for Safari/WebGPU and other browser runtimes. It does not export
+a fake ONNX BitNet op. The v1 browser path requires `spin=False` and
+`quant_weight_opt=none`; AWQ/pre-scale and spin transforms need dedicated browser
+epilogues before they can be enabled.
+
 ## Programmatic
 
 ```python
