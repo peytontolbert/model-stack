@@ -68,6 +68,12 @@ def _model_config_dict(model_cfg: object | None) -> dict[str, Any] | None:
 
 
 def _layer_manifest(name: str, layer: QuantizedLinearBitNet, layer_dir: Path) -> dict[str, Any]:
+    act_quant_mode = str(getattr(layer, "act_quant_mode", "none"))
+    if act_quant_mode not in {"none", "static_int8"}:
+        raise ValueError(
+            f"layer {name} uses act_quant_mode={act_quant_mode!r}; "
+            "browser BitNet v1 supports only 'none' and 'static_int8'"
+        )
     spec = layer.runtime_packed_linear_spec(backend="bitnet", dtype=torch.float32, device="cpu")
     if spec is None or spec.get("format") != "bitnet_w2a8":
         raise ValueError(f"layer {name} does not expose Model Stack BitNet packed state")
@@ -79,13 +85,6 @@ def _layer_manifest(name: str, layer: QuantizedLinearBitNet, layer_dir: Path) ->
         raise ValueError(
             f"layer {name} uses AWQ/pre_scale; browser BitNet export requires quant_weight_opt='none' for v1"
         )
-    act_quant_mode = str(spec.get("act_quant_mode", "none"))
-    if act_quant_mode not in {"none", "static_int8"}:
-        raise ValueError(
-            f"layer {name} uses act_quant_mode={act_quant_mode!r}; "
-            "browser BitNet v1 supports only 'none' and 'static_int8'"
-        )
-
     layer_dir.mkdir(parents=True, exist_ok=True)
     safe_name = _safe_layer_name(name)
     tensors = {
