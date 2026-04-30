@@ -80,6 +80,15 @@ def _parse_ints(value: str) -> list[int]:
     return [int(item.strip()) for item in str(value).split(",") if item.strip()]
 
 
+def _normalize_activation_quant_mode_and_bits(mode: str, bits: int) -> tuple[str, int]:
+    mode_name = str(mode).strip().lower()
+    if mode_name in {"dynamic_int4", "dynamic_a4"}:
+        return "dynamic_int8", 4
+    if mode_name in {"static_int4", "static_a4"}:
+        return "static_int8", 4
+    return mode_name, int(bits)
+
+
 def _consume(value: torch.Tensor, sink: torch.Tensor | None) -> None:
     if sink is not None:
         sink.add_(value.reshape(-1)[0].float())
@@ -193,8 +202,14 @@ def _build_bitnet_linear(
     return linear, bitnet.to(device=device)
 
 
-def _prepare_backend_weight(bitnet: QuantizedLinearBitNet, *, activation_quant: str, device: torch.device) -> None:
-    mode = str(activation_quant).strip().lower()
+def _prepare_backend_weight(
+    bitnet: QuantizedLinearBitNet,
+    *,
+    activation_quant: str,
+    activation_quant_bits: int,
+    device: torch.device,
+) -> None:
+    mode, _bits = _normalize_activation_quant_mode_and_bits(activation_quant, activation_quant_bits)
     if mode in {"", "none", "off"}:
         bitnet._compute_backend_weight(device=device)
         bitnet._decode_backend_weight(device=device)
@@ -218,6 +233,11 @@ def _bench_one(
     repeats: int,
     consume_output: bool,
 ) -> dict[str, object]:
+    requested_activation_quant = str(activation_quant)
+    activation_quant, activation_quant_bits = _normalize_activation_quant_mode_and_bits(
+        activation_quant,
+        activation_quant_bits,
+    )
     x = torch.randn(rows, preset.model_dim, device=device, dtype=dtype)
     _linear_in, bitnet_in = _build_bitnet_linear(
         preset.model_dim,
@@ -243,8 +263,18 @@ def _bench_one(
     )
 
     with torch.inference_mode():
-        _prepare_backend_weight(bitnet_in, activation_quant=activation_quant, device=device)
-        _prepare_backend_weight(bitnet_out, activation_quant=activation_quant, device=device)
+        _prepare_backend_weight(
+            bitnet_in,
+            activation_quant=activation_quant,
+            activation_quant_bits=activation_quant_bits,
+            device=device,
+        )
+        _prepare_backend_weight(
+            bitnet_out,
+            activation_quant=activation_quant,
+            activation_quant_bits=activation_quant_bits,
+            device=device,
+        )
         dense_in_weight = bitnet_in.runtime_weight(dtype=dtype, device=device).contiguous()
         dense_in_bias = bitnet_in.runtime_bias(dtype=dtype, device=device)
         dense_out_weight = bitnet_out.runtime_weight(dtype=dtype, device=device).contiguous()
@@ -302,7 +332,9 @@ def _bench_one(
         "in_projection_features": int(preset.in_projection_features),
         "activation": preset.activation,
         "gated": bool(preset.gated),
-        "activation_quant": str(activation_quant),
+        "activation_quant": requested_activation_quant,
+        "canonical_activation_quant": str(activation_quant),
+        "activation_quant_bits": int(activation_quant_bits),
         "dense_bitnet_dequant_mlp_ms": dense_ms,
         "model_stack_mlp_module_ms": auto_ms,
         "model_stack_mlp_module_speedup_vs_dequant": dense_ms / auto_ms if auto_ms > 0.0 else math.inf,

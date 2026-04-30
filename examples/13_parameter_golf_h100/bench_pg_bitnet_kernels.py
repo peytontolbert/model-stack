@@ -90,6 +90,15 @@ def _parse_shapes(values: list[str]) -> list[LinearShape]:
     return shapes
 
 
+def _normalize_activation_quant_mode_and_bits(mode: str, bits: int) -> tuple[str, int]:
+    mode_name = str(mode).strip().lower()
+    if mode_name in {"dynamic_int4", "dynamic_a4"}:
+        return "dynamic_int8", 4
+    if mode_name in {"static_int4", "static_a4"}:
+        return "static_int8", 4
+    return mode_name, int(bits)
+
+
 def _consume(value: torch.Tensor, sink: torch.Tensor | None) -> None:
     if sink is None:
         return
@@ -226,6 +235,11 @@ def _bench_one(
     include_qat_forward: bool,
     include_int8_baselines: bool,
 ) -> dict[str, object]:
+    requested_activation_quant = str(activation_quant)
+    activation_quant, activation_quant_bits = _normalize_activation_quant_mode_and_bits(
+        activation_quant,
+        activation_quant_bits,
+    )
     x = torch.randn(rows, shape.in_features, device=device, dtype=dtype)
     linear, bitnet, qat = _build_layer(
         shape,
@@ -239,10 +253,11 @@ def _bench_one(
     )
 
     with torch.inference_mode():
-        if str(activation_quant).strip().lower() in {"", "none", "off"}:
+        mode_name = str(activation_quant).strip().lower()
+        if mode_name in {"", "none", "off"}:
             bitnet._compute_backend_weight(device=device)
             bitnet._decode_backend_weight(device=device)
-        elif str(activation_quant).strip().lower() in {"dynamic_int8", "static_int8"}:
+        elif mode_name in {"dynamic_int8", "static_int8"}:
             bitnet._int8_backend_weight(device=device)
         dequant_weight = bitnet.runtime_weight(dtype=dtype, device=device).contiguous()
         dequant_bias = bitnet.runtime_bias(dtype=dtype, device=device)
@@ -275,7 +290,6 @@ def _bench_one(
 
         int8_baseline_items: dict[str, tuple[Callable[[], torch.Tensor], torch.Tensor]] = {}
         int8_kernel_metric_items: dict[str, Callable[[], torch.Tensor]] = {}
-        mode_name = str(activation_quant).strip().lower()
         if include_int8_baselines and mode_name in {"dynamic_int8", "static_int8"}:
             qweight, inv_scale = bitnet._int8_backend_weight(device=device)
             int8_bias = bitnet.runtime_bias(dtype=dtype, device=device)
@@ -310,7 +324,11 @@ def _bench_one(
             # cost. The one-time quantization here is deliberately outside the timed path.
             qx_once, row_scale_once, out_dtype = bitnet.runtime_quantize_int8_input(x)
 
-            if module is not None and hasattr(module, "int8_quantize_activation_forward"):
+            if (
+                int(activation_quant_bits) == 8
+                and module is not None
+                and hasattr(module, "int8_quantize_activation_forward")
+            ):
                 def activation_int8_quantize() -> torch.Tensor:
                     qx, _row_scale = module.int8_quantize_activation_forward(x, act_scale)
                     return qx
@@ -339,9 +357,10 @@ def _bench_one(
 
             int8_baseline_items = {
                 "direct_bitnet_int8_from_float": (direct_bitnet_int8_from_float, direct_bitnet_int8_from_float()),
-                "native_int8_from_float": (native_int8_from_float, native_int8_from_float()),
                 "prequant_int8_matmul": (prequant_int8_matmul, prequant_int8_matmul()),
             }
+            if int(activation_quant_bits) == 8:
+                int8_baseline_items["native_int8_from_float"] = (native_int8_from_float, native_int8_from_float())
 
         timer_kwargs = {
             "warmup": warmup,
@@ -382,7 +401,9 @@ def _bench_one(
         "in_features": int(shape.in_features),
         "out_features": int(shape.out_features),
         "expected_plan": _expected_plan(rows, shape.in_features),
-        "activation_quant": str(activation_quant),
+        "activation_quant": requested_activation_quant,
+        "canonical_activation_quant": str(activation_quant),
+        "activation_quant_bits": int(activation_quant_bits),
         "dense_original_ms": dense_original_ms,
         "dense_bitnet_dequant_ms": dense_ref_ms,
         "model_stack_auto_ms": auto_ms,
