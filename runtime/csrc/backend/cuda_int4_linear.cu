@@ -420,6 +420,69 @@ __global__ void int4_linear_forward_sm90_imma_kernel(
   }
 }
 
+template <typename scalar_t, int TileOut>
+__global__ __launch_bounds__(kThreads, 2) void int4_linear_grad_input_tiled_kernel(
+    const scalar_t* __restrict__ grad_out,
+    const uint8_t* __restrict__ packed_weight,
+    const float* __restrict__ inv_scale,
+    scalar_t* __restrict__ grad_input,
+    int64_t rows,
+    int64_t out_features,
+    int64_t in_features,
+    int64_t packed_cols) {
+  __shared__ scalar_t grad_tile[kThreadRows][TileOut];
+  __shared__ float scaled_w_tile[kThreadCols][TileOut];
+
+  const int local_col = static_cast<int>(threadIdx.x);
+  const int local_row = static_cast<int>(threadIdx.y);
+  const int thread_linear = local_row * kThreadCols + local_col;
+  const int64_t row = static_cast<int64_t>(blockIdx.y) * kThreadRows + local_row;
+  const int64_t in_col = static_cast<int64_t>(blockIdx.x) * kThreadCols + local_col;
+
+  float acc = 0.0f;
+  for (int64_t out0 = 0; out0 < out_features; out0 += TileOut) {
+    for (int index = thread_linear; index < kThreadRows * TileOut; index += kThreads) {
+      const int tile_row = index / TileOut;
+      const int tile_out = index % TileOut;
+      const int64_t global_row = static_cast<int64_t>(blockIdx.y) * kThreadRows + tile_row;
+      const int64_t global_out = out0 + tile_out;
+      grad_tile[tile_row][tile_out] =
+          (global_row < rows && global_out < out_features)
+              ? grad_out[global_row * out_features + global_out]
+              : static_cast<scalar_t>(0);
+    }
+    for (int index = thread_linear; index < kThreadCols * TileOut; index += kThreads) {
+      const int tile_in = index / TileOut;
+      const int tile_out = index % TileOut;
+      const int64_t global_in = static_cast<int64_t>(blockIdx.x) * kThreadCols + tile_in;
+      const int64_t global_out = out0 + tile_out;
+      float value = 0.0f;
+      if (global_in < in_features && global_out < out_features) {
+        const uint8_t packed = packed_weight[global_out * packed_cols + (global_in >> 1)];
+        const int q = static_cast<int>(DecodePackedInt4(packed, global_in));
+        value = static_cast<float>(q) * inv_scale[global_out];
+      }
+      scaled_w_tile[tile_in][tile_out] = value;
+    }
+    __syncthreads();
+
+    if (row < rows && in_col < in_features) {
+      #pragma unroll
+      for (int tile_out = 0; tile_out < TileOut; ++tile_out) {
+        if (out0 + tile_out >= out_features) {
+          break;
+        }
+        acc += static_cast<float>(grad_tile[local_row][tile_out]) * scaled_w_tile[local_col][tile_out];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (row < rows && in_col < in_features) {
+    grad_input[row * in_features + in_col] = static_cast<scalar_t>(acc);
+  }
+}
+
 inline bool UseTiledInt4Kernel(int64_t rows, int64_t out_features, int64_t in_features) {
   return rows > 0 && out_features > 0 && in_features >= 32 && (rows * out_features) >= 256;
 }
@@ -570,4 +633,67 @@ torch::Tensor CudaInt4LinearForward(
   std::vector<int64_t> out_sizes(x_contig.sizes().begin(), x_contig.sizes().end());
   out_sizes.back() = out_features;
   return out_2d.view(out_sizes);
+}
+
+torch::Tensor CudaInt4LinearGradInputForward(
+    const torch::Tensor& grad_out,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& inv_scale,
+    int64_t in_features) {
+  TORCH_CHECK(grad_out.is_cuda(), "CudaInt4LinearGradInputForward: grad_out must be a CUDA tensor");
+  TORCH_CHECK(packed_weight.is_cuda(), "CudaInt4LinearGradInputForward: packed_weight must be a CUDA tensor");
+  TORCH_CHECK(inv_scale.is_cuda(), "CudaInt4LinearGradInputForward: inv_scale must be a CUDA tensor");
+  TORCH_CHECK(IsSupportedInt4LinearDtype(grad_out.scalar_type()), "CudaInt4LinearGradInputForward: unsupported grad_out dtype");
+  TORCH_CHECK(packed_weight.scalar_type() == torch::kUInt8, "CudaInt4LinearGradInputForward: packed_weight must be uint8");
+  TORCH_CHECK(inv_scale.scalar_type() == torch::kFloat32, "CudaInt4LinearGradInputForward: inv_scale must be float32");
+  TORCH_CHECK(grad_out.dim() >= 2, "CudaInt4LinearGradInputForward: grad_out must have rank >= 2");
+  TORCH_CHECK(packed_weight.dim() == 2, "CudaInt4LinearGradInputForward: packed_weight must be rank-2");
+  TORCH_CHECK(inv_scale.dim() == 1, "CudaInt4LinearGradInputForward: inv_scale must be rank-1");
+  TORCH_CHECK(in_features > 0, "CudaInt4LinearGradInputForward: in_features must be positive");
+
+  c10::cuda::CUDAGuard device_guard{grad_out.device()};
+  auto grad_contig = grad_out.contiguous();
+  auto packed_contig = packed_weight.contiguous();
+  auto scale_contig = inv_scale.contiguous();
+  const auto out_features = grad_contig.size(-1);
+  const auto rows = grad_contig.numel() / out_features;
+  const auto packed_cols = packed_contig.size(1);
+  TORCH_CHECK(packed_contig.size(0) == out_features, "CudaInt4LinearGradInputForward: output feature mismatch");
+  TORCH_CHECK(scale_contig.size(0) == out_features, "CudaInt4LinearGradInputForward: inv_scale size mismatch");
+  TORCH_CHECK(packed_cols == (in_features + 1) / 2, "CudaInt4LinearGradInputForward: packed weight column count mismatch");
+
+  auto grad_input_2d = torch::empty({rows, in_features}, grad_contig.options());
+  if (rows == 0 || out_features == 0) {
+    std::vector<int64_t> out_sizes(grad_contig.sizes().begin(), grad_contig.sizes().end());
+    out_sizes.back() = in_features;
+    return grad_input_2d.view(out_sizes);
+  }
+
+  constexpr int kGradInputTileOut = 64;
+  const dim3 threads(kThreadCols, kThreadRows);
+  const dim3 blocks(
+      static_cast<unsigned int>((in_features + kThreadCols - 1) / kThreadCols),
+      static_cast<unsigned int>((rows + kThreadRows - 1) / kThreadRows));
+  auto stream = c10::cuda::getCurrentCUDAStream(grad_out.get_device());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      grad_contig.scalar_type(),
+      "model_stack_cuda_int4_linear_grad_input",
+      [&] {
+        int4_linear_grad_input_tiled_kernel<scalar_t, kGradInputTileOut><<<blocks, threads, 0, stream.stream()>>>(
+            grad_contig.data_ptr<scalar_t>(),
+            packed_contig.data_ptr<uint8_t>(),
+            scale_contig.data_ptr<float>(),
+            grad_input_2d.data_ptr<scalar_t>(),
+            rows,
+            out_features,
+            in_features,
+            packed_cols);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  std::vector<int64_t> out_sizes(grad_contig.sizes().begin(), grad_contig.sizes().end());
+  out_sizes.back() = in_features;
+  return grad_input_2d.view(out_sizes);
 }

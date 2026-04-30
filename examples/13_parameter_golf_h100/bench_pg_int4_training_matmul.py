@@ -106,6 +106,7 @@ def main() -> None:
         if x.grad is not None:
             x.grad = None
         old = os.environ.get("MODEL_STACK_INT4_NATIVE_FORWARD_UNDER_GRAD")
+        old_packed_grad = os.environ.pop("MODEL_STACK_INT4_PACKED_GRAD_INPUT", None)
         os.environ["MODEL_STACK_INT4_NATIVE_FORWARD_UNDER_GRAD"] = "1"
         try:
             out = int4(x)
@@ -116,11 +117,35 @@ def main() -> None:
                 os.environ.pop("MODEL_STACK_INT4_NATIVE_FORWARD_UNDER_GRAD", None)
             else:
                 os.environ["MODEL_STACK_INT4_NATIVE_FORWARD_UNDER_GRAD"] = old
+            if old_packed_grad is not None:
+                os.environ["MODEL_STACK_INT4_PACKED_GRAD_INPUT"] = old_packed_grad
+
+    def int4_native_forward_packed_grad_input_step() -> torch.Tensor:
+        if x.grad is not None:
+            x.grad = None
+        old = os.environ.get("MODEL_STACK_INT4_NATIVE_FORWARD_UNDER_GRAD")
+        old_packed_grad = os.environ.get("MODEL_STACK_INT4_PACKED_GRAD_INPUT")
+        os.environ["MODEL_STACK_INT4_NATIVE_FORWARD_UNDER_GRAD"] = "1"
+        os.environ["MODEL_STACK_INT4_PACKED_GRAD_INPUT"] = "1"
+        try:
+            out = int4(x)
+            out.backward(grad)
+            return out
+        finally:
+            if old is None:
+                os.environ.pop("MODEL_STACK_INT4_NATIVE_FORWARD_UNDER_GRAD", None)
+            else:
+                os.environ["MODEL_STACK_INT4_NATIVE_FORWARD_UNDER_GRAD"] = old
+            if old_packed_grad is None:
+                os.environ.pop("MODEL_STACK_INT4_PACKED_GRAD_INPUT", None)
+            else:
+                os.environ["MODEL_STACK_INT4_PACKED_GRAD_INPUT"] = old_packed_grad
 
     rows = [
         _bench_variant("dense_train", dense_step, device=device, warmup=int(args.warmup), iters=int(args.iters)),
         _bench_variant("int4_default_train", int4_default_step, device=device, warmup=int(args.warmup), iters=int(args.iters)),
         _bench_variant("int4_native_forward_dense_backward_train", int4_native_forward_step, device=device, warmup=int(args.warmup), iters=int(args.iters)),
+        _bench_variant("int4_native_forward_packed_grad_input_train", int4_native_forward_packed_grad_input_step, device=device, warmup=int(args.warmup), iters=int(args.iters)),
     ]
     baseline = float(rows[0]["ms"])
     for row in rows:
