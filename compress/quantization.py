@@ -84,6 +84,11 @@ def _parameter_signature(tensor: torch.Tensor | None):
 
 
 def _spin_enabled(spin_enabled_flag: torch.Tensor) -> bool:
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = getattr(compiler, "is_compiling", None)
+    if callable(is_compiling) and is_compiling():
+        value = os.getenv("MODEL_STACK_TRAINABLE_BITNET_SPIN", "").strip().lower()
+        return value in {"1", "true", "yes", "on", "hadamard", "hbitlinear", "h-bitlinear"}
     return bool(int(spin_enabled_flag.item()) != 0)
 
 
