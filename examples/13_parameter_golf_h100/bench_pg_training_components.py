@@ -463,23 +463,26 @@ def main() -> None:
                 iters=args.iters,
                 repeats=args.repeats,
             )
-            int8 = _bench_component(
-                name,
-                module,
-                state_dict=state,
-                args_tuple=inputs,
-                grad_out=grad_out,
-                mode="dynamic_int8_ste",
-                dtype=dtype,
-                device=device,
-                compile_module=args.compile_module,
-                warmup=args.warmup,
-                iters=args.iters,
-                repeats=args.repeats,
-            )
-            int8["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / int8["forward_ms"]
-            int8["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / int8["train_step_ms"]
-            result = {"component": name, "variants": [dense, int8]}
+            variants = [dense]
+            for mode in pg_bench.BITNET_STE_MODES:
+                bitnet = _bench_component(
+                    name,
+                    module,
+                    state_dict=state,
+                    args_tuple=inputs,
+                    grad_out=grad_out,
+                    mode=mode,
+                    dtype=dtype,
+                    device=device,
+                    compile_module=args.compile_module,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    repeats=args.repeats,
+                )
+                bitnet["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / bitnet["forward_ms"]
+                bitnet["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / bitnet["train_step_ms"]
+                variants.append(bitnet)
+            result = {"component": name, "variants": variants}
             print(json.dumps(result) if args.jsonl else result)
 
     optimizer_result = {

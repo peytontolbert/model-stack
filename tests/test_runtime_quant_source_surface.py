@@ -221,11 +221,14 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "--include-relu2-mlp-pair" in training_bench_source
     assert "--include-pg-block" in training_bench_source
     assert "--block-fused-qkv" in training_bench_source
+    assert 'BITNET_STE_MODES = ("dynamic_int8_ste", "dynamic_int4_ste")' in training_bench_source
     assert "\"MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED\": os.environ.get(" in training_bench_source
     assert "MODEL_STACK_ATTENTION_REPEAT_KV" in training_bench_source
     assert "def _maybe_repeat_kv_heads(" in training_bench_source
     assert "relu2_mlp_pair_1024_3072_1024" in training_bench_source
     assert "MODEL_STACK_BITNET_QAT=\"${MODEL_STACK_BITNET_QAT:-1}\"" in pg_run_source
+    assert "MODEL_STACK_BITNET_ACT_QUANT=\"${MODEL_STACK_BITNET_ACT_QUANT:-${MODEL_STACK_BITNET_ACTIVATION_QUANT:-none}}\"" in pg_run_source
+    assert "MODEL_STACK_BITNET_ACT_BITS=\"${MODEL_STACK_BITNET_ACT_BITS:-${MODEL_STACK_BITNET_ACTIVATION_BITS:-8}}\"" in pg_run_source
     assert "MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE=\"${MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE:-pg_h100_mlp}\"" in pg_run_source
     assert (
         "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT="

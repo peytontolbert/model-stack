@@ -32,6 +32,9 @@ class LinearShape:
     out_features: int
 
 
+BITNET_STE_MODES = ("dynamic_int8_ste", "dynamic_int4_ste")
+
+
 PRESETS: dict[str, list[LinearShape]] = {
     "runtime_row_1024x7_relu2_mlp3": [
         LinearShape("attn_qkv_fused", 1024, 1536),
@@ -284,33 +287,34 @@ def _bench_shape(
     )
     variants = [dense]
     if device.type == "cuda":
-        int8, int8_tensors = _bench_variant(
-            shape,
-            mode="dynamic_int8_ste",
-            state_dict=state_dict,
-            x=x,
-            grad_out=grad_out,
-            rows=rows,
-            dtype=dtype,
-            device=device,
-            bias=bias,
-            input_grad=input_grad,
-            compile_module=compile_module,
-            warmup=warmup,
-            iters=iters,
-            repeats=repeats,
-        )
-        int8["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / int8["forward_ms"]
-        int8["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / int8["train_step_ms"]
-        int8["out_max_abs_err_vs_dense_ste"] = float((int8_tensors["out"] - dense_tensors["out"]).abs().max().item())
-        int8["grad_weight_max_abs_err_vs_dense_ste"] = float(
-            (int8_tensors["grad_weight"] - dense_tensors["grad_weight"]).abs().max().item()
-        )
-        if "grad_input" in dense_tensors and "grad_input" in int8_tensors:
-            int8["grad_input_max_abs_err_vs_dense_ste"] = float(
-                (int8_tensors["grad_input"] - dense_tensors["grad_input"]).abs().max().item()
+        for mode in BITNET_STE_MODES:
+            bitnet, bitnet_tensors = _bench_variant(
+                shape,
+                mode=mode,
+                state_dict=state_dict,
+                x=x,
+                grad_out=grad_out,
+                rows=rows,
+                dtype=dtype,
+                device=device,
+                bias=bias,
+                input_grad=input_grad,
+                compile_module=compile_module,
+                warmup=warmup,
+                iters=iters,
+                repeats=repeats,
             )
-        variants.append(int8)
+            bitnet["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / bitnet["forward_ms"]
+            bitnet["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / bitnet["train_step_ms"]
+            bitnet["out_max_abs_err_vs_dense_ste"] = float((bitnet_tensors["out"] - dense_tensors["out"]).abs().max().item())
+            bitnet["grad_weight_max_abs_err_vs_dense_ste"] = float(
+                (bitnet_tensors["grad_weight"] - dense_tensors["grad_weight"]).abs().max().item()
+            )
+            if "grad_input" in dense_tensors and "grad_input" in bitnet_tensors:
+                bitnet["grad_input_max_abs_err_vs_dense_ste"] = float(
+                    (bitnet_tensors["grad_input"] - dense_tensors["grad_input"]).abs().max().item()
+                )
+            variants.append(bitnet)
 
     return {
         "shape": shape.name,
@@ -441,35 +445,36 @@ def _bench_relu2_mlp_pair(
     )
     variants = [dense]
     if device.type == "cuda":
-        int8, int8_tensors = _bench_relu2_mlp_pair_variant(
-            mode="dynamic_int8_ste",
-            state_dict=state_dict,
-            x=x,
-            grad_out=grad_out,
-            rows=rows,
-            dtype=dtype,
-            device=device,
-            bias=bias,
-            input_grad=input_grad,
-            compile_module=compile_module,
-            warmup=warmup,
-            iters=iters,
-            repeats=repeats,
-        )
-        int8["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / int8["forward_ms"]
-        int8["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / int8["train_step_ms"]
-        int8["out_max_abs_err_vs_dense_ste"] = float((int8_tensors["out"] - dense_tensors["out"]).abs().max().item())
-        int8["up_grad_weight_max_abs_err_vs_dense_ste"] = float(
-            (int8_tensors["up_grad_weight"] - dense_tensors["up_grad_weight"]).abs().max().item()
-        )
-        int8["down_grad_weight_max_abs_err_vs_dense_ste"] = float(
-            (int8_tensors["down_grad_weight"] - dense_tensors["down_grad_weight"]).abs().max().item()
-        )
-        if "grad_input" in dense_tensors and "grad_input" in int8_tensors:
-            int8["grad_input_max_abs_err_vs_dense_ste"] = float(
-                (int8_tensors["grad_input"] - dense_tensors["grad_input"]).abs().max().item()
+        for mode in BITNET_STE_MODES:
+            bitnet, bitnet_tensors = _bench_relu2_mlp_pair_variant(
+                mode=mode,
+                state_dict=state_dict,
+                x=x,
+                grad_out=grad_out,
+                rows=rows,
+                dtype=dtype,
+                device=device,
+                bias=bias,
+                input_grad=input_grad,
+                compile_module=compile_module,
+                warmup=warmup,
+                iters=iters,
+                repeats=repeats,
             )
-        variants.append(int8)
+            bitnet["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / bitnet["forward_ms"]
+            bitnet["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / bitnet["train_step_ms"]
+            bitnet["out_max_abs_err_vs_dense_ste"] = float((bitnet_tensors["out"] - dense_tensors["out"]).abs().max().item())
+            bitnet["up_grad_weight_max_abs_err_vs_dense_ste"] = float(
+                (bitnet_tensors["up_grad_weight"] - dense_tensors["up_grad_weight"]).abs().max().item()
+            )
+            bitnet["down_grad_weight_max_abs_err_vs_dense_ste"] = float(
+                (bitnet_tensors["down_grad_weight"] - dense_tensors["down_grad_weight"]).abs().max().item()
+            )
+            if "grad_input" in dense_tensors and "grad_input" in bitnet_tensors:
+                bitnet["grad_input_max_abs_err_vs_dense_ste"] = float(
+                    (bitnet_tensors["grad_input"] - dense_tensors["grad_input"]).abs().max().item()
+                )
+            variants.append(bitnet)
 
     return {
         "shape": "relu2_mlp_pair_1024_3072_1024",
@@ -766,7 +771,9 @@ def _trainable_bitnet_dynamic_mode_enabled() -> bool:
     return os.getenv("MODEL_STACK_TRAINABLE_BITNET_TRAINING_FORWARD", "dense_ste").strip().lower() in {
         "int8_ste",
         "dynamic_int8_ste",
+        "dynamic_int4_ste",
         "w2a8_ste",
+        "w2a4_ste",
     }
 
 
@@ -1006,46 +1013,47 @@ def _bench_pg_block(
     )
     variants = [dense]
     if device.type == "cuda":
-        int8, int8_tensors = _bench_pg_block_variant(
-            mode="dynamic_int8_ste",
-            state_dict=state_dict,
-            x=x,
-            x0=x0,
-            grad_out=grad_out,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            dim=dim,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            mlp_mult=mlp_mult,
-            rope_base=rope_base,
-            qk_gain_init=qk_gain_init,
-            dtype=dtype,
-            device=device,
-            bias=bias,
-            fused_qkv=fused_qkv,
-            input_grad=input_grad,
-            compile_module=compile_module,
-            warmup=warmup,
-            iters=iters,
-            repeats=repeats,
-        )
-        int8["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / int8["forward_ms"]
-        int8["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / int8["train_step_ms"]
-        int8["out_max_abs_err_vs_dense_ste"] = float((int8_tensors["out"] - dense_tensors["out"]).abs().max().item())
-        int8["param_grad_max_abs_err_vs_dense_ste"] = _max_abs_err_by_key(
-            int8_tensors["param_grads"],
-            dense_tensors["param_grads"],
-        )
-        if "grad_input" in dense_tensors and "grad_input" in int8_tensors:
-            int8["grad_input_max_abs_err_vs_dense_ste"] = float(
-                (int8_tensors["grad_input"] - dense_tensors["grad_input"]).abs().max().item()
+        for mode in BITNET_STE_MODES:
+            bitnet, bitnet_tensors = _bench_pg_block_variant(
+                mode=mode,
+                state_dict=state_dict,
+                x=x,
+                x0=x0,
+                grad_out=grad_out,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                dim=dim,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                mlp_mult=mlp_mult,
+                rope_base=rope_base,
+                qk_gain_init=qk_gain_init,
+                dtype=dtype,
+                device=device,
+                bias=bias,
+                fused_qkv=fused_qkv,
+                input_grad=input_grad,
+                compile_module=compile_module,
+                warmup=warmup,
+                iters=iters,
+                repeats=repeats,
             )
-        if "grad_x0" in dense_tensors and "grad_x0" in int8_tensors:
-            int8["grad_x0_max_abs_err_vs_dense_ste"] = float(
-                (int8_tensors["grad_x0"] - dense_tensors["grad_x0"]).abs().max().item()
+            bitnet["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / bitnet["forward_ms"]
+            bitnet["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / bitnet["train_step_ms"]
+            bitnet["out_max_abs_err_vs_dense_ste"] = float((bitnet_tensors["out"] - dense_tensors["out"]).abs().max().item())
+            bitnet["param_grad_max_abs_err_vs_dense_ste"] = _max_abs_err_by_key(
+                bitnet_tensors["param_grads"],
+                dense_tensors["param_grads"],
             )
-        variants.append(int8)
+            if "grad_input" in dense_tensors and "grad_input" in bitnet_tensors:
+                bitnet["grad_input_max_abs_err_vs_dense_ste"] = float(
+                    (bitnet_tensors["grad_input"] - dense_tensors["grad_input"]).abs().max().item()
+                )
+            if "grad_x0" in dense_tensors and "grad_x0" in bitnet_tensors:
+                bitnet["grad_x0_max_abs_err_vs_dense_ste"] = float(
+                    (bitnet_tensors["grad_x0"] - dense_tensors["grad_x0"]).abs().max().item()
+                )
+            variants.append(bitnet)
 
     return {
         "shape": f"pg_block_d{dim}_h{num_heads}_kv{num_kv_heads}_mlp{mlp_mult}",
