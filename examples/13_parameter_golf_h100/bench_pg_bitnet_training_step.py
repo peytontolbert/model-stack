@@ -216,7 +216,7 @@ def _bitnet_optimized_training_env(mode: str, *, compile_module: bool) -> dict[s
                 ),
                 "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT": os.environ.get(
                     "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT",
-                    "none",
+                    "dynamic_int8_transpose",
                 ),
             }
         )
