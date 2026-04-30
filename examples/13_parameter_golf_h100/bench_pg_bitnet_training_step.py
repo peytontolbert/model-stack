@@ -112,40 +112,60 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _consume_benchmark_output(value: object) -> None:
+    if torch.is_tensor(value):
+        value.detach().float().sum().item()
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            _consume_benchmark_output(item)
+
+
 def _time_once(
-    fn: Callable[[], None],
+    fn: Callable[[], object],
     *,
     warmup: int,
     iters: int,
     device: torch.device,
+    consume_output: bool,
 ) -> float:
     for _ in range(warmup):
-        fn()
+        value = fn()
+        if consume_output:
+            _consume_benchmark_output(value)
     _sync(device)
     if device.type == "cuda":
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            fn()
-        end.record()
+        with torch.cuda.device(device):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                value = fn()
+                if consume_output:
+                    _consume_benchmark_output(value)
+            end.record()
         _sync(device)
         return float(start.elapsed_time(end) / max(iters, 1))
     t0 = time.perf_counter()
     for _ in range(iters):
-        fn()
+        value = fn()
+        if consume_output:
+            _consume_benchmark_output(value)
     return float((time.perf_counter() - t0) * 1000.0 / max(iters, 1))
 
 
 def _time_median(
-    fn: Callable[[], None],
+    fn: Callable[[], object],
     *,
     warmup: int,
     iters: int,
     repeats: int,
     device: torch.device,
+    consume_output: bool = False,
 ) -> float:
-    values = [_time_once(fn, warmup=warmup, iters=iters, device=device) for _ in range(max(1, repeats))]
+    values = [
+        _time_once(fn, warmup=warmup, iters=iters, device=device, consume_output=consume_output)
+        for _ in range(max(1, repeats))
+    ]
     return float(statistics.median(values))
 
 
@@ -246,6 +266,7 @@ def _bench_variant(
     warmup: int,
     iters: int,
     repeats: int,
+    consume_output: bool,
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
     layer = _make_layer(shape, dtype=dtype, device=device, bias=bias)
     layer.load_state_dict(state_dict, strict=True)
@@ -262,13 +283,13 @@ def _bench_variant(
             out = runner(x)
         out.backward(grad_out)
 
-    def forward_only() -> None:
+    def forward_only() -> torch.Tensor:
         with torch.no_grad(), _temporary_env(env):
-            runner(x.detach())
+            return runner(x.detach())
 
-    def weight_quantize_only() -> None:
+    def weight_quantize_only() -> tuple[torch.Tensor, torch.Tensor]:
         with torch.no_grad():
-            bitnet_runtime_row_quantize(layer.weight.detach(), eps=float(layer.eps))
+            return bitnet_runtime_row_quantize(layer.weight.detach(), eps=float(layer.eps))
 
     weight_quantize_ms = _time_median(
         weight_quantize_only,
@@ -276,8 +297,16 @@ def _bench_variant(
         iters=iters,
         repeats=repeats,
         device=device,
+        consume_output=consume_output,
     )
-    forward_ms = _time_median(forward_only, warmup=warmup, iters=iters, repeats=repeats, device=device)
+    forward_ms = _time_median(
+        forward_only,
+        warmup=warmup,
+        iters=iters,
+        repeats=repeats,
+        device=device,
+        consume_output=consume_output,
+    )
     train_step_ms = _time_median(train_step, warmup=warmup, iters=iters, repeats=repeats, device=device)
 
     _clear_grads(layer, x)
@@ -319,6 +348,7 @@ def _bench_shape(
     warmup: int,
     iters: int,
     repeats: int,
+    consume_output: bool,
 ) -> dict[str, object]:
     reference_layer = _make_layer(shape, dtype=dtype, device=device, bias=bias)
     state_dict = _clone_state_dict(reference_layer)
@@ -339,6 +369,7 @@ def _bench_shape(
         warmup=warmup,
         iters=iters,
         repeats=repeats,
+        consume_output=consume_output,
     )
     variants = [dense]
     if device.type == "cuda":
@@ -358,6 +389,7 @@ def _bench_shape(
                 warmup=warmup,
                 iters=iters,
                 repeats=repeats,
+                consume_output=consume_output,
             )
             bitnet["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / bitnet["forward_ms"]
             bitnet["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / bitnet["train_step_ms"]
@@ -380,6 +412,7 @@ def _bench_shape(
         "device": str(device),
         "input_grad": bool(input_grad),
         "compile_module": bool(compile_module),
+        "consume_output": bool(consume_output),
         "variants": variants,
     }
 
@@ -411,6 +444,7 @@ def _bench_relu2_mlp_pair_variant(
     warmup: int,
     iters: int,
     repeats: int,
+    consume_output: bool,
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
     mlp = _Relu2MlpPair(dtype=dtype, device=device, bias=bias)
     mlp.load_state_dict(state_dict, strict=True)
@@ -429,11 +463,18 @@ def _bench_relu2_mlp_pair_variant(
             out = runner(x)
         out.backward(grad_out)
 
-    def forward_only() -> None:
+    def forward_only() -> torch.Tensor:
         with torch.no_grad(), _temporary_env(env):
-            runner(x.detach())
+            return runner(x.detach())
 
-    forward_ms = _time_median(forward_only, warmup=warmup, iters=iters, repeats=repeats, device=device)
+    forward_ms = _time_median(
+        forward_only,
+        warmup=warmup,
+        iters=iters,
+        repeats=repeats,
+        device=device,
+        consume_output=consume_output,
+    )
     train_step_ms = _time_median(train_step, warmup=warmup, iters=iters, repeats=repeats, device=device)
 
     mlp.zero_grad(set_to_none=True)
@@ -484,6 +525,7 @@ def _bench_relu2_mlp_pair(
     warmup: int,
     iters: int,
     repeats: int,
+    consume_output: bool,
 ) -> dict[str, object]:
     reference_mlp = _Relu2MlpPair(dtype=dtype, device=device, bias=bias)
     state_dict = _clone_state_dict(reference_mlp)
@@ -503,6 +545,7 @@ def _bench_relu2_mlp_pair(
         warmup=warmup,
         iters=iters,
         repeats=repeats,
+        consume_output=consume_output,
     )
     variants = [dense]
     if device.type == "cuda":
@@ -521,6 +564,7 @@ def _bench_relu2_mlp_pair(
                 warmup=warmup,
                 iters=iters,
                 repeats=repeats,
+                consume_output=consume_output,
             )
             bitnet["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / bitnet["forward_ms"]
             bitnet["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / bitnet["train_step_ms"]
@@ -547,6 +591,7 @@ def _bench_relu2_mlp_pair(
         "device": str(device),
         "input_grad": bool(input_grad),
         "compile_module": bool(compile_module),
+        "consume_output": bool(consume_output),
         "variants": variants,
     }
 
@@ -948,6 +993,7 @@ def _bench_pg_block_variant(
     warmup: int,
     iters: int,
     repeats: int,
+    consume_output: bool,
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
     rows = int(batch_size) * int(seq_len)
     block = _make_pg_block(
@@ -976,11 +1022,18 @@ def _bench_pg_block_variant(
             out = runner(x, x0)
         out.backward(grad_out)
 
-    def forward_only() -> None:
+    def forward_only() -> torch.Tensor:
         with torch.no_grad(), _temporary_env(env), _autocast_context(device, dtype):
-            runner(x.detach(), x0.detach())
+            return runner(x.detach(), x0.detach())
 
-    forward_ms = _time_median(forward_only, warmup=warmup, iters=iters, repeats=repeats, device=device)
+    forward_ms = _time_median(
+        forward_only,
+        warmup=warmup,
+        iters=iters,
+        repeats=repeats,
+        device=device,
+        consume_output=consume_output,
+    )
     train_step_ms = _time_median(train_step, warmup=warmup, iters=iters, repeats=repeats, device=device)
 
     _clear_module_and_input_grads(block, x, x0)
@@ -1044,6 +1097,7 @@ def _bench_pg_block(
     warmup: int,
     iters: int,
     repeats: int,
+    consume_output: bool,
 ) -> dict[str, object]:
     reference_block = _make_pg_block(
         dim=dim,
@@ -1084,6 +1138,7 @@ def _bench_pg_block(
         warmup=warmup,
         iters=iters,
         repeats=repeats,
+        consume_output=consume_output,
     )
     variants = [dense]
     if device.type == "cuda":
@@ -1111,6 +1166,7 @@ def _bench_pg_block(
                 warmup=warmup,
                 iters=iters,
                 repeats=repeats,
+                consume_output=consume_output,
             )
             bitnet["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / bitnet["forward_ms"]
             bitnet["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / bitnet["train_step_ms"]
@@ -1143,6 +1199,7 @@ def _bench_pg_block(
         "input_grad": bool(input_grad),
         "compile_module": bool(compile_module),
         "fused_qkv": bool(fused_qkv),
+        "consume_output": bool(consume_output),
         "variants": variants,
     }
 
@@ -1172,6 +1229,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--consume-output", action="store_true", help="Synchronously consume forward/quantize outputs while timing.")
     parser.add_argument("--jsonl", action="store_true")
     args = parser.parse_args()
 
@@ -1217,6 +1275,7 @@ def main() -> None:
             warmup=args.warmup,
             iters=args.iters,
             repeats=args.repeats,
+            consume_output=bool(args.consume_output),
         )
         if args.jsonl:
             print(json.dumps(result, sort_keys=True))
@@ -1241,6 +1300,7 @@ def main() -> None:
             warmup=args.warmup,
             iters=args.iters,
             repeats=args.repeats,
+            consume_output=bool(args.consume_output),
         )
         if args.jsonl:
             print(json.dumps(result, sort_keys=True))
@@ -1257,6 +1317,7 @@ def main() -> None:
             warmup=args.warmup,
             iters=args.iters,
             repeats=args.repeats,
+            consume_output=bool(args.consume_output),
         )
         if args.jsonl:
             print(json.dumps(result, sort_keys=True))
