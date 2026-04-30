@@ -42,6 +42,7 @@ _EXPORTS = {
     "prepare_window_pattern_attention_mask": "runtime.blocks",
     "stack_native_execution_info": "runtime.blocks",
     "ContiguousKVCache": "runtime.kv_cache",
+    "Int3ContiguousKVCache": "runtime.kv_cache",
     "PagedKVCache": "runtime.kv_cache",
     "init_kv_cache": "runtime.kv_cache",
     "clone_kv_cache_rows": "runtime.kv_cache",

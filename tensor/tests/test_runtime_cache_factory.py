@@ -81,6 +81,49 @@ def test_resolve_kv_cache_backend_prefers_native_paged(monkeypatch):
     assert cache_mod.resolve_kv_cache_backend() == "native-paged"
 
 
+def test_resolve_kv_cache_backend_accepts_int3_aliases(monkeypatch):
+    monkeypatch.delenv("MODEL_STACK_KV_BACKEND", raising=False)
+    assert cache_mod.resolve_kv_cache_backend("int3") == "int3-contiguous"
+    assert cache_mod.resolve_kv_cache_backend("quantized_int3") == "int3-contiguous"
+
+
+def test_int3_kv_pack_roundtrip_bounds_error():
+    x = torch.randn(2, 3, 5)
+    packed, scale, dim = runtime_kv_cache_mod.quantize_pack_int3_lastdim(x)
+    y = runtime_kv_cache_mod.unpack_dequantize_int3_lastdim(packed, scale, dim, dtype=x.dtype)
+    assert packed.dtype is torch.uint8
+    assert y.shape == x.shape
+    assert torch.all((y - x).abs() <= scale.unsqueeze(-1) * 0.51 + 1e-6)
+
+
+def test_int3_contiguous_kv_cache_append_read_and_evict():
+    cache = cache_mod.create_kv_cache(
+        cache_mod.KVCacheSpec(
+            batch=2,
+            n_layers=1,
+            n_kv_heads=2,
+            head_dim=5,
+            pagesize=4,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            backend="int3",
+        )
+    )
+    assert isinstance(cache, runtime_kv_cache_mod.Int3ContiguousKVCache)
+    k = torch.randn(2, 2, 3, 5)
+    v = torch.randn(2, 2, 3, 5)
+    cache.append_batch(0, k, v)
+    out_k, out_v = cache.read_batch(0, 0, 3)
+    assert out_k.shape == k.shape
+    assert out_v.shape == v.shape
+    assert torch.equal(cache.layer_lengths(0), torch.tensor([3, 3]))
+    cache.evict(2)
+    assert torch.equal(cache.layer_lengths(0), torch.tensor([2, 2]))
+    tail_k, tail_v = cache.read_batch(0, 0, 2)
+    assert tail_k.shape == (2, 2, 2, 5)
+    assert tail_v.shape == (2, 2, 2, 5)
+
+
 def test_create_kv_cache_wraps_native_cache_state(monkeypatch):
     fake_native_state = object()
     monkeypatch.setattr(cache_mod, "resolve_kv_cache_backend", lambda requested=None: "native-paged")

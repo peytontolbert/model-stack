@@ -15,6 +15,64 @@ from runtime.ops import paged_kv_read_last as runtime_paged_kv_read_last
 from runtime.ops import paged_kv_read_range as runtime_paged_kv_read_range
 
 
+_INT3_PACK_SHIFTS = torch.tensor([0, 3, 6, 9, 12, 15, 18, 21], dtype=torch.int32)
+
+
+def _int3_shifts(device: torch.device) -> torch.Tensor:
+    return _INT3_PACK_SHIFTS.to(device=device)
+
+
+def quantize_pack_int3_lastdim(x: torch.Tensor, *, eps: float = 1e-8) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Pack signed int3 values for the last dimension using per-vector scales.
+
+    Values are quantized to [-3, 3], stored as unsigned codes [0, 6], and packed
+    eight codes into three bytes. The returned scale has shape x.shape[:-1].
+    """
+    if x.ndim < 1:
+        raise ValueError("int3 KV quantization expects rank >= 1")
+    original_last_dim = int(x.shape[-1])
+    if original_last_dim <= 0:
+        raise ValueError("int3 KV quantization expects non-empty last dimension")
+    x_f = x.float()
+    scale = (x_f.abs().amax(dim=-1).clamp_min(float(eps)) / 3.0).to(dtype=torch.float32)
+    q = torch.round(x_f / scale.unsqueeze(-1)).clamp_(-3, 3).to(dtype=torch.int16) + 3
+    pad = (-original_last_dim) % 8
+    if pad:
+        q = torch.nn.functional.pad(q, (0, pad), value=3)
+    groups = q.reshape(*q.shape[:-1], q.shape[-1] // 8, 8).to(dtype=torch.int32)
+    words = (groups << _int3_shifts(q.device)).sum(dim=-1).to(dtype=torch.int32)
+    packed = torch.stack(
+        (
+            (words & 0xFF).to(dtype=torch.uint8),
+            ((words >> 8) & 0xFF).to(dtype=torch.uint8),
+            ((words >> 16) & 0xFF).to(dtype=torch.uint8),
+        ),
+        dim=-1,
+    ).reshape(*words.shape[:-1], words.shape[-1] * 3).contiguous()
+    return packed, scale.contiguous(), original_last_dim
+
+
+def unpack_dequantize_int3_lastdim(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    original_last_dim: int,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    if packed.ndim < 1:
+        raise ValueError("packed int3 tensor expects rank >= 1")
+    if int(original_last_dim) <= 0:
+        raise ValueError("original_last_dim must be positive")
+    if int(packed.shape[-1]) % 3 != 0:
+        raise ValueError("packed int3 last dimension must be a multiple of 3 bytes")
+    byte_groups = packed.reshape(*packed.shape[:-1], packed.shape[-1] // 3, 3).to(dtype=torch.int32)
+    words = byte_groups[..., 0] | (byte_groups[..., 1] << 8) | (byte_groups[..., 2] << 16)
+    codes = ((words.unsqueeze(-1) >> _int3_shifts(packed.device)) & 0x7).to(dtype=torch.int16)
+    signed = (codes.reshape(*packed.shape[:-1], -1)[..., : int(original_last_dim)] - 3).to(dtype=torch.float32)
+    out = signed * scale.to(device=packed.device, dtype=torch.float32).unsqueeze(-1)
+    return out.to(dtype=dtype or torch.float32)
+
+
 class _NativeLayerTensorList:
     def __init__(self, parent: "PagedKVCache", attr: str) -> None:
         self.parent = parent
@@ -605,6 +663,169 @@ class ContiguousKVCache(RuntimeKVCacheMixin):
         return self
 
 
+class Int3ContiguousKVCache(RuntimeKVCacheMixin):
+    def __init__(
+        self,
+        batch: int,
+        n_layers: int,
+        n_kv_heads: int,
+        head_dim: int,
+        pagesize: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        *,
+        backend_name: str = "int3-contiguous",
+    ):
+        self.batch = int(batch)
+        self.n_layers = int(n_layers)
+        self.n_kv_heads = int(n_kv_heads)
+        self.head_dim = int(head_dim)
+        self.pagesize = max(int(pagesize), 1)
+        self.dtype = dtype
+        self.device = device
+        self.backend = str(backend_name)
+        self.K: list[list[torch.Tensor | None]] = [[None for _ in range(self.batch)] for _ in range(self.n_layers)]
+        self.V: list[list[torch.Tensor | None]] = [[None for _ in range(self.batch)] for _ in range(self.n_layers)]
+        self.K_scale: list[list[torch.Tensor | None]] = [[None for _ in range(self.batch)] for _ in range(self.n_layers)]
+        self.V_scale: list[list[torch.Tensor | None]] = [[None for _ in range(self.batch)] for _ in range(self.n_layers)]
+        self.lengths = [[0 for _ in range(self.batch)] for _ in range(self.n_layers)]
+
+    def layer_lengths(self, layer_idx: int) -> torch.Tensor:
+        return torch.tensor(self.lengths[int(layer_idx)], dtype=torch.long, device=self.device)
+
+    def layer_max_length(self, layer_idx: int) -> int:
+        return max(self.lengths[int(layer_idx)], default=0)
+
+    def _pack_chunk(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x_local = x.to(device=self.device, dtype=self.dtype).contiguous()
+        packed, scale, dim = quantize_pack_int3_lastdim(x_local)
+        if dim != self.head_dim:
+            raise ValueError(f"int3 KV chunk head_dim mismatch: got {dim}, expected {self.head_dim}")
+        return packed, scale
+
+    def _unpack(self, packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return unpack_dequantize_int3_lastdim(packed, scale, self.head_dim, dtype=self.dtype)
+
+    def append(self, layer_idx: int, batch_idx: int, k_chunk: torch.Tensor, v_chunk: torch.Tensor):
+        layer_idx = int(layer_idx)
+        batch_idx = int(batch_idx)
+        k_pack, k_scale = self._pack_chunk(k_chunk)
+        v_pack, v_scale = self._pack_chunk(v_chunk)
+        if self.K[layer_idx][batch_idx] is None:
+            self.K[layer_idx][batch_idx] = k_pack
+            self.V[layer_idx][batch_idx] = v_pack
+            self.K_scale[layer_idx][batch_idx] = k_scale
+            self.V_scale[layer_idx][batch_idx] = v_scale
+        else:
+            self.K[layer_idx][batch_idx] = torch.cat((self.K[layer_idx][batch_idx], k_pack), dim=1).contiguous()
+            self.V[layer_idx][batch_idx] = torch.cat((self.V[layer_idx][batch_idx], v_pack), dim=1).contiguous()
+            self.K_scale[layer_idx][batch_idx] = torch.cat((self.K_scale[layer_idx][batch_idx], k_scale), dim=1).contiguous()
+            self.V_scale[layer_idx][batch_idx] = torch.cat((self.V_scale[layer_idx][batch_idx], v_scale), dim=1).contiguous()
+        self.lengths[layer_idx][batch_idx] += int(k_chunk.shape[1])
+
+    def append_batch(
+        self,
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        block_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        assert k.dim() == 4 and v.dim() == 4, "KV must be (B,H,T,D)"
+        assert k.shape == v.shape, "K and V shapes must match"
+        assert k.shape[1] == self.n_kv_heads and k.shape[3] == self.head_dim, "KV chunk shape mismatch"
+        ids = (
+            torch.arange(self.batch, device=self.device, dtype=torch.long)
+            if block_ids is None
+            else block_ids.to(device=self.device, dtype=torch.long).contiguous().view(-1)
+        )
+        assert int(ids.numel()) == int(k.shape[0]), "block_ids must match KV batch size"
+        for idx, batch_idx in enumerate(ids.tolist()):
+            self.append(int(layer_idx), int(batch_idx), k[idx], v[idx])
+
+    def slice(self, layer_idx: int, batch_idx: int, start: int, end: int):
+        layer_idx = int(layer_idx)
+        batch_idx = int(batch_idx)
+        k = self.K[layer_idx][batch_idx]
+        v = self.V[layer_idx][batch_idx]
+        ks = self.K_scale[layer_idx][batch_idx]
+        vs = self.V_scale[layer_idx][batch_idx]
+        if k is None or v is None or ks is None or vs is None:
+            return None, None
+        s = max(int(start), 0)
+        e = min(int(end), int(self.lengths[layer_idx][batch_idx]))
+        if s >= e:
+            return None, None
+        return self._unpack(k[:, s:e, :], ks[:, s:e]), self._unpack(v[:, s:e, :], vs[:, s:e])
+
+    def read_batch(
+        self,
+        layer_idx: int,
+        start: int,
+        end: int,
+        block_ids: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ids = (
+            torch.arange(self.batch, device=self.device, dtype=torch.long)
+            if block_ids is None
+            else block_ids.to(device=self.device, dtype=torch.long).contiguous().view(-1)
+        )
+        rows = int(ids.numel())
+        s = max(int(start), 0)
+        e = max(int(end), s)
+        width = e - s
+        out_k = torch.zeros(rows, self.n_kv_heads, width, self.head_dim, dtype=self.dtype, device=self.device)
+        out_v = torch.zeros_like(out_k)
+        for row, batch_idx in enumerate(ids.tolist()):
+            k_row, v_row = self.slice(layer_idx, int(batch_idx), s, e)
+            if k_row is None or v_row is None:
+                continue
+            live = int(k_row.shape[1])
+            out_k[row, :, :live, :].copy_(k_row)
+            out_v[row, :, :live, :].copy_(v_row)
+        return out_k, out_v
+
+    def read(self, layer_idx: int, start: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.read_batch(layer_idx, start, end, block_ids=None)
+
+    def evict(self, max_tokens: int, policy: str = "fifo"):
+        keep = max(int(max_tokens), 0)
+        if policy not in ("fifo", "sliding-window", "lru"):
+            return
+        for layer_idx in range(self.n_layers):
+            for batch_idx in range(self.batch):
+                live = int(self.lengths[layer_idx][batch_idx])
+                if live <= keep:
+                    continue
+                if keep <= 0:
+                    self.K[layer_idx][batch_idx] = None
+                    self.V[layer_idx][batch_idx] = None
+                    self.K_scale[layer_idx][batch_idx] = None
+                    self.V_scale[layer_idx][batch_idx] = None
+                else:
+                    self.K[layer_idx][batch_idx] = self.K[layer_idx][batch_idx][:, live - keep : live, :].contiguous()
+                    self.V[layer_idx][batch_idx] = self.V[layer_idx][batch_idx][:, live - keep : live, :].contiguous()
+                    self.K_scale[layer_idx][batch_idx] = self.K_scale[layer_idx][batch_idx][:, live - keep : live].contiguous()
+                    self.V_scale[layer_idx][batch_idx] = self.V_scale[layer_idx][batch_idx][:, live - keep : live].contiguous()
+                self.lengths[layer_idx][batch_idx] = keep
+
+    def reorder_rows_(self, row_ids: torch.Tensor):
+        cloned = clone_kv_cache_rows(self, row_ids)
+        self.batch = cloned.batch
+        self.n_layers = cloned.n_layers
+        self.n_kv_heads = cloned.n_kv_heads
+        self.head_dim = cloned.head_dim
+        self.pagesize = cloned.pagesize
+        self.dtype = cloned.dtype
+        self.device = cloned.device
+        self.backend = cloned.backend
+        self.K = cloned.K
+        self.V = cloned.V
+        self.K_scale = cloned.K_scale
+        self.V_scale = cloned.V_scale
+        self.lengths = cloned.lengths
+        return self
+
+
 def init_kv_cache(batch: int, n_layers: int, n_kv_heads: int, head_dim: int, pagesize: int, dtype: torch.dtype, device: torch.device):
     from runtime.cache import KVCacheSpec, create_kv_cache
 
@@ -918,6 +1139,7 @@ def paged_attention_decode(
 
 __all__ = [
     "ContiguousKVCache",
+    "Int3ContiguousKVCache",
     "PagedKVCache",
     "clone_kv_cache_rows",
     "concat_kv_caches",
@@ -929,4 +1151,6 @@ __all__ = [
     "paged_attention_decode",
     "kv_cache_evict",
     "kv_cache_slice",
+    "quantize_pack_int3_lastdim",
+    "unpack_dequantize_int3_lastdim",
 ]

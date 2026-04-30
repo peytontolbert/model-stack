@@ -2,6 +2,7 @@ from runtime.attention import scaled_dot_product_attention, select_attention_bac
 from runtime.attention_modules import EagerAttention, FlashAttention, TritonAttention, XFormersAttention
 from runtime.kv_cache import (
     ContiguousKVCache,
+    Int3ContiguousKVCache,
     PagedKVCache,
     init_kv_cache,
     kv_cache_append,
@@ -28,6 +29,7 @@ __all__ = [
     "TritonAttention",
     "XFormersAttention",
     "ContiguousKVCache",
+    "Int3ContiguousKVCache",
     "PagedKVCache",
     "init_kv_cache",
     "kv_cache_append",

@@ -90,9 +90,13 @@ def _normalize_backend_name(requested: str | None) -> str:
     aliases = {
         "native": "native-paged",
         "native_paged": "native-paged",
+        "int3": "int3-contiguous",
+        "int3_contiguous": "int3-contiguous",
+        "quantized-int3": "int3-contiguous",
+        "quantized_int3": "int3-contiguous",
     }
     candidate = aliases.get(candidate, candidate)
-    valid = {"auto", "paged", "contiguous", "native-paged"}
+    valid = {"auto", "paged", "contiguous", "native-paged", "int3-contiguous"}
     if candidate not in valid:
         raise ValueError(
             f"Unsupported KV cache backend '{requested}'. "
@@ -166,9 +170,20 @@ def kv_cache_spec_from_model(
 
 
 def create_kv_cache(spec: KVCacheSpec):
-    from runtime.kv_cache import ContiguousKVCache, PagedKVCache
+    from runtime.kv_cache import ContiguousKVCache, Int3ContiguousKVCache, PagedKVCache
 
     backend = resolve_kv_cache_backend(spec.backend)
+    if backend == "int3-contiguous":
+        return Int3ContiguousKVCache(
+            spec.batch,
+            spec.n_layers,
+            spec.n_kv_heads,
+            spec.head_dim,
+            spec.pagesize,
+            spec.dtype,
+            spec.device,
+            backend_name=backend,
+        )
     if backend == "contiguous":
         return ContiguousKVCache(
             spec.batch,

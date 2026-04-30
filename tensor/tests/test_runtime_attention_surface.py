@@ -143,6 +143,7 @@ def test_attn_package_exports_runtime_attention_surface():
     assert attn.TritonAttention is runtime_attention_modules_mod.TritonAttention
     assert attn.XFormersAttention is runtime_attention_modules_mod.XFormersAttention
     assert attn.ContiguousKVCache is runtime_kv_cache_mod.ContiguousKVCache
+    assert attn.Int3ContiguousKVCache is runtime_kv_cache_mod.Int3ContiguousKVCache
     assert attn.PagedKVCache is runtime_kv_cache_mod.PagedKVCache
     assert attn.share_kv_heads is runtime_gqa_mod.share_kv_heads
     assert attn.beam_search is runtime_decoding_mod.beam_search
