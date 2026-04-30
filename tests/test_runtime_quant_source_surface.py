@@ -150,12 +150,15 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     bitnet_frontend_source = _read("runtime/csrc/backend/bitnet/bitnet_frontend.cu")
     cuda_int8_linear_source = _read("runtime/csrc/backend/cuda_int8_linear.cu")
     cuda_quant_source = _read("runtime/csrc/backend/cuda_quant_int8_frontend.cu")
+    native_source = _read("runtime/csrc/model_stack_native.cpp")
     pg_run_source = _read("examples/13_parameter_golf_h100/run_pg_8xh100.sh")
     assert "def resolve_linear_module_tensors(" in ops_source
     assert "def linear_module(" in ops_source
     assert "def mlp_module(" in ops_source
+    assert "def _try_squared_activation_dynamic_int8_down_projection(" in ops_source
     assert "def _try_relu2_dynamic_int8_down_projection(" in ops_source
     assert "int8_quantize_relu2_activation_forward" in ops_source
+    assert "int8_quantize_leaky_relu_half2_activation_forward" in ops_source
     assert "runtime_linear_from_quantized_input" in ops_source
     assert "def linear_module_signature(" in ops_source
     assert "def packed_linear_module_signature(" in ops_source
@@ -357,13 +360,18 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "{\"int8_quantize_activation_transpose\", true}" in native_source
     assert "{\"int8_linear_grad_weight_from_float\", true}" in native_source
     assert "{\"int8_quantize_relu2_activation\", true}" in native_source
+    assert "{\"int8_quantize_leaky_relu_half2_activation\", true}" in native_source
     assert "bool HasCudaBitNetInputFrontendKernel()" in native_source
     assert "CudaInt8QuantizeActivationForward(" in native_source
     assert "CudaInt8QuantizeRelu2ActivationForward(" in native_source
+    assert "CudaInt8QuantizeLeakyReluHalf2ActivationForward(" in native_source
     assert "CudaInt8LinearFromFloatPreScaleForward(" in native_source
     assert "Int8QuantizeRelu2ActivationForward" in native_source
+    assert "Int8QuantizeLeakyReluHalf2ActivationForward" in native_source
     assert "int8_quantize_relu2_activation_forward" in native_source
+    assert "int8_quantize_leaky_relu_half2_activation_forward" in native_source
     assert "quantize_relu2_activation_int8_rowwise_wide_cached_kernel" in cuda_quant_source
+    assert "quantize_leaky_relu_half2_activation_int8_rowwise_wide_cached_kernel" in cuda_quant_source
     assert "quantize_activation_int8_rowwise_warp_pre_scale_kernel" in cuda_quant_source
     assert "QuantizeActivationInt8RowwisePreScaleCuda" in cuda_quant_source
     assert "MODEL_STACK_INT8_QUANT_WARP_ROWS_PER_BLOCK" in native_source
@@ -386,6 +394,7 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "m.def(\"int8_quantize_activation_transpose_forward\"" in native_source
     assert "m.def(\"int8_linear_grad_weight_from_float_forward\"" in native_source
     assert "m.def(\"int8_quantize_relu2_activation_forward\"" in native_source
+    assert "m.def(\"int8_quantize_leaky_relu_half2_activation_forward\"" in native_source
     assert "bitnet_int8_linear_from_float_forward" in native_source
     assert "bitnet_int8_fused_qkv_packed_heads_projection_forward" in native_source
     assert "bool TryLoadBitNetModuleState(" in native_source
@@ -407,6 +416,7 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "\"bitnet_runtime_row_quantize\"" in native_py_source
     assert "\"int8_quantize_activation_transpose\"" in native_py_source
     assert "\"int8_quantize_relu2_activation\"" in native_py_source
+    assert "\"int8_quantize_leaky_relu_half2_activation\"" in native_py_source
     assert "return BitNetLinearStateForward(x, bitnet_state);" in native_source
     assert "PyCallableAttr(module, \"_spin_enabled_runtime\")" in native_source
     assert "PyCallableAttr(module, \"_pre_scale_active_runtime\")" in native_source

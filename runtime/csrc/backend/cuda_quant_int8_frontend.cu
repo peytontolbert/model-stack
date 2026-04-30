@@ -155,6 +155,13 @@ __device__ __forceinline__ scalar_t Relu2Cast(scalar_t value) {
 }
 
 template <typename scalar_t>
+__device__ __forceinline__ scalar_t LeakyReluHalf2Cast(scalar_t value) {
+  const float v = static_cast<float>(value);
+  const float y = v > 0.0f ? v : 0.5f * v;
+  return static_cast<scalar_t>(y * y);
+}
+
+template <typename scalar_t>
 __global__ void quantize_activation_int8_rowwise_kernel(
     const scalar_t* __restrict__ x,
     const float* __restrict__ provided_scale,
@@ -376,6 +383,46 @@ __global__ void quantize_relu2_activation_int8_rowwise_kernel(
   }
 }
 
+template <typename scalar_t>
+__global__ void quantize_leaky_relu_half2_activation_int8_rowwise_kernel(
+    const scalar_t* __restrict__ x,
+    int8_t* __restrict__ qx,
+    float* __restrict__ row_scale,
+    int64_t rows,
+    int64_t cols) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  if (row >= rows) {
+    return;
+  }
+  __shared__ float shared_max[kQuantThreads];
+  float local_max = 0.0f;
+  const int64_t row_offset = row * cols;
+  for (int64_t col = threadIdx.x; col < cols; col += blockDim.x) {
+    const scalar_t value_raw = LeakyReluHalf2Cast(x[row_offset + col]);
+    local_max = fmaxf(local_max, fabsf(static_cast<float>(value_raw)));
+  }
+  shared_max[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared_max[threadIdx.x] = fmaxf(shared_max[threadIdx.x], shared_max[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+
+  const float scale = shared_max[0] > 0.0f ? (shared_max[0] / 127.0f) : 1.0f;
+  if (threadIdx.x == 0) {
+    row_scale[row] = scale;
+  }
+  __syncthreads();
+
+  const float inv_scale = 1.0f / scale;
+  for (int64_t col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float scaled = static_cast<float>(LeakyReluHalf2Cast(x[row_offset + col])) * inv_scale;
+    qx[row_offset + col] = QuantizeScaledToInt8(scaled);
+  }
+}
+
 template <typename scalar_t, int RowsPerBlock>
 __global__ void quantize_activation_int8_rowwise_warp_kernel(
     const scalar_t* __restrict__ x,
@@ -541,6 +588,49 @@ __global__ void quantize_relu2_activation_int8_rowwise_warp_cached_kernel(
   scalar_t* row_values = shared_values + static_cast<int64_t>(warp_id) * cols;
   for (int64_t col = lane; col < cols; col += kQuantWarpSize) {
     const scalar_t value_raw = Relu2Cast(x[row_offset + col]);
+    row_values[col] = value_raw;
+    local_max = fmaxf(local_max, fabsf(static_cast<float>(value_raw)));
+  }
+  unsigned int mask = 0xffffffffu;
+  for (int offset = kQuantWarpSize / 2; offset > 0; offset >>= 1) {
+    local_max = fmaxf(local_max, __shfl_down_sync(mask, local_max, offset));
+  }
+
+  float scale = 1.0f;
+  if (lane == 0) {
+    scale = local_max > 0.0f ? (local_max / 127.0f) : 1.0f;
+    row_scale[row] = scale;
+  }
+  scale = __shfl_sync(mask, scale, 0);
+  const float inv_scale = 1.0f / scale;
+
+  for (int64_t col = lane; col < cols; col += kQuantWarpSize) {
+    const float scaled = static_cast<float>(row_values[col]) * inv_scale;
+    qx[row_offset + col] = QuantizeScaledToInt8(scaled);
+  }
+}
+
+template <typename scalar_t, int RowsPerBlock>
+__global__ void quantize_leaky_relu_half2_activation_int8_rowwise_warp_cached_kernel(
+    const scalar_t* __restrict__ x,
+    int8_t* __restrict__ qx,
+    float* __restrict__ row_scale,
+    int64_t rows,
+    int64_t cols) {
+  extern __shared__ __align__(16) unsigned char shared_values_raw[];
+  auto* shared_values = reinterpret_cast<scalar_t*>(shared_values_raw);
+  const int warp_id = threadIdx.x / kQuantWarpSize;
+  const int lane = threadIdx.x & (kQuantWarpSize - 1);
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * RowsPerBlock + warp_id;
+  if (row >= rows) {
+    return;
+  }
+
+  float local_max = 0.0f;
+  const int64_t row_offset = row * cols;
+  scalar_t* row_values = shared_values + static_cast<int64_t>(warp_id) * cols;
+  for (int64_t col = lane; col < cols; col += kQuantWarpSize) {
+    const scalar_t value_raw = LeakyReluHalf2Cast(x[row_offset + col]);
     row_values[col] = value_raw;
     local_max = fmaxf(local_max, fabsf(static_cast<float>(value_raw)));
   }
@@ -765,6 +855,68 @@ __global__ void quantize_relu2_activation_int8_rowwise_wide_cached_kernel(
   if (row_valid) {
     for (int64_t col = group_lane; col < cols; col += kQuantWideGroupSize) {
       const scalar_t value_raw = Relu2Cast(x[row_offset + col]);
+      row_values[col] = value_raw;
+      local_max = fmaxf(local_max, fabsf(static_cast<float>(value_raw)));
+    }
+  }
+  unsigned int mask = 0xffffffffu;
+  for (int offset = kQuantWarpSize / 2; offset > 0; offset >>= 1) {
+    local_max = fmaxf(local_max, __shfl_down_sync(mask, local_max, offset));
+  }
+  if (row_valid && lane == 0) {
+    shared_warp_max[warp_id] = local_max;
+  }
+  __syncthreads();
+
+  if (row_valid && group_lane < kQuantWarpSize) {
+    float group_max = group_lane < kQuantWideWarpsPerRow
+        ? shared_warp_max[group_id * kQuantWideWarpsPerRow + group_lane]
+        : 0.0f;
+    for (int offset = kQuantWarpSize / 2; offset > 0; offset >>= 1) {
+      group_max = fmaxf(group_max, __shfl_down_sync(mask, group_max, offset));
+    }
+    if (group_lane == 0) {
+      const float scale = group_max > 0.0f ? (group_max / 127.0f) : 1.0f;
+      row_scale[row] = scale;
+      shared_scale[group_id] = scale;
+    }
+  }
+  __syncthreads();
+
+  if (row_valid) {
+    const float inv_scale = 1.0f / shared_scale[group_id];
+    for (int64_t col = group_lane; col < cols; col += kQuantWideGroupSize) {
+      const float scaled = static_cast<float>(row_values[col]) * inv_scale;
+      qx[row_offset + col] = QuantizeScaledToInt8(scaled);
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void quantize_leaky_relu_half2_activation_int8_rowwise_wide_cached_kernel(
+    const scalar_t* __restrict__ x,
+    int8_t* __restrict__ qx,
+    float* __restrict__ row_scale,
+    int64_t rows,
+    int64_t cols) {
+  extern __shared__ __align__(16) unsigned char shared_values_raw[];
+  auto* shared_values = reinterpret_cast<scalar_t*>(shared_values_raw);
+  const int group_id = threadIdx.x / kQuantWideGroupSize;
+  const int group_lane = threadIdx.x & (kQuantWideGroupSize - 1);
+  const int warp_id = threadIdx.x / kQuantWarpSize;
+  const int lane = threadIdx.x & (kQuantWarpSize - 1);
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * kQuantWideRowsPerBlock + group_id;
+  const bool row_valid = row < rows;
+
+  __shared__ float shared_warp_max[kQuantThreads / kQuantWarpSize];
+  __shared__ float shared_scale[kQuantWideRowsPerBlock];
+
+  float local_max = 0.0f;
+  const int64_t row_offset = row * cols;
+  scalar_t* row_values = shared_values + static_cast<int64_t>(group_id) * cols;
+  if (row_valid) {
+    for (int64_t col = group_lane; col < cols; col += kQuantWideGroupSize) {
+      const scalar_t value_raw = LeakyReluHalf2Cast(x[row_offset + col]);
       row_values[col] = value_raw;
       local_max = fmaxf(local_max, fabsf(static_cast<float>(value_raw)));
     }
@@ -1539,6 +1691,103 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeRelu2ActivationInt8RowwiseCuda(
   return {qx_2d.view(out_sizes), row_scale};
 }
 
+std::tuple<torch::Tensor, torch::Tensor> QuantizeLeakyReluHalf2ActivationInt8RowwiseCuda(
+    const torch::Tensor& x) {
+  TORCH_CHECK(x.is_cuda(), "QuantizeLeakyReluHalf2ActivationInt8RowwiseCuda: x must be a CUDA tensor");
+  TORCH_CHECK(IsSupportedInt8FrontendDtype(x.scalar_type()),
+              "QuantizeLeakyReluHalf2ActivationInt8RowwiseCuda: unsupported input dtype");
+  TORCH_CHECK(x.dim() >= 2, "QuantizeLeakyReluHalf2ActivationInt8RowwiseCuda: x must have rank >= 2");
+
+  c10::cuda::CUDAGuard device_guard{x.device()};
+  const auto cols = x.size(-1);
+  const auto rows = x.numel() / cols;
+  auto x_2d = x.reshape({rows, cols}).contiguous();
+  auto qx_2d = torch::empty({rows, cols}, x.options().dtype(torch::kInt8));
+  auto row_scale = torch::empty({rows}, x.options().dtype(torch::kFloat32));
+  auto stream = c10::cuda::getCurrentCUDAStream(x.get_device());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      x_2d.scalar_type(),
+      "model_stack_cuda_quantize_leaky_relu_half2_activation_int8_rowwise",
+      [&] {
+        if (Int8QuantWideRowEnabled(cols) &&
+            Int8QuantSharedCacheEnabled(cols, kQuantWideRowsPerBlock, sizeof(scalar_t))) {
+          const auto blocks =
+              static_cast<unsigned int>((rows + kQuantWideRowsPerBlock - 1) / kQuantWideRowsPerBlock);
+          const auto shared_bytes =
+              static_cast<size_t>(kQuantWideRowsPerBlock) * static_cast<size_t>(cols) * sizeof(scalar_t);
+          quantize_leaky_relu_half2_activation_int8_rowwise_wide_cached_kernel<scalar_t><<<
+              blocks,
+              kQuantThreads,
+              shared_bytes,
+              stream.stream()>>>(
+              x_2d.data_ptr<scalar_t>(),
+              qx_2d.data_ptr<int8_t>(),
+              row_scale.data_ptr<float>(),
+              rows,
+              cols);
+        } else if (Int8QuantWarpRowEnabled(cols)) {
+          const auto launch_warp_rows = [&](auto rows_constant, int threads) {
+            constexpr int rows_per_block = decltype(rows_constant)::value;
+            const auto blocks = static_cast<unsigned int>((rows + rows_per_block - 1) / rows_per_block);
+            if (!Int8QuantSharedCacheEnabled(cols, rows_per_block, sizeof(scalar_t))) {
+              quantize_leaky_relu_half2_activation_int8_rowwise_kernel<scalar_t><<<
+                  static_cast<unsigned int>(rows),
+                  kQuantThreads,
+                  0,
+                  stream.stream()>>>(
+                  x_2d.data_ptr<scalar_t>(),
+                  qx_2d.data_ptr<int8_t>(),
+                  row_scale.data_ptr<float>(),
+                  rows,
+                  cols);
+              return;
+            }
+            const auto shared_bytes =
+                static_cast<size_t>(rows_per_block) * static_cast<size_t>(cols) * sizeof(scalar_t);
+            quantize_leaky_relu_half2_activation_int8_rowwise_warp_cached_kernel<scalar_t, rows_per_block><<<
+                blocks,
+                threads,
+                shared_bytes,
+                stream.stream()>>>(
+                x_2d.data_ptr<scalar_t>(),
+                qx_2d.data_ptr<int8_t>(),
+                row_scale.data_ptr<float>(),
+                rows,
+                cols);
+          };
+          switch (Int8QuantWarpRowsPerBlock()) {
+            case kQuantWarp4RowsPerBlock:
+              launch_warp_rows(std::integral_constant<int, kQuantWarp4RowsPerBlock>{}, kQuantWarp4Threads);
+              break;
+            case kQuantWarp16RowsPerBlock:
+              launch_warp_rows(std::integral_constant<int, kQuantWarp16RowsPerBlock>{}, kQuantWarp16Threads);
+              break;
+            default:
+              launch_warp_rows(std::integral_constant<int, kQuantWarpRowsPerBlock>{}, kQuantWarpThreads);
+              break;
+          }
+        } else {
+          quantize_leaky_relu_half2_activation_int8_rowwise_kernel<scalar_t><<<
+              static_cast<unsigned int>(rows),
+              kQuantThreads,
+              0,
+              stream.stream()>>>(
+              x_2d.data_ptr<scalar_t>(),
+              qx_2d.data_ptr<int8_t>(),
+              row_scale.data_ptr<float>(),
+              rows,
+              cols);
+        }
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
+  return {qx_2d.view(out_sizes), row_scale};
+}
+
 }  // namespace
 
 bool HasCudaInt8QuantFrontendKernel() {
@@ -1569,6 +1818,12 @@ std::vector<torch::Tensor> CudaInt8QuantizeActivationColumnwiseForward(
 std::vector<torch::Tensor> CudaInt8QuantizeRelu2ActivationForward(
     const torch::Tensor& x) {
   auto quantized = QuantizeRelu2ActivationInt8RowwiseCuda(x);
+  return {std::get<0>(quantized), std::get<1>(quantized)};
+}
+
+std::vector<torch::Tensor> CudaInt8QuantizeLeakyReluHalf2ActivationForward(
+    const torch::Tensor& x) {
+  auto quantized = QuantizeLeakyReluHalf2ActivationInt8RowwiseCuda(x);
   return {std::get<0>(quantized), std::get<1>(quantized)};
 }
 

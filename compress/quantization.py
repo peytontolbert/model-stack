@@ -3096,6 +3096,24 @@ def _trainable_bitnet_activation_quant_percentile() -> float:
     return float(os.getenv("MODEL_STACK_TRAINABLE_BITNET_ACT_QUANT_PERCENTILE", "0.999"))
 
 
+def _trainable_bitnet_spin_enabled() -> bool:
+    value = os.getenv("MODEL_STACK_TRAINABLE_BITNET_SPIN", "").strip().lower()
+    return value in {"1", "true", "yes", "on", "hadamard", "hbitlinear", "h-bitlinear"}
+
+
+def _trainable_bitnet_spin_random() -> bool:
+    return os.getenv("MODEL_STACK_TRAINABLE_BITNET_SPIN_RANDOM", "1").strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def _trainable_bitnet_spin_seed() -> int:
+    return int(os.getenv("MODEL_STACK_TRAINABLE_BITNET_SPIN_SEED", "0"))
+
+
 def _trainable_bitnet_backward_grad_input_mode() -> str:
     return os.getenv("MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT", "").strip().lower()
 
@@ -3528,6 +3546,15 @@ class TrainableBitNetLinear(nn.Module):
         self.eps = float(eps)
         self.weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
         self.bias = nn.Parameter(torch.empty(self.out_features)) if bias else None
+        self.register_buffer("spin_signs", torch.ones(self.in_features, dtype=torch.float32))
+        self.register_buffer("spin_enabled_flag", torch.zeros((), dtype=torch.uint8))
+        _configure_spin_state(
+            self.spin_enabled_flag,
+            self.spin_signs,
+            enabled=_trainable_bitnet_spin_enabled(),
+            random_signs=_trainable_bitnet_spin_random(),
+            seed=_trainable_bitnet_spin_seed(),
+        )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -3562,6 +3589,8 @@ class TrainableBitNetLinear(nn.Module):
         device: torch.device | str | None = None,
     ) -> torch.Tensor:
         weight = self.ternary_weight()
+        if _spin_enabled(self.spin_enabled_flag):
+            weight = undo_spin_transform(weight, self.spin_signs.to(device=weight.device))
         if dtype is not None or device is not None:
             weight = weight.to(
                 device=weight.device if device is None else torch.device(device),
@@ -3638,16 +3667,23 @@ class TrainableBitNetLinear(nn.Module):
             return False
         return x.is_cuda
 
+    def _spin_training_inputs(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if not _spin_enabled(self.spin_enabled_flag):
+            return x, self.weight
+        signs = self.spin_signs.to(device=x.device)
+        return apply_spin_transform(x, signs), apply_spin_transform(self.weight, signs.to(device=self.weight.device))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._int8_ste_forward_enabled(x):
             act_quant_mode, act_quant_bits = _trainable_bitnet_activation_quant()
             act_quant_percentile = _trainable_bitnet_activation_quant_percentile()
+            x_forward, weight_forward = self._spin_training_inputs(x)
             if _torch_compiler_is_compiling() and not _env_flag_enabled(
                 "MODEL_STACK_TRAINABLE_BITNET_DISABLE_COMPILED_AUTOGRAD_FUNCTION"
             ):
                 return _TrainableBitNetInt8STEFunction.apply(
-                    x,
-                    self.weight,
+                    x_forward,
+                    weight_forward,
                     self.bias,
                     float(self.eps),
                     str(act_quant_mode),
@@ -3660,8 +3696,8 @@ class TrainableBitNetLinear(nn.Module):
                 and _TRAINABLE_BITNET_INT8_STE_OUTPUT_COMPILE_OP is not None
             ):
                 return _TRAINABLE_BITNET_INT8_STE_OUTPUT_COMPILE_OP(
-                    x,
-                    self.weight,
+                    x_forward,
+                    weight_forward,
                     self.bias,
                     float(self.eps),
                     str(act_quant_mode),
@@ -3670,8 +3706,8 @@ class TrainableBitNetLinear(nn.Module):
                 )
             if _torch_compiler_is_compiling() and _TRAINABLE_BITNET_INT8_STE_COMPILE_OP is not None:
                 out, _qweight, _row_scale = _TRAINABLE_BITNET_INT8_STE_COMPILE_OP(
-                    x,
-                    self.weight,
+                    x_forward,
+                    weight_forward,
                     self.bias,
                     float(self.eps),
                     str(act_quant_mode),
@@ -3680,8 +3716,8 @@ class TrainableBitNetLinear(nn.Module):
                 )
                 return out
             return _TrainableBitNetInt8STEFunction.apply(
-                x,
-                self.weight,
+                x_forward,
+                weight_forward,
                 self.bias,
                 float(self.eps),
                 str(act_quant_mode),
@@ -3689,13 +3725,17 @@ class TrainableBitNetLinear(nn.Module):
                 float(act_quant_percentile),
             )
         weight = self.ternary_weight().to(dtype=x.dtype if x.dtype.is_floating_point else self.weight.dtype)
+        if _spin_enabled(self.spin_enabled_flag):
+            x = apply_spin_transform(x, self.spin_signs.to(device=x.device))
+            weight = apply_spin_transform(weight, self.spin_signs.to(device=weight.device))
         bias = None if self.bias is None else self.bias.to(dtype=weight.dtype)
         return F.linear(x.to(dtype=weight.dtype), weight, bias)
 
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias={self.bias is not None}, scale_layout={self.scale_layout!r}"
+            f"bias={self.bias is not None}, scale_layout={self.scale_layout!r}, "
+            f"spin={_spin_enabled(self.spin_enabled_flag)}"
         )
 
 

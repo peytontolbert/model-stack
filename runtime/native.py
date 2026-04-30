@@ -29,6 +29,7 @@ _FALLBACK_NATIVE_OPS = [
     "int8_quantize_activation",
     "int8_quantize_activation_transpose",
     "int8_quantize_relu2_activation",
+    "int8_quantize_leaky_relu_half2_activation",
     "int8_linear",
     "int8_linear_from_float",
     "int8_linear_grad_weight_from_float",

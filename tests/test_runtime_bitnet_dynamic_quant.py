@@ -86,3 +86,17 @@ def test_trainable_bitnet_dynamic_int4_ste_defaults_to_four_bit(monkeypatch) -> 
     monkeypatch.delenv("MODEL_STACK_TRAINABLE_BITNET_ACT_QUANT_BITS", raising=False)
 
     assert _trainable_bitnet_activation_quant() == ("dynamic_int8", 4)
+
+
+def test_trainable_bitnet_spin_preserves_dense_forward(monkeypatch) -> None:
+    source = nn.Linear(6, 3, bias=False)
+    x = torch.randn(4, 6)
+
+    monkeypatch.delenv("MODEL_STACK_TRAINABLE_BITNET_SPIN", raising=False)
+    plain = TrainableBitNetLinear(6, 3, bias=False).from_float(source)
+
+    monkeypatch.setenv("MODEL_STACK_TRAINABLE_BITNET_SPIN", "hadamard")
+    monkeypatch.setenv("MODEL_STACK_TRAINABLE_BITNET_SPIN_RANDOM", "0")
+    spun = TrainableBitNetLinear(6, 3, bias=False).from_float(source)
+
+    torch.testing.assert_close(spun(x), plain(x), atol=1e-5, rtol=1e-5)

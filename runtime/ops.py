@@ -3608,10 +3608,11 @@ def mlp(
     return linear(hidden, w_out_weight, w_out_bias, backend=backend)
 
 
-def _try_relu2_dynamic_int8_down_projection(
+def _try_squared_activation_dynamic_int8_down_projection(
     hidden: torch.Tensor,
     w_out_module,
     *,
+    activation: str,
     backend: str | None,
 ) -> torch.Tensor | None:
     if not _is_auto_backend(backend):
@@ -3635,13 +3636,44 @@ def _try_relu2_dynamic_int8_down_projection(
     runtime_from_quantized = getattr(w_out_module, "runtime_linear_from_quantized_input", None)
     if not callable(runtime_from_quantized):
         return None
-    if not has_native_op("int8_quantize_relu2_activation"):
+    leaky_relu_0p5_squared_aliases = {
+        "leaky_relu_0p5_squared",
+        "leaky_relu2",
+        "leaky-relu2",
+        "leaky-relu-0p5-squared",
+        "leaky_relu_0.5_squared",
+        "leaky-relu-0.5-squared",
+    }
+    act = str(activation).lower()
+    op_name = None
+    method_name = None
+    if act in {"relu2", "squared_relu", "squared-relu"}:
+        op_name = "int8_quantize_relu2_activation"
+        method_name = "int8_quantize_relu2_activation_forward"
+    elif act in leaky_relu_0p5_squared_aliases:
+        op_name = "int8_quantize_leaky_relu_half2_activation"
+        method_name = "int8_quantize_leaky_relu_half2_activation_forward"
+    if op_name is None or method_name is None or not has_native_op(op_name):
         return None
     module = native_module()
-    if module is None or not hasattr(module, "int8_quantize_relu2_activation_forward"):
+    if module is None or not hasattr(module, method_name):
         return None
-    qx, row_scale = module.int8_quantize_relu2_activation_forward(hidden)
+    qx, row_scale = getattr(module, method_name)(hidden)
     return runtime_from_quantized(qx, row_scale, out_dtype=hidden.dtype)
+
+
+def _try_relu2_dynamic_int8_down_projection(
+    hidden: torch.Tensor,
+    w_out_module,
+    *,
+    backend: str | None,
+) -> torch.Tensor | None:
+    return _try_squared_activation_dynamic_int8_down_projection(
+        hidden,
+        w_out_module,
+        activation="relu2",
+        backend=backend,
+    )
 
 
 def mlp_module(
@@ -3659,10 +3691,33 @@ def mlp_module(
         hidden = linear_module(x, w_in_module, backend=backend)
         act = str(activation).lower()
         if not gated and act in {"relu2", "squared_relu", "squared-relu"}:
-            fused_out = _try_relu2_dynamic_int8_down_projection(hidden, w_out_module, backend=backend)
+            fused_out = _try_squared_activation_dynamic_int8_down_projection(
+                hidden,
+                w_out_module,
+                activation=act,
+                backend=backend,
+            )
             if fused_out is not None:
                 return fused_out
             y = F.relu(hidden)
+            hidden = y * y
+        elif not gated and act in {
+            "leaky_relu_0p5_squared",
+            "leaky_relu2",
+            "leaky-relu2",
+            "leaky-relu-0p5-squared",
+            "leaky_relu_0.5_squared",
+            "leaky-relu-0.5-squared",
+        }:
+            fused_out = _try_squared_activation_dynamic_int8_down_projection(
+                hidden,
+                w_out_module,
+                activation=act,
+                backend=backend,
+            )
+            if fused_out is not None:
+                return fused_out
+            y = F.leaky_relu(hidden, negative_slope=0.5)
             hidden = y * y
         elif gated:
             a, b = hidden.chunk(2, dim=-1)
