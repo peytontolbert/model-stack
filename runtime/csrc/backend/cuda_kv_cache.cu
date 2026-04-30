@@ -10,6 +10,91 @@ namespace {
 
 constexpr int kThreads = 256;
 
+__device__ __forceinline__ uint32_t PackInt3Code(uint32_t word, int idx, int code) {
+  return word | ((static_cast<uint32_t>(code) & 0x7u) << (idx * 3));
+}
+
+template <typename scalar_t>
+__global__ void int3_pack_lastdim_kernel(
+    const scalar_t* __restrict__ x,
+    uint8_t* __restrict__ packed,
+    float* __restrict__ scale,
+    int64_t vectors,
+    int64_t dim,
+    int64_t packed_dim,
+    int64_t groups) {
+  const int64_t vector = static_cast<int64_t>(blockIdx.x);
+  if (vector >= vectors) {
+    return;
+  }
+  __shared__ float shared_max[kThreads];
+  float local_max = 0.0f;
+  const int64_t base = vector * dim;
+  for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+    local_max = fmaxf(local_max, fabsf(static_cast<float>(x[base + d])));
+  }
+  shared_max[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared_max[threadIdx.x] = fmaxf(shared_max[threadIdx.x], shared_max[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  const float s = shared_max[0] > 0.0f ? (shared_max[0] / 3.0f) : 1.0f;
+  if (threadIdx.x == 0) {
+    scale[vector] = s;
+  }
+  __syncthreads();
+
+  for (int64_t group = threadIdx.x; group < groups; group += blockDim.x) {
+    uint32_t word = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int64_t d = group * 8 + i;
+      int code = 3;
+      if (d < dim) {
+        int q = __float2int_rn(static_cast<float>(x[base + d]) / s);
+        q = q < -3 ? -3 : q;
+        q = q > 3 ? 3 : q;
+        code = q + 3;
+      }
+      word = PackInt3Code(word, i, code);
+    }
+    const int64_t out = vector * packed_dim + group * 3;
+    packed[out + 0] = static_cast<uint8_t>(word & 0xFFu);
+    packed[out + 1] = static_cast<uint8_t>((word >> 8) & 0xFFu);
+    packed[out + 2] = static_cast<uint8_t>((word >> 16) & 0xFFu);
+  }
+}
+
+template <typename scalar_t>
+__global__ void int3_dequantize_lastdim_kernel(
+    const uint8_t* __restrict__ packed,
+    const float* __restrict__ scale,
+    scalar_t* __restrict__ out,
+    int64_t vectors,
+    int64_t dim,
+    int64_t packed_dim,
+    int64_t groups) {
+  const int64_t total = vectors * dim;
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  const int64_t vector = idx / dim;
+  const int64_t d = idx % dim;
+  const int64_t group = d / 8;
+  const int in_group = static_cast<int>(d % 8);
+  const int64_t p = vector * packed_dim + group * 3;
+  const uint32_t word = static_cast<uint32_t>(packed[p + 0]) |
+      (static_cast<uint32_t>(packed[p + 1]) << 8) |
+      (static_cast<uint32_t>(packed[p + 2]) << 16);
+  const int code = static_cast<int>((word >> (in_group * 3)) & 0x7u);
+  const int q = code - 3;
+  out[idx] = static_cast<scalar_t>(static_cast<float>(q) * scale[vector]);
+}
+
 template <typename scalar_t>
 __global__ void kv_cache_write_forward_kernel(
     scalar_t* __restrict__ cache,
@@ -859,6 +944,97 @@ torch::Tensor CudaPagedKvReadRangeForward(
             pages_contig.size(3));
       });
 
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+std::vector<torch::Tensor> CudaInt3PackLastDimForward(const torch::Tensor& x) {
+  TORCH_CHECK(x.is_cuda(), "CudaInt3PackLastDimForward: x must be CUDA");
+  TORCH_CHECK(x.dim() >= 1, "CudaInt3PackLastDimForward: x must have rank >= 1");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
+                  x.scalar_type() == torch::kBFloat16,
+              "CudaInt3PackLastDimForward: x must be float32, float16, or bfloat16");
+  c10::cuda::CUDAGuard device_guard{x.device()};
+  auto x_contig = x.contiguous();
+  const auto dim = x_contig.size(-1);
+  TORCH_CHECK(dim > 0, "CudaInt3PackLastDimForward: last dim must be non-empty");
+  const auto vectors = x_contig.numel() / dim;
+  const auto groups = (dim + 7) / 8;
+  const auto packed_dim = groups * 3;
+  std::vector<int64_t> packed_sizes(x_contig.sizes().begin(), x_contig.sizes().end());
+  packed_sizes.back() = packed_dim;
+  std::vector<int64_t> scale_sizes(x_contig.sizes().begin(), x_contig.sizes().end() - 1);
+  auto packed = torch::empty(packed_sizes, x_contig.options().dtype(torch::kUInt8));
+  auto scale = torch::empty(scale_sizes, x_contig.options().dtype(torch::kFloat32));
+  if (vectors == 0) {
+    return {packed, scale};
+  }
+  auto stream = c10::cuda::getCurrentCUDAStream(x.get_device());
+  const dim3 blocks(static_cast<unsigned int>(vectors));
+  const dim3 threads(kThreads);
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      x_contig.scalar_type(),
+      "model_stack_cuda_int3_pack_lastdim",
+      [&] {
+        int3_pack_lastdim_kernel<scalar_t><<<blocks, threads, 0, stream.stream()>>>(
+            x_contig.data_ptr<scalar_t>(),
+            packed.data_ptr<uint8_t>(),
+            scale.data_ptr<float>(),
+            vectors,
+            dim,
+            packed_dim,
+            groups);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {packed, scale};
+}
+
+torch::Tensor CudaInt3DequantizeLastDimForward(
+    const torch::Tensor& packed,
+    const torch::Tensor& scale,
+    int64_t original_last_dim,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  TORCH_CHECK(packed.is_cuda() && scale.is_cuda(), "CudaInt3DequantizeLastDimForward: tensors must be CUDA");
+  TORCH_CHECK(packed.scalar_type() == torch::kUInt8, "CudaInt3DequantizeLastDimForward: packed must be uint8");
+  TORCH_CHECK(scale.scalar_type() == torch::kFloat32, "CudaInt3DequantizeLastDimForward: scale must be float32");
+  TORCH_CHECK(packed.dim() >= 1, "CudaInt3DequantizeLastDimForward: packed must have rank >= 1");
+  TORCH_CHECK(original_last_dim > 0, "CudaInt3DequantizeLastDimForward: original_last_dim must be positive");
+  TORCH_CHECK(packed.size(-1) % 3 == 0, "CudaInt3DequantizeLastDimForward: packed last dim must be divisible by 3");
+  c10::cuda::CUDAGuard device_guard{packed.device()};
+  auto packed_contig = packed.contiguous();
+  auto scale_contig = scale.contiguous();
+  const auto packed_dim = packed_contig.size(-1);
+  const auto groups = packed_dim / 3;
+  const auto vectors = packed_contig.numel() / packed_dim;
+  TORCH_CHECK(scale_contig.numel() == vectors, "CudaInt3DequantizeLastDimForward: scale shape mismatch");
+  std::vector<int64_t> out_sizes(packed_contig.sizes().begin(), packed_contig.sizes().end());
+  out_sizes.back() = original_last_dim;
+  const auto dtype = out_dtype.has_value() ? out_dtype.value() : torch::kFloat32;
+  auto out = torch::empty(out_sizes, packed_contig.options().dtype(dtype));
+  if (vectors == 0) {
+    return out;
+  }
+  auto stream = c10::cuda::getCurrentCUDAStream(packed.get_device());
+  const auto total = vectors * original_last_dim;
+  const dim3 blocks(static_cast<unsigned int>((total + kThreads - 1) / kThreads));
+  const dim3 threads(kThreads);
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      out.scalar_type(),
+      "model_stack_cuda_int3_dequantize_lastdim",
+      [&] {
+        int3_dequantize_lastdim_kernel<scalar_t><<<blocks, threads, 0, stream.stream()>>>(
+            packed_contig.data_ptr<uint8_t>(),
+            scale_contig.data_ptr<float>(),
+            out.data_ptr<scalar_t>(),
+            vectors,
+            original_last_dim,
+            packed_dim,
+            groups);
+      });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }

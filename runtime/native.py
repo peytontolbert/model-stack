@@ -72,6 +72,8 @@ _FALLBACK_NATIVE_OPS = [
     "paged_kv_compact",
     "paged_kv_gather",
     "paged_kv_write",
+    "int3_kv_pack",
+    "int3_kv_dequantize",
     "paged_attention_decode",
     "attention_decode",
     "attention_prefill",

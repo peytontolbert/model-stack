@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 
 from runtime.cache import RuntimeKVCacheMixin
-from runtime.native import create_native_paged_kv_cache_state
+from runtime.native import create_native_paged_kv_cache_state, has_native_op, native_module
 from runtime.ops import kv_cache_write as runtime_kv_cache_write
 from runtime.ops import paged_kv_append as runtime_paged_kv_append
 from runtime.ops import paged_kv_compact as runtime_paged_kv_compact
@@ -33,6 +33,15 @@ def quantize_pack_int3_lastdim(x: torch.Tensor, *, eps: float = 1e-8) -> tuple[t
     original_last_dim = int(x.shape[-1])
     if original_last_dim <= 0:
         raise ValueError("int3 KV quantization expects non-empty last dimension")
+    if (
+        x.is_cuda
+        and os.environ.get("MODEL_STACK_DISABLE_NATIVE_INT3_KV", "0") != "1"
+        and has_native_op("int3_kv_pack")
+    ):
+        module = native_module()
+        if module is not None and hasattr(module, "int3_kv_pack_forward"):
+            packed, scale = module.int3_kv_pack_forward(x)
+            return packed, scale, original_last_dim
     x_f = x.float()
     scale = (x_f.abs().amax(dim=-1).clamp_min(float(eps)) / 3.0).to(dtype=torch.float32)
     q = torch.round(x_f / scale.unsqueeze(-1)).clamp_(-3, 3).to(dtype=torch.int16) + 3
@@ -65,6 +74,14 @@ def unpack_dequantize_int3_lastdim(
         raise ValueError("original_last_dim must be positive")
     if int(packed.shape[-1]) % 3 != 0:
         raise ValueError("packed int3 last dimension must be a multiple of 3 bytes")
+    if (
+        packed.is_cuda
+        and os.environ.get("MODEL_STACK_DISABLE_NATIVE_INT3_KV", "0") != "1"
+        and has_native_op("int3_kv_dequantize")
+    ):
+        module = native_module()
+        if module is not None and hasattr(module, "int3_kv_dequantize_forward"):
+            return module.int3_kv_dequantize_forward(packed, scale, int(original_last_dim), dtype or torch.float32)
     byte_groups = packed.reshape(*packed.shape[:-1], packed.shape[-1] // 3, 3).to(dtype=torch.int32)
     words = byte_groups[..., 0] | (byte_groups[..., 1] << 8) | (byte_groups[..., 2] << 16)
     codes = ((words.unsqueeze(-1) >> _int3_shifts(packed.device)) & 0x7).to(dtype=torch.int16)

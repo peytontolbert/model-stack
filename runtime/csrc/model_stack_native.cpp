@@ -279,6 +279,12 @@ torch::Tensor CudaPagedKvWriteForward(
     const torch::Tensor& block_table,
     const torch::Tensor& positions,
     const torch::Tensor& values);
+std::vector<torch::Tensor> CudaInt3PackLastDimForward(const torch::Tensor& x);
+torch::Tensor CudaInt3DequantizeLastDimForward(
+    const torch::Tensor& packed,
+    const torch::Tensor& scale,
+    int64_t original_last_dim,
+    const c10::optional<torch::ScalarType>& out_dtype);
 std::vector<torch::Tensor> CudaProjectedQkvRotaryPagedWriteForward(
     const torch::Tensor& projected,
     const torch::Tensor& cos,
@@ -755,6 +761,8 @@ std::map<std::string, bool> NativeOpMap() {
       {"paged_kv_compact", true},
       {"paged_kv_gather", true},
       {"paged_kv_write", true},
+      {"int3_kv_pack", true},
+      {"int3_kv_dequantize", true},
       {"paged_attention_decode", true},
       {"attention_decode", true},
       {"attention_prefill", true},
@@ -1879,9 +1887,9 @@ py::dict RuntimeInfo() {
   info["compiled_with_cuda"] = false;
 #endif
   info["native_ops"] = std::vector<std::string>{
-      "activation", "gated_activation", "embedding", "linear", "linear_module", "bitnet_transform_input", "bitnet_linear", "bitnet_linear_compute_packed", "bitnet_linear_from_float", "bitnet_int8_linear_from_float", "bitnet_int8_fused_qkv_packed_heads_projection", "int4_linear", "nf4_linear", "fp8_linear", "int8_quantize_activation", "int8_quantize_activation_transpose", "int8_quantize_relu2_activation", "int8_quantize_leaky_relu_half2_activation", "int8_linear", "int8_linear_from_float", "int8_linear_grad_weight_from_float", "int8_attention", "int8_attention_from_float", "pack_bitnet_weight", "bitnet_runtime_row_quantize", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "bitnet_qkv_packed_heads_projection", "bitnet_fused_qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "paged_attention_decode", "attention_decode", "attention_prefill", "sampling", "beam_search_step", "incremental_beam_search"};
+      "activation", "gated_activation", "embedding", "linear", "linear_module", "bitnet_transform_input", "bitnet_linear", "bitnet_linear_compute_packed", "bitnet_linear_from_float", "bitnet_int8_linear_from_float", "bitnet_int8_fused_qkv_packed_heads_projection", "int4_linear", "nf4_linear", "fp8_linear", "int8_quantize_activation", "int8_quantize_activation_transpose", "int8_quantize_relu2_activation", "int8_quantize_leaky_relu_half2_activation", "int8_linear", "int8_linear_from_float", "int8_linear_grad_weight_from_float", "int8_attention", "int8_attention_from_float", "pack_bitnet_weight", "bitnet_runtime_row_quantize", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "bitnet_qkv_packed_heads_projection", "bitnet_fused_qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "int3_kv_pack", "int3_kv_dequantize", "paged_attention_decode", "attention_decode", "attention_prefill", "sampling", "beam_search_step", "incremental_beam_search"};
   info["planned_ops"] = std::vector<std::string>{
-      "activation", "gated_activation", "embedding", "linear", "linear_module", "bitnet_transform_input", "bitnet_linear", "bitnet_linear_compute_packed", "bitnet_linear_from_float", "bitnet_int8_linear_from_float", "bitnet_int8_fused_qkv_packed_heads_projection", "int4_linear", "nf4_linear", "fp8_linear", "int8_quantize_activation", "int8_quantize_activation_transpose", "int8_quantize_relu2_activation", "int8_quantize_leaky_relu_half2_activation", "int8_linear", "int8_linear_from_float", "int8_linear_grad_weight_from_float", "int8_attention", "int8_attention_from_float", "pack_bitnet_weight", "bitnet_runtime_row_quantize", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "bitnet_qkv_packed_heads_projection", "bitnet_fused_qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "paged_attention_decode", "attention_decode",
+      "activation", "gated_activation", "embedding", "linear", "linear_module", "bitnet_transform_input", "bitnet_linear", "bitnet_linear_compute_packed", "bitnet_linear_from_float", "bitnet_int8_linear_from_float", "bitnet_int8_fused_qkv_packed_heads_projection", "int4_linear", "nf4_linear", "fp8_linear", "int8_quantize_activation", "int8_quantize_activation_transpose", "int8_quantize_relu2_activation", "int8_quantize_leaky_relu_half2_activation", "int8_linear", "int8_linear_from_float", "int8_linear_grad_weight_from_float", "int8_attention", "int8_attention_from_float", "pack_bitnet_weight", "bitnet_runtime_row_quantize", "pack_linear_weight", "mlp", "qkv_projection", "pack_qkv_weights", "qkv_packed_heads_projection", "bitnet_qkv_packed_heads_projection", "bitnet_fused_qkv_packed_heads_projection", "qkv_heads_projection", "split_heads", "merge_heads", "head_output_projection", "prepare_attention_mask", "resolve_position_ids", "create_causal_mask", "resolve_rotary_embedding", "token_counts", "append_tokens", "decode_positions", "rms_norm", "add_rms_norm", "residual_add", "layer_norm", "add_layer_norm", "rope", "kv_cache_append", "kv_cache_write", "kv_cache_gather", "paged_kv_assign_blocks", "paged_kv_reserve_pages", "paged_kv_read_range", "paged_kv_read_last", "paged_kv_append", "paged_kv_compact", "paged_kv_gather", "paged_kv_write", "int3_kv_pack", "int3_kv_dequantize", "paged_attention_decode", "attention_decode",
       "attention_prefill", "sampling", "beam_search_step", "incremental_beam_search"};
   info["linear_backend_default"] = HasCublasLtLinearBackend() ? "cublaslt" : "aten";
   info["linear_sm8x_aten_auto_disable_env"] = std::string("MODEL_STACK_DISABLE_SM8X_ATEN_LINEAR_AUTO");
@@ -2108,6 +2116,8 @@ py::dict RuntimeInfo() {
   }
   if (HasCudaKvCacheKernel()) {
     cuda_backend_ops.push_back("kv_cache");
+    cuda_backend_ops.push_back("int3_kv_pack");
+    cuda_backend_ops.push_back("int3_kv_dequantize");
   }
   if (HasCudaAttentionKernel()) {
     cuda_backend_ops.push_back("attention");
@@ -2531,6 +2541,130 @@ torch::Tensor KvCacheGatherForward(
     gathered.push_back(cache.select(0, b).index_select(1, positions_long.select(0, b)));
   }
   return torch::stack(gathered, 0);
+}
+
+std::vector<torch::Tensor> Int3KvPackForward(const torch::Tensor& x) {
+  TORCH_CHECK(x.defined(), "int3_kv_pack_forward: x must be defined");
+  TORCH_CHECK(x.dim() >= 1, "int3_kv_pack_forward: x must have rank >= 1");
+  TORCH_CHECK(x.size(-1) > 0, "int3_kv_pack_forward: last dim must be non-empty");
+  TORCH_CHECK(
+      x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
+          x.scalar_type() == torch::kBFloat16,
+      "int3_kv_pack_forward: x must be float32, float16, or bfloat16");
+
+  if (x.is_cuda() && HasCudaKvCacheKernel()) {
+    return CudaInt3PackLastDimForward(x);
+  }
+  TORCH_CHECK(!x.is_cuda(), "int3_kv_pack_forward: CUDA int3 kernel is unavailable");
+
+  auto x_cpu = x.to(torch::TensorOptions().device(torch::kCPU).dtype(x.scalar_type())).contiguous();
+  const auto dim = x_cpu.size(-1);
+  const auto vectors = x_cpu.numel() / dim;
+  const auto groups = (dim + 7) / 8;
+  const auto packed_dim = groups * 3;
+  std::vector<int64_t> packed_sizes(x_cpu.sizes().begin(), x_cpu.sizes().end());
+  packed_sizes.back() = packed_dim;
+  std::vector<int64_t> scale_sizes(x_cpu.sizes().begin(), x_cpu.sizes().end() - 1);
+  auto packed = torch::empty(packed_sizes, torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8));
+  auto scale = torch::empty(scale_sizes, torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+  auto packed_2d = packed.reshape({vectors, packed_dim});
+  auto scale_flat = scale.reshape({vectors});
+  auto packed_ptr = packed_2d.data_ptr<uint8_t>();
+  auto scale_ptr = scale_flat.data_ptr<float>();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      x_cpu.scalar_type(),
+      "model_stack_cpu_int3_pack_lastdim",
+      [&] {
+        const auto* x_ptr = x_cpu.data_ptr<scalar_t>();
+        for (int64_t vector = 0; vector < vectors; ++vector) {
+          const int64_t base = vector * dim;
+          float max_abs = 0.0f;
+          for (int64_t d = 0; d < dim; ++d) {
+            max_abs = std::max(max_abs, std::fabs(static_cast<float>(x_ptr[base + d])));
+          }
+          const float s = max_abs > 0.0f ? max_abs / 3.0f : 1.0f;
+          scale_ptr[vector] = s;
+          for (int64_t group = 0; group < groups; ++group) {
+            uint32_t word = 0;
+            for (int i = 0; i < 8; ++i) {
+              const int64_t d = group * 8 + i;
+              int code = 3;
+              if (d < dim) {
+                int q = static_cast<int>(std::nearbyint(static_cast<float>(x_ptr[base + d]) / s));
+                q = std::max(-3, std::min(3, q));
+                code = q + 3;
+              }
+              word |= (static_cast<uint32_t>(code) & 0x7u) << (i * 3);
+            }
+            const int64_t out = vector * packed_dim + group * 3;
+            packed_ptr[out + 0] = static_cast<uint8_t>(word & 0xFFu);
+            packed_ptr[out + 1] = static_cast<uint8_t>((word >> 8) & 0xFFu);
+            packed_ptr[out + 2] = static_cast<uint8_t>((word >> 16) & 0xFFu);
+          }
+        }
+      });
+  return {packed.contiguous(), scale.contiguous()};
+}
+
+torch::Tensor Int3KvDequantizeForward(
+    const torch::Tensor& packed,
+    const torch::Tensor& scale,
+    int64_t original_last_dim,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  TORCH_CHECK(packed.defined() && scale.defined(), "int3_kv_dequantize_forward: packed and scale must be defined");
+  TORCH_CHECK(packed.scalar_type() == torch::kUInt8, "int3_kv_dequantize_forward: packed must be uint8");
+  TORCH_CHECK(scale.scalar_type() == torch::kFloat32, "int3_kv_dequantize_forward: scale must be float32");
+  TORCH_CHECK(packed.dim() >= 1, "int3_kv_dequantize_forward: packed must have rank >= 1");
+  TORCH_CHECK(original_last_dim > 0, "int3_kv_dequantize_forward: original_last_dim must be positive");
+  TORCH_CHECK(packed.size(-1) % 3 == 0, "int3_kv_dequantize_forward: packed last dim must be divisible by 3");
+  TORCH_CHECK(packed.device() == scale.device(), "int3_kv_dequantize_forward: device mismatch");
+
+  if (packed.is_cuda() && scale.is_cuda() && HasCudaKvCacheKernel()) {
+    return CudaInt3DequantizeLastDimForward(packed, scale, original_last_dim, out_dtype);
+  }
+  TORCH_CHECK(!packed.is_cuda(), "int3_kv_dequantize_forward: CUDA int3 kernel is unavailable");
+
+  auto packed_cpu = packed.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8)).contiguous();
+  auto scale_cpu = scale.to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32)).contiguous();
+  const auto packed_dim = packed_cpu.size(-1);
+  const auto groups = packed_dim / 3;
+  const auto vectors = packed_cpu.numel() / packed_dim;
+  TORCH_CHECK(scale_cpu.numel() == vectors, "int3_kv_dequantize_forward: scale shape mismatch");
+  std::vector<int64_t> out_sizes(packed_cpu.sizes().begin(), packed_cpu.sizes().end());
+  out_sizes.back() = original_last_dim;
+  const auto dtype = out_dtype.has_value() ? out_dtype.value() : torch::kFloat32;
+  auto out = torch::empty(out_sizes, torch::TensorOptions().device(torch::kCPU).dtype(dtype));
+  auto out_2d = out.reshape({vectors, original_last_dim});
+  auto packed_2d = packed_cpu.reshape({vectors, packed_dim});
+  auto scale_flat = scale_cpu.reshape({vectors});
+  const auto* packed_ptr = packed_2d.data_ptr<uint8_t>();
+  const auto* scale_ptr = scale_flat.data_ptr<float>();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      out.scalar_type(),
+      "model_stack_cpu_int3_dequantize_lastdim",
+      [&] {
+        auto* out_ptr = out_2d.data_ptr<scalar_t>();
+        for (int64_t vector = 0; vector < vectors; ++vector) {
+          for (int64_t d = 0; d < original_last_dim; ++d) {
+            const int64_t group = d / 8;
+            const int in_group = static_cast<int>(d % 8);
+            const int64_t p = vector * packed_dim + group * 3;
+            const uint32_t word = static_cast<uint32_t>(packed_ptr[p + 0]) |
+                (static_cast<uint32_t>(packed_ptr[p + 1]) << 8) |
+                (static_cast<uint32_t>(packed_ptr[p + 2]) << 16);
+            const int code = static_cast<int>((word >> (in_group * 3)) & 0x7u);
+            out_ptr[vector * original_last_dim + d] =
+                static_cast<scalar_t>(static_cast<float>(code - 3) * scale_ptr[vector]);
+          }
+        }
+      });
+  return out;
 }
 
 std::tuple<torch::Tensor, torch::Tensor, int64_t> PagedKvAssignBlocksForward(
@@ -10156,6 +10290,9 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("v_cache") = py::none(), py::arg("k_new"), py::arg("v_new"));
   m.def("kv_cache_write_forward", &KvCacheWriteForward, py::arg("cache"), py::arg("chunk"), py::arg("start"));
   m.def("kv_cache_gather_forward", &KvCacheGatherForward, py::arg("cache"), py::arg("positions"));
+  m.def("int3_kv_pack_forward", &Int3KvPackForward, py::arg("x"));
+  m.def("int3_kv_dequantize_forward", &Int3KvDequantizeForward, py::arg("packed"), py::arg("scale"),
+        py::arg("original_last_dim"), py::arg("out_dtype") = py::none());
   m.def("paged_kv_assign_blocks_forward", &PagedKvAssignBlocksForward, py::arg("block_table"),
         py::arg("block_ids"), py::arg("starts"), py::arg("total"), py::arg("page_size"),
         py::arg("next_page_id"));
