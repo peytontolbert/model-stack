@@ -223,12 +223,23 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "--include-relu2-mlp-pair" in training_bench_source
     assert "--include-pg-block" in training_bench_source
     assert "--block-fused-qkv" in training_bench_source
+    assert "--no-preset-shapes" in training_bench_source
     assert 'BITNET_STE_MODES = ("dynamic_int8_ste", "dynamic_int4_ste")' in training_bench_source
+    assert "def _bitnet_optimized_training_env(" in training_bench_source
+    assert '"MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT",' in training_bench_source
+    assert '"MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT",' in training_bench_source
+    assert '"bitnet_training_env": {key: value for key, value in env.items() if value is not None}' in training_bench_source
+    assert "def _bitnet_shape_gate_expected_allows(" in training_bench_source
+    assert '"bitnet_shape_gate_expected_allows": _bitnet_shape_gate_expected_allows(' in training_bench_source
     assert 'if mode_name in {"dynamic_int4", "dynamic_a4"}:' in kernel_bench_source
     assert '"canonical_activation_quant": str(activation_quant)' in kernel_bench_source
     assert "int(activation_quant_bits) == 8" in kernel_bench_source
     assert 'if mode_name in {"dynamic_int4", "dynamic_a4"}:' in mlp_subgraph_bench_source
     assert '"canonical_activation_quant": str(activation_quant)' in mlp_subgraph_bench_source
+    components_bench_source = _read("examples/13_parameter_golf_h100/bench_pg_training_components.py")
+    assert '"MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT",' in components_bench_source
+    assert '"MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT",' in components_bench_source
+    assert '"bitnet_training_env": {key: value for key, value in env.items() if value is not None}' in components_bench_source
     assert "\"MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED\": os.environ.get(" in training_bench_source
     assert "MODEL_STACK_ATTENTION_REPEAT_KV" in training_bench_source
     assert "def _maybe_repeat_kv_heads(" in training_bench_source

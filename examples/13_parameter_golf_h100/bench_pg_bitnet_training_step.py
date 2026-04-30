@@ -173,6 +173,63 @@ def _reset_torch_compile_cache() -> None:
         reset()
 
 
+def _bitnet_optimized_training_env(mode: str, *, compile_module: bool) -> dict[str, str | None]:
+    env_mode = None if mode == "dense_ste" else mode
+    env: dict[str, str | None] = {
+        "MODEL_STACK_TRAINABLE_BITNET_TRAINING_FORWARD": env_mode,
+        "MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED": os.environ.get(
+            "MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED",
+            "1",
+        ),
+        "MODEL_STACK_TRAINABLE_BITNET_COMPILED_INT8_STE": "1" if compile_module and mode != "dense_ste" else None,
+    }
+    if mode != "dense_ste":
+        env.update(
+            {
+                "MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE": os.environ.get(
+                    "MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE",
+                    "pg_h100_mlp",
+                ),
+                "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT": os.environ.get(
+                    "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT",
+                    "dynamic_int8_explicit_scale",
+                ),
+                "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT": os.environ.get(
+                    "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT",
+                    "dynamic_int8_transpose",
+                ),
+            }
+        )
+    return env
+
+
+def _bitnet_shape_gate_expected_allows(
+    env: dict[str, str | None],
+    *,
+    rows: int,
+    in_features: int,
+    out_features: int,
+) -> bool | None:
+    if env.get("MODEL_STACK_TRAINABLE_BITNET_TRAINING_FORWARD") is None:
+        return None
+    policy = str(env.get("MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE") or "").strip().lower()
+    if policy in {"", "0", "false", "off", "none"}:
+        return True
+    if policy not in {"expansion_only", "pg_h100_expansion", "pg_h100_mlp", "h100_pg_v1", "h100_pg_v2"}:
+        return True
+    min_rows = int(os.environ.get("MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE_MIN_ROWS", "32768"))
+    min_ratio = float(os.environ.get("MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE_MIN_OUT_IN_RATIO", "2.0"))
+    if policy in {"pg_h100_mlp", "h100_pg_v2"}:
+        mlp_shapes = {
+            (1024, 2048),
+            (2048, 1024),
+            (1024, 3072),
+            (3072, 1024),
+        }
+        return int(rows) >= min_rows and (int(in_features), int(out_features)) in mlp_shapes
+    return int(rows) >= min_rows and int(out_features) >= int(math.ceil(float(in_features) * min_ratio))
+
+
 def _bench_variant(
     shape: LinearShape,
     *,
@@ -190,18 +247,9 @@ def _bench_variant(
     iters: int,
     repeats: int,
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
-    del rows
     layer = _make_layer(shape, dtype=dtype, device=device, bias=bias)
     layer.load_state_dict(state_dict, strict=True)
-    env_mode = None if mode == "dense_ste" else mode
-    env = {
-        "MODEL_STACK_TRAINABLE_BITNET_TRAINING_FORWARD": env_mode,
-        "MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED": os.environ.get(
-            "MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED",
-            "1",
-        ),
-        "MODEL_STACK_TRAINABLE_BITNET_COMPILED_INT8_STE": "1" if compile_module and mode != "dense_ste" else None,
-    }
+    env = _bitnet_optimized_training_env(mode, compile_module=compile_module)
     runner = layer
     if compile_module and device.type == "cuda":
         _reset_torch_compile_cache()
@@ -245,6 +293,13 @@ def _bench_variant(
     result = {
         "mode": mode,
         "compile_module": bool(compile_module),
+        "bitnet_training_env": {key: value for key, value in env.items() if value is not None},
+        "bitnet_shape_gate_expected_allows": _bitnet_shape_gate_expected_allows(
+            env,
+            rows=int(rows),
+            in_features=shape.in_features,
+            out_features=shape.out_features,
+        ),
         "weight_quantize_ms": weight_quantize_ms,
         "forward_ms": forward_ms,
         "train_step_ms": train_step_ms,
@@ -357,18 +412,9 @@ def _bench_relu2_mlp_pair_variant(
     iters: int,
     repeats: int,
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
-    del rows
     mlp = _Relu2MlpPair(dtype=dtype, device=device, bias=bias)
     mlp.load_state_dict(state_dict, strict=True)
-    env_mode = None if mode == "dense_ste" else mode
-    env = {
-        "MODEL_STACK_TRAINABLE_BITNET_TRAINING_FORWARD": env_mode,
-        "MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED": os.environ.get(
-            "MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED",
-            "1",
-        ),
-        "MODEL_STACK_TRAINABLE_BITNET_COMPILED_INT8_STE": "1" if compile_module and mode != "dense_ste" else None,
-    }
+    env = _bitnet_optimized_training_env(mode, compile_module=compile_module)
     runner = mlp
     if compile_module and device.type == "cuda":
         _reset_torch_compile_cache()
@@ -406,6 +452,21 @@ def _bench_relu2_mlp_pair_variant(
     result = {
         "mode": mode,
         "compile_module": bool(compile_module),
+        "bitnet_training_env": {key: value for key, value in env.items() if value is not None},
+        "bitnet_shape_gate_expected_allows": {
+            "up": _bitnet_shape_gate_expected_allows(
+                env,
+                rows=int(rows),
+                in_features=1024,
+                out_features=3072,
+            ),
+            "down": _bitnet_shape_gate_expected_allows(
+                env,
+                rows=int(rows),
+                in_features=3072,
+                out_features=1024,
+            ),
+        },
         "forward_ms": forward_ms,
         "train_step_ms": train_step_ms,
     }
@@ -888,7 +949,7 @@ def _bench_pg_block_variant(
     iters: int,
     repeats: int,
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
-    del batch_size, seq_len
+    rows = int(batch_size) * int(seq_len)
     block = _make_pg_block(
         dim=dim,
         num_heads=num_heads,
@@ -902,15 +963,7 @@ def _bench_pg_block_variant(
         fused_qkv=fused_qkv,
     )
     block.load_state_dict(state_dict, strict=True)
-    env_mode = None if mode == "dense_ste" else mode
-    env = {
-        "MODEL_STACK_TRAINABLE_BITNET_TRAINING_FORWARD": env_mode,
-        "MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED": os.environ.get(
-            "MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED",
-            "1",
-        ),
-        "MODEL_STACK_TRAINABLE_BITNET_COMPILED_INT8_STE": "1" if compile_module and mode != "dense_ste" else None,
-    }
+    env = _bitnet_optimized_training_env(mode, compile_module=compile_module)
     runner = block
     if compile_module and device.type == "cuda":
         _reset_torch_compile_cache()
@@ -945,6 +998,27 @@ def _bench_pg_block_variant(
     result = {
         "mode": mode,
         "compile_module": bool(compile_module),
+        "bitnet_training_env": {key: value for key, value in env.items() if value is not None},
+        "bitnet_shape_gate_expected_allows": {
+            "mlp_up": _bitnet_shape_gate_expected_allows(
+                env,
+                rows=rows,
+                in_features=dim,
+                out_features=dim * mlp_mult,
+            ),
+            "mlp_down": _bitnet_shape_gate_expected_allows(
+                env,
+                rows=rows,
+                in_features=dim * mlp_mult,
+                out_features=dim,
+            ),
+            "attention": _bitnet_shape_gate_expected_allows(
+                env,
+                rows=rows,
+                in_features=dim,
+                out_features=dim,
+            ),
+        },
         "forward_ms": forward_ms,
         "train_step_ms": train_step_ms,
     }
@@ -1077,6 +1151,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark TrainableBitNetLinear forward+backward on PG shapes.")
     parser.add_argument("--preset", choices=sorted(PRESETS), default="runtime_row_1024x7_relu2_mlp3")
     parser.add_argument("--shape", action="append", default=[], help="Custom shape NAME:IN:OUT or IN:OUT")
+    parser.add_argument("--no-preset-shapes", action="store_true", help="Benchmark only --shape entries.")
     parser.add_argument("--rows", type=int, default=65536)
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
@@ -1111,7 +1186,9 @@ def main() -> None:
         enable_flash_sdp(True)
         enable_mem_efficient_sdp(False)
         enable_math_sdp(False)
-    shapes = _parse_shapes(args.shape) if args.shape else PRESETS[args.preset]
+    shapes = ([] if args.no_preset_shapes else list(PRESETS[args.preset])) + _parse_shapes(args.shape)
+    if not shapes:
+        raise ValueError("no shapes selected; use a preset or pass --shape")
     header = {
         "header": {
             "device": str(device),

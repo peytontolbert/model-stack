@@ -68,7 +68,7 @@ def _time_median(fn: Callable[[], None], *, warmup: int, iters: int, repeats: in
 
 
 def _env_for_mode(mode: str, compile_module: bool) -> dict[str, str | None]:
-    return {
+    env: dict[str, str | None] = {
         "MODEL_STACK_TRAINABLE_BITNET_TRAINING_FORWARD": None if mode == "dense_ste" else mode,
         "MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED": os.environ.get(
             "MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED",
@@ -76,6 +76,24 @@ def _env_for_mode(mode: str, compile_module: bool) -> dict[str, str | None]:
         ),
         "MODEL_STACK_TRAINABLE_BITNET_COMPILED_INT8_STE": "1" if compile_module and mode != "dense_ste" else None,
     }
+    if mode != "dense_ste":
+        env.update(
+            {
+                "MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE": os.environ.get(
+                    "MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE",
+                    "pg_h100_mlp",
+                ),
+                "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT": os.environ.get(
+                    "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT",
+                    "dynamic_int8_explicit_scale",
+                ),
+                "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT": os.environ.get(
+                    "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT",
+                    "dynamic_int8_transpose",
+                ),
+            }
+        )
+    return env
 
 
 def _clone_state_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -138,6 +156,7 @@ def _bench_component(
         "component": name,
         "mode": mode,
         "compile_module": bool(compile_module),
+        "bitnet_training_env": {key: value for key, value in env.items() if value is not None},
         "forward_ms": forward_ms,
         "train_step_ms": train_step_ms,
         "backward_plus_overhead_ms": max(train_step_ms - forward_ms, 0.0),
