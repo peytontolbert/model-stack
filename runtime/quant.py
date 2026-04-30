@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional
+import os
 
 import torch
 
@@ -34,6 +35,10 @@ _NF4_CODEBOOK_VALUES = (
 )
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _should_use_eager_autograd_fallback(*tensors: torch.Tensor | None) -> bool:
     if not torch.is_grad_enabled():
         return False
@@ -41,6 +46,43 @@ def _should_use_eager_autograd_fallback(*tensors: torch.Tensor | None) -> bool:
         if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
             return True
     return False
+
+
+class _NativeInt4LinearForwardDenseBackward(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight_packed: torch.Tensor,
+        inv_scale: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        module = native_module()
+        if module is None or not hasattr(module, "int4_linear_forward"):
+            raise RuntimeError("native int4_linear_forward is unavailable")
+        x_cast = x.contiguous()
+        packed_cast = weight_packed.to(device=x_cast.device, dtype=torch.uint8).contiguous()
+        scale_cast = inv_scale.to(device=x_cast.device, dtype=torch.float32).contiguous()
+        bias_cast = None if bias is None else bias.to(device=x_cast.device, dtype=x_cast.dtype).contiguous()
+        out = module.int4_linear_forward(x_cast, packed_cast, scale_cast, bias_cast)
+        dequant_weight = _dequantize_packed_int4_weight(
+            packed_cast,
+            scale_cast,
+            original_last_dim=int(x_cast.shape[-1]),
+            dtype=x_cast.dtype if x_cast.dtype.is_floating_point else torch.float32,
+        )
+        ctx.save_for_backward(dequant_weight)
+        ctx.input_shape = tuple(x.shape)
+        ctx.bias_is_tensor = bias is not None
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (dequant_weight,) = ctx.saved_tensors
+        grad_2d = grad_output.reshape(-1, grad_output.shape[-1]).to(dtype=dequant_weight.dtype)
+        grad_input = grad_2d.matmul(dequant_weight).reshape(ctx.input_shape)
+        grad_bias = grad_2d.sum(dim=0) if ctx.bias_is_tensor else None
+        return grad_input, None, None, grad_bias
 
 
 def _torch_compiler_is_compiling() -> bool:
@@ -1173,6 +1215,18 @@ def int4_linear(
     packed_cast = weight_packed.to(device=target_device, dtype=torch.uint8)
     scale_cast = inv_scale.to(device=target_device, dtype=torch.float32)
     bias_cast = None if bias is None else bias.to(device=target_device, dtype=compute_dtype)
+    if (
+        packed_cast.is_cuda
+        and _should_use_eager_autograd_fallback(x_cast, bias_cast)
+        and _env_flag_enabled("MODEL_STACK_INT4_NATIVE_FORWARD_UNDER_GRAD")
+    ):
+        module = native_module()
+        if (
+            has_native_op("int4_linear")
+            and module is not None
+            and hasattr(module, "int4_linear_forward")
+        ):
+            return _NativeInt4LinearForwardDenseBackward.apply(x_cast, packed_cast, scale_cast, bias_cast)
     if packed_cast.is_cuda and not _should_use_eager_autograd_fallback(x_cast, bias_cast):
         module = native_module()
         if (

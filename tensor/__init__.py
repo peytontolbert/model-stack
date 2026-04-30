@@ -106,7 +106,7 @@ from .shape import ensure_even_last_dim, split_heads, merge_heads
 from .shape import split_qkv, merge_qkv, center_pad, pad_to_multiple, right_trim_to, assert_mask_shape, assert_boolean_mask, assert_broadcastable, split_gqa_heads, merge_gqa_heads, ensure_contiguous_lastdim, reorder_to_channels_last_2d, stride_equal, is_view_of, expect_shape, same_shape, enforce_static_shape, trace_shape, expect_memory_format, bhdt_to_bthd, contiguous_lastdim, assert_shape, assert_mask, pack_heads, unpack_heads, rechunk, S, unify, graph_shapes, infer, broadcast_plan, tile, reorder
 from .dtypes import cast_for_softmax, cast_for_norm, restore_dtype, to_dtype_like, is_fp16, is_bf16, is_int8, is_fp8, cast_logits_for_loss, set_matmul_precision, maybe_autocast, expect_dtype, promote_mixed, amp_policy_for_op, fp8_dynamic_scale_update
 from .dtypes import FP8AmaxTracker, fp8_scale_from_amax, with_logits_precision
-from .losses import masked_cross_entropy, sequence_nll, masked_cross_entropy_ls, masked_kl_div, masked_js_div, sequence_nll_zloss, masked_mse, masked_huber, masked_perplexity, bce_with_logits_masked, nll_tokenwise, masked_label_margin_loss, masked_log_score, masked_spherical_loss
+from .losses import masked_cross_entropy, softcapped_cross_entropy, softcapped_cross_entropy_manual, sequence_nll, masked_cross_entropy_ls, masked_kl_div, masked_js_div, sequence_nll_zloss, masked_mse, masked_huber, masked_perplexity, bce_with_logits_masked, nll_tokenwise, masked_label_margin_loss, masked_log_score, masked_spherical_loss
 from .random import seed_everything, set_deterministic, philox_stream, rng_scope, dropout_mask
 from .ragged import pack_sequences, unpack_sequences, segment_sum as ragged_segment_sum, segment_mean as ragged_segment_mean, segment_max as ragged_segment_max, segment_min as ragged_segment_min, ragged_gather
 from .ragged import packed_softmax as ragged_packed_softmax, packed_logsumexp as ragged_packed_logsumexp, ragged_inclusive_cumsum, ragged_exclusive_cumsum, ragged_scatter
@@ -369,6 +369,8 @@ __all__ = [
     "fp8_scale_from_amax",
     "with_logits_precision",
     "masked_cross_entropy",
+    "softcapped_cross_entropy",
+    "softcapped_cross_entropy_manual",
     "sequence_nll",
     "masked_cross_entropy_ls",
     "masked_kl_div",

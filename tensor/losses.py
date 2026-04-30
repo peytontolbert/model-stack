@@ -2,6 +2,44 @@ import torch
 import torch.nn.functional as F
 
 
+def softcapped_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    softcap: float = 30.0,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Cross entropy after Gemini-style tanh logit softcapping."""
+    if softcap <= 0.0:
+        raise ValueError(f"softcap must be positive, got {softcap}")
+    capped = float(softcap) * torch.tanh(logits / float(softcap))
+    return F.cross_entropy(capped.float(), targets, reduction=reduction)
+
+
+def softcapped_cross_entropy_manual(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    softcap: float = 30.0,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Softcapped CE using explicit gather/logsumexp; benchmark before use."""
+    if softcap <= 0.0:
+        raise ValueError(f"softcap must be positive, got {softcap}")
+    if reduction not in {"mean", "sum", "none"}:
+        raise ValueError(f"unsupported reduction: {reduction}")
+    capped = float(softcap) * torch.tanh(logits.float() / float(softcap))
+    max_vals = capped.amax(dim=-1, keepdim=True)
+    logsumexp = (capped - max_vals).exp().sum(dim=-1).log() + max_vals.squeeze(-1)
+    target_vals = capped.gather(-1, targets.view(*targets.shape, 1)).squeeze(-1)
+    loss = logsumexp - target_vals
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    return loss
+
+
 def masked_cross_entropy(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -259,5 +297,3 @@ def masked_spherical_loss(logits: torch.Tensor, targets: torch.Tensor, mask: tor
         mden = mask.to(loss.dtype).sum().clamp_min(1.0)
         return loss.sum() / mden if reduction == "mean" else (loss.sum() if reduction == "sum" else loss)
     return loss.mean() if reduction == "mean" else (loss.sum() if reduction == "sum" else loss)
-
-

@@ -1,5 +1,5 @@
 import torch
-from losses import masked_cross_entropy, sequence_nll
+from tensor.losses import masked_cross_entropy, sequence_nll, softcapped_cross_entropy, softcapped_cross_entropy_manual
 
 
 def test_masked_cross_entropy_padding_ignored():
@@ -21,3 +21,16 @@ def test_sequence_nll_matches_cross_entropy():
     assert torch.allclose(ce, nll)
 
 
+def test_softcapped_cross_entropy_manual_matches_torch_path():
+    torch.manual_seed(0)
+    logits = torch.randn(7, 13, requires_grad=True)
+    logits_manual = logits.detach().clone().requires_grad_(True)
+    targets = torch.randint(0, 13, (7,))
+
+    loss = softcapped_cross_entropy(logits, targets, softcap=30.0)
+    manual = softcapped_cross_entropy_manual(logits_manual, targets, softcap=30.0)
+    loss.backward()
+    manual.backward()
+
+    assert torch.allclose(manual, loss, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(logits_manual.grad, logits.grad, atol=1e-6, rtol=1e-6)
