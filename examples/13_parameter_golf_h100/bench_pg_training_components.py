@@ -43,27 +43,60 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _time_once(fn: Callable[[], None], *, warmup: int, iters: int, device: torch.device) -> float:
+def _consume_benchmark_output(value: object) -> None:
+    if torch.is_tensor(value):
+        value.detach().sum().item()
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            _consume_benchmark_output(item)
+
+
+def _time_once(
+    fn: Callable[[], object],
+    *,
+    warmup: int,
+    iters: int,
+    device: torch.device,
+    consume_output: bool,
+) -> float:
     for _ in range(warmup):
-        fn()
+        value = fn()
+        if consume_output:
+            _consume_benchmark_output(value)
     _sync(device)
     if device.type == "cuda":
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            fn()
-        end.record()
+        with torch.cuda.device(device):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                value = fn()
+                if consume_output:
+                    _consume_benchmark_output(value)
+            end.record()
         _sync(device)
         return float(start.elapsed_time(end) / max(iters, 1))
     t0 = time.perf_counter()
     for _ in range(iters):
-        fn()
+        value = fn()
+        if consume_output:
+            _consume_benchmark_output(value)
     return float((time.perf_counter() - t0) * 1000.0 / max(iters, 1))
 
 
-def _time_median(fn: Callable[[], None], *, warmup: int, iters: int, repeats: int, device: torch.device) -> float:
-    values = [_time_once(fn, warmup=warmup, iters=iters, device=device) for _ in range(max(1, repeats))]
+def _time_median(
+    fn: Callable[[], object],
+    *,
+    warmup: int,
+    iters: int,
+    repeats: int,
+    device: torch.device,
+    consume_output: bool = False,
+) -> float:
+    values = [
+        _time_once(fn, warmup=warmup, iters=iters, device=device, consume_output=consume_output)
+        for _ in range(max(1, repeats))
+    ]
     return float(statistics.median(values))
 
 
@@ -130,6 +163,7 @@ def _bench_component(
     warmup: int,
     iters: int,
     repeats: int,
+    consume_output: bool,
 ) -> dict[str, object]:
     env = _env_for_mode(mode, compile_module)
     runner = _load_runner(module, state_dict=state_dict, env=env, compile_module=compile_module, device=device)
@@ -140,9 +174,9 @@ def _bench_component(
             if item.grad is not None:
                 item.grad = None
 
-    def forward_only() -> None:
+    def forward_only() -> torch.Tensor:
         with torch.no_grad(), pg_bench._temporary_env(env), pg_bench._autocast_context(device, dtype):
-            runner(*tuple(item.detach() for item in args_tuple))
+            return runner(*tuple(item.detach() for item in args_tuple))
 
     def train_step() -> None:
         clear_grads()
@@ -150,12 +184,20 @@ def _bench_component(
             out = runner(*args_tuple)
         out.backward(grad_out)
 
-    forward_ms = _time_median(forward_only, warmup=warmup, iters=iters, repeats=repeats, device=device)
+    forward_ms = _time_median(
+        forward_only,
+        warmup=warmup,
+        iters=iters,
+        repeats=repeats,
+        device=device,
+        consume_output=consume_output,
+    )
     train_step_ms = _time_median(train_step, warmup=warmup, iters=iters, repeats=repeats, device=device)
     return {
         "component": name,
         "mode": mode,
         "compile_module": bool(compile_module),
+        "consume_output": bool(consume_output),
         "bitnet_training_env": {key: value for key, value in env.items() if value is not None},
         "forward_ms": forward_ms,
         "train_step_ms": train_step_ms,
@@ -223,6 +265,7 @@ def _bench_muon_optimizer_variants(
     warmup: int,
     iters: int,
     repeats: int,
+    consume_output: bool,
 ) -> list[dict[str, object]]:
     matrix_params = _prepare_block_grads(
         module,
@@ -366,7 +409,14 @@ def _bench_muon_optimizer_variants(
                 "optimizer_blocks": int(optimizer_blocks),
                 "batched_min_bucket": int(batched_min_bucket),
                 "row_norm": bool(row_norm),
-                "step_ms": _time_median(fn, warmup=warmup, iters=iters, repeats=repeats, device=device),
+                "step_ms": _time_median(
+                    fn,
+                    warmup=warmup,
+                    iters=iters,
+                    repeats=repeats,
+                    device=device,
+                    consume_output=consume_output,
+                ),
             }
         )
     baseline = variants[0]["step_ms"]
@@ -401,6 +451,7 @@ def main() -> None:
         not in {"", "0", "false", "off", "no"},
     )
     parser.add_argument("--optimizer-only", action="store_true")
+    parser.add_argument("--consume-output", action="store_true", help="Synchronously consume forward outputs while timing.")
     parser.add_argument("--jsonl", action="store_true")
     args = parser.parse_args()
 
@@ -459,6 +510,7 @@ def main() -> None:
         "optimizer_blocks": int(args.optimizer_blocks),
         "muon_batched_min_bucket": int(args.muon_batched_min_bucket),
         "muon_row_norm": bool(args.muon_row_norm),
+        "consume_output": bool(args.consume_output),
     }
     if args.jsonl:
         print(json.dumps({"header": header}))
@@ -481,6 +533,7 @@ def main() -> None:
                 warmup=args.warmup,
                 iters=args.iters,
                 repeats=args.repeats,
+                consume_output=bool(args.consume_output),
             )
             variants = [dense]
             for mode in pg_bench.BITNET_STE_MODES:
@@ -497,6 +550,7 @@ def main() -> None:
                     warmup=args.warmup,
                     iters=args.iters,
                     repeats=args.repeats,
+                    consume_output=bool(args.consume_output),
                 )
                 bitnet["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / bitnet["forward_ms"]
                 bitnet["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / bitnet["train_step_ms"]
@@ -520,6 +574,7 @@ def main() -> None:
             warmup=args.warmup,
             iters=args.iters,
             repeats=args.repeats,
+            consume_output=bool(args.consume_output),
         ),
     }
     print(json.dumps(optimizer_result) if args.jsonl else optimizer_result)
