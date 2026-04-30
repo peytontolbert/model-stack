@@ -11,6 +11,7 @@ class ModelConfig:
     n_layers: int
     d_ff: int
     vocab_size: int
+    n_kv_heads: int | None = None
     head_dim: int | None = None
     attn_impl: Literal["eager", "flash", "triton", "xformers", "sdpa", "torch", "flash2", "xformers2"] = "eager"
     rope_theta: float = 1e6
@@ -42,3 +43,7 @@ class ModelConfig:
     rope_attention_scaling: Optional[float] = None
     # Token ids
     pad_token_id: Optional[int] = None
+    # Encoder-decoder source ordering. Older encoder-decoder checkpoints left
+    # this disabled; AgentKernel Lite enables it so evidence/title order is
+    # visible to cross-attention.
+    encoder_position_embeddings: bool = False

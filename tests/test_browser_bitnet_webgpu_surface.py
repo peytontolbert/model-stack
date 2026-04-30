@@ -7,6 +7,8 @@ ROOT = Path(__file__).resolve().parents[1]
 WGSL = ROOT / "browser" / "bitnet" / "bitnet_linear.wgsl"
 JS = ROOT / "browser" / "bitnet" / "bitnet_webgpu.js"
 ENCDEC_JS = ROOT / "browser" / "bitnet" / "encdec_runtime.js"
+WASM_JS = ROOT / "browser" / "bitnet" / "bitnet_wasm_runtime.js"
+WASM_RS = ROOT / "browser" / "bitnet_wasm" / "src" / "lib.rs"
 
 
 def test_bitnet_wgsl_documents_model_stack_ternary_decode() -> None:
@@ -50,11 +52,38 @@ def test_encoder_decoder_browser_runtime_has_required_execution_surface() -> Non
     source = ENCDEC_JS.read_text()
 
     assert "class BitNetEncoderDecoderWebGPU" in source
+    assert "class BitNetEncoderDecoderWASM" in source
     assert "async encode" in source
     assert "async decode" in source
     assert "async forward" in source
+    assert "createGenerationSession" in source
+    assert "BitNetEncoderDecoderGenerationSession" in source
+    assert "selfAttentionIncremental" in source
+    assert "crossAttentionCached" in source
     assert "cross_block.cross" in source
     assert "self_attn_block.attn" in source
     assert "w_in" in source
     assert "w_out" in source
     assert "gatedActivation" in source
+    assert "wIn.layout.logicalOut === wOut.layout.logicalIn * 2" in source
+    assert "hidden.length === seqLen * wOut.layout.logicalIn * 2" in source
+
+
+def test_bitnet_wasm_runtime_uses_packed_kernel() -> None:
+    source = WASM_JS.read_text()
+
+    assert "model_stack_bitnet_wasm.js" in source
+    assert "bitnet_linear_f32" in source
+    assert "packedWeight" in source
+    assert "scaleValues" in source
+    assert "segmentOffsets" in source
+
+
+def test_bitnet_wasm_kernel_has_tiled_simd_surface() -> None:
+    source = WASM_RS.read_text()
+
+    assert "const OUT_TILE" in source
+    assert "step_by(OUT_TILE)" in source
+    assert "dot_packed_row_noquant_simd" in source
+    assert "target_feature = \"simd128\"" in source
+    assert "f32x4_mul" in source

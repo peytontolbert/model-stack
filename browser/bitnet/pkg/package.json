@@ -1,0 +1,15 @@
+{
+  "name": "model-stack-bitnet-wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "model_stack_bitnet_wasm_bg.wasm",
+    "model_stack_bitnet_wasm.js",
+    "model_stack_bitnet_wasm.d.ts"
+  ],
+  "main": "model_stack_bitnet_wasm.js",
+  "types": "model_stack_bitnet_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

@@ -3555,6 +3555,36 @@ class TrainableBitNetLinear(nn.Module):
     def ternary_weight(self) -> torch.Tensor:
         return _bitnet_runtime_row_ste_weight(self.weight, eps=self.eps)
 
+    def runtime_weight(
+        self,
+        *,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        weight = self.ternary_weight()
+        if dtype is not None or device is not None:
+            weight = weight.to(
+                device=weight.device if device is None else torch.device(device),
+                dtype=weight.dtype if dtype is None else dtype,
+            )
+        return weight
+
+    def runtime_bias(
+        self,
+        *,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor | None:
+        if self.bias is None:
+            return None
+        bias = self.bias
+        if dtype is not None or device is not None:
+            bias = bias.to(
+                device=bias.device if device is None else torch.device(device),
+                dtype=bias.dtype if dtype is None else dtype,
+            )
+        return bias
+
     @torch.no_grad()
     def quantized_codes_and_scales(self) -> tuple[torch.Tensor, torch.Tensor]:
         return _bitnet_runtime_row_codes_and_scale(self.weight.detach(), eps=self.eps)
@@ -3991,7 +4021,7 @@ def prepare_bitnet_qat_linear_modules(
             scale_layout=scale_layout,
             group_size=group_size,
             eps=eps,
-        ).to(device=module.weight.device, dtype=module.weight.dtype)
+        ).to(device=module.weight.device, dtype=torch.float32)
         qat.from_float(module)
         setattr(parent, attr_name, qat)
         replacements[name] = qat
@@ -4069,9 +4099,13 @@ def quantize_linear_modules(
                 spin_seed=module_spin_seed,
             )
         elif quant_scheme in {"bitnet_qat", "qat_bitnet", "trainable_bitnet"}:
+            # QAT needs a high-precision shadow weight. Keeping this in the
+            # source module dtype, commonly bf16 for small browser models,
+            # makes the ternary thresholds too coarse for AdamW to recover
+            # coherent generation after full-model BitNet projection.
             ql = TrainableBitNetLinear(module.in_features, module.out_features, bias=(module.bias is not None)).to(
                 device=module.weight.device,
-                dtype=module.weight.dtype,
+                dtype=torch.float32,
             )
             ql.from_float(module)
         elif quant_scheme == "int4":

@@ -28,7 +28,7 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _write_tensor(path: Path, tensor: torch.Tensor) -> dict[str, Any]:
+def _write_tensor(path: Path, tensor: torch.Tensor, *, float_dtype: str = "float32") -> dict[str, Any]:
     cpu = tensor.detach().cpu().contiguous()
     if cpu.dtype == torch.uint8:
         data = cpu.numpy()
@@ -37,8 +37,12 @@ def _write_tensor(path: Path, tensor: torch.Tensor) -> dict[str, Any]:
         data = cpu.to(dtype=torch.int32).numpy()
         dtype = "int32"
     elif cpu.dtype in {torch.float16, torch.bfloat16, torch.float32, torch.float64}:
-        data = cpu.to(dtype=torch.float32).numpy()
-        dtype = "float32"
+        if str(float_dtype).lower() in {"float16", "fp16", "f16"}:
+            data = cpu.to(dtype=torch.float16).numpy()
+            dtype = "float16"
+        else:
+            data = cpu.to(dtype=torch.float32).numpy()
+            dtype = "float32"
     else:
         raise TypeError(f"unsupported browser BitNet tensor dtype: {cpu.dtype}")
     path.write_bytes(data.tobytes(order="C"))
@@ -51,8 +55,8 @@ def _write_tensor(path: Path, tensor: torch.Tensor) -> dict[str, Any]:
     }
 
 
-def _write_dense_tensor(path: Path, tensor: torch.Tensor) -> dict[str, Any]:
-    entry = _write_tensor(path, tensor)
+def _write_dense_tensor(path: Path, tensor: torch.Tensor, *, dense_dtype: str = "float32") -> dict[str, Any]:
+    entry = _write_tensor(path, tensor, float_dtype=dense_dtype)
     entry["path"] = f"dense/{entry['path']}"
     return entry
 
@@ -119,11 +123,20 @@ def _copy_runtime_files(outdir: Path) -> dict[str, str]:
         "webgpu_js": "bitnet_webgpu.js",
         "wgsl": "bitnet_linear.wgsl",
         "encdec_js": "encdec_runtime.js",
+        "wasm_runtime_js": "bitnet_wasm_runtime.js",
+        "wasm_js": "pkg/model_stack_bitnet_wasm.js",
+        "wasm_binary": "pkg/model_stack_bitnet_wasm_bg.wasm",
     }
     copied: dict[str, str] = {}
     for key, filename in files.items():
         src = BROWSER_BITNET_DIR / filename
-        dst = runtime_dir / filename
+        if not src.exists() and filename.startswith("pkg/"):
+            raise FileNotFoundError(
+                f"browser BitNet WASM package is missing: {src}. "
+                "Run `wasm-pack build --target web --release --out-dir ../bitnet/pkg` "
+                "from browser/bitnet_wasm before exporting."
+            )
+        dst = runtime_dir / Path(filename).name
         shutil.copyfile(src, dst)
         copied[key] = str(dst.relative_to(outdir))
     return copied
@@ -133,20 +146,51 @@ def _is_inside_bitnet_parameter(name: str, bitnet_module_names: set[str]) -> boo
     return any(name == module_name or name.startswith(module_name + ".") for module_name in bitnet_module_names)
 
 
-def _dense_tensor_manifest(model: torch.nn.Module, outdir: Path, bitnet_module_names: set[str]) -> dict[str, Any]:
+def _named_parameters_with_aliases(model: torch.nn.Module):
+    try:
+        yield from model.named_parameters(remove_duplicate=False)
+    except TypeError:  # pragma: no cover - older PyTorch compatibility
+        yield from model.named_parameters()
+
+
+def _dense_tensor_manifest(
+    model: torch.nn.Module,
+    outdir: Path,
+    bitnet_module_names: set[str],
+    *,
+    dense_dtype: str = "float32",
+    dense_float32_patterns: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     dense_dir = outdir / "dense"
     dense_dir.mkdir(parents=True, exist_ok=True)
     tensors: dict[str, Any] = {}
-    for name, param in model.named_parameters():
+    force_float32 = tuple(str(item) for item in (dense_float32_patterns or ()) if str(item))
+
+    def dtype_for_name(name: str) -> tuple[str, str]:
+        selected = "float32" if any(pattern in name for pattern in force_float32) else dense_dtype
+        suffix = "f16" if str(selected).lower() in {"float16", "fp16", "f16"} else "f32"
+        return selected, suffix
+
+    for name, param in _named_parameters_with_aliases(model):
         if _is_inside_bitnet_parameter(name, bitnet_module_names):
             continue
-        tensors[name] = _write_dense_tensor(dense_dir / f"{_safe_layer_name(name)}.f32.bin", param)
+        selected_dtype, suffix = dtype_for_name(name)
+        tensors[name] = _write_dense_tensor(
+            dense_dir / f"{_safe_layer_name(name)}.{suffix}.bin",
+            param,
+            dense_dtype=selected_dtype,
+        )
     for name, buffer in model.named_buffers():
         if _is_inside_bitnet_parameter(name, bitnet_module_names):
             continue
         if buffer.numel() == 0:
             continue
-        tensors[name] = _write_dense_tensor(dense_dir / f"{_safe_layer_name(name)}.f32.bin", buffer)
+        selected_dtype, suffix = dtype_for_name(name)
+        tensors[name] = _write_dense_tensor(
+            dense_dir / f"{_safe_layer_name(name)}.{suffix}.bin",
+            buffer,
+            dense_dtype=selected_dtype,
+        )
     return tensors
 
 
@@ -220,6 +264,11 @@ def _graph_manifest(model: torch.nn.Module, layers: list[dict[str, Any]]) -> dic
             "encoder": "enc_embed.weight",
             "decoder": "dec_embed.weight",
         }
+        if bool(getattr(cfg, "encoder_position_embeddings", False)):
+            graph["encoder_position_embeddings"] = True
+            graph["position_embeddings"] = {
+                "encoder": "enc_pos_embed.weight",
+            }
         graph["final_norms"] = {
             "encoder": {"weight": "enc_norm.weight", "bias": "enc_norm.bias"},
             "decoder": {"weight": "dec_norm.weight", "bias": "dec_norm.bias"},
@@ -241,6 +290,8 @@ def export_browser_bitnet_bundle(
     *,
     model_cfg: object | None = None,
     max_seq_len: int | None = None,
+    dense_dtype: str = "float32",
+    dense_float32_patterns: list[str] | tuple[str, ...] | None = None,
 ) -> Path:
     """Export packed BitNet linear tensors and browser runtime metadata.
 
@@ -264,17 +315,20 @@ def export_browser_bitnet_bundle(
         for name, module in model.named_modules()
         if isinstance(module, QuantizedLinearBitNet)
     ]
-    if not layers:
-        raise ValueError("browser-bitnet export found no QuantizedLinearBitNet modules")
-
     runtime_files = _copy_runtime_files(output_dir)
-    dense_tensors = _dense_tensor_manifest(model, output_dir, bitnet_names)
+    dense_tensors = _dense_tensor_manifest(
+        model,
+        output_dir,
+        bitnet_names,
+        dense_dtype=dense_dtype,
+        dense_float32_patterns=dense_float32_patterns,
+    )
     manifest: dict[str, Any] = {
         "format": "model-stack-browser-bitnet",
         "format_version": 1,
         "runtime": {
             "primary": "webgpu",
-            "fallback": "wasm-simd-required",
+            "fallback": "wasm",
             "safari": {
                 "https_required": True,
                 "webgpu_feature_detection": "navigator.gpu",
@@ -285,6 +339,8 @@ def export_browser_bitnet_bundle(
         "model": _model_config_dict(model_cfg),
         "graph": _graph_manifest(model, layers),
         "dense_tensors": dense_tensors,
+        "dense_dtype": str(dense_dtype),
+        "dense_float32_patterns": list(dense_float32_patterns or []),
         "max_seq_len": None if max_seq_len is None else int(max_seq_len),
         "layers": layers,
     }

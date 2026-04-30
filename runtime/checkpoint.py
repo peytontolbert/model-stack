@@ -295,6 +295,7 @@ def model_config_from_hf_llama_snapshot_config(
         n_layers=n_layers,
         d_ff=d_ff,
         vocab_size=vocab_size,
+        n_kv_heads=n_kv_heads,
         head_dim=head_dim,
         rope_theta=rope_theta,
         dtype=("bfloat16" if torch_dtype == torch.bfloat16 else "float32"),
@@ -350,6 +351,7 @@ def model_config_from_hf_llama_transformers_config(
         n_layers=n_layers,
         d_ff=d_ff,
         vocab_size=vocab_size,
+        n_kv_heads=n_kv_heads,
         attn_impl="sdpa",
         rope_theta=float(rope_theta if rope_theta is not None else getattr(cfg_hf, "rope_theta", 1e6)),
         max_position_embeddings=int(
@@ -438,18 +440,6 @@ def build_local_llama_from_snapshot(
         DistConfig = None  # type: ignore
         has_dist = False
 
-    model = build_causal_lm(
-        cfg,
-        block="llama",
-        n_kv_heads=n_kv_heads,
-        tie_weights=tie_weights,
-    )
-    try:
-        model = model.to(dtype=torch_dtype)
-    except Exception:
-        pass
-    load_hf_llama_weights_into_local(model, ckpt_dir)
-
     target_device = device
     try:
         if str(device).startswith("cuda") and (device_map == "auto") and torch.cuda.is_available():
@@ -477,7 +467,18 @@ def build_local_llama_from_snapshot(
     except Exception:
         target_device = device
 
-    model = model.to(target_device).eval()
+    model = build_causal_lm(
+        cfg,
+        block="llama",
+        n_kv_heads=n_kv_heads,
+        tie_weights=tie_weights,
+    )
+    try:
+        model = model.to(device=target_device, dtype=torch_dtype)
+    except Exception:
+        pass
+    load_hf_llama_weights_into_local(model, ckpt_dir)
+    model = model.eval()
 
     try:
         if has_dist:
