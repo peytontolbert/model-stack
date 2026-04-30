@@ -3623,7 +3623,8 @@ def _try_squared_activation_dynamic_int8_down_projection(
         return None
     if str(getattr(w_out_module, "act_quant_mode", "")).strip().lower() != "dynamic_int8":
         return None
-    if int(getattr(w_out_module, "act_quant_bits", 0)) != 8:
+    act_quant_bits = int(getattr(w_out_module, "act_quant_bits", 0))
+    if act_quant_bits < 2 or act_quant_bits > 8:
         return None
     if str(getattr(w_out_module, "act_quant_method", "absmax")).strip().lower() not in {"", "absmax"}:
         return None
@@ -3658,7 +3659,7 @@ def _try_squared_activation_dynamic_int8_down_projection(
     module = native_module()
     if module is None or not hasattr(module, method_name):
         return None
-    qx, row_scale = getattr(module, method_name)(hidden)
+    qx, row_scale = getattr(module, method_name)(hidden, act_quant_bits)
     return runtime_from_quantized(qx, row_scale, out_dtype=hidden.dtype)
 
 

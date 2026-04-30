@@ -90,3 +90,26 @@ def test_native_int8_quantize_leaky_relu_half_squared_matches_torch() -> None:
 
     max_abs_diff = (reconstructed - torch_out).abs().max().item()
     assert max_abs_diff <= torch_out.abs().amax(dim=1).max().item() / 127.0 + 0.02
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native quantized activation parity")
+def test_native_quantize_leaky_relu_half_squared_supports_a4_scale() -> None:
+    device = _test_device()
+    if device.type != "cuda":
+        pytest.skip("CUDA device required for native quantized activation parity")
+    module = runtime_ops.native_module()
+    if module is None or not hasattr(module, "int8_quantize_leaky_relu_half2_activation_forward"):
+        pytest.skip("native leaky ReLU squared int8 quantizer is unavailable")
+
+    torch.manual_seed(3)
+    x = torch.randn(11, 129, device=device, dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        qx, row_scale = module.int8_quantize_leaky_relu_half2_activation_forward(x, 4)
+        torch_out = F.leaky_relu(x, negative_slope=0.5).square().float()
+        reconstructed = qx.float() * row_scale.view(-1, 1)
+        torch.cuda.synchronize(device)
+
+    assert int(qx.abs().max().item()) <= 7
+    max_abs_diff = (reconstructed - torch_out).abs().max().item()
+    assert max_abs_diff <= torch_out.abs().amax(dim=1).max().item() / 7.0 + 0.02

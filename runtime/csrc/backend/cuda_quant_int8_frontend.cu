@@ -140,6 +140,13 @@ __device__ __forceinline__ int8_t QuantizeScaledToInt8(float scaled) {
   return static_cast<int8_t>(q);
 }
 
+__device__ __forceinline__ int8_t QuantizeScaledToInt8Qmax(float scaled, int qmax) {
+  int q = __float2int_rn(scaled);
+  q = q < -qmax ? -qmax : q;
+  q = q > qmax ? qmax : q;
+  return static_cast<int8_t>(q);
+}
+
 __device__ __forceinline__ uint32_t PackInt8x4(int8_t q0, int8_t q1, int8_t q2, int8_t q3) {
   return static_cast<uint32_t>(static_cast<uint8_t>(q0)) |
       (static_cast<uint32_t>(static_cast<uint8_t>(q1)) << 8) |
@@ -349,7 +356,8 @@ __global__ void quantize_relu2_activation_int8_rowwise_kernel(
     int8_t* __restrict__ qx,
     float* __restrict__ row_scale,
     int64_t rows,
-    int64_t cols) {
+    int64_t cols,
+    int qmax) {
   const int64_t row = static_cast<int64_t>(blockIdx.x);
   if (row >= rows) {
     return;
@@ -370,7 +378,7 @@ __global__ void quantize_relu2_activation_int8_rowwise_kernel(
     __syncthreads();
   }
 
-  const float scale = shared_max[0] > 0.0f ? (shared_max[0] / 127.0f) : 1.0f;
+  const float scale = shared_max[0] > 0.0f ? (shared_max[0] / static_cast<float>(qmax)) : 1.0f;
   if (threadIdx.x == 0) {
     row_scale[row] = scale;
   }
@@ -379,7 +387,7 @@ __global__ void quantize_relu2_activation_int8_rowwise_kernel(
   const float inv_scale = 1.0f / scale;
   for (int64_t col = threadIdx.x; col < cols; col += blockDim.x) {
     const float scaled = static_cast<float>(Relu2Cast(x[row_offset + col])) * inv_scale;
-    qx[row_offset + col] = QuantizeScaledToInt8(scaled);
+    qx[row_offset + col] = QuantizeScaledToInt8Qmax(scaled, qmax);
   }
 }
 
@@ -389,7 +397,8 @@ __global__ void quantize_leaky_relu_half2_activation_int8_rowwise_kernel(
     int8_t* __restrict__ qx,
     float* __restrict__ row_scale,
     int64_t rows,
-    int64_t cols) {
+    int64_t cols,
+    int qmax) {
   const int64_t row = static_cast<int64_t>(blockIdx.x);
   if (row >= rows) {
     return;
@@ -410,7 +419,7 @@ __global__ void quantize_leaky_relu_half2_activation_int8_rowwise_kernel(
     __syncthreads();
   }
 
-  const float scale = shared_max[0] > 0.0f ? (shared_max[0] / 127.0f) : 1.0f;
+  const float scale = shared_max[0] > 0.0f ? (shared_max[0] / static_cast<float>(qmax)) : 1.0f;
   if (threadIdx.x == 0) {
     row_scale[row] = scale;
   }
@@ -419,7 +428,7 @@ __global__ void quantize_leaky_relu_half2_activation_int8_rowwise_kernel(
   const float inv_scale = 1.0f / scale;
   for (int64_t col = threadIdx.x; col < cols; col += blockDim.x) {
     const float scaled = static_cast<float>(LeakyReluHalf2Cast(x[row_offset + col])) * inv_scale;
-    qx[row_offset + col] = QuantizeScaledToInt8(scaled);
+    qx[row_offset + col] = QuantizeScaledToInt8Qmax(scaled, qmax);
   }
 }
 
@@ -573,7 +582,8 @@ __global__ void quantize_relu2_activation_int8_rowwise_warp_cached_kernel(
     int8_t* __restrict__ qx,
     float* __restrict__ row_scale,
     int64_t rows,
-    int64_t cols) {
+    int64_t cols,
+    int qmax) {
   extern __shared__ __align__(16) unsigned char shared_values_raw[];
   auto* shared_values = reinterpret_cast<scalar_t*>(shared_values_raw);
   const int warp_id = threadIdx.x / kQuantWarpSize;
@@ -598,7 +608,7 @@ __global__ void quantize_relu2_activation_int8_rowwise_warp_cached_kernel(
 
   float scale = 1.0f;
   if (lane == 0) {
-    scale = local_max > 0.0f ? (local_max / 127.0f) : 1.0f;
+    scale = local_max > 0.0f ? (local_max / static_cast<float>(qmax)) : 1.0f;
     row_scale[row] = scale;
   }
   scale = __shfl_sync(mask, scale, 0);
@@ -606,7 +616,7 @@ __global__ void quantize_relu2_activation_int8_rowwise_warp_cached_kernel(
 
   for (int64_t col = lane; col < cols; col += kQuantWarpSize) {
     const float scaled = static_cast<float>(row_values[col]) * inv_scale;
-    qx[row_offset + col] = QuantizeScaledToInt8(scaled);
+    qx[row_offset + col] = QuantizeScaledToInt8Qmax(scaled, qmax);
   }
 }
 
@@ -616,7 +626,8 @@ __global__ void quantize_leaky_relu_half2_activation_int8_rowwise_warp_cached_ke
     int8_t* __restrict__ qx,
     float* __restrict__ row_scale,
     int64_t rows,
-    int64_t cols) {
+    int64_t cols,
+    int qmax) {
   extern __shared__ __align__(16) unsigned char shared_values_raw[];
   auto* shared_values = reinterpret_cast<scalar_t*>(shared_values_raw);
   const int warp_id = threadIdx.x / kQuantWarpSize;
@@ -641,7 +652,7 @@ __global__ void quantize_leaky_relu_half2_activation_int8_rowwise_warp_cached_ke
 
   float scale = 1.0f;
   if (lane == 0) {
-    scale = local_max > 0.0f ? (local_max / 127.0f) : 1.0f;
+    scale = local_max > 0.0f ? (local_max / static_cast<float>(qmax)) : 1.0f;
     row_scale[row] = scale;
   }
   scale = __shfl_sync(mask, scale, 0);
@@ -649,7 +660,7 @@ __global__ void quantize_leaky_relu_half2_activation_int8_rowwise_warp_cached_ke
 
   for (int64_t col = lane; col < cols; col += kQuantWarpSize) {
     const float scaled = static_cast<float>(row_values[col]) * inv_scale;
-    qx[row_offset + col] = QuantizeScaledToInt8(scaled);
+    qx[row_offset + col] = QuantizeScaledToInt8Qmax(scaled, qmax);
   }
 }
 
@@ -836,7 +847,8 @@ __global__ void quantize_relu2_activation_int8_rowwise_wide_cached_kernel(
     int8_t* __restrict__ qx,
     float* __restrict__ row_scale,
     int64_t rows,
-    int64_t cols) {
+    int64_t cols,
+    int qmax) {
   extern __shared__ __align__(16) unsigned char shared_values_raw[];
   auto* shared_values = reinterpret_cast<scalar_t*>(shared_values_raw);
   const int group_id = threadIdx.x / kQuantWideGroupSize;
@@ -876,7 +888,7 @@ __global__ void quantize_relu2_activation_int8_rowwise_wide_cached_kernel(
       group_max = fmaxf(group_max, __shfl_down_sync(mask, group_max, offset));
     }
     if (group_lane == 0) {
-      const float scale = group_max > 0.0f ? (group_max / 127.0f) : 1.0f;
+      const float scale = group_max > 0.0f ? (group_max / static_cast<float>(qmax)) : 1.0f;
       row_scale[row] = scale;
       shared_scale[group_id] = scale;
     }
@@ -887,7 +899,7 @@ __global__ void quantize_relu2_activation_int8_rowwise_wide_cached_kernel(
     const float inv_scale = 1.0f / shared_scale[group_id];
     for (int64_t col = group_lane; col < cols; col += kQuantWideGroupSize) {
       const float scaled = static_cast<float>(row_values[col]) * inv_scale;
-      qx[row_offset + col] = QuantizeScaledToInt8(scaled);
+      qx[row_offset + col] = QuantizeScaledToInt8Qmax(scaled, qmax);
     }
   }
 }
@@ -898,7 +910,8 @@ __global__ void quantize_leaky_relu_half2_activation_int8_rowwise_wide_cached_ke
     int8_t* __restrict__ qx,
     float* __restrict__ row_scale,
     int64_t rows,
-    int64_t cols) {
+    int64_t cols,
+    int qmax) {
   extern __shared__ __align__(16) unsigned char shared_values_raw[];
   auto* shared_values = reinterpret_cast<scalar_t*>(shared_values_raw);
   const int group_id = threadIdx.x / kQuantWideGroupSize;
@@ -938,7 +951,7 @@ __global__ void quantize_leaky_relu_half2_activation_int8_rowwise_wide_cached_ke
       group_max = fmaxf(group_max, __shfl_down_sync(mask, group_max, offset));
     }
     if (group_lane == 0) {
-      const float scale = group_max > 0.0f ? (group_max / 127.0f) : 1.0f;
+      const float scale = group_max > 0.0f ? (group_max / static_cast<float>(qmax)) : 1.0f;
       row_scale[row] = scale;
       shared_scale[group_id] = scale;
     }
@@ -949,7 +962,7 @@ __global__ void quantize_leaky_relu_half2_activation_int8_rowwise_wide_cached_ke
     const float inv_scale = 1.0f / shared_scale[group_id];
     for (int64_t col = group_lane; col < cols; col += kQuantWideGroupSize) {
       const float scaled = static_cast<float>(row_values[col]) * inv_scale;
-      qx[row_offset + col] = QuantizeScaledToInt8(scaled);
+      qx[row_offset + col] = QuantizeScaledToInt8Qmax(scaled, qmax);
     }
   }
 }
@@ -1595,13 +1608,17 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeActivationInt8ColumnwiseCuda(
 }
 
 std::tuple<torch::Tensor, torch::Tensor> QuantizeRelu2ActivationInt8RowwiseCuda(
-    const torch::Tensor& x) {
+    const torch::Tensor& x,
+    int64_t act_quant_bits) {
   TORCH_CHECK(x.is_cuda(), "QuantizeRelu2ActivationInt8RowwiseCuda: x must be a CUDA tensor");
   TORCH_CHECK(IsSupportedInt8FrontendDtype(x.scalar_type()),
               "QuantizeRelu2ActivationInt8RowwiseCuda: unsupported input dtype");
   TORCH_CHECK(x.dim() >= 2, "QuantizeRelu2ActivationInt8RowwiseCuda: x must have rank >= 2");
+  TORCH_CHECK(act_quant_bits >= 2 && act_quant_bits <= 8,
+              "QuantizeRelu2ActivationInt8RowwiseCuda: act_quant_bits must be in [2, 8]");
 
   c10::cuda::CUDAGuard device_guard{x.device()};
+  const int qmax = (1 << (static_cast<int>(act_quant_bits) - 1)) - 1;
   const auto cols = x.size(-1);
   const auto rows = x.numel() / cols;
   auto x_2d = x.reshape({rows, cols}).contiguous();
@@ -1630,7 +1647,8 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeRelu2ActivationInt8RowwiseCuda(
               qx_2d.data_ptr<int8_t>(),
               row_scale.data_ptr<float>(),
               rows,
-              cols);
+              cols,
+              qmax);
         } else if (Int8QuantWarpRowEnabled(cols)) {
           const auto launch_warp_rows = [&](auto rows_constant, int threads) {
             constexpr int rows_per_block = decltype(rows_constant)::value;
@@ -1645,7 +1663,8 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeRelu2ActivationInt8RowwiseCuda(
                   qx_2d.data_ptr<int8_t>(),
                   row_scale.data_ptr<float>(),
                   rows,
-                  cols);
+                  cols,
+                  qmax);
               return;
             }
             const auto shared_bytes =
@@ -1659,7 +1678,8 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeRelu2ActivationInt8RowwiseCuda(
                 qx_2d.data_ptr<int8_t>(),
                 row_scale.data_ptr<float>(),
                 rows,
-                cols);
+                cols,
+                qmax);
           };
           switch (Int8QuantWarpRowsPerBlock()) {
             case kQuantWarp4RowsPerBlock:
@@ -1682,7 +1702,8 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeRelu2ActivationInt8RowwiseCuda(
               qx_2d.data_ptr<int8_t>(),
               row_scale.data_ptr<float>(),
               rows,
-              cols);
+              cols,
+              qmax);
         }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1692,13 +1713,17 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeRelu2ActivationInt8RowwiseCuda(
 }
 
 std::tuple<torch::Tensor, torch::Tensor> QuantizeLeakyReluHalf2ActivationInt8RowwiseCuda(
-    const torch::Tensor& x) {
+    const torch::Tensor& x,
+    int64_t act_quant_bits) {
   TORCH_CHECK(x.is_cuda(), "QuantizeLeakyReluHalf2ActivationInt8RowwiseCuda: x must be a CUDA tensor");
   TORCH_CHECK(IsSupportedInt8FrontendDtype(x.scalar_type()),
               "QuantizeLeakyReluHalf2ActivationInt8RowwiseCuda: unsupported input dtype");
   TORCH_CHECK(x.dim() >= 2, "QuantizeLeakyReluHalf2ActivationInt8RowwiseCuda: x must have rank >= 2");
+  TORCH_CHECK(act_quant_bits >= 2 && act_quant_bits <= 8,
+              "QuantizeLeakyReluHalf2ActivationInt8RowwiseCuda: act_quant_bits must be in [2, 8]");
 
   c10::cuda::CUDAGuard device_guard{x.device()};
+  const int qmax = (1 << (static_cast<int>(act_quant_bits) - 1)) - 1;
   const auto cols = x.size(-1);
   const auto rows = x.numel() / cols;
   auto x_2d = x.reshape({rows, cols}).contiguous();
@@ -1727,7 +1752,8 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeLeakyReluHalf2ActivationInt8Row
               qx_2d.data_ptr<int8_t>(),
               row_scale.data_ptr<float>(),
               rows,
-              cols);
+              cols,
+              qmax);
         } else if (Int8QuantWarpRowEnabled(cols)) {
           const auto launch_warp_rows = [&](auto rows_constant, int threads) {
             constexpr int rows_per_block = decltype(rows_constant)::value;
@@ -1742,7 +1768,8 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeLeakyReluHalf2ActivationInt8Row
                   qx_2d.data_ptr<int8_t>(),
                   row_scale.data_ptr<float>(),
                   rows,
-                  cols);
+                  cols,
+                  qmax);
               return;
             }
             const auto shared_bytes =
@@ -1756,7 +1783,8 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeLeakyReluHalf2ActivationInt8Row
                 qx_2d.data_ptr<int8_t>(),
                 row_scale.data_ptr<float>(),
                 rows,
-                cols);
+                cols,
+                qmax);
           };
           switch (Int8QuantWarpRowsPerBlock()) {
             case kQuantWarp4RowsPerBlock:
@@ -1779,7 +1807,8 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeLeakyReluHalf2ActivationInt8Row
               qx_2d.data_ptr<int8_t>(),
               row_scale.data_ptr<float>(),
               rows,
-              cols);
+              cols,
+              qmax);
         }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1816,14 +1845,16 @@ std::vector<torch::Tensor> CudaInt8QuantizeActivationColumnwiseForward(
 }
 
 std::vector<torch::Tensor> CudaInt8QuantizeRelu2ActivationForward(
-    const torch::Tensor& x) {
-  auto quantized = QuantizeRelu2ActivationInt8RowwiseCuda(x);
+    const torch::Tensor& x,
+    int64_t act_quant_bits) {
+  auto quantized = QuantizeRelu2ActivationInt8RowwiseCuda(x, act_quant_bits);
   return {std::get<0>(quantized), std::get<1>(quantized)};
 }
 
 std::vector<torch::Tensor> CudaInt8QuantizeLeakyReluHalf2ActivationForward(
-    const torch::Tensor& x) {
-  auto quantized = QuantizeLeakyReluHalf2ActivationInt8RowwiseCuda(x);
+    const torch::Tensor& x,
+    int64_t act_quant_bits) {
+  auto quantized = QuantizeLeakyReluHalf2ActivationInt8RowwiseCuda(x, act_quant_bits);
   return {std::get<0>(quantized), std::get<1>(quantized)};
 }
 

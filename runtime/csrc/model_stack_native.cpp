@@ -195,9 +195,11 @@ std::vector<torch::Tensor> CudaInt8QuantizeActivationColumnwiseForward(
     const torch::Tensor& x,
     const c10::optional<torch::Tensor>& provided_scale);
 std::vector<torch::Tensor> CudaInt8QuantizeRelu2ActivationForward(
-    const torch::Tensor& x);
+    const torch::Tensor& x,
+    int64_t act_quant_bits);
 std::vector<torch::Tensor> CudaInt8QuantizeLeakyReluHalf2ActivationForward(
-    const torch::Tensor& x);
+    const torch::Tensor& x,
+    int64_t act_quant_bits);
 torch::Tensor CudaInt8LinearFromFloatForward(
     const torch::Tensor& x,
     const torch::Tensor& qweight,
@@ -947,7 +949,11 @@ torch::Tensor ReferenceInt4LinearForward(
 
 std::pair<torch::Tensor, torch::Tensor> ReferenceQuantizeActivationInt8Rowwise(
     const torch::Tensor& x,
-    const c10::optional<torch::Tensor>& provided_scale) {
+    const c10::optional<torch::Tensor>& provided_scale,
+    int act_quant_bits = 8) {
+  TORCH_CHECK(act_quant_bits >= 2 && act_quant_bits <= 8,
+              "ReferenceQuantizeActivationInt8Rowwise: act_quant_bits must be in [2, 8]");
+  const float qmax = static_cast<float>((1 << (act_quant_bits - 1)) - 1);
   const auto cols = x.size(-1);
   const auto rows = x.numel() / cols;
   auto x_float = x.to(torch::kFloat32);
@@ -963,9 +969,9 @@ std::pair<torch::Tensor, torch::Tensor> ReferenceQuantizeActivationInt8Rowwise(
     }
     row_scale = row_scale.clamp_min(1e-8).contiguous();
   } else {
-    row_scale = (x_2d.abs().amax(-1).clamp_min(1e-8) / 127.0f).to(torch::kFloat32).contiguous();
+    row_scale = (x_2d.abs().amax(-1).clamp_min(1e-8) / qmax).to(torch::kFloat32).contiguous();
   }
-  auto qx = torch::round(x_2d / row_scale.unsqueeze(1)).clamp(-127.0f, 127.0f).to(torch::kInt8);
+  auto qx = torch::round(x_2d / row_scale.unsqueeze(1)).clamp(-qmax, qmax).to(torch::kInt8);
   std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
   return {qx.view(out_sizes), row_scale};
 }
@@ -5081,37 +5087,41 @@ std::vector<torch::Tensor> Int8QuantizeActivationTransposeForward(
   return {quantized.first, quantized.second};
 }
 
-std::vector<torch::Tensor> Int8QuantizeRelu2ActivationForward(const torch::Tensor& x) {
+std::vector<torch::Tensor> Int8QuantizeRelu2ActivationForward(const torch::Tensor& x, int64_t act_quant_bits) {
   TORCH_CHECK(x.defined(), "int8_quantize_relu2_activation_forward: x must be defined");
   TORCH_CHECK(x.dim() >= 2, "int8_quantize_relu2_activation_forward: x must have rank >= 2");
   TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
                   x.scalar_type() == torch::kBFloat16,
               "int8_quantize_relu2_activation_forward: x must use float32, float16, or bfloat16");
+  TORCH_CHECK(act_quant_bits >= 2 && act_quant_bits <= 8,
+              "int8_quantize_relu2_activation_forward: act_quant_bits must be in [2, 8]");
 #if MODEL_STACK_WITH_CUDA
   if (x.is_cuda() && HasCudaInt8QuantFrontendKernel()) {
-    return CudaInt8QuantizeRelu2ActivationForward(x);
+    return CudaInt8QuantizeRelu2ActivationForward(x, act_quant_bits);
   }
 #endif
   auto y = at::relu(x);
   y = y * y;
-  auto quantized = ReferenceQuantizeActivationInt8Rowwise(y, c10::nullopt);
+  auto quantized = ReferenceQuantizeActivationInt8Rowwise(y, c10::nullopt, static_cast<int>(act_quant_bits));
   return {quantized.first, quantized.second};
 }
 
-std::vector<torch::Tensor> Int8QuantizeLeakyReluHalf2ActivationForward(const torch::Tensor& x) {
+std::vector<torch::Tensor> Int8QuantizeLeakyReluHalf2ActivationForward(const torch::Tensor& x, int64_t act_quant_bits) {
   TORCH_CHECK(x.defined(), "int8_quantize_leaky_relu_half2_activation_forward: x must be defined");
   TORCH_CHECK(x.dim() >= 2, "int8_quantize_leaky_relu_half2_activation_forward: x must have rank >= 2");
   TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
                   x.scalar_type() == torch::kBFloat16,
               "int8_quantize_leaky_relu_half2_activation_forward: x must use float32, float16, or bfloat16");
+  TORCH_CHECK(act_quant_bits >= 2 && act_quant_bits <= 8,
+              "int8_quantize_leaky_relu_half2_activation_forward: act_quant_bits must be in [2, 8]");
 #if MODEL_STACK_WITH_CUDA
   if (x.is_cuda() && HasCudaInt8QuantFrontendKernel()) {
-    return CudaInt8QuantizeLeakyReluHalf2ActivationForward(x);
+    return CudaInt8QuantizeLeakyReluHalf2ActivationForward(x, act_quant_bits);
   }
 #endif
   auto y = at::leaky_relu(x, 0.5);
   y = y * y;
-  auto quantized = ReferenceQuantizeActivationInt8Rowwise(y, c10::nullopt);
+  auto quantized = ReferenceQuantizeActivationInt8Rowwise(y, c10::nullopt, static_cast<int>(act_quant_bits));
   return {quantized.first, quantized.second};
 }
 
@@ -10235,8 +10245,10 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("provided_scale") = py::none());
   m.def("int8_quantize_activation_columnwise_forward", &CudaInt8QuantizeActivationColumnwiseForward, py::arg("x"),
         py::arg("provided_scale") = py::none());
-  m.def("int8_quantize_relu2_activation_forward", &Int8QuantizeRelu2ActivationForward, py::arg("x"));
-  m.def("int8_quantize_leaky_relu_half2_activation_forward", &Int8QuantizeLeakyReluHalf2ActivationForward, py::arg("x"));
+  m.def("int8_quantize_relu2_activation_forward", &Int8QuantizeRelu2ActivationForward, py::arg("x"),
+        py::arg("act_quant_bits") = 8);
+  m.def("int8_quantize_leaky_relu_half2_activation_forward", &Int8QuantizeLeakyReluHalf2ActivationForward, py::arg("x"),
+        py::arg("act_quant_bits") = 8);
   m.def(
       "int8_linear_forward",
       [](const torch::Tensor& qx,

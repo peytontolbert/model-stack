@@ -395,6 +395,7 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "m.def(\"int8_linear_grad_weight_from_float_forward\"" in native_source
     assert "m.def(\"int8_quantize_relu2_activation_forward\"" in native_source
     assert "m.def(\"int8_quantize_leaky_relu_half2_activation_forward\"" in native_source
+    assert 'py::arg("act_quant_bits") = 8' in native_source
     assert "bitnet_int8_linear_from_float_forward" in native_source
     assert "bitnet_int8_fused_qkv_packed_heads_projection_forward" in native_source
     assert "bool TryLoadBitNetModuleState(" in native_source
