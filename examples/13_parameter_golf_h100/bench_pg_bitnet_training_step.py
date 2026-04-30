@@ -114,7 +114,7 @@ def _sync(device: torch.device) -> None:
 
 def _consume_benchmark_output(value: object) -> None:
     if torch.is_tensor(value):
-        value.detach().float().sum().item()
+        value.detach().sum().item()
     elif isinstance(value, (tuple, list)):
         for item in value:
             _consume_benchmark_output(item)
