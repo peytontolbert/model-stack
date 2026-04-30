@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import torch.nn as nn
 import torch
 
-from compress.quantization import QuantizedLinearBitNet
+from compress.quantization import QuantizedLinearBitNet, TrainableBitNetLinear, _trainable_bitnet_activation_quant
 from runtime.ops import bitnet_transform_input
 from runtime.quant import bitnet_int8_linear_from_float
 
@@ -66,3 +67,22 @@ def test_quantized_linear_bitnet_accepts_dynamic_int4_alias() -> None:
     torch.testing.assert_close(row_scale, torch.tensor([2.0 / 7.0, 200.0 / 7.0]))
     assert int(qx.abs().max().item()) <= 7
     torch.testing.assert_close(qx[:, 1], torch.tensor([7, 7], dtype=torch.int8))
+
+
+def test_trainable_bitnet_exports_dynamic_int4_alias() -> None:
+    source = nn.Linear(2, 2, bias=False)
+    layer = TrainableBitNetLinear(2, 2, bias=False).from_float(source)
+
+    quantized = layer.to_quantized(activation_quant="dynamic_int4", activation_quant_bits=8)
+
+    assert isinstance(quantized, QuantizedLinearBitNet)
+    assert quantized.act_quant_mode == "dynamic_int8"
+    assert quantized.act_quant_bits == 4
+
+
+def test_trainable_bitnet_dynamic_int4_ste_defaults_to_four_bit(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_STACK_TRAINABLE_BITNET_TRAINING_FORWARD", "dynamic_int4_ste")
+    monkeypatch.delenv("MODEL_STACK_TRAINABLE_BITNET_ACT_QUANT", raising=False)
+    monkeypatch.delenv("MODEL_STACK_TRAINABLE_BITNET_ACT_QUANT_BITS", raising=False)
+
+    assert _trainable_bitnet_activation_quant() == ("dynamic_int8", 4)
