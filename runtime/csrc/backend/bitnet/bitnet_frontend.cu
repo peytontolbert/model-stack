@@ -6,7 +6,10 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cctype>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "bitnet_common.cuh"
@@ -18,6 +21,25 @@ namespace {
 constexpr int kBitNetTransformThreads = 256;
 constexpr int kBitNetRow1Threads = 32;
 constexpr int kBitNetRow1ColsPerThread = 8;
+
+std::string NormalizeActivationQuantMode(const std::string& mode) {
+  std::string normalized = mode;
+  std::transform(
+      normalized.begin(),
+      normalized.end(),
+      normalized.begin(),
+      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  if (normalized.empty() || normalized == "off") {
+    return "none";
+  }
+  if (normalized == "dynamic_int4" || normalized == "dynamic_a4") {
+    return "dynamic_int8";
+  }
+  if (normalized == "static_int4" || normalized == "static_a4") {
+    return "static_int8";
+  }
+  return normalized;
+}
 
 struct CachedBitNetRow1QuantScratch {
   int device_index = -1;
@@ -518,7 +540,7 @@ torch::Tensor CudaBitNetTransformInputForward(
     pre_scale_cast = scale;
   }
 
-  const auto mode_name = act_quant_mode;
+  const auto mode_name = NormalizeActivationQuantMode(act_quant_mode);
   const bool apply_quant = !(mode_name.empty() || mode_name == "none" || mode_name == "off");
   c10::optional<torch::Tensor> provided_scale = c10::nullopt;
   if (apply_quant) {
@@ -609,7 +631,7 @@ std::tuple<torch::Tensor, torch::Tensor> CudaBitNetQuantizeActivationInt8CodesFo
     pre_scale_cast = scale;
   }
 
-  const auto mode_name = act_quant_mode;
+  const auto mode_name = NormalizeActivationQuantMode(act_quant_mode);
   TORCH_CHECK(
       mode_name == "dynamic_int8" || mode_name == "static_int8",
       "CudaBitNetQuantizeActivationInt8CodesForward: unsupported activation quant mode");
@@ -706,7 +728,7 @@ std::tuple<torch::Tensor, torch::Tensor> CudaBitNetQuantizeGatedActivationInt8Co
     pre_scale_cast = scale;
   }
 
-  const auto mode_name = act_quant_mode;
+  const auto mode_name = NormalizeActivationQuantMode(act_quant_mode);
   TORCH_CHECK(
       mode_name == "dynamic_int8" || mode_name == "static_int8",
       "CudaBitNetQuantizeGatedActivationInt8CodesForward: unsupported activation quant mode");
@@ -818,7 +840,7 @@ torch::Tensor CudaBitNetInt8LinearFromFloatRow1Forward(
   }
 
   c10::optional<torch::Tensor> provided_scale = c10::nullopt;
-  const auto mode_name = act_quant_mode;
+  const auto mode_name = NormalizeActivationQuantMode(act_quant_mode);
   if (mode_name == "static_int8") {
     TORCH_CHECK(
         act_scale.has_value() && act_scale.value().defined(),

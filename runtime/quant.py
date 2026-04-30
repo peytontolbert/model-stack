@@ -531,6 +531,16 @@ def nf4_dequantize(qx: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
     return _dequantize_nf4_codes(qx.to(dtype=torch.uint8), meta, dtype=target_dtype)
 
 
+def _normalize_activation_quant_mode_and_bits(mode: str, bits: int) -> tuple[str, int]:
+    mode_name = str(mode).strip().lower()
+    bits_value = int(bits)
+    if mode_name in {"dynamic_int4", "dynamic_a4"}:
+        return "dynamic_int8", 4
+    if mode_name in {"static_int4", "static_a4"}:
+        return "static_int8", 4
+    return mode_name, bits_value
+
+
 def quantize_activation_int8_rowwise(
     x: torch.Tensor,
     *,
@@ -1017,6 +1027,7 @@ def bitnet_int8_linear_from_float(
     if pre_scale is not None:
         pre_scale_cast = pre_scale.to(device=target_device, dtype=compute_dtype).reshape(-1).contiguous()
     act_scale_cast = _coerce_optional_row_scale(act_scale, device=target_device)
+    mode_name, act_quant_bits = _normalize_activation_quant_mode_and_bits(act_quant_mode, act_quant_bits)
 
     if (
         x_cast.is_cuda
@@ -1029,7 +1040,7 @@ def bitnet_int8_linear_from_float(
             inv_scale_cast,
             bias_cast,
             pre_scale_cast,
-            str(act_quant_mode),
+            str(mode_name),
             str(act_quant_method),
             int(act_quant_bits),
             float(act_quant_percentile),
@@ -1051,7 +1062,7 @@ def bitnet_int8_linear_from_float(
                     inv_scale_cast,
                     bias_cast,
                     pre_scale_cast,
-                    str(act_quant_mode),
+                    str(mode_name),
                     str(act_quant_method),
                     int(act_quant_bits),
                     float(act_quant_percentile),
@@ -1063,7 +1074,6 @@ def bitnet_int8_linear_from_float(
     if pre_scale_cast is not None:
         x_local = x_local / pre_scale_cast.view(*([1] * (x_local.ndim - 1)), -1)
 
-    mode_name = str(act_quant_mode).strip().lower()
     if mode_name == "static_int8":
         if act_scale_cast is None:
             raise ValueError("BitNet static_int8 requires act_scale")

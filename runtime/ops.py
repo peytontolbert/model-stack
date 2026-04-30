@@ -2242,6 +2242,16 @@ def _quant_max(bits: int) -> int:
     return (1 << (bits - 1)) - 1
 
 
+def _normalize_activation_quant_mode_and_bits(mode: str, bits: int) -> tuple[str, int]:
+    mode_name = str(mode).strip().lower()
+    bits_value = int(bits)
+    if mode_name in {"dynamic_int4", "dynamic_a4"}:
+        return "dynamic_int8", 4
+    if mode_name in {"static_int4", "static_a4"}:
+        return "static_int8", 4
+    return mode_name, bits_value
+
+
 def _percentile_scale(x: torch.Tensor, p: float = 0.999) -> torch.Tensor:
     xa = x.abs().float()
     q = float(max(0.0, min(1.0, p)))
@@ -2402,7 +2412,7 @@ def _apply_packed_activation_quantization(
     method: str,
     percentile: float,
 ) -> torch.Tensor:
-    mode_name = str(mode).strip().lower()
+    mode_name, bits = _normalize_activation_quant_mode_and_bits(mode, bits)
     if mode_name in {"", "none", "off"}:
         return x
     if mode_name == "dynamic_int8":
@@ -2428,6 +2438,7 @@ def bitnet_transform_input(
     act_quant_percentile: float = 0.999,
 ) -> torch.Tensor:
     x_local = x
+    mode_name, act_quant_bits = _normalize_activation_quant_mode_and_bits(act_quant_mode, act_quant_bits)
     if getattr(x_local, "is_cuda", False) and not _should_use_eager_autograd_fallback(x_local):
         module = native_module()
         if has_native_op("bitnet_transform_input") and module is not None and hasattr(module, "bitnet_transform_input_forward"):
@@ -2437,7 +2448,7 @@ def bitnet_transform_input(
                     bool(spin_enabled),
                     spin_signs if isinstance(spin_signs, torch.Tensor) else None,
                     pre_scale if isinstance(pre_scale, torch.Tensor) else None,
-                    str(act_quant_mode),
+                    str(mode_name),
                     str(act_quant_method),
                     int(act_quant_bits),
                     float(act_quant_percentile),
@@ -2454,7 +2465,7 @@ def bitnet_transform_input(
         x_local = _apply_pre_scale_to_input(x_local, pre_scale)
     x_local = _apply_packed_activation_quantization(
         x_local,
-        mode=str(act_quant_mode),
+        mode=str(mode_name),
         act_scale=act_scale if isinstance(act_scale, torch.Tensor) else None,
         bits=int(act_quant_bits),
         method=str(act_quant_method),
@@ -2529,7 +2540,10 @@ def _bitnet_int8_quantize_input(
     x: torch.Tensor,
     spec: dict,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.dtype]:
-    mode = str(spec.get("act_quant_mode", "none")).strip().lower()
+    mode, bits = _normalize_activation_quant_mode_and_bits(
+        spec.get("act_quant_mode", "none"),
+        int(spec.get("act_quant_bits", 8)),
+    )
     if mode not in {"dynamic_int8", "static_int8"}:
         raise RuntimeError(f"bitnet_w2a8_int8 requires dynamic_int8 or static_int8 input mode, got {mode}")
 
@@ -2540,7 +2554,6 @@ def _bitnet_int8_quantize_input(
         x_local = _apply_pre_scale_to_input(x_local, pre_scale)
 
     rows = x_local.reshape(-1, x_local.shape[-1]).shape[0]
-    bits = int(spec.get("act_quant_bits", 8))
     if mode == "dynamic_int8":
         row_scale = _calibrate_activation_rowwise_scale(
             x_local,
@@ -2592,6 +2605,10 @@ def _bitnet_int8_linear_from_float_input(
     bias = spec.get("bias")
     pre_scale = spec.get("pre_scale") if isinstance(spec.get("pre_scale"), torch.Tensor) else None
     act_scale = spec.get("act_scale") if isinstance(spec.get("act_scale"), torch.Tensor) else None
+    mode_name, act_quant_bits = _normalize_activation_quant_mode_and_bits(
+        spec.get("act_quant_mode", "dynamic_int8"),
+        int(spec.get("act_quant_bits", 8)),
+    )
 
     if not _should_use_eager_autograd_fallback(x_cast, spec["qweight"], bias):
         if has_native_op("bitnet_int8_linear_from_float"):
@@ -2603,9 +2620,9 @@ def _bitnet_int8_linear_from_float_input(
                     spec["inv_scale"],
                     bias,
                     pre_scale,
-                    str(spec.get("act_quant_mode", "dynamic_int8")),
+                    str(mode_name),
                     str(spec.get("act_quant_method", "absmax")),
-                    int(spec.get("act_quant_bits", 8)),
+                    int(act_quant_bits),
                     float(spec.get("act_quant_percentile", 0.999)),
                     act_scale,
                     target_dtype,
@@ -2655,20 +2672,23 @@ def _bitnet_qkv_input_transform_signature(spec: dict) -> tuple:
             tuple(value.detach().cpu().reshape(-1).tolist()),
         )
 
-    mode = str(spec.get("act_quant_mode", "none")).strip().lower()
+    mode, bits = _normalize_activation_quant_mode_and_bits(
+        spec.get("act_quant_mode", "none"),
+        int(spec.get("act_quant_bits", 8)),
+    )
     if mode in {"", "none", "off"}:
         act_signature = ("none",)
     elif mode == "dynamic_int8":
         act_signature = (
             "dynamic_int8",
             str(spec.get("act_quant_method", "absmax")).strip().lower(),
-            int(spec.get("act_quant_bits", 8)),
+            int(bits),
             float(spec.get("act_quant_percentile", 0.999)),
         )
     elif mode == "static_int8":
         act_signature = (
             "static_int8",
-            int(spec.get("act_quant_bits", 8)),
+            int(bits),
             _tensor_signature(spec.get("act_scale")),
         )
     else:

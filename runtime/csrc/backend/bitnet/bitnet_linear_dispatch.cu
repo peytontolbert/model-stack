@@ -21,6 +21,12 @@ std::string NormalizeModeName(const std::string& mode) {
   if (normalized.empty() || normalized == "off") {
     return "none";
   }
+  if (normalized == "dynamic_int4" || normalized == "dynamic_a4") {
+    return "dynamic_int8";
+  }
+  if (normalized == "static_int4" || normalized == "static_a4") {
+    return "static_int8";
+  }
   return normalized;
 }
 

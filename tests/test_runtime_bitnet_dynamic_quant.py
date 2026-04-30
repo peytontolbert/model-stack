@@ -51,3 +51,18 @@ def test_quantized_linear_bitnet_shared_int8_input_uses_row_local_dynamic_scales
     assert out_dtype is torch.float32
     torch.testing.assert_close(row_scale, torch.tensor([2.0, 200.0]))
     torch.testing.assert_close(qx, torch.tensor([[0, 1], [0, 1]], dtype=torch.int8))
+
+
+def test_quantized_linear_bitnet_accepts_dynamic_int4_alias() -> None:
+    layer = QuantizedLinearBitNet(2, 2, bias=False)
+    layer.act_quant_mode = "dynamic_int4"
+    layer.act_quant_bits = 8
+    layer.act_quant_method = "absmax"
+    x = torch.tensor([[1.0, 2.0], [100.0, 200.0]], dtype=torch.float32)
+
+    qx, row_scale, out_dtype = layer.runtime_quantize_int8_input(x)
+
+    assert out_dtype is torch.float32
+    torch.testing.assert_close(row_scale, torch.tensor([2.0 / 7.0, 200.0 / 7.0]))
+    assert int(qx.abs().max().item()) <= 7
+    torch.testing.assert_close(qx[:, 1], torch.tensor([7, 7], dtype=torch.int8))

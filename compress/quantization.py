@@ -742,6 +742,16 @@ def _quant_max(bits: int) -> int:
     return (1 << (bits - 1)) - 1
 
 
+def _normalize_activation_quant_mode_and_bits(mode: str, bits: int) -> tuple[str, int]:
+    mode_name = str(mode).strip().lower()
+    bits_value = int(bits)
+    if mode_name in {"dynamic_int4", "dynamic_a4"}:
+        return "dynamic_int8", 4
+    if mode_name in {"static_int4", "static_a4"}:
+        return "static_int8", 4
+    return mode_name, bits_value
+
+
 def calibrate_activation_scale(
     inputs: torch.Tensor,
     *,
@@ -812,7 +822,7 @@ def _apply_activation_quantization(
     method: str,
     percentile: float,
 ) -> torch.Tensor:
-    mode_name = str(mode).strip().lower()
+    mode_name, bits = _normalize_activation_quant_mode_and_bits(mode, bits)
     if mode_name in {"", "none", "off"}:
         return x
     if mode_name == "dynamic_int8":
@@ -2465,7 +2475,7 @@ class QuantizedLinearBitNet(nn.Module):
         )
 
     def _uses_int8_packed_backend(self) -> bool:
-        mode_name = str(self.act_quant_mode).strip().lower()
+        mode_name, _ = _normalize_activation_quant_mode_and_bits(self.act_quant_mode, self.act_quant_bits)
         return (not self._spin_enabled_runtime()) and mode_name in {"dynamic_int8", "static_int8"}
 
     def _compute_backend_weight(
@@ -2826,8 +2836,7 @@ class QuantizedLinearBitNet(nn.Module):
         return str(backend).strip().lower() == "bitnet"
 
     def runtime_shared_int8_input_signature(self):
-        mode_name = str(self.act_quant_mode).strip().lower()
-        bits = int(self.act_quant_bits)
+        mode_name, bits = _normalize_activation_quant_mode_and_bits(self.act_quant_mode, self.act_quant_bits)
         if bits < 2 or bits > 8 or mode_name not in {"dynamic_int8", "static_int8"}:
             return None
         spin_enabled = self._spin_enabled_runtime()
@@ -2878,8 +2887,7 @@ class QuantizedLinearBitNet(nn.Module):
         if self._pre_scale_active_runtime():
             x_local = _apply_pre_scale_to_input(x_local, self.pre_scale.to(device=target_device))
 
-        mode_name = str(self.act_quant_mode).strip().lower()
-        bits = int(self.act_quant_bits)
+        mode_name, bits = _normalize_activation_quant_mode_and_bits(self.act_quant_mode, self.act_quant_bits)
         if bits < 2 or bits > 8 or mode_name not in {"dynamic_int8", "static_int8"}:
             raise RuntimeError(
                 "runtime_quantize_int8_input requires activation_quant in {dynamic_int8, static_int8} with bits in [2, 8]"
@@ -2952,8 +2960,9 @@ class QuantizedLinearBitNet(nn.Module):
         self.quant_calibration = str(calibration)
         self.quant_percentile = float(percentile)
         self.weight_opt = str(weight_opt)
-        self.act_quant_mode = str(activation_quant)
-        self.act_quant_bits = int(activation_quant_bits)
+        act_quant_mode, act_quant_bits = _normalize_activation_quant_mode_and_bits(activation_quant, activation_quant_bits)
+        self.act_quant_mode = act_quant_mode
+        self.act_quant_bits = int(act_quant_bits)
         self.act_quant_method = str(activation_quant_method)
         self.act_quant_percentile = float(activation_quant_percentile)
         _configure_spin_state(
@@ -2971,7 +2980,7 @@ class QuantizedLinearBitNet(nn.Module):
         return self
 
     def runtime_linear(self, x: torch.Tensor, *, backend: str | None = None) -> torch.Tensor:
-        mode_name = str(self.act_quant_mode).strip().lower()
+        mode_name, act_quant_bits = _normalize_activation_quant_mode_and_bits(self.act_quant_mode, self.act_quant_bits)
         target_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
         target_device = x.device
 
@@ -3015,7 +3024,7 @@ class QuantizedLinearBitNet(nn.Module):
                 mode_name == "dynamic_int8"
                 and backend_name in {"", "auto", "aten"}
                 and not self._spin_enabled_runtime()
-                and int(self.act_quant_bits) == 8
+                and int(act_quant_bits) == 8
             ):
                 if self._prefer_dynamic_int8_dense_decode_fallback(x) or self._prefer_dynamic_int8_dense_hopper_prefill_fallback(x):
                     x_local = x.to(device=target_device, dtype=target_dtype)
@@ -3034,7 +3043,7 @@ class QuantizedLinearBitNet(nn.Module):
                 pre_scale=pre_scale,
                 act_quant_mode=self.act_quant_mode,
                 act_scale=act_scale,
-                act_quant_bits=int(self.act_quant_bits),
+                act_quant_bits=int(act_quant_bits),
                 act_quant_method=self.act_quant_method,
                 act_quant_percentile=float(self.act_quant_percentile),
             )
@@ -3050,7 +3059,7 @@ class QuantizedLinearBitNet(nn.Module):
             pre_scale=pre_scale,
             act_quant_mode=self.act_quant_mode,
             act_scale=act_scale,
-            act_quant_bits=int(self.act_quant_bits),
+            act_quant_bits=int(act_quant_bits),
             act_quant_method=self.act_quant_method,
             act_quant_percentile=float(self.act_quant_percentile),
         )

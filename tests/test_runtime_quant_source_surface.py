@@ -659,6 +659,8 @@ def test_native_bitnet_cuda_kernel_sources_are_registered_in_source() -> None:
     assert frontend_source.count("CudaBitNetCalibrateInputScaleForward(") == 1
     assert "return (row_max.clamp_min(1.0e-8f) / qmax).to(torch::kFloat32);" in frontend_source
     assert "row_max.amax().reshape({1})" not in frontend_source
+    assert "dynamic_int4" in dispatch_source
+    assert "dynamic_int4" in frontend_source
     assert "compute_packed_words" in native_source
     assert "decode_nz_masks" in native_source
     assert "FusedRmsNormBitNetLinearStateForward(" in native_source
