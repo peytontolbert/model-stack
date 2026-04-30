@@ -2713,7 +2713,7 @@ class QuantizedLinearBitNet(nn.Module):
             return False
         if (int(major), int(minor)) < (9, 0):
             return False
-        if int(self.act_quant_bits) != 8:
+        if int(self.act_quant_bits) < 2 or int(self.act_quant_bits) > 8:
             return False
         shape = (int(self.in_features), int(self.out_features))
         return shape in {

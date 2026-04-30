@@ -7912,7 +7912,8 @@ bool CanUseHopperDynamicInt8BitNetPrefillPolicy(
   if (!state.qweight.defined() || state.qweight.dim() != 2) {
     return false;
   }
-  if (NormalizeBackendName(state.act_quant_mode) != "dynamic_int8" || state.act_quant_bits != 8) {
+  if (NormalizeBackendName(state.act_quant_mode) != "dynamic_int8" ||
+      state.act_quant_bits < 2 || state.act_quant_bits > 8) {
     return false;
   }
   const auto rows = x.size(-1) > 0 ? x.numel() / x.size(-1) : 0;
@@ -7945,6 +7946,9 @@ bool CanUseDenseBitNetPrefillPolicy(
     const torch::Tensor& x,
     const BitNetModuleState& state) {
   if (!CanUseHopperDynamicInt8BitNetPrefillPolicy(x, state)) {
+    return false;
+  }
+  if (state.act_quant_bits != 8) {
     return false;
   }
   const auto out_features = state.qweight.size(0);
