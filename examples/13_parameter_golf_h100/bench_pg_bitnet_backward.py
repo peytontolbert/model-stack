@@ -161,6 +161,7 @@ def _bench_shape(
     include_packed_bitnet: bool,
     include_int8_grad_weight: bool,
     include_int8_grad_weight_upper_bound: bool,
+    act_quant_bits: int,
 ) -> dict[str, object]:
     weight = torch.randn(shape.out_features, shape.in_features, device=device, dtype=dtype).mul_(0.125)
     x = torch.randn(rows, shape.in_features, device=device, dtype=dtype)
@@ -188,7 +189,7 @@ def _bench_shape(
             pre_scale=None,
             act_quant_mode="dynamic_int8",
             act_scale=None,
-            act_quant_bits=8,
+            act_quant_bits=int(act_quant_bits),
             act_quant_method="absmax",
             act_quant_percentile=0.999,
         )
@@ -202,7 +203,7 @@ def _bench_shape(
             pre_scale=inv_pre_scale,
             act_quant_mode="dynamic_int8",
             act_scale=None,
-            act_quant_bits=8,
+            act_quant_bits=int(act_quant_bits),
             act_quant_method="absmax",
             act_quant_percentile=0.999,
         )
@@ -229,6 +230,7 @@ def _bench_shape(
         "out_features": int(shape.out_features),
         "dtype": str(dtype),
         "device": str(device),
+        "act_quant_bits": int(act_quant_bits),
         "dense_grad_input_ms": dense_gi_ms,
         "dense_grad_weight_ms": dense_gw_ms,
         "int8_grad_input_explicit_scale_ms": int8_explicit_ms,
@@ -512,9 +514,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark BitNet trainable backward component candidates.")
     parser.add_argument("--preset", choices=sorted(PRESETS), default="runtime_row_1024x7_relu2_mlp3")
     parser.add_argument("--shape", action="append", default=[], help="Custom shape NAME:IN:OUT or IN:OUT")
+    parser.add_argument("--no-preset-shapes", action="store_true", help="Benchmark only --shape entries.")
     parser.add_argument("--rows", type=int, default=65536)
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--act-quant-bits", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=3)
@@ -527,7 +531,9 @@ def main() -> None:
 
     device = torch.device(args.device)
     dtype = _dtype(args.dtype)
-    shapes = _parse_shapes(args.shape) if args.shape else PRESETS[args.preset]
+    shapes = ([] if args.no_preset_shapes else list(PRESETS[args.preset])) + _parse_shapes(args.shape)
+    if not shapes:
+        raise ValueError("no shapes selected; use a preset or pass --shape")
     header = {
         "header": {
             "device": str(device),
@@ -552,6 +558,7 @@ def main() -> None:
             include_packed_bitnet=bool(args.include_packed_bitnet),
             include_int8_grad_weight=bool(args.include_int8_grad_weight),
             include_int8_grad_weight_upper_bound=bool(args.include_int8_grad_weight_upper_bound),
+            act_quant_bits=int(args.act_quant_bits),
         )
         print(json.dumps(result, sort_keys=True) if args.jsonl else json.dumps(result, indent=2, sort_keys=True))
 

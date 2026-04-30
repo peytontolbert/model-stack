@@ -240,6 +240,10 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert '"MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT",' in components_bench_source
     assert '"MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT",' in components_bench_source
     assert '"bitnet_training_env": {key: value for key, value in env.items() if value is not None}' in components_bench_source
+    backward_bench_source = _read("examples/13_parameter_golf_h100/bench_pg_bitnet_backward.py")
+    assert "--act-quant-bits" in backward_bench_source
+    assert "--no-preset-shapes" in backward_bench_source
+    assert '"act_quant_bits": int(act_quant_bits)' in backward_bench_source
     assert "\"MODEL_STACK_ENABLE_INT8_LINEAR_CUTLASS_FUSED\": os.environ.get(" in training_bench_source
     assert "MODEL_STACK_ATTENTION_REPEAT_KV" in training_bench_source
     assert "def _maybe_repeat_kv_heads(" in training_bench_source
