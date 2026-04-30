@@ -259,7 +259,7 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     )
     assert (
         "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT="
-        "\"${MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT:-dynamic_int8_transpose}\""
+        "\"${MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT:-none}\""
         in pg_run_source
     )
     assert "MODEL_STACK_ATTENTION_REPEAT_KV=\"${MODEL_STACK_ATTENTION_REPEAT_KV:-}\"" in pg_run_source
