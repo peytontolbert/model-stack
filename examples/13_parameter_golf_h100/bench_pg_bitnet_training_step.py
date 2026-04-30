@@ -223,6 +223,18 @@ def _bitnet_optimized_training_env(mode: str, *, compile_module: bool) -> dict[s
     return env
 
 
+def _bitnet_training_env_with_grad_weight(
+    mode: str,
+    *,
+    compile_module: bool,
+    grad_weight_mode: str | None,
+) -> dict[str, str | None]:
+    env = _bitnet_optimized_training_env(mode, compile_module=compile_module)
+    if mode != "dense_ste" and grad_weight_mode is not None:
+        env["MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT"] = str(grad_weight_mode)
+    return env
+
+
 def _bitnet_shape_gate_expected_allows(
     env: dict[str, str | None],
     *,
@@ -267,10 +279,15 @@ def _bench_variant(
     iters: int,
     repeats: int,
     consume_output: bool,
+    grad_weight_mode: str | None,
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
     layer = _make_layer(shape, dtype=dtype, device=device, bias=bias)
     layer.load_state_dict(state_dict, strict=True)
-    env = _bitnet_optimized_training_env(mode, compile_module=compile_module)
+    env = _bitnet_training_env_with_grad_weight(
+        mode,
+        compile_module=compile_module,
+        grad_weight_mode=grad_weight_mode,
+    )
     runner = layer
     if compile_module and device.type == "cuda":
         _reset_torch_compile_cache()
@@ -349,6 +366,7 @@ def _bench_shape(
     iters: int,
     repeats: int,
     consume_output: bool,
+    grad_weight_mode: str | None,
 ) -> dict[str, object]:
     reference_layer = _make_layer(shape, dtype=dtype, device=device, bias=bias)
     state_dict = _clone_state_dict(reference_layer)
@@ -370,6 +388,7 @@ def _bench_shape(
         iters=iters,
         repeats=repeats,
         consume_output=consume_output,
+        grad_weight_mode=grad_weight_mode,
     )
     variants = [dense]
     if device.type == "cuda":
@@ -390,6 +409,7 @@ def _bench_shape(
                 iters=iters,
                 repeats=repeats,
                 consume_output=consume_output,
+                grad_weight_mode=grad_weight_mode,
             )
             bitnet["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / bitnet["forward_ms"]
             bitnet["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / bitnet["train_step_ms"]
@@ -445,10 +465,15 @@ def _bench_relu2_mlp_pair_variant(
     iters: int,
     repeats: int,
     consume_output: bool,
+    grad_weight_mode: str | None,
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
     mlp = _Relu2MlpPair(dtype=dtype, device=device, bias=bias)
     mlp.load_state_dict(state_dict, strict=True)
-    env = _bitnet_optimized_training_env(mode, compile_module=compile_module)
+    env = _bitnet_training_env_with_grad_weight(
+        mode,
+        compile_module=compile_module,
+        grad_weight_mode=grad_weight_mode,
+    )
     runner = mlp
     if compile_module and device.type == "cuda":
         _reset_torch_compile_cache()
@@ -526,6 +551,7 @@ def _bench_relu2_mlp_pair(
     iters: int,
     repeats: int,
     consume_output: bool,
+    grad_weight_mode: str | None,
 ) -> dict[str, object]:
     reference_mlp = _Relu2MlpPair(dtype=dtype, device=device, bias=bias)
     state_dict = _clone_state_dict(reference_mlp)
@@ -546,6 +572,7 @@ def _bench_relu2_mlp_pair(
         iters=iters,
         repeats=repeats,
         consume_output=consume_output,
+        grad_weight_mode=grad_weight_mode,
     )
     variants = [dense]
     if device.type == "cuda":
@@ -565,6 +592,7 @@ def _bench_relu2_mlp_pair(
                 iters=iters,
                 repeats=repeats,
                 consume_output=consume_output,
+                grad_weight_mode=grad_weight_mode,
             )
             bitnet["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / bitnet["forward_ms"]
             bitnet["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / bitnet["train_step_ms"]
@@ -994,6 +1022,7 @@ def _bench_pg_block_variant(
     iters: int,
     repeats: int,
     consume_output: bool,
+    grad_weight_mode: str | None,
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
     rows = int(batch_size) * int(seq_len)
     block = _make_pg_block(
@@ -1009,7 +1038,11 @@ def _bench_pg_block_variant(
         fused_qkv=fused_qkv,
     )
     block.load_state_dict(state_dict, strict=True)
-    env = _bitnet_optimized_training_env(mode, compile_module=compile_module)
+    env = _bitnet_training_env_with_grad_weight(
+        mode,
+        compile_module=compile_module,
+        grad_weight_mode=grad_weight_mode,
+    )
     runner = block
     if compile_module and device.type == "cuda":
         _reset_torch_compile_cache()
@@ -1098,6 +1131,7 @@ def _bench_pg_block(
     iters: int,
     repeats: int,
     consume_output: bool,
+    grad_weight_mode: str | None,
 ) -> dict[str, object]:
     reference_block = _make_pg_block(
         dim=dim,
@@ -1139,6 +1173,7 @@ def _bench_pg_block(
         iters=iters,
         repeats=repeats,
         consume_output=consume_output,
+        grad_weight_mode=grad_weight_mode,
     )
     variants = [dense]
     if device.type == "cuda":
@@ -1167,6 +1202,7 @@ def _bench_pg_block(
                 iters=iters,
                 repeats=repeats,
                 consume_output=consume_output,
+                grad_weight_mode=grad_weight_mode,
             )
             bitnet["forward_speedup_vs_dense_ste"] = dense["forward_ms"] / bitnet["forward_ms"]
             bitnet["train_step_speedup_vs_dense_ste"] = dense["train_step_ms"] / bitnet["train_step_ms"]
@@ -1230,6 +1266,11 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--consume-output", action="store_true", help="Synchronously consume forward/quantize outputs while timing.")
+    parser.add_argument(
+        "--grad-weight-mode",
+        default=None,
+        help="Override MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT for BitNet variants.",
+    )
     parser.add_argument("--jsonl", action="store_true")
     args = parser.parse_args()
 
@@ -1276,6 +1317,7 @@ def main() -> None:
             iters=args.iters,
             repeats=args.repeats,
             consume_output=bool(args.consume_output),
+            grad_weight_mode=args.grad_weight_mode,
         )
         if args.jsonl:
             print(json.dumps(result, sort_keys=True))
@@ -1301,6 +1343,7 @@ def main() -> None:
             iters=args.iters,
             repeats=args.repeats,
             consume_output=bool(args.consume_output),
+            grad_weight_mode=args.grad_weight_mode,
         )
         if args.jsonl:
             print(json.dumps(result, sort_keys=True))
@@ -1318,6 +1361,7 @@ def main() -> None:
             iters=args.iters,
             repeats=args.repeats,
             consume_output=bool(args.consume_output),
+            grad_weight_mode=args.grad_weight_mode,
         )
         if args.jsonl:
             print(json.dumps(result, sort_keys=True))

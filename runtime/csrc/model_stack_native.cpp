@@ -2005,6 +2005,8 @@ py::dict RuntimeInfo() {
   info["int8_linear_frontend_shared_cache_disable_env"] =
       std::string("MODEL_STACK_DISABLE_INT8_QUANT_SHARED_CACHE");
   info["int8_linear_frontend_vec4_enable_env"] = std::string("MODEL_STACK_ENABLE_INT8_QUANT_VEC4");
+  info["int8_linear_grad_weight_transpose_tile_env"] = std::string("MODEL_STACK_INT8_TRANSPOSE_TILE_DIM");
+  info["int8_linear_grad_weight_transpose_tile_options"] = std::vector<int>{32, 64};
   info["int8_linear_wgmma_activation_strategy"] =
       std::string("rebias_s8_to_u8_minus_128_weight_sum");
   info["int8_attention_dtypes"] = HasCudaInt8AttentionKernel()

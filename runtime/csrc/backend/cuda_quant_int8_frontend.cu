@@ -54,6 +54,8 @@ constexpr int kColumnQuantWideThreadsX = 32;
 constexpr int kColumnQuantWideThreadsY = 8;
 constexpr int kTransposeTileDim = 32;
 constexpr int kTransposeBlockRows = 8;
+constexpr int kTransposeWideTileDim = 64;
+constexpr int kTransposeWideBlockRows = 8;
 
 bool Int8QuantWarpRowEnabled(int64_t cols) {
   const char* disable = std::getenv("MODEL_STACK_DISABLE_INT8_QUANT_WARP_ROW");
@@ -117,6 +119,14 @@ bool Int8QuantVec4Enabled(int64_t cols) {
     return false;
   }
   return (cols % 4) == 0;
+}
+
+bool Int8TransposeWideTileEnabled() {
+  const char* env = std::getenv("MODEL_STACK_INT8_TRANSPOSE_TILE_DIM");
+  if (env == nullptr || env[0] == '\0') {
+    return false;
+  }
+  return std::atoi(env) == kTransposeWideTileDim;
 }
 
 bool IsSupportedInt8FrontendDtype(torch::ScalarType dtype) {
@@ -258,21 +268,21 @@ __global__ void quantize_activation_int8_columnwise_transpose_finalize_scale_ker
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, int TileDim, int BlockRows>
 __global__ void quantize_activation_int8_columnwise_transpose_kernel(
     const scalar_t* __restrict__ x,
     const float* __restrict__ col_scale,
     int8_t* __restrict__ qx_t,
     int64_t rows,
     int64_t cols) {
-  __shared__ int8_t tile[kTransposeTileDim][kTransposeTileDim + 1];
+  __shared__ int8_t tile[TileDim][TileDim + 1];
 
-  const int64_t in_col = static_cast<int64_t>(blockIdx.x) * kTransposeTileDim + threadIdx.x;
-  const int64_t in_row_base = static_cast<int64_t>(blockIdx.y) * kTransposeTileDim + threadIdx.y;
+  const int64_t in_col = static_cast<int64_t>(blockIdx.x) * TileDim + threadIdx.x;
+  const int64_t in_row_base = static_cast<int64_t>(blockIdx.y) * TileDim + threadIdx.y;
 
   if (in_col < cols) {
     const float inv_scale = 1.0f / col_scale[in_col];
-    for (int j = 0; j < kTransposeTileDim; j += kTransposeBlockRows) {
+    for (int j = 0; j < TileDim; j += BlockRows) {
       const int64_t in_row = in_row_base + j;
       if (in_row < rows) {
         const float scaled = static_cast<float>(x[in_row * cols + in_col]) * inv_scale;
@@ -282,9 +292,9 @@ __global__ void quantize_activation_int8_columnwise_transpose_kernel(
   }
   __syncthreads();
 
-  const int64_t out_col = static_cast<int64_t>(blockIdx.y) * kTransposeTileDim + threadIdx.x;
-  const int64_t out_row_base = static_cast<int64_t>(blockIdx.x) * kTransposeTileDim + threadIdx.y;
-  for (int j = 0; j < kTransposeTileDim; j += kTransposeBlockRows) {
+  const int64_t out_col = static_cast<int64_t>(blockIdx.y) * TileDim + threadIdx.x;
+  const int64_t out_row_base = static_cast<int64_t>(blockIdx.x) * TileDim + threadIdx.y;
+  for (int j = 0; j < TileDim; j += BlockRows) {
     const int64_t out_row = out_row_base + j;
     if (out_row < cols && out_col < rows) {
       qx_t[out_row * rows + out_col] = tile[threadIdx.x][threadIdx.y + j];
@@ -1250,10 +1260,15 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeActivationInt8ColumnwiseTranspo
   const dim3 amax_blocks(
       static_cast<unsigned int>((cols + amax_cols_per_block - 1) / amax_cols_per_block),
       static_cast<unsigned int>(row_tiles));
-  const dim3 transpose_threads(kTransposeTileDim, kTransposeBlockRows);
+  const bool wide_transpose_tile = Int8TransposeWideTileEnabled();
+  const int transpose_tile_dim = wide_transpose_tile ? kTransposeWideTileDim : kTransposeTileDim;
+  const int transpose_block_rows = wide_transpose_tile ? kTransposeWideBlockRows : kTransposeBlockRows;
+  const dim3 transpose_threads(
+      static_cast<unsigned int>(transpose_tile_dim),
+      static_cast<unsigned int>(transpose_block_rows));
   const dim3 transpose_blocks(
-      static_cast<unsigned int>((cols + kTransposeTileDim - 1) / kTransposeTileDim),
-      static_cast<unsigned int>((rows + kTransposeTileDim - 1) / kTransposeTileDim));
+      static_cast<unsigned int>((cols + transpose_tile_dim - 1) / transpose_tile_dim),
+      static_cast<unsigned int>((rows + transpose_tile_dim - 1) / transpose_tile_dim));
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
@@ -1295,16 +1310,35 @@ std::tuple<torch::Tensor, torch::Tensor> QuantizeActivationInt8ColumnwiseTranspo
               row_tiles,
               cols);
         }
-        quantize_activation_int8_columnwise_transpose_kernel<scalar_t><<<
-            transpose_blocks,
-            transpose_threads,
-            0,
-            stream.stream()>>>(
-            x_2d.data_ptr<scalar_t>(),
-            col_scale.data_ptr<float>(),
-            qx_t.data_ptr<int8_t>(),
-            rows,
-            cols);
+        if (wide_transpose_tile) {
+          quantize_activation_int8_columnwise_transpose_kernel<
+              scalar_t,
+              kTransposeWideTileDim,
+              kTransposeWideBlockRows><<<
+              transpose_blocks,
+              transpose_threads,
+              0,
+              stream.stream()>>>(
+              x_2d.data_ptr<scalar_t>(),
+              col_scale.data_ptr<float>(),
+              qx_t.data_ptr<int8_t>(),
+              rows,
+              cols);
+        } else {
+          quantize_activation_int8_columnwise_transpose_kernel<
+              scalar_t,
+              kTransposeTileDim,
+              kTransposeBlockRows><<<
+              transpose_blocks,
+              transpose_threads,
+              0,
+              stream.stream()>>>(
+              x_2d.data_ptr<scalar_t>(),
+              col_scale.data_ptr<float>(),
+              qx_t.data_ptr<int8_t>(),
+              rows,
+              cols);
+        }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {qx_t, col_scale};

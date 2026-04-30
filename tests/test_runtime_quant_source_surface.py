@@ -214,6 +214,9 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT" in quant_source
     assert "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT" in quant_source
     assert "def _trainable_bitnet_save_backward_context(" in quant_source
+    assert "MODEL_STACK_INT8_TRANSPOSE_TILE_DIM" in cuda_quant_source
+    assert "kTransposeWideTileDim = 64" in cuda_quant_source
+    assert "int8_linear_grad_weight_transpose_tile_options" in native_source
     assert "pg_h100_expansion" in quant_source
     assert "(1024, 2048),  # Parameter Golf relu2 MLP up projection, MLP_MULT=2." in quant_source
     training_bench_source = _read("examples/13_parameter_golf_h100/bench_pg_bitnet_training_step.py")
@@ -224,6 +227,7 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "--include-pg-block" in training_bench_source
     assert "--block-fused-qkv" in training_bench_source
     assert "--no-preset-shapes" in training_bench_source
+    assert "--grad-weight-mode" in training_bench_source
     assert 'BITNET_STE_MODES = ("dynamic_int8_ste", "dynamic_int4_ste")' in training_bench_source
     assert "def _bitnet_optimized_training_env(" in training_bench_source
     assert '"MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT",' in training_bench_source
