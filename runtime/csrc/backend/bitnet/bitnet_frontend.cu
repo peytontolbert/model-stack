@@ -489,7 +489,7 @@ torch::Tensor CudaBitNetCalibrateInputScaleForward(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   const float qmax = static_cast<float>(BitNetQuantMax(act_quant_bits));
-  return (row_max.amax().reshape({1}).clamp_min(1.0e-8f) / qmax).to(torch::kFloat32);
+  return (row_max.clamp_min(1.0e-8f) / qmax).to(torch::kFloat32);
 }
 
 torch::Tensor CudaBitNetTransformInputForward(
