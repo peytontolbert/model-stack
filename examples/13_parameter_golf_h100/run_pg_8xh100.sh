@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 PG_DIR="${PG_DIR:-${ROOT_DIR}/other_repos/parameter-golf}"
-PRESET="${PG_PRESET:-runtime_row_1024x7_swiglu_mlp2}"
+PRESET="${PG_PRESET:-runtime_row_1024x7_relu2_mlp2}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
 cd "${PG_DIR}"
@@ -62,15 +62,15 @@ common_env=(
 )
 
 case "${PRESET}" in
-  runtime_row_1024x7_swiglu_mlp2)
+  runtime_row_1024x7_relu2_mlp2)
     preset_env=(
-      RUN_ID="${RUN_ID:-ternary_runtime_row_sp1024_ctx4096_8xh100_swiglu_mlp2_1024x7}"
+      RUN_ID="${RUN_ID:-ternary_runtime_row_sp1024_ctx4096_8xh100_relu2_mlp2_1024x7}"
       MODEL_DIM="${MODEL_DIM:-1024}"
       NUM_LAYERS="${NUM_LAYERS:-7}"
       NUM_HEADS="${NUM_HEADS:-16}"
       NUM_KV_HEADS="${NUM_KV_HEADS:-4}"
       MLP_MULT="${MLP_MULT:-2}"
-      ACTIVATION="${ACTIVATION:-swiglu}"
+      ACTIVATION="${ACTIVATION:-relu2}"
       TRAINING_DEPTH_RECURRENCE="${TRAINING_DEPTH_RECURRENCE:-1}"
       EVAL_DEPTH_RECURRENCE="${EVAL_DEPTH_RECURRENCE:-1}"
       ROPE_TYPE="${ROPE_TYPE:-yarn}"
@@ -120,7 +120,7 @@ case "${PRESET}" in
     )
     ;;
   *)
-    echo "Unknown PG_PRESET=${PRESET}; expected runtime_row_1024x7_swiglu_mlp2, runtime_row_1024x7_relu2_mlp3, runtime_row_512, or runtime_row_1024" >&2
+    echo "Unknown PG_PRESET=${PRESET}; expected runtime_row_1024x7_relu2_mlp2, runtime_row_1024x7_relu2_mlp3, runtime_row_512, or runtime_row_1024" >&2
     exit 2
     ;;
 esac

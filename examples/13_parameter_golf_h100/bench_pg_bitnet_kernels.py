@@ -32,6 +32,14 @@ class LinearShape:
 
 
 PRESETS: dict[str, list[LinearShape]] = {
+    "runtime_row_1024x7_relu2_mlp2": [
+        LinearShape("attn_q", 1024, 1024),
+        LinearShape("attn_k", 1024, 256),
+        LinearShape("attn_v", 1024, 256),
+        LinearShape("attn_out", 1024, 1024),
+        LinearShape("mlp_up", 1024, 2048),
+        LinearShape("mlp_down", 2048, 1024),
+    ],
     "runtime_row_1024x7_relu2_mlp3": [
         LinearShape("attn_qkv_fused", 1024, 1536),
         LinearShape("attn_out", 1024, 1024),

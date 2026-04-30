@@ -37,6 +37,13 @@ class MlpPreset:
 
 
 PRESETS: dict[str, MlpPreset] = {
+    "runtime_row_1024x7_relu2_mlp2": MlpPreset(
+        name="runtime_row_1024x7_relu2_mlp2",
+        model_dim=1024,
+        hidden_features=2048,
+        activation="relu2",
+        gated=False,
+    ),
     "runtime_row_1024x7_relu2_mlp3": MlpPreset(
         name="runtime_row_1024x7_relu2_mlp3",
         model_dim=1024,

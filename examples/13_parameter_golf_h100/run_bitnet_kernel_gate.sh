@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 DEVICE="${DEVICE:-cuda:0}"
-PRESET="${PG_PRESET:-runtime_row_1024x7_relu2_mlp3}"
+PRESET="${PG_PRESET:-runtime_row_1024x7_relu2_mlp2}"
 ROWS="${ROWS:-1,16,4096,65536}"
 WARMUP="${WARMUP:-30}"
 ITERS="${ITERS:-100}"

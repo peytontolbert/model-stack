@@ -32,22 +32,23 @@ class LinearShape:
     out_features: int
 
 
-BITNET_STE_MODES = ("dynamic_int8_ste", "dynamic_int4_ste")
+BITNET_STE_MODES = ("dynamic_int8_ste", "dynamic_int4_ste", "packed_int4_ste")
 
 
 PRESETS: dict[str, list[LinearShape]] = {
+    "runtime_row_1024x7_relu2_mlp2": [
+        LinearShape("attn_q", 1024, 1024),
+        LinearShape("attn_k", 1024, 256),
+        LinearShape("attn_v", 1024, 256),
+        LinearShape("attn_out", 1024, 1024),
+        LinearShape("mlp_up_relu2", 1024, 2048),
+        LinearShape("mlp_down_relu2", 2048, 1024),
+    ],
     "runtime_row_1024x7_relu2_mlp3": [
         LinearShape("attn_qkv_fused", 1024, 1536),
         LinearShape("attn_out", 1024, 1024),
         LinearShape("mlp_up_relu2", 1024, 3072),
         LinearShape("mlp_down_relu2", 3072, 1024),
-        LinearShape("lm_head", 1024, 1024),
-    ],
-    "runtime_row_1024x7_swiglu_mlp2": [
-        LinearShape("attn_qkv_fused", 1024, 1536),
-        LinearShape("attn_out", 1024, 1024),
-        LinearShape("swiglu_gate_up", 1024, 4096),
-        LinearShape("swiglu_down", 2048, 1024),
         LinearShape("lm_head", 1024, 1024),
     ],
 }

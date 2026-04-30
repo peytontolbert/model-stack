@@ -3159,6 +3159,37 @@ def _trainable_bitnet_int8_shape_gate_allows(
     return rows >= min_rows and int(out_features) >= int(math.ceil(float(in_features) * min_ratio))
 
 
+def _trainable_bitnet_packed_int4_shape_gate_allows(
+    x: torch.Tensor,
+    *,
+    in_features: int,
+    out_features: int,
+) -> bool:
+    """Restrict packed INT4 training experiments to measured PG MLP GEMMs.
+
+    The existing INT8 gate has older expansion-only policies used for quick
+    experiments. Packed INT4 tensor-core work is narrower: the first target is
+    the ReLU2 MLP pair where the per-rank flattened token matrix is large
+    enough to amortize packing/launch overhead.
+    """
+
+    if not _trainable_bitnet_int8_shape_gate_allows(
+        x,
+        in_features=in_features,
+        out_features=out_features,
+    ):
+        return False
+    policy = os.getenv("MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE", "").strip().lower()
+    if policy in {"pg_h100_mlp", "h100_pg_v2"}:
+        return (int(in_features), int(out_features)) in {
+            (1024, 2048),
+            (2048, 1024),
+            (1024, 3072),
+            (3072, 1024),
+        }
+    return True
+
+
 def _torch_compiler_is_compiling() -> bool:
     compiler = getattr(torch, "compiler", None)
     is_compiling = getattr(compiler, "is_compiling", None)
@@ -3522,6 +3553,43 @@ class _TrainableBitNetInt8STEFunction(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None, None, None, None
 
 
+class _TrainableBitNetPackedInt4STEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        eps: float,
+    ) -> torch.Tensor:
+        if not x.is_cuda:
+            raise RuntimeError("TrainableBitNetLinear packed INT4 STE forward requires CUDA")
+        target_dtype = x.dtype if x.dtype.is_floating_point else weight.dtype
+        x_local = x.to(dtype=target_dtype)
+        qweight, row_scale = _bitnet_runtime_row_codes_and_scale(weight.detach(), eps=float(eps))
+        packed_weight = _pack_int4_signed(qweight).to(device=x_local.device, dtype=torch.uint8).contiguous()
+        row_scale = row_scale.to(device=x_local.device, dtype=torch.float32).contiguous()
+        bias_local = None if bias is None else bias.to(device=x_local.device, dtype=target_dtype)
+        out = runtime_int4_linear(x_local, packed_weight, row_scale, bias_local)
+        _trainable_bitnet_save_backward_context(
+            ctx,
+            x=x,
+            weight=weight,
+            bias=bias,
+            qweight=qweight.to(device=x_local.device, dtype=torch.int8).contiguous(),
+            row_scale=row_scale,
+            eps=float(eps),
+            act_quant_bits=8,
+            act_quant_percentile=1.0,
+        )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input, grad_weight, grad_bias = _trainable_bitnet_int8_ste_backward(ctx, grad_output)
+        return grad_input, grad_weight, grad_bias, None
+
+
 class TrainableBitNetLinear(nn.Module):
     """Trainable runtime-row BitNet linear with a float shadow weight.
 
@@ -3660,7 +3728,21 @@ class TrainableBitNetLinear(nn.Module):
 
     def _int8_ste_forward_enabled(self, x: torch.Tensor) -> bool:
         mode = _trainable_bitnet_training_forward_mode()
-        if mode not in {"int8_ste", "dynamic_int8_ste", "w2a8_ste", "dynamic_int4_ste", "w2a4_ste"}:
+        if mode not in {
+            "int8_ste",
+            "dynamic_int8_ste",
+            "w2a8_ste",
+            "dynamic_int4_ste",
+            "w2a4_ste",
+            "packed_int4_ste",
+            "w4_packed_ste",
+        }:
+            return False
+        if mode in {"packed_int4_ste", "w4_packed_ste"} and not _trainable_bitnet_packed_int4_shape_gate_allows(
+            x,
+            in_features=self.in_features,
+            out_features=self.out_features,
+        ):
             return False
         if _torch_compiler_is_compiling() and not _env_flag_enabled("MODEL_STACK_TRAINABLE_BITNET_COMPILED_INT8_STE"):
             return False
@@ -3680,6 +3762,15 @@ class TrainableBitNetLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._int8_ste_forward_enabled(x):
+            mode = _trainable_bitnet_training_forward_mode()
+            if mode in {"packed_int4_ste", "w4_packed_ste"}:
+                x_forward, weight_forward = self._spin_training_inputs(x)
+                return _TrainableBitNetPackedInt4STEFunction.apply(
+                    x_forward,
+                    weight_forward,
+                    self.bias,
+                    float(self.eps),
+                )
             act_quant_mode, act_quant_bits = _trainable_bitnet_activation_quant()
             act_quant_percentile = _trainable_bitnet_activation_quant_percentile()
             x_forward, weight_forward = self._spin_training_inputs(x)
