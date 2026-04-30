@@ -29,6 +29,11 @@ class EncoderDecoderLM(nn.Module):
         vocab = vocab_size if vocab_size is not None else cfg.vocab_size
         self.enc_embed = nn.Embedding(vocab, cfg.d_model)
         self.dec_embed = nn.Embedding(vocab, cfg.d_model)
+        if bool(getattr(cfg, "encoder_position_embeddings", False)):
+            max_positions = int(getattr(cfg, "max_position_embeddings", None) or 4096)
+            self.enc_pos_embed = nn.Embedding(max_positions, cfg.d_model)
+        else:
+            self.enc_pos_embed = None
         if tie_embeddings:
             self.dec_embed.weight = self.enc_embed.weight
         enc_schedule = drop_path_linear(cfg.n_layers, drop_path_max_enc)
@@ -51,6 +56,15 @@ class EncoderDecoderLM(nn.Module):
 
     def encode(self, input_ids: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         x = runtime_embedding(self.enc_embed.weight, input_ids, self.enc_embed.padding_idx)
+        if self.enc_pos_embed is not None:
+            if input_ids.shape[1] > self.enc_pos_embed.num_embeddings:
+                raise ValueError(
+                    f"encoder input length {input_ids.shape[1]} exceeds "
+                    f"encoder position capacity {self.enc_pos_embed.num_embeddings}"
+                )
+            positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+            positions = positions.expand(input_ids.shape[0], input_ids.shape[1])
+            x = x + runtime_embedding(self.enc_pos_embed.weight, positions, self.enc_pos_embed.padding_idx)
         x = execute_encoder_stack(self.encoder, x, padding_mask)
         return apply_native_norm(x, self.enc_norm)
 

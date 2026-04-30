@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 
 from specs.config import ModelConfig
+import runtime.checkpoint as runtime_checkpoint_mod
 from runtime.cache import create_kv_cache, kv_cache_runtime_info, kv_cache_spec_from_config, resolve_kv_cache_backend
 from runtime.generation import (
     GenerationConfig,
@@ -18,6 +19,8 @@ from runtime.generation import (
 from runtime.loader import load_model_dir as runtime_load_model_dir
 from runtime.prep import (
     prepare_model_for_runtime as runtime_prepare_model_for_runtime,
+    resolve_model_device as runtime_resolve_model_device,
+    resolve_model_dtype as runtime_resolve_model_dtype,
     resolve_model_config as runtime_resolve_model_config,
 )
 from runtime.native import runtime_info as native_runtime_info
@@ -76,6 +79,49 @@ class ModelRuntime:
 
     @classmethod
     def from_dir(cls, model_dir: Optional[str] = None, *, device: Optional[str] = None, dtype: Optional[str] = None, kv_pagesize: int = 512) -> "ModelRuntime":
+        hf_llama_snapshot_dir = (
+            os.environ.get("MODEL_STACK_HF_LLAMA_SNAPSHOT_DIR")
+            or os.environ.get("HF_LLAMA_SNAPSHOT_DIR")
+            or ""
+        ).strip()
+        if hf_llama_snapshot_dir:
+            load_device = str(runtime_resolve_model_device(device))
+            load_dtype = runtime_resolve_model_dtype(
+                dtype,
+                config_dtype=(
+                    os.environ.get("MODEL_STACK_HF_LLAMA_DTYPE")
+                    or os.environ.get("MODEL_STACK_DTYPE")
+                    or None
+                ),
+            )
+            device_map = (
+                os.environ.get("MODEL_STACK_HF_LLAMA_DEVICE_MAP")
+                or os.environ.get("HF_LLAMA_DEVICE_MAP")
+                or None
+            )
+            model, _hf_cfg = runtime_checkpoint_mod.build_local_llama_from_snapshot(
+                hf_llama_snapshot_dir,
+                load_device,
+                load_dtype,
+                device_map=device_map,
+            )
+            resolved_cfg = runtime_resolve_model_config(model)
+            if resolved_cfg is None:
+                raise ValueError("HF LLaMA snapshot loader returned a model without a ModelConfig cfg")
+            try:
+                first_param = next(model.parameters())
+                resolved_device = first_param.device
+                resolved_dtype = first_param.dtype
+            except StopIteration:
+                resolved_device = runtime_resolve_model_device(device)
+                resolved_dtype = load_dtype
+            return cls(
+                resolved_cfg,
+                model,
+                resolved_device,
+                resolved_dtype,
+                kv_pagesize,
+            )
         indir = model_dir or os.environ.get("MODEL_DIR")
         if not indir:
             raise ValueError("MODEL_DIR environment variable not set and model_dir not provided")

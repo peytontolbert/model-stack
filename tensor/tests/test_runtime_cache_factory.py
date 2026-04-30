@@ -1254,6 +1254,7 @@ def test_snapshot_hf_llama_config_helper_derives_runtime_model_config():
     assert cfg.d_model == 32
     assert cfg.n_layers == 3
     assert cfg.n_heads == 4
+    assert cfg.n_kv_heads == 2
     assert cfg.d_ff == 96
     assert cfg.vocab_size == 128
     assert cfg.head_dim == 8
@@ -1300,6 +1301,7 @@ def test_transformers_hf_llama_config_helper_derives_runtime_model_config():
     assert cfg.d_model == 48
     assert cfg.n_layers == 2
     assert cfg.n_heads == 6
+    assert cfg.n_kv_heads == 3
     assert cfg.d_ff == 128
     assert cfg.vocab_size == 256
     assert cfg.head_dim == 8
@@ -1493,9 +1495,48 @@ def test_build_local_llama_from_snapshot_uses_runtime_hf_loader(monkeypatch, tmp
     assert seen["build"]["kwargs"]["n_kv_heads"] == 2
     assert seen["build"]["kwargs"]["tie_weights"] is False
     assert seen["load"] == {"model": model, "ckpt_dir": str(tmp_path)}
+    assert len(model.to_calls) == 1
+    assert model.to_calls[0]["kwargs"]["device"] == "cpu"
     assert model.to_calls[0]["kwargs"]["dtype"] == torch.float16
-    assert model.to_calls[-1]["args"] == ("cpu",)
     assert model.eval_calls == 1
+
+
+def test_model_runtime_from_dir_can_load_hf_llama_snapshot_env(monkeypatch, tmp_path):
+    snapshot_dir = tmp_path / "hf-llama"
+    snapshot_dir.mkdir()
+    cfg = _cfg()
+    model = torch.nn.Linear(1, 1)
+    model.cfg = cfg
+    seen = {}
+
+    def fake_build_local_llama_from_snapshot(ckpt_dir, device, torch_dtype, device_map=None):
+        seen["ckpt_dir"] = ckpt_dir
+        seen["device"] = device
+        seen["torch_dtype"] = torch_dtype
+        seen["device_map"] = device_map
+        return model, {"model_type": "llama"}
+
+    monkeypatch.setenv("MODEL_STACK_HF_LLAMA_SNAPSHOT_DIR", str(snapshot_dir))
+    monkeypatch.setenv("MODEL_STACK_HF_LLAMA_DTYPE", "float32")
+    monkeypatch.setenv("MODEL_STACK_HF_LLAMA_DEVICE_MAP", "auto")
+    monkeypatch.setattr(
+        serve_runtime_mod.runtime_checkpoint_mod,
+        "build_local_llama_from_snapshot",
+        fake_build_local_llama_from_snapshot,
+    )
+
+    runtime = serve_runtime_mod.ModelRuntime.from_dir(device="cpu")
+
+    assert runtime.cfg is cfg
+    assert runtime.model is model
+    assert str(runtime.device) == "cpu"
+    assert runtime.dtype == torch.float32
+    assert seen == {
+        "ckpt_dir": str(snapshot_dir),
+        "device": "cpu",
+        "torch_dtype": torch.float32,
+        "device_map": "auto",
+    }
 
 
 def test_apply_attention_biases_combines_bool_mask_alibi_and_rpb(monkeypatch):

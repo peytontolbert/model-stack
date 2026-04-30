@@ -37,13 +37,17 @@ Outputs:
 - `manifest.json`
 - `layers/*.bin` packed ternary weights, scales, layout headers, offsets, and bias tensors
 - `runtime/bitnet_webgpu.js`
+- `runtime/bitnet_wasm_runtime.js`
+- `runtime/model_stack_bitnet_wasm.js`
+- `runtime/model_stack_bitnet_wasm_bg.wasm`
 - `runtime/bitnet_linear.wgsl`
 - `modelcard.json`
 
-This target is for Safari/WebGPU and other browser runtimes. It does not export
-a fake ONNX BitNet op. The v1 browser path requires `spin=False` and
-`quant_weight_opt=none`; AWQ/pre-scale and spin transforms need dedicated browser
-epilogues before they can be enabled.
+This target is for browser runtimes with WebGPU first and packed BitNet WASM as
+the compatibility fallback. It does not export a fake ONNX BitNet op or expand
+packed weights to dense ONNX weights. The v1 browser path requires `spin=False`
+and `quant_weight_opt=none`; AWQ/pre-scale and spin transforms need dedicated
+browser epilogues before they can be enabled.
 
 ## Programmatic
 

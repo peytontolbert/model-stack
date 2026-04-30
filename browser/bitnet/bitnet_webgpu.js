@@ -1,5 +1,7 @@
 const PARAM_U32_COUNT = 12;
 const PARAM_BUFFER_BYTES = PARAM_U32_COUNT * 4;
+const shaderTextCache = new Map();
+const pipelineCache = new WeakMap();
 
 function align4(value) {
   return (value + 3) & ~3;
@@ -59,8 +61,33 @@ function resolveUrl(path, baseUrl) {
   return new URL(path, baseUrl).toString();
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(url, options = {}) {
+  const attempts = Math.max(1, Number(options.attempts || 5));
+  let lastError = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) return response;
+      if (response.status < 500 && response.status !== 408 && response.status !== 429) {
+        throw new Error(`failed to fetch ${url}: ${response.status}`);
+      }
+      lastError = new Error(`failed to fetch ${url}: ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < attempts - 1) {
+      await sleep(Math.min(2000, 150 * 2 ** attempt));
+    }
+  }
+  throw lastError || new Error(`failed to fetch ${url}`);
+}
+
 async function fetchJson(url) {
-  const response = await fetch(url);
+  const response = await fetchWithRetry(url);
   if (!response.ok) {
     throw new Error(`failed to fetch ${url}: ${response.status}`);
   }
@@ -68,15 +95,45 @@ async function fetchJson(url) {
 }
 
 async function fetchText(url) {
-  const response = await fetch(url);
+  const response = await fetchWithRetry(url);
   if (!response.ok) {
     throw new Error(`failed to fetch ${url}: ${response.status}`);
   }
   return response.text();
 }
 
+async function fetchTextCached(url) {
+  if (!shaderTextCache.has(url)) {
+    shaderTextCache.set(url, fetchText(url));
+  }
+  return shaderTextCache.get(url);
+}
+
+async function getBitNetPipeline(device, shaderCode, cacheKey) {
+  let deviceCache = pipelineCache.get(device);
+  if (!deviceCache) {
+    deviceCache = new Map();
+    pipelineCache.set(device, deviceCache);
+  }
+  if (!deviceCache.has(cacheKey)) {
+    deviceCache.set(cacheKey, (async () => {
+      const module = device.createShaderModule({ code: shaderCode });
+      const descriptor = {
+        layout: "auto",
+        compute: { module, entryPoint: "bitnet_linear_main" },
+      };
+      const pipeline = typeof device.createComputePipelineAsync === "function"
+        ? await device.createComputePipelineAsync(descriptor)
+        : device.createComputePipeline(descriptor);
+      return { module, pipeline };
+    })());
+  }
+  return deviceCache.get(cacheKey);
+}
+
 async function fetchTensor(entry, baseUrl, TypedArray) {
-  const response = await fetch(resolveUrl(entry.path, baseUrl));
+  const url = resolveUrl(entry.path, baseUrl);
+  const response = await fetchWithRetry(url);
   if (!response.ok) {
     throw new Error(`failed to fetch ${entry.path}: ${response.status}`);
   }
@@ -117,14 +174,19 @@ export class BitNetLinearWebGPU {
     this.inputQuantBits = bundle.inputQuantBits ?? 8;
     this.inputScaleRows = bundle.inputScaleRows ?? 1;
 
-    if (!bundle.shaderCode) {
-      throw new Error("BitNetLinearWebGPU requires shaderCode; use fromManifestLayer() or fromManifestUrl()");
+    if (!bundle.shaderCode && !bundle.pipeline) {
+      throw new Error("BitNetLinearWebGPU requires shaderCode or pipeline; use fromManifestLayer() or fromManifestUrl()");
     }
-    this.module = device.createShaderModule({ code: bundle.shaderCode });
-    this.pipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module: this.module, entryPoint: "bitnet_linear_main" },
-    });
+    if (bundle.pipeline) {
+      this.module = bundle.module || null;
+      this.pipeline = bundle.pipeline;
+    } else {
+      this.module = device.createShaderModule({ code: bundle.shaderCode });
+      this.pipeline = device.createComputePipeline({
+        layout: "auto",
+        compute: { module: this.module, entryPoint: "bitnet_linear_main" },
+      });
+    }
 
     this.packedWeightBuffer = createStorageBuffer(device, packedWeightToWords(bundle.packedWeight));
     this.scaleBuffer = createStorageBuffer(device, new Float32Array(bundle.scaleValues));
@@ -143,19 +205,42 @@ export class BitNetLinearWebGPU {
     });
   }
 
-  static async fromManifestLayer(device, manifest, layer, manifestUrl) {
+  static async fromManifestLayer(device, manifest, layer, manifestUrl, options = {}) {
+    const progress = typeof options.progress === "function" ? options.progress : () => {};
+    const index = Number(options.index || 0);
+    const total = Number(options.total || 0);
+    const name = String(options.name || layer.name || "layer");
+    const label = total ? `${index}/${total}: ${name}` : name;
     const baseUrl = new URL(".", manifestUrl).toString();
-    const runtimeBaseUrl = resolveUrl(".", resolveUrl(manifest.runtime.files.wgsl, baseUrl));
-    const shaderCode = await fetchText(resolveUrl(manifest.runtime.files.wgsl, baseUrl));
+    const shaderUrl = resolveUrl(manifest.runtime.files.wgsl, baseUrl);
+    const runtimeBaseUrl = resolveUrl(".", shaderUrl);
+    progress({ phase: "layer_shader", index, total, name, message: `Loading shader for BitNet layer ${label}` });
+    const shaderCode = options.shaderCode || await fetchTextCached(shaderUrl);
+    progress({ phase: "layer_pipeline", index, total, name, message: `Preparing WebGPU pipeline for BitNet layer ${label}` });
+    const pipelineBundle = options.pipeline
+      ? { module: options.module || null, pipeline: options.pipeline }
+      : await getBitNetPipeline(device, shaderCode, shaderUrl);
     const tensors = layer.tensors;
+    const layersBaseUrl = resolveUrl("layers/", baseUrl);
+    progress({ phase: "layer_tensors", index, total, name, message: `Loading tensors for BitNet layer ${label}` });
+    const [packedWeight, scaleValues, segmentOffsets, bias, inputScales] = await Promise.all([
+      fetchTensor(tensors.packed_weight, layersBaseUrl, Uint8Array),
+      fetchTensor(tensors.scale_values, layersBaseUrl, Float32Array),
+      fetchTensor(tensors.segment_offsets, layersBaseUrl, Int32Array),
+      tensors.bias ? fetchTensor(tensors.bias, layersBaseUrl, Float32Array) : Promise.resolve(null),
+      fetchTensor(tensors.act_scale, layersBaseUrl, tensorType(tensors.act_scale)),
+    ]);
+    progress({ phase: "layer_upload", index, total, name, message: `Uploading BitNet layer ${label}` });
     return new BitNetLinearWebGPU(device, {
       shaderCode,
+      module: pipelineBundle.module,
+      pipeline: pipelineBundle.pipeline,
       layoutHeader: layer.layout_header,
-      packedWeight: await fetchTensor(tensors.packed_weight, resolveUrl("layers/", baseUrl), Uint8Array),
-      scaleValues: await fetchTensor(tensors.scale_values, resolveUrl("layers/", baseUrl), Float32Array),
-      segmentOffsets: await fetchTensor(tensors.segment_offsets, resolveUrl("layers/", baseUrl), Int32Array),
-      bias: tensors.bias ? await fetchTensor(tensors.bias, resolveUrl("layers/", baseUrl), Float32Array) : null,
-      inputScales: await fetchTensor(tensors.act_scale, resolveUrl("layers/", baseUrl), tensorType(tensors.act_scale)),
+      packedWeight,
+      scaleValues,
+      segmentOffsets,
+      bias,
+      inputScales,
       inputQuantMode: layer.act_quant_mode === "none" ? 0 : 1,
       inputQuantBits: layer.act_quant_bits,
       inputScaleRows: layer.act_quant_mode === "static_int8" ? 1 : 1,

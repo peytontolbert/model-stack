@@ -1,0 +1,1 @@
+/data/agentkernel/other_repos/model-stack/browser/bitnet_wasm/target/wasm32-unknown-unknown/release/model_stack_bitnet_wasm.wasm: /data/agentkernel/other_repos/model-stack/browser/bitnet_wasm/src/lib.rs

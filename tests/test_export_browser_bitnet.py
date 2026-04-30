@@ -42,6 +42,19 @@ class TinyBitNetModel(torch.nn.Module):
         return self.proj(x)
 
 
+class TinyTiedEncoderDecoderBitNetModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.enc_embed = torch.nn.Embedding(8, 4)
+        self.dec_embed = torch.nn.Embedding(8, 4)
+        self.dec_embed.weight = self.enc_embed.weight
+        self.encoder = torch.nn.ModuleList()
+        self.decoder = torch.nn.ModuleList()
+        self.enc_norm = torch.nn.LayerNorm(4)
+        self.dec_norm = torch.nn.LayerNorm(4)
+        self.lm_head = QuantizedLinearBitNet(4, 8, bias=False).from_float(torch.nn.Linear(4, 8, bias=False), spin=False)
+
+
 def test_browser_bitnet_export_writes_manifest_runtime_and_layer_bins(tmp_path: Path) -> None:
     out = export_model(
         TinyBitNetModel(),
@@ -54,12 +67,19 @@ def test_browser_bitnet_export_writes_manifest_runtime_and_layer_bins(tmp_path: 
 
     assert manifest["format"] == "model-stack-browser-bitnet"
     assert manifest["runtime"]["primary"] == "webgpu"
+    assert manifest["runtime"]["fallback"] == "wasm"
     assert manifest["runtime"]["files"]["webgpu_js"] == "runtime/bitnet_webgpu.js"
     assert manifest["runtime"]["files"]["wgsl"] == "runtime/bitnet_linear.wgsl"
     assert manifest["runtime"]["files"]["encdec_js"] == "runtime/encdec_runtime.js"
+    assert manifest["runtime"]["files"]["wasm_runtime_js"] == "runtime/bitnet_wasm_runtime.js"
+    assert manifest["runtime"]["files"]["wasm_js"] == "runtime/model_stack_bitnet_wasm.js"
+    assert manifest["runtime"]["files"]["wasm_binary"] == "runtime/model_stack_bitnet_wasm_bg.wasm"
     assert (tmp_path / "runtime" / "bitnet_webgpu.js").exists()
     assert (tmp_path / "runtime" / "bitnet_linear.wgsl").exists()
     assert (tmp_path / "runtime" / "encdec_runtime.js").exists()
+    assert (tmp_path / "runtime" / "bitnet_wasm_runtime.js").exists()
+    assert (tmp_path / "runtime" / "model_stack_bitnet_wasm.js").exists()
+    assert (tmp_path / "runtime" / "model_stack_bitnet_wasm_bg.wasm").exists()
 
     assert len(manifest["layers"]) == 1
     layer = manifest["layers"][0]
@@ -84,3 +104,18 @@ def test_browser_bitnet_export_rejects_dynamic_activation_quant(tmp_path: Path) 
         assert "dynamic_int8" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected dynamic_int8 browser export to fail")
+
+
+def test_browser_bitnet_export_preserves_tied_embedding_aliases(tmp_path: Path) -> None:
+    out = export_model(
+        TinyTiedEncoderDecoderBitNetModel(),
+        ExportConfig(target="browser-bitnet", outdir=str(tmp_path)),
+        model_cfg=ModelConfig(d_model=4, n_heads=1, n_layers=0, d_ff=8, vocab_size=8),
+    )
+    manifest = json.loads(out.read_text())
+
+    assert manifest["graph"]["architecture"] == "encoder_decoder"
+    assert manifest["graph"]["embeddings"]["encoder"] == "enc_embed.weight"
+    assert manifest["graph"]["embeddings"]["decoder"] == "dec_embed.weight"
+    assert "enc_embed.weight" in manifest["dense_tensors"]
+    assert "dec_embed.weight" in manifest["dense_tensors"]
