@@ -117,9 +117,16 @@ Strict ternary activation + weight path, measured on H100 2026-05-01 with
 | 8-lane, 64 cols | `M=65536 K=2048 N=1024` | 0.4046 ms | 7.1678 ms | 7.6155 ms | 82.1280 ms | 0.5451 ms | 0.3483 ms | loses, 0.0457x |
 | 8-lane, 16 cols | `M=65536 K=1024 N=2048` | 0.2606 ms | 9.1641 ms | 9.3671 ms | 83.2650 ms | 0.5778 ms | 0.3854 ms | loses, 0.0411x |
 | 8-lane, 16 cols | `M=65536 K=2048 N=1024` | 0.4013 ms | 6.5941 ms | 7.0901 ms | 82.1199 ms | 0.5494 ms | 0.3481 ms | loses, 0.0491x |
+| static 32/64 words, 8-lane, 32 cols | `M=65536 K=1024 N=2048` | 0.2597 ms | 8.6689 ms | 8.9338 ms | 82.6476 ms | 0.5740 ms | 0.3855 ms | loses, 0.0432x |
+| static 32/64 words, 8-lane, 32 cols | `M=65536 K=2048 N=1024` | 0.4020 ms | 6.3625 ms | 6.7956 ms | 82.7428 ms | 0.5512 ms | 0.3483 ms | loses, 0.0513x |
+| static 32/64 words, 8-lane, 16 cols | `M=65536 K=1024 N=2048` | 0.2657 ms | 8.7135 ms | 8.9679 ms | 83.2688 ms | 0.5777 ms | 0.3853 ms | loses, 0.0430x |
+| static 32/64 words, 8-lane, 16 cols | `M=65536 K=2048 N=1024` | 0.4013 ms | 6.2348 ms | 6.6879 ms | 82.7415 ms | 0.5415 ms | 0.3483 ms | loses, 0.0521x |
+| static 32/64 words, 8-lane, 8 cols | `M=65536 K=1024 N=2048` | 0.2596 ms | 10.0981 ms | 10.3740 ms | 82.6468 ms | 0.5826 ms | 0.3852 ms | loses, 0.0371x |
+| static 32/64 words, 8-lane, 8 cols | `M=65536 K=2048 N=1024` | 0.4092 ms | 6.2955 ms | 6.7461 ms | 82.7415 ms | 0.5467 ms | 0.3484 ms | loses, 0.0516x |
 
-The selected strict ternary layout is 8 lanes per output and 32 output columns
-per CTA. It is the best measured overall MLP-pair tradeoff. This is the first
-strict path that is meaningfully faster than the BF16-activation ternary
-baseline, because compute is now bitset/popcount on ternary activation masks
-and ternary weight masks. It is still slower than dense BF16 and CUTLASS INT4.
+The selected strict ternary layout is static-specialized 32/64 mask words, 8
+lanes per output, and 16 output columns per CTA. It is the best measured
+overall MLP-pair tradeoff so far. This is the first strict path that is
+meaningfully faster than the BF16-activation ternary baseline, because compute
+is now bitset/popcount on ternary activation masks and ternary weight masks. It
+is still slower than dense BF16 and CUTLASS INT4.

@@ -18,7 +18,8 @@ constexpr int kTernaryLinearGroupLanes = 4;
 constexpr int kTernaryLinearChunkWords = 4;
 constexpr int kTernaryLinearChunkValues = kTernaryLinearChunkWords * 32;
 constexpr int kTernaryLinearThreadsX = kTernaryLinearBlockCols * kTernaryLinearGroupLanes;
-constexpr int kStrictTernaryBlockCols = 32;
+constexpr int kStrictTernaryBlockRows = 1;
+constexpr int kStrictTernaryBlockCols = 16;
 constexpr int kStrictTernaryGroupLanes = 8;
 constexpr int kStrictTernaryThreadsX = kStrictTernaryBlockCols * kStrictTernaryGroupLanes;
 
@@ -187,7 +188,7 @@ __global__ void bitnet_ternary_linear_kernel(
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, int StaticWordCols>
 __global__ void bitnet_strict_ternary_linear_kernel(
     const uint32_t* __restrict__ x_pos_masks,
     const uint32_t* __restrict__ x_neg_masks,
@@ -202,14 +203,17 @@ __global__ void bitnet_strict_ternary_linear_kernel(
     int64_t n_tiles) {
   const int lane_in_group = static_cast<int>(threadIdx.x) & (kStrictTernaryGroupLanes - 1);
   const int col_in_block = static_cast<int>(threadIdx.x) / kStrictTernaryGroupLanes;
+  const int row_in_block = static_cast<int>(threadIdx.y);
   const int64_t tile = static_cast<int64_t>(blockIdx.x);
-  const int64_t row = tile / n_tiles;
-  const int64_t col_tile = tile - row * n_tiles;
+  const int64_t row_tile = tile / n_tiles;
+  const int64_t col_tile = tile - row_tile * n_tiles;
+  const int64_t row = row_tile * kStrictTernaryBlockRows + row_in_block;
   const int64_t col = col_tile * kStrictTernaryBlockCols + col_in_block;
   const bool valid = row < m && col < n;
 
   int acc = 0;
-  for (int64_t word_col = lane_in_group; word_col < word_cols; word_col += kStrictTernaryGroupLanes) {
+  const int64_t active_word_cols = StaticWordCols > 0 ? StaticWordCols : word_cols;
+  for (int64_t word_col = lane_in_group; word_col < active_word_cols; word_col += kStrictTernaryGroupLanes) {
     if (valid) {
       const uint32_t xp = x_pos_masks[row * word_cols + word_col];
       const uint32_t xn = x_neg_masks[row * word_cols + word_col];
@@ -430,8 +434,9 @@ torch::Tensor CudaBitNetStrictTernaryLinearForward(
   }
 
   const int64_t n_tiles = (n + kStrictTernaryBlockCols - 1) / kStrictTernaryBlockCols;
-  const dim3 blocks(static_cast<unsigned int>(rows * n_tiles));
-  const dim3 threads(kStrictTernaryThreadsX);
+  const int64_t row_tiles = (rows + kStrictTernaryBlockRows - 1) / kStrictTernaryBlockRows;
+  const dim3 blocks(static_cast<unsigned int>(row_tiles * n_tiles));
+  const dim3 threads(kStrictTernaryThreadsX, kStrictTernaryBlockRows);
   auto stream = c10::cuda::getCurrentCUDAStream(x_pos_masks.device().index());
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf,
@@ -439,7 +444,34 @@ torch::Tensor CudaBitNetStrictTernaryLinearForward(
       out_dtype,
       "bitnet_strict_ternary_linear_cuda",
       [&] {
-        bitnet_strict_ternary_linear_kernel<scalar_t><<<blocks, threads, 0, stream.stream()>>>(
+        if (word_cols == 32) {
+          bitnet_strict_ternary_linear_kernel<scalar_t, 32><<<blocks, threads, 0, stream.stream()>>>(
+              reinterpret_cast<const uint32_t*>(xp.data_ptr<int32_t>()),
+              reinterpret_cast<const uint32_t*>(xn.data_ptr<int32_t>()),
+              xs.data_ptr<float>(),
+              reinterpret_cast<const uint32_t*>(wp.data_ptr<int32_t>()),
+              reinterpret_cast<const uint32_t*>(wn.data_ptr<int32_t>()),
+              ws.data_ptr<float>(),
+              out.data_ptr<scalar_t>(),
+              rows,
+              n,
+              word_cols,
+              n_tiles);
+        } else if (word_cols == 64) {
+          bitnet_strict_ternary_linear_kernel<scalar_t, 64><<<blocks, threads, 0, stream.stream()>>>(
+              reinterpret_cast<const uint32_t*>(xp.data_ptr<int32_t>()),
+              reinterpret_cast<const uint32_t*>(xn.data_ptr<int32_t>()),
+              xs.data_ptr<float>(),
+              reinterpret_cast<const uint32_t*>(wp.data_ptr<int32_t>()),
+              reinterpret_cast<const uint32_t*>(wn.data_ptr<int32_t>()),
+              ws.data_ptr<float>(),
+              out.data_ptr<scalar_t>(),
+              rows,
+              n,
+              word_cols,
+              n_tiles);
+        } else {
+          bitnet_strict_ternary_linear_kernel<scalar_t, 0><<<blocks, threads, 0, stream.stream()>>>(
             reinterpret_cast<const uint32_t*>(xp.data_ptr<int32_t>()),
             reinterpret_cast<const uint32_t*>(xn.data_ptr<int32_t>()),
             xs.data_ptr<float>(),
@@ -451,6 +483,7 @@ torch::Tensor CudaBitNetStrictTernaryLinearForward(
             n,
             word_cols,
             n_tiles);
+        }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
