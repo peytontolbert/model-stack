@@ -31,6 +31,7 @@ from runtime.quant import _should_use_eager_autograd_fallback
 from runtime.quant import nf4_dequantize as runtime_nf4_dequantize
 from runtime.quant import nf4_linear as runtime_nf4_linear
 from runtime.quant import nf4_quantize as runtime_nf4_quantize
+from runtime.quant import cutlass_int4_bf16_linear as runtime_cutlass_int4_bf16_linear
 from runtime.quant import int4_linear as runtime_int4_linear
 from runtime.quant import int8_linear as runtime_int8_linear
 from runtime.quant import int8_linear_grad_weight_from_float as runtime_int8_linear_grad_weight_from_float
@@ -222,6 +223,22 @@ def _pack_int4_signed(qweight: torch.Tensor) -> torch.Tensor:
     q = q + 8
     if q.size(-1) % 2 != 0:
         pad = torch.full((*q.shape[:-1], 1), 8, dtype=q.dtype, device=q.device)
+        q = torch.cat([q, pad], dim=-1)
+    low = q[..., 0::2]
+    high = q[..., 1::2]
+    return (low | (high << 4)).to(dtype=torch.uint8)
+
+
+def _pack_int4_twos_complement(qweight: torch.Tensor) -> torch.Tensor:
+    """Pack signed 4-bit two's-complement values for CUTLASS int4b_t."""
+    if qweight.dtype not in {torch.int8, torch.int16, torch.int32, torch.int64}:
+        raise TypeError("qweight must be an integer tensor")
+    q = qweight.to(dtype=torch.int16)
+    if bool(((q < -8) | (q > 7)).any()):
+        raise ValueError("signed int4 values must be in [-8, 7]")
+    q = q & 0x0F
+    if q.size(-1) % 2 != 0:
+        pad = torch.zeros((*q.shape[:-1], 1), dtype=q.dtype, device=q.device)
         q = torch.cat([q, pad], dim=-1)
     low = q[..., 0::2]
     high = q[..., 1::2]
@@ -3567,10 +3584,21 @@ class _TrainableBitNetPackedInt4STEFunction(torch.autograd.Function):
         target_dtype = x.dtype if x.dtype.is_floating_point else weight.dtype
         x_local = x.to(dtype=target_dtype)
         qweight, row_scale = _bitnet_runtime_row_codes_and_scale(weight.detach(), eps=float(eps))
-        packed_weight = _pack_int4_signed(qweight).to(device=x_local.device, dtype=torch.uint8).contiguous()
         row_scale = row_scale.to(device=x_local.device, dtype=torch.float32).contiguous()
         bias_local = None if bias is None else bias.to(device=x_local.device, dtype=target_dtype)
-        out = runtime_int4_linear(x_local, packed_weight, row_scale, bias_local)
+        if _env_flag_enabled("MODEL_STACK_TRAINABLE_BITNET_CUTLASS_INT4_FORWARD"):
+            if bias_local is not None:
+                raise RuntimeError("CUTLASS packed INT4 BitNet training forward does not support bias yet")
+            if x_local.dtype != torch.bfloat16:
+                raise RuntimeError("CUTLASS packed INT4 BitNet training forward requires bfloat16 activations")
+            packed_weight_rowmajor = _pack_int4_twos_complement(qweight.contiguous()).to(
+                device=x_local.device,
+                dtype=torch.uint8,
+            ).contiguous()
+            out = runtime_cutlass_int4_bf16_linear(x_local, packed_weight_rowmajor, row_scale, None)
+        else:
+            packed_weight = _pack_int4_signed(qweight).to(device=x_local.device, dtype=torch.uint8).contiguous()
+            out = runtime_int4_linear(x_local, packed_weight, row_scale, bias_local)
         _trainable_bitnet_save_backward_context(
             ctx,
             x=x,

@@ -166,6 +166,11 @@ torch::Tensor CudaInt4LinearGradInputForward(
     const torch::Tensor& inv_scale,
     int64_t in_features);
 bool HasCudaInt4LinearKernel();
+torch::Tensor CutlassInt4Bf16LinearForward(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight_rowmajor,
+    const torch::Tensor& scale,
+    const c10::optional<torch::Tensor>& bias);
 torch::Tensor CudaNf4LinearForward(
     const torch::Tensor& x,
     const torch::Tensor& packed_weight,
@@ -5147,6 +5152,39 @@ torch::Tensor Int4LinearGradInputForward(
       inv_scale,
       c10::nullopt);
   return ReferenceLinearForward(grad_out, weight, c10::nullopt);
+}
+
+torch::Tensor CutlassInt4Bf16LinearForwardChecked(
+    const torch::Tensor& x,
+    const torch::Tensor& packed_weight_rowmajor,
+    const torch::Tensor& scale,
+    const c10::optional<torch::Tensor>& bias) {
+  TORCH_CHECK(x.defined() && packed_weight_rowmajor.defined() && scale.defined(),
+              "cutlass_int4_bf16_linear_forward: x, packed_weight_rowmajor, and scale must be defined");
+  TORCH_CHECK(x.dim() >= 2, "cutlass_int4_bf16_linear_forward: x must have rank >= 2");
+  TORCH_CHECK(x.scalar_type() == torch::kBFloat16,
+              "cutlass_int4_bf16_linear_forward: x must be bfloat16");
+  TORCH_CHECK(packed_weight_rowmajor.dim() == 2,
+              "cutlass_int4_bf16_linear_forward: packed_weight_rowmajor must be rank-2");
+  TORCH_CHECK(packed_weight_rowmajor.scalar_type() == torch::kUInt8,
+              "cutlass_int4_bf16_linear_forward: packed_weight_rowmajor must use uint8 storage");
+  TORCH_CHECK(scale.dim() == 1, "cutlass_int4_bf16_linear_forward: scale must be rank-1");
+  TORCH_CHECK(packed_weight_rowmajor.size(0) == scale.size(0),
+              "cutlass_int4_bf16_linear_forward: packed N dimension mismatch");
+  TORCH_CHECK(packed_weight_rowmajor.size(1) == (x.size(-1) + 1) / 2,
+              "cutlass_int4_bf16_linear_forward: packed K dimension mismatch");
+  TORCH_CHECK(!bias.has_value() || !bias.value().defined(),
+              "cutlass_int4_bf16_linear_forward: bias is not supported yet");
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && packed_weight_rowmajor.is_cuda() && scale.is_cuda()) {
+    auto out = CutlassInt4Bf16LinearForward(x, packed_weight_rowmajor, scale, bias);
+    if (out.defined()) {
+      return out;
+    }
+  }
+#endif
+  TORCH_CHECK(false, "cutlass_int4_bf16_linear_forward: CUTLASS SM90 backend unavailable or shape unsupported");
+  return torch::Tensor();
 }
 
 torch::Tensor Nf4LinearForward(
@@ -10575,6 +10613,8 @@ PYBIND11_MODULE(_model_stack_native, m) {
         py::arg("inv_scale"), py::arg("bias") = py::none());
   m.def("int4_linear_grad_input_forward", &Int4LinearGradInputForward, py::arg("grad_out"),
         py::arg("packed_weight"), py::arg("inv_scale"), py::arg("in_features"));
+  m.def("cutlass_int4_bf16_linear_forward", &CutlassInt4Bf16LinearForwardChecked, py::arg("x"),
+        py::arg("packed_weight_rowmajor"), py::arg("scale"), py::arg("bias") = py::none());
   m.def("pack_bitnet_weight_forward", &PackBitNetWeightForward, py::arg("weight"),
         py::arg("scale_values") = py::none(), py::arg("layout_header") = py::none(),
         py::arg("segment_offsets") = py::none());

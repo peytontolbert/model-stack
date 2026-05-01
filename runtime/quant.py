@@ -1260,6 +1260,30 @@ def int4_linear(
     return runtime_linear(x_cast, weight, bias_cast)
 
 
+def cutlass_int4_bf16_linear(
+    x: torch.Tensor,
+    weight_packed_rowmajor: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if bias is not None:
+        raise RuntimeError("cutlass_int4_bf16_linear does not support bias yet")
+    if x.dtype != torch.bfloat16:
+        raise RuntimeError("cutlass_int4_bf16_linear requires bfloat16 activations")
+    target_device = weight_packed_rowmajor.device
+    x_cast = x.to(device=target_device, dtype=torch.bfloat16)
+    packed_cast = weight_packed_rowmajor.to(device=target_device, dtype=torch.uint8).contiguous()
+    scale_cast = scale.to(device=target_device, dtype=torch.float32).contiguous()
+    module = native_module()
+    if (
+        packed_cast.is_cuda
+        and module is not None
+        and hasattr(module, "cutlass_int4_bf16_linear_forward")
+    ):
+        return module.cutlass_int4_bf16_linear_forward(x_cast, packed_cast, scale_cast, None)
+    raise RuntimeError("cutlass_int4_bf16_linear requires the native CUTLASS backend")
+
+
 def bitnet_linear(
     x: torch.Tensor,
     packed_weight: torch.Tensor,
