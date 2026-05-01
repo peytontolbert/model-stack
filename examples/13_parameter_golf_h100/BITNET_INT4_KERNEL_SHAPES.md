@@ -129,12 +129,24 @@ Strict ternary activation + weight path, measured on H100 2026-05-01 with
 | unrolled static words, 8-lane, 32 cols | `M=65536 K=2048 N=1024` | 0.4009 ms | 5.9830 ms | 6.3610 ms | 82.1266 ms | 0.5458 ms | 0.3484 ms | loses, 0.0548x |
 | unrolled static words, 8-lane, 8 cols | `M=65536 K=1024 N=2048` | 0.2595 ms | 10.1182 ms | 10.3520 ms | 82.6469 ms | 0.5736 ms | 0.3851 ms | loses, 0.0372x |
 | unrolled static words, 8-lane, 8 cols | `M=65536 K=2048 N=1024` | 0.4001 ms | 6.0555 ms | 6.5034 ms | 82.7411 ms | 0.5476 ms | 0.3481 ms | loses, 0.0535x |
+| corrected 16-lane reduction, 16 cols | `M=65536 K=1024 N=2048` | 0.2597 ms | 10.3753 ms | 10.6250 ms | 82.6592 ms | 0.5833 ms | 0.3851 ms | loses, 0.0362x |
+| corrected 16-lane reduction, 16 cols | `M=65536 K=2048 N=1024` | 0.4051 ms | 6.8507 ms | 7.2224 ms | 82.1265 ms | 0.5469 ms | 0.3483 ms | loses, 0.0482x |
+| full-warp 32-lane, 8 cols | `M=65536 K=1024 N=2048` | 0.2594 ms | 19.0425 ms | 19.3065 ms | 82.6473 ms | 0.5727 ms | 0.3853 ms | loses, 0.0200x |
+| full-warp 32-lane, 8 cols | `M=65536 K=2048 N=1024` | 0.4017 ms | 10.5221 ms | 10.9368 ms | 82.7423 ms | 0.5402 ms | 0.3479 ms | loses, 0.0318x |
+| unrolled static words, 4-lane, 32 cols | `M=65536 K=1024 N=2048` | 0.2605 ms | 9.8664 ms | 10.1346 ms | 83.2734 ms | 0.5763 ms | 0.3851 ms | loses, 0.0380x |
+| unrolled static words, 4-lane, 32 cols | `M=65536 K=2048 N=1024` | 0.4013 ms | 9.4872 ms | 9.9180 ms | 82.7494 ms | 0.5487 ms | 0.3482 ms | loses, 0.0351x |
+| two-output lane group, 8-lane, 32 cols | `M=65536 K=1024 N=2048` | 0.2592 ms | 7.6630 ms | 7.9371 ms | 83.2606 ms | 0.5742 ms | 0.3851 ms | loses, 0.0485x |
+| two-output lane group, 8-lane, 32 cols | `M=65536 K=2048 N=1024` | 0.4063 ms | 6.7395 ms | 7.1276 ms | 82.7399 ms | 0.5460 ms | 0.3480 ms | loses, 0.0488x |
+| two-popcount dot, aligned, 8-lane, 16 cols | `M=65536 K=1024 N=2048` | 0.2601 ms | 6.7145 ms | 6.9191 ms | 82.6398 ms | 0.5734 ms | 0.3850 ms | loses, 0.0556x |
+| two-popcount dot, aligned, 8-lane, 16 cols | `M=65536 K=2048 N=1024` | 0.3998 ms | 5.8166 ms | 6.2773 ms | 82.7399 ms | 0.5465 ms | 0.3483 ms | loses, 0.0555x |
 
-The selected strict ternary layout is unrolled static-specialized 32/64 mask
-words, 8 lanes per output, and 16 output columns per CTA. It is the best
+The selected strict ternary layout is two-popcount static-specialized 32/64
+mask words, 8 lanes per output, and 16 output columns per CTA. It is the best
 measured overall MLP-pair tradeoff so far. Shared activation-mask caching was
 also tested, but the extra CTA synchronization regressed to 9.9031 ms and
-7.8523 ms full strict on the same two shapes. This is the first strict path
-that is meaningfully faster than the BF16-activation ternary baseline, because
-compute is now bitset/popcount on ternary activation masks and ternary weight
-masks. It is still slower than dense BF16 and CUTLASS INT4.
+7.8523 ms full strict on the same two shapes. Wider lane groups were retested
+with complete reductions; 16-lane and full-warp 32-lane groups both regressed,
+so the winning lane split remains 8 lanes per ternary dot. This is the first
+strict path that is meaningfully faster than the BF16-activation ternary
+baseline, because compute is now bitset/popcount on ternary activation masks
+and ternary weight masks. It is still slower than dense BF16 and CUTLASS INT4.

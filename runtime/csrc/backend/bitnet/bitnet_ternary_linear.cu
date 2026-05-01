@@ -19,8 +19,8 @@ constexpr int kTernaryLinearChunkWords = 4;
 constexpr int kTernaryLinearChunkValues = kTernaryLinearChunkWords * 32;
 constexpr int kTernaryLinearThreadsX = kTernaryLinearBlockCols * kTernaryLinearGroupLanes;
 constexpr int kStrictTernaryBlockRows = 1;
-constexpr int kStrictTernaryBlockCols = 16;
 constexpr int kStrictTernaryGroupLanes = 8;
+constexpr int kStrictTernaryBlockCols = 16;
 constexpr int kStrictTernaryThreadsX = kStrictTernaryBlockCols * kStrictTernaryGroupLanes;
 
 __global__ void bitnet_ternary_pack_masks_kernel(
@@ -220,10 +220,8 @@ __global__ void bitnet_strict_ternary_linear_kernel(
         const uint32_t xn = x_neg_masks[row * word_cols + word_col];
         const uint32_t wp = w_pos_masks[col * word_cols + word_col];
         const uint32_t wn = w_neg_masks[col * word_cols + word_col];
-        acc += __popc(xp & wp);
-        acc += __popc(xn & wn);
-        acc -= __popc(xp & wn);
-        acc -= __popc(xn & wp);
+        acc += __popc((xp & wp) | (xn & wn));
+        acc -= __popc((xp & wn) | (xn & wp));
       }
     }
   } else {
@@ -233,18 +231,74 @@ __global__ void bitnet_strict_ternary_linear_kernel(
         const uint32_t xn = x_neg_masks[row * word_cols + word_col];
         const uint32_t wp = w_pos_masks[col * word_cols + word_col];
         const uint32_t wn = w_neg_masks[col * word_cols + word_col];
-        acc += __popc(xp & wp);
-        acc += __popc(xn & wn);
-        acc -= __popc(xp & wn);
-        acc -= __popc(xn & wp);
+        acc += __popc((xp & wp) | (xn & wn));
+        acc -= __popc((xp & wn) | (xn & wp));
       }
     }
   }
 
-  acc += __shfl_down_sync(0xffffffff, acc, 4, kStrictTernaryGroupLanes);
+  if constexpr (kStrictTernaryGroupLanes >= 32) {
+    acc += __shfl_down_sync(0xffffffff, acc, 16, kStrictTernaryGroupLanes);
+  }
+  if constexpr (kStrictTernaryGroupLanes >= 16) {
+    acc += __shfl_down_sync(0xffffffff, acc, 8, kStrictTernaryGroupLanes);
+  }
+  if constexpr (kStrictTernaryGroupLanes >= 8) {
+    acc += __shfl_down_sync(0xffffffff, acc, 4, kStrictTernaryGroupLanes);
+  }
   acc += __shfl_down_sync(0xffffffff, acc, 2, kStrictTernaryGroupLanes);
   acc += __shfl_down_sync(0xffffffff, acc, 1, kStrictTernaryGroupLanes);
   if (valid && lane_in_group == 0) {
+    const float scale = x_row_scale[row] * w_row_scale[col];
+    out[row * n + col] = static_cast<scalar_t>(static_cast<float>(acc) * scale);
+  }
+}
+
+template <typename scalar_t, int StaticWordCols>
+__global__ void bitnet_strict_ternary_linear_aligned_kernel(
+    const uint32_t* __restrict__ x_pos_masks,
+    const uint32_t* __restrict__ x_neg_masks,
+    const float* __restrict__ x_row_scale,
+    const uint32_t* __restrict__ w_pos_masks,
+    const uint32_t* __restrict__ w_neg_masks,
+    const float* __restrict__ w_row_scale,
+    scalar_t* __restrict__ out,
+    int64_t n,
+    int64_t word_cols,
+    int64_t n_tiles) {
+  static_assert(StaticWordCols > 0, "aligned strict ternary kernel requires a static word count");
+  const int lane_in_group = static_cast<int>(threadIdx.x) & (kStrictTernaryGroupLanes - 1);
+  const int col_in_block = static_cast<int>(threadIdx.x) / kStrictTernaryGroupLanes;
+  const int row_in_block = static_cast<int>(threadIdx.y);
+  const int64_t tile = static_cast<int64_t>(blockIdx.x);
+  const int64_t row_tile = tile / n_tiles;
+  const int64_t col_tile = tile - row_tile * n_tiles;
+  const int64_t row = row_tile * kStrictTernaryBlockRows + row_in_block;
+  const int64_t col = col_tile * kStrictTernaryBlockCols + col_in_block;
+
+  int acc = 0;
+#pragma unroll
+  for (int word_col = lane_in_group; word_col < StaticWordCols; word_col += kStrictTernaryGroupLanes) {
+    const uint32_t xp = x_pos_masks[row * word_cols + word_col];
+    const uint32_t xn = x_neg_masks[row * word_cols + word_col];
+    const uint32_t wp = w_pos_masks[col * word_cols + word_col];
+    const uint32_t wn = w_neg_masks[col * word_cols + word_col];
+    acc += __popc((xp & wp) | (xn & wn));
+    acc -= __popc((xp & wn) | (xn & wp));
+  }
+
+  if constexpr (kStrictTernaryGroupLanes >= 32) {
+    acc += __shfl_down_sync(0xffffffff, acc, 16, kStrictTernaryGroupLanes);
+  }
+  if constexpr (kStrictTernaryGroupLanes >= 16) {
+    acc += __shfl_down_sync(0xffffffff, acc, 8, kStrictTernaryGroupLanes);
+  }
+  if constexpr (kStrictTernaryGroupLanes >= 8) {
+    acc += __shfl_down_sync(0xffffffff, acc, 4, kStrictTernaryGroupLanes);
+  }
+  acc += __shfl_down_sync(0xffffffff, acc, 2, kStrictTernaryGroupLanes);
+  acc += __shfl_down_sync(0xffffffff, acc, 1, kStrictTernaryGroupLanes);
+  if (lane_in_group == 0) {
     const float scale = x_row_scale[row] * w_row_scale[col];
     out[row * n + col] = static_cast<scalar_t>(static_cast<float>(acc) * scale);
   }
@@ -452,6 +506,7 @@ torch::Tensor CudaBitNetStrictTernaryLinearForward(
   const int64_t row_tiles = (rows + kStrictTernaryBlockRows - 1) / kStrictTernaryBlockRows;
   const dim3 blocks(static_cast<unsigned int>(row_tiles * n_tiles));
   const dim3 threads(kStrictTernaryThreadsX, kStrictTernaryBlockRows);
+  const bool use_aligned_kernel = (rows % kStrictTernaryBlockRows) == 0 && (n % kStrictTernaryBlockCols) == 0;
   auto stream = c10::cuda::getCurrentCUDAStream(x_pos_masks.device().index());
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf,
@@ -460,7 +515,20 @@ torch::Tensor CudaBitNetStrictTernaryLinearForward(
       "bitnet_strict_ternary_linear_cuda",
       [&] {
         if (word_cols == 32) {
-          bitnet_strict_ternary_linear_kernel<scalar_t, 32><<<blocks, threads, 0, stream.stream()>>>(
+          if (use_aligned_kernel) {
+            bitnet_strict_ternary_linear_aligned_kernel<scalar_t, 32><<<blocks, threads, 0, stream.stream()>>>(
+                reinterpret_cast<const uint32_t*>(xp.data_ptr<int32_t>()),
+                reinterpret_cast<const uint32_t*>(xn.data_ptr<int32_t>()),
+                xs.data_ptr<float>(),
+                reinterpret_cast<const uint32_t*>(wp.data_ptr<int32_t>()),
+                reinterpret_cast<const uint32_t*>(wn.data_ptr<int32_t>()),
+                ws.data_ptr<float>(),
+                out.data_ptr<scalar_t>(),
+                n,
+                word_cols,
+                n_tiles);
+          } else {
+            bitnet_strict_ternary_linear_kernel<scalar_t, 32><<<blocks, threads, 0, stream.stream()>>>(
               reinterpret_cast<const uint32_t*>(xp.data_ptr<int32_t>()),
               reinterpret_cast<const uint32_t*>(xn.data_ptr<int32_t>()),
               xs.data_ptr<float>(),
@@ -472,8 +540,22 @@ torch::Tensor CudaBitNetStrictTernaryLinearForward(
               n,
               word_cols,
               n_tiles);
+          }
         } else if (word_cols == 64) {
-          bitnet_strict_ternary_linear_kernel<scalar_t, 64><<<blocks, threads, 0, stream.stream()>>>(
+          if (use_aligned_kernel) {
+            bitnet_strict_ternary_linear_aligned_kernel<scalar_t, 64><<<blocks, threads, 0, stream.stream()>>>(
+              reinterpret_cast<const uint32_t*>(xp.data_ptr<int32_t>()),
+              reinterpret_cast<const uint32_t*>(xn.data_ptr<int32_t>()),
+              xs.data_ptr<float>(),
+              reinterpret_cast<const uint32_t*>(wp.data_ptr<int32_t>()),
+              reinterpret_cast<const uint32_t*>(wn.data_ptr<int32_t>()),
+              ws.data_ptr<float>(),
+              out.data_ptr<scalar_t>(),
+              n,
+              word_cols,
+              n_tiles);
+          } else {
+            bitnet_strict_ternary_linear_kernel<scalar_t, 64><<<blocks, threads, 0, stream.stream()>>>(
               reinterpret_cast<const uint32_t*>(xp.data_ptr<int32_t>()),
               reinterpret_cast<const uint32_t*>(xn.data_ptr<int32_t>()),
               xs.data_ptr<float>(),
@@ -485,6 +567,7 @@ torch::Tensor CudaBitNetStrictTernaryLinearForward(
               n,
               word_cols,
               n_tiles);
+          }
         } else {
           bitnet_strict_ternary_linear_kernel<scalar_t, 0><<<blocks, threads, 0, stream.stream()>>>(
             reinterpret_cast<const uint32_t*>(xp.data_ptr<int32_t>()),
