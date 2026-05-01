@@ -278,13 +278,24 @@ __global__ void bitnet_strict_ternary_linear_aligned_kernel(
 
   int acc = 0;
 #pragma unroll
-  for (int word_col = lane_in_group; word_col < StaticWordCols; word_col += kStrictTernaryGroupLanes) {
+  for (int word_col = lane_in_group; word_col < StaticWordCols; word_col += 2 * kStrictTernaryGroupLanes) {
     const uint32_t xp = x_pos_masks[row * word_cols + word_col];
     const uint32_t xn = x_neg_masks[row * word_cols + word_col];
     const uint32_t wp = w_pos_masks[col * word_cols + word_col];
     const uint32_t wn = w_neg_masks[col * word_cols + word_col];
-    acc += __popc((xp & wp) | (xn & wn));
-    acc -= __popc((xp & wn) | (xn & wp));
+    const int next_word_col = word_col + kStrictTernaryGroupLanes;
+    const uint32_t xp1 = x_pos_masks[row * word_cols + next_word_col];
+    const uint32_t xn1 = x_neg_masks[row * word_cols + next_word_col];
+    const uint32_t wp1 = w_pos_masks[col * word_cols + next_word_col];
+    const uint32_t wn1 = w_neg_masks[col * word_cols + next_word_col];
+    const uint64_t same =
+        static_cast<uint64_t>((xp & wp) | (xn & wn)) |
+        (static_cast<uint64_t>((xp1 & wp1) | (xn1 & wn1)) << 32);
+    const uint64_t cross =
+        static_cast<uint64_t>((xp & wn) | (xn & wp)) |
+        (static_cast<uint64_t>((xp1 & wn1) | (xn1 & wp1)) << 32);
+    acc += __popcll(same);
+    acc -= __popcll(cross);
   }
 
   if constexpr (kStrictTernaryGroupLanes >= 32) {

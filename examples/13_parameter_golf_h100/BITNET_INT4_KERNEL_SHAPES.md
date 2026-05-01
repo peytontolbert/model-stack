@@ -139,14 +139,21 @@ Strict ternary activation + weight path, measured on H100 2026-05-01 with
 | two-output lane group, 8-lane, 32 cols | `M=65536 K=2048 N=1024` | 0.4063 ms | 6.7395 ms | 7.1276 ms | 82.7399 ms | 0.5460 ms | 0.3480 ms | loses, 0.0488x |
 | two-popcount dot, aligned, 8-lane, 16 cols | `M=65536 K=1024 N=2048` | 0.2601 ms | 6.7145 ms | 6.9191 ms | 82.6398 ms | 0.5734 ms | 0.3850 ms | loses, 0.0556x |
 | two-popcount dot, aligned, 8-lane, 16 cols | `M=65536 K=2048 N=1024` | 0.3998 ms | 5.8166 ms | 6.2773 ms | 82.7399 ms | 0.5465 ms | 0.3483 ms | loses, 0.0555x |
+| canonical sign-mismatch dot, aligned, 8-lane, 16 cols | `M=65536 K=1024 N=2048` | 0.2606 ms | 6.8200 ms | 7.0420 ms | 83.2684 ms | 0.5776 ms | 0.3851 ms | loses, 0.0547x |
+| canonical sign-mismatch dot, aligned, 8-lane, 16 cols | `M=65536 K=2048 N=1024` | 0.4006 ms | 5.8101 ms | 6.1783 ms | 82.1302 ms | 0.5454 ms | 0.3482 ms | loses, 0.0564x |
+| paired 64-bit popcount, aligned, 8-lane, 16 cols | `M=65536 K=1024 N=2048` | 0.2618 ms | 6.6236 ms | 6.8650 ms | 82.6443 ms | 0.5715 ms | 0.3850 ms | loses, 0.0561x |
+| paired 64-bit popcount, aligned, 8-lane, 16 cols | `M=65536 K=2048 N=1024` | 0.4019 ms | 5.7592 ms | 6.1906 ms | 82.1248 ms | 0.5489 ms | 0.3481 ms | loses, 0.0562x |
+| paired 64-bit popcount, aligned, 8-lane, 32 cols | `M=65536 K=1024 N=2048` | 0.2589 ms | 6.7545 ms | 7.0139 ms | 82.6479 ms | 0.5722 ms | 0.3850 ms | loses, 0.0549x |
+| paired 64-bit popcount, aligned, 8-lane, 32 cols | `M=65536 K=2048 N=1024` | 0.4018 ms | 5.8517 ms | 6.2661 ms | 82.7401 ms | 0.5466 ms | 0.3480 ms | loses, 0.0555x |
 
-The selected strict ternary layout is two-popcount static-specialized 32/64
-mask words, 8 lanes per output, and 16 output columns per CTA. It is the best
-measured overall MLP-pair tradeoff so far. Shared activation-mask caching was
-also tested, but the extra CTA synchronization regressed to 9.9031 ms and
-7.8523 ms full strict on the same two shapes. Wider lane groups were retested
-with complete reductions; 16-lane and full-warp 32-lane groups both regressed,
-so the winning lane split remains 8 lanes per ternary dot. This is the first
-strict path that is meaningfully faster than the BF16-activation ternary
-baseline, because compute is now bitset/popcount on ternary activation masks
-and ternary weight masks. It is still slower than dense BF16 and CUTLASS INT4.
+The selected strict ternary layout is paired 64-bit popcount over
+static-specialized 32/64 mask words, 8 lanes per output, and 16 output columns
+per CTA. It is the best measured overall MLP-pair tradeoff so far. Shared
+activation-mask caching was also tested, but the extra CTA synchronization
+regressed to 9.9031 ms and 7.8523 ms full strict on the same two shapes. Wider
+lane groups were retested with complete reductions; 16-lane and full-warp
+32-lane groups both regressed, so the winning lane split remains 8 lanes per
+ternary dot. This is the first strict path that is meaningfully faster than the
+BF16-activation ternary baseline, because compute is now bitset/popcount on
+ternary activation masks and ternary weight masks. It is still slower than
+dense BF16 and CUTLASS INT4.
