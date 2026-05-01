@@ -123,10 +123,18 @@ Strict ternary activation + weight path, measured on H100 2026-05-01 with
 | static 32/64 words, 8-lane, 16 cols | `M=65536 K=2048 N=1024` | 0.4013 ms | 6.2348 ms | 6.6879 ms | 82.7415 ms | 0.5415 ms | 0.3483 ms | loses, 0.0521x |
 | static 32/64 words, 8-lane, 8 cols | `M=65536 K=1024 N=2048` | 0.2596 ms | 10.0981 ms | 10.3740 ms | 82.6468 ms | 0.5826 ms | 0.3852 ms | loses, 0.0371x |
 | static 32/64 words, 8-lane, 8 cols | `M=65536 K=2048 N=1024` | 0.4092 ms | 6.2955 ms | 6.7461 ms | 82.7415 ms | 0.5467 ms | 0.3484 ms | loses, 0.0516x |
+| unrolled static words, 8-lane, 16 cols | `M=65536 K=1024 N=2048` | 0.2600 ms | 7.2200 ms | 7.3801 ms | 82.6516 ms | 0.5834 ms | 0.3851 ms | loses, 0.0522x |
+| unrolled static words, 8-lane, 16 cols | `M=65536 K=2048 N=1024` | 0.4030 ms | 5.9663 ms | 6.3808 ms | 82.7420 ms | 0.5447 ms | 0.3483 ms | loses, 0.0546x |
+| unrolled static words, 8-lane, 32 cols | `M=65536 K=1024 N=2048` | 0.2594 ms | 7.1668 ms | 7.4261 ms | 83.2616 ms | 0.5809 ms | 0.3850 ms | loses, 0.0518x |
+| unrolled static words, 8-lane, 32 cols | `M=65536 K=2048 N=1024` | 0.4009 ms | 5.9830 ms | 6.3610 ms | 82.1266 ms | 0.5458 ms | 0.3484 ms | loses, 0.0548x |
+| unrolled static words, 8-lane, 8 cols | `M=65536 K=1024 N=2048` | 0.2595 ms | 10.1182 ms | 10.3520 ms | 82.6469 ms | 0.5736 ms | 0.3851 ms | loses, 0.0372x |
+| unrolled static words, 8-lane, 8 cols | `M=65536 K=2048 N=1024` | 0.4001 ms | 6.0555 ms | 6.5034 ms | 82.7411 ms | 0.5476 ms | 0.3481 ms | loses, 0.0535x |
 
-The selected strict ternary layout is static-specialized 32/64 mask words, 8
-lanes per output, and 16 output columns per CTA. It is the best measured
-overall MLP-pair tradeoff so far. This is the first strict path that is
-meaningfully faster than the BF16-activation ternary baseline, because compute
-is now bitset/popcount on ternary activation masks and ternary weight masks. It
-is still slower than dense BF16 and CUTLASS INT4.
+The selected strict ternary layout is unrolled static-specialized 32/64 mask
+words, 8 lanes per output, and 16 output columns per CTA. It is the best
+measured overall MLP-pair tradeoff so far. Shared activation-mask caching was
+also tested, but the extra CTA synchronization regressed to 9.9031 ms and
+7.8523 ms full strict on the same two shapes. This is the first strict path
+that is meaningfully faster than the BF16-activation ternary baseline, because
+compute is now bitset/popcount on ternary activation masks and ternary weight
+masks. It is still slower than dense BF16 and CUTLASS INT4.
