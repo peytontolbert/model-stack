@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 
 #include <cstdint>
@@ -27,6 +28,21 @@ bool IsSupportedCutlassInt4ActivationDtype(torch::ScalarType dtype) {
 
 #if defined(MODEL_STACK_WITH_CUTLASS_GEMM) && MODEL_STACK_WITH_CUTLASS_GEMM && \
     defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
+
+using CutlassInt4ElementA = cutlass::bfloat16_t;
+using CutlassInt4ElementB = cutlass::int4b_t;
+using CutlassInt4LayoutB = cutlass::layout::ColumnMajor;
+using CutlassInt4StrideB = cutlass::detail::TagToStrideB_t<CutlassInt4LayoutB>;
+using CutlassInt4ValueShuffle = cute::Layout<cute::Shape<cute::_2, cute::_4>, cute::Stride<cute::_4, cute::_1>>;
+constexpr int kCutlassInt4NumShuffleAtoms = 1;
+using CutlassInt4MmaAtomShape = cute::Layout<cute::Shape<cute::_1, cute::Int<kCutlassInt4NumShuffleAtoms>>>;
+using CutlassInt4LayoutAtomQuant = decltype(cutlass::compute_memory_reordering_atom<
+                                            CutlassInt4ElementA,
+                                            CutlassInt4MmaAtomShape,
+                                            CutlassInt4ValueShuffle>());
+using CutlassInt4LayoutBReordered = decltype(cute::tile_to_shape(
+    CutlassInt4LayoutAtomQuant{},
+    cute::Layout<cute::Shape<int, int, int>, CutlassInt4StrideB>{}));
 
 template <class TileShape, class EngineSrc, class LayoutSrc, class EngineDst, class LayoutDst, class TiledCopy>
 __global__ void model_stack_int4_reorder_tensor_kernel(
@@ -90,20 +106,44 @@ void ReorderTensorAsync(
       stream);
 }
 
+template <class LayoutDst>
+__global__ void model_stack_pack_int4_shuffled_kernel(
+    const int8_t* __restrict__ qweight,
+    uint32_t* __restrict__ packed_words,
+    LayoutDst layout_dst,
+    int64_t n,
+    int64_t k) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = n * k;
+  if (idx >= total) {
+    return;
+  }
+  const int64_t row = idx / k;
+  const int64_t col = idx - row * k;
+  const int value = static_cast<int>(qweight[idx]);
+  const uint32_t nibble = static_cast<uint32_t>(value & 0x0F);
+  const int64_t dst_element = static_cast<int64_t>(layout_dst(static_cast<int>(row), static_cast<int>(col), 0));
+  const int64_t dst_byte = dst_element >> 1;
+  const int64_t dst_word = dst_byte >> 2;
+  const uint32_t bit_shift = static_cast<uint32_t>(((dst_byte & 3) * 8) + ((dst_element & 1) * 4));
+  atomicOr(packed_words + dst_word, nibble << bit_shift);
+}
+
 torch::Tensor RunCutlassInt4Bf16LinearSm90(
     const torch::Tensor& x_2d,
     const torch::Tensor& packed_weight_rowmajor,
-    const torch::Tensor& scale_bf16) {
+    const torch::Tensor& scale_bf16,
+    bool packed_weight_is_shuffled) {
   using namespace cute;
 
-  using ElementA = cutlass::bfloat16_t;
+  using ElementA = CutlassInt4ElementA;
   using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 8;
 
-  using ElementB = cutlass::int4b_t;
-  using LayoutB = cutlass::layout::ColumnMajor;
+  using ElementB = CutlassInt4ElementB;
+  using LayoutB = CutlassInt4LayoutB;
   constexpr int AlignmentB = 32;
-  using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
+  using StrideB = CutlassInt4StrideB;
 
   using ElementAccumulator = float;
   using ElementCompute = float;
@@ -123,16 +163,7 @@ torch::Tensor RunCutlassInt4Bf16LinearSm90(
   using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
   using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
   using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
-  using ValueShuffle = Layout<Shape<_2, _4>, Stride<_4, _1>>;
-  constexpr int NumShuffleAtoms = 1;
-  using MmaAtomShape = Layout<Shape<_1, Int<NumShuffleAtoms>>>;
-  using LayoutAtomQuant = decltype(cutlass::compute_memory_reordering_atom<
-                                   ElementA,
-                                   MmaAtomShape,
-                                   ValueShuffle>());
-  using LayoutBReordered = decltype(cute::tile_to_shape(
-      LayoutAtomQuant{},
-      Layout<Shape<int, int, int>, StrideB>{}));
+  using LayoutBReordered = CutlassInt4LayoutBReordered;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
@@ -217,20 +248,27 @@ torch::Tensor RunCutlassInt4Bf16LinearSm90(
       cute::make_shape(static_cast<int>(n), 1, 1));
   auto shape_b = cute::make_shape(static_cast<int>(n), static_cast<int>(k), 1);
   auto layout_b = cute::make_layout(shape_b, stride_b);
-  LayoutBReordered layout_b_reordered = cute::tile_to_shape(LayoutAtomQuant{}, shape_b);
-  auto reordered_weight = torch::empty_like(packed_weight_rowmajor);
-  ReorderTensorAsync(
-      reinterpret_cast<const ElementB*>(packed_weight_rowmajor.data_ptr<uint8_t>()),
-      layout_b,
-      reinterpret_cast<ElementB*>(reordered_weight.data_ptr<uint8_t>()),
-      layout_b_reordered,
-      stream.stream());
+  LayoutBReordered layout_b_reordered = cute::tile_to_shape(CutlassInt4LayoutAtomQuant{}, shape_b);
+  torch::Tensor reordered_weight;
+  const ElementB* gemm_weight_ptr = nullptr;
+  if (packed_weight_is_shuffled) {
+    gemm_weight_ptr = reinterpret_cast<const ElementB*>(packed_weight_rowmajor.data_ptr<uint8_t>());
+  } else {
+    reordered_weight = torch::empty_like(packed_weight_rowmajor);
+    ReorderTensorAsync(
+        reinterpret_cast<const ElementB*>(packed_weight_rowmajor.data_ptr<uint8_t>()),
+        layout_b,
+        reinterpret_cast<ElementB*>(reordered_weight.data_ptr<uint8_t>()),
+        layout_b_reordered,
+        stream.stream());
+    gemm_weight_ptr = reinterpret_cast<const ElementB*>(reordered_weight.data_ptr<uint8_t>());
+  }
 
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
       problem_shape,
       {
-          reinterpret_cast<const ElementB*>(reordered_weight.data_ptr<uint8_t>()),
+          gemm_weight_ptr,
           layout_b_reordered,
           reinterpret_cast<const ElementA*>(x_2d.data_ptr()),
           stride_a,
@@ -274,11 +312,56 @@ torch::Tensor RunCutlassInt4Bf16LinearSm90(
 
 }  // namespace
 
+torch::Tensor CutlassInt4PackShuffledForward(const torch::Tensor& qweight) {
+#if defined(MODEL_STACK_WITH_CUTLASS_GEMM) && MODEL_STACK_WITH_CUTLASS_GEMM && \
+    defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
+  if (!qweight.is_cuda() || qweight.scalar_type() != torch::kInt8 || qweight.dim() != 2) {
+    return torch::Tensor();
+  }
+  c10::cuda::CUDAGuard device_guard{qweight.device()};
+  auto q_contig = qweight.contiguous();
+  const auto n = q_contig.size(0);
+  const auto k = q_contig.size(1);
+  if (n <= 0 || k <= 0 || (k % 2) != 0 ||
+      n > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+      k > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+    return torch::Tensor();
+  }
+  const auto packed_cols = (k + 1) / 2;
+  const auto total_packed_bytes = n * packed_cols;
+  if ((total_packed_bytes % static_cast<int64_t>(sizeof(uint32_t))) != 0) {
+    return torch::Tensor();
+  }
+  auto packed = torch::zeros({n, packed_cols}, q_contig.options().dtype(torch::kUInt8));
+  auto stream = c10::cuda::getCurrentCUDAStream(q_contig.get_device());
+
+  auto shape_b = cute::make_shape(static_cast<int>(n), static_cast<int>(k), 1);
+  CutlassInt4LayoutBReordered layout_b_reordered =
+      cute::tile_to_shape(CutlassInt4LayoutAtomQuant{}, shape_b);
+
+  const int threads = 256;
+  const int64_t total = n * k;
+  const dim3 blocks(static_cast<unsigned int>((total + threads - 1) / threads));
+  model_stack_pack_int4_shuffled_kernel<<<blocks, threads, 0, stream.stream()>>>(
+      q_contig.data_ptr<int8_t>(),
+      reinterpret_cast<uint32_t*>(packed.data_ptr<uint8_t>()),
+      layout_b_reordered,
+      n,
+      k);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return packed;
+#else
+  (void)qweight;
+  return torch::Tensor();
+#endif
+}
+
 torch::Tensor CutlassInt4Bf16LinearForward(
     const torch::Tensor& x,
     const torch::Tensor& packed_weight_rowmajor,
     const torch::Tensor& scale,
-    const c10::optional<torch::Tensor>& bias) {
+    const c10::optional<torch::Tensor>& bias,
+    bool packed_weight_is_shuffled) {
 #if defined(MODEL_STACK_WITH_CUTLASS_GEMM) && MODEL_STACK_WITH_CUTLASS_GEMM && \
     defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
   if (!x.is_cuda() || !packed_weight_rowmajor.is_cuda() || !scale.is_cuda()) {
@@ -304,7 +387,8 @@ torch::Tensor CutlassInt4Bf16LinearForward(
   auto out_2d = RunCutlassInt4Bf16LinearSm90(
       x_contig.view({rows, in_features}),
       packed_contig,
-      scale_bf16);
+      scale_bf16,
+      packed_weight_is_shuffled);
   if (!out_2d.defined()) {
     return torch::Tensor();
   }
@@ -313,9 +397,10 @@ torch::Tensor CutlassInt4Bf16LinearForward(
   return out_2d.view(out_sizes);
 #else
   (void)x;
-  (void)packed_weight_colmajor;
+  (void)packed_weight_rowmajor;
   (void)scale;
   (void)bias;
+  (void)packed_weight_is_shuffled;
   return torch::Tensor();
 #endif
 }

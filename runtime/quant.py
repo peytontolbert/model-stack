@@ -1265,6 +1265,8 @@ def cutlass_int4_bf16_linear(
     weight_packed_rowmajor: torch.Tensor,
     scale: torch.Tensor,
     bias: torch.Tensor | None = None,
+    *,
+    packed_weight_is_shuffled: bool = False,
 ) -> torch.Tensor:
     if bias is not None:
         raise RuntimeError("cutlass_int4_bf16_linear does not support bias yet")
@@ -1280,8 +1282,24 @@ def cutlass_int4_bf16_linear(
         and module is not None
         and hasattr(module, "cutlass_int4_bf16_linear_forward")
     ):
-        return module.cutlass_int4_bf16_linear_forward(x_cast, packed_cast, scale_cast, None)
+        return module.cutlass_int4_bf16_linear_forward(
+            x_cast,
+            packed_cast,
+            scale_cast,
+            None,
+            bool(packed_weight_is_shuffled),
+        )
     raise RuntimeError("cutlass_int4_bf16_linear requires the native CUTLASS backend")
+
+
+def cutlass_int4_pack_shuffled(qweight: torch.Tensor) -> torch.Tensor:
+    module = native_module()
+    if module is None or not hasattr(module, "cutlass_int4_pack_shuffled_forward"):
+        raise RuntimeError("cutlass_int4_pack_shuffled requires the native CUTLASS backend")
+    qweight_cast = qweight.to(dtype=torch.int8).contiguous()
+    if not qweight_cast.is_cuda:
+        raise RuntimeError("cutlass_int4_pack_shuffled requires CUDA qweight")
+    return module.cutlass_int4_pack_shuffled_forward(qweight_cast)
 
 
 def bitnet_linear(

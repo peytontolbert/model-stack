@@ -32,6 +32,7 @@ from runtime.quant import nf4_dequantize as runtime_nf4_dequantize
 from runtime.quant import nf4_linear as runtime_nf4_linear
 from runtime.quant import nf4_quantize as runtime_nf4_quantize
 from runtime.quant import cutlass_int4_bf16_linear as runtime_cutlass_int4_bf16_linear
+from runtime.quant import cutlass_int4_pack_shuffled as runtime_cutlass_int4_pack_shuffled
 from runtime.quant import int4_linear as runtime_int4_linear
 from runtime.quant import int8_linear as runtime_int8_linear
 from runtime.quant import int8_linear_grad_weight_from_float as runtime_int8_linear_grad_weight_from_float
@@ -3591,11 +3592,18 @@ class _TrainableBitNetPackedInt4STEFunction(torch.autograd.Function):
                 raise RuntimeError("CUTLASS packed INT4 BitNet training forward does not support bias yet")
             if x_local.dtype != torch.bfloat16:
                 raise RuntimeError("CUTLASS packed INT4 BitNet training forward requires bfloat16 activations")
-            packed_weight_rowmajor = _pack_int4_twos_complement(qweight.contiguous()).to(
+            qweight_cuda = qweight.to(device=x_local.device, dtype=torch.int8).contiguous()
+            packed_weight_shuffled = runtime_cutlass_int4_pack_shuffled(qweight_cuda).to(
                 device=x_local.device,
                 dtype=torch.uint8,
             ).contiguous()
-            out = runtime_cutlass_int4_bf16_linear(x_local, packed_weight_rowmajor, row_scale, None)
+            out = runtime_cutlass_int4_bf16_linear(
+                x_local,
+                packed_weight_shuffled,
+                row_scale,
+                None,
+                packed_weight_is_shuffled=True,
+            )
         else:
             packed_weight = _pack_int4_signed(qweight).to(device=x_local.device, dtype=torch.uint8).contiguous()
             out = runtime_int4_linear(x_local, packed_weight, row_scale, bias_local)

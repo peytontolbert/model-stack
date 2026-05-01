@@ -53,3 +53,17 @@ it is not a packed INT4 tensor-core GEMM.
 Do not use `int3_kv_pack` as training proof. That path is for KV-cache storage
 and decode/eval plumbing. It only matters for Parameter Golf training speed if
 we add a fused packed attention path that avoids dequantizing K/V before SDPA.
+
+Direct shuffled CUTLASS pack result, measured on H100 2026-05-01 with
+`bench_cutlass_direct_int4.py`:
+
+| Shape | Pack | CUTLASS GEMM | Pack+GEMM | Dense BF16 | Result |
+|---|---:|---:|---:|---:|---|
+| `M=65536 K=1024 N=2048` | 0.0134 ms | 0.5786 ms | 0.5936 ms | 0.3838 ms | loses, 0.6466x |
+| `M=65536 K=2048 N=1024` | 0.0140 ms | 0.5794 ms | 0.5836 ms | 0.3474 ms | loses, 0.5952x |
+
+The row-major pack plus CUTLASS reorder overhead is no longer the bottleneck.
+The direct packer is fast and exact for these shapes. The remaining loss is the
+CUTLASS mixed BF16xINT4 GEMM itself versus cuBLAS BF16 dense GEMM on the PG MLP
+matrices, so this path must remain opt-in until a different GEMM mainloop or
+training fusion beats dense.
