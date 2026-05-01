@@ -44,13 +44,24 @@ def main() -> None:
         dense_w = (q.float() * w_scale[:, None]).to(torch.bfloat16).contiguous()
 
         w_pos, w_neg = native_module.bitnet_ternary_pack_masks_forward(q)
+        w_pos64, w_neg64 = native_module.bitnet_ternary_pack_masks64_forward(q)
         x_pos, x_neg, x_scale = native_module.bitnet_ternary_quantize_activation_forward(x)
+        x_pos64, x_neg64, x_scale64 = native_module.bitnet_ternary_quantize_activation64_forward(x)
         strict = native_module.bitnet_strict_ternary_linear_forward(
             x_pos,
             x_neg,
             x_scale,
             w_pos,
             w_neg,
+            w_scale,
+            torch.bfloat16,
+        )
+        strict64 = native_module.bitnet_strict_ternary_linear64_forward(
+            x_pos64,
+            x_neg64,
+            x_scale64,
+            w_pos64,
+            w_neg64,
             w_scale,
             torch.bfloat16,
         )
@@ -66,6 +77,7 @@ def main() -> None:
         x_ref_q = torch.round(x.float() / x_ref_scale[:, None]).clamp(-1, 1)
         strict_ref = (x_ref_q @ strict_ref_w.t()).mul(x_ref_scale[:, None]).to(torch.bfloat16)
         strict_diff = (strict - strict_ref).float().abs()
+        strict64_diff = (strict64 - strict_ref).float().abs()
         bf16_diff = (ternary_bf16 - dense).float().abs()
         int4_diff = (cutlass_int4 - dense).float().abs()
 
@@ -75,6 +87,12 @@ def main() -> None:
                 x_pos, x_neg, x_scale, w_pos, w_neg, w_scale, torch.bfloat16
             )
         )
+        strict64_quant_ms = _time_ms(lambda: native_module.bitnet_ternary_quantize_activation64_forward(x))
+        strict64_linear_ms = _time_ms(
+            lambda: native_module.bitnet_strict_ternary_linear64_forward(
+                x_pos64, x_neg64, x_scale64, w_pos64, w_neg64, w_scale, torch.bfloat16
+            )
+        )
 
         def strict_full() -> torch.Tensor:
             xp, xn, xs = native_module.bitnet_ternary_quantize_activation_forward(x)
@@ -82,7 +100,14 @@ def main() -> None:
                 xp, xn, xs, w_pos, w_neg, w_scale, torch.bfloat16
             )
 
+        def strict64_full() -> torch.Tensor:
+            xp, xn, xs = native_module.bitnet_ternary_quantize_activation64_forward(x)
+            return native_module.bitnet_strict_ternary_linear64_forward(
+                xp, xn, xs, w_pos64, w_neg64, w_scale, torch.bfloat16
+            )
+
         strict_full_ms = _time_ms(strict_full)
+        strict64_full_ms = _time_ms(strict64_full)
         bf16_ternary_ms = _time_ms(lambda: native_module.bitnet_ternary_linear_forward(x, w_pos, w_neg, w_scale))
         dense_ms = _time_ms(lambda: x.matmul(dense_w.t()))
         int4_ms = _time_ms(lambda: native_module.cutlass_int4_bf16_linear_forward(x, packed_int4, w_scale, None, True))
@@ -90,11 +115,15 @@ def main() -> None:
         print(
             f"shape m={m} k={k} n={n} "
             f"strict_diff_max={float(strict_diff.max()):.6g} strict_diff_mean={float(strict_diff.mean()):.6g} "
+            f"strict64_diff_max={float(strict64_diff.max()):.6g} strict64_diff_mean={float(strict64_diff.mean()):.6g} "
             f"bf16_ternary_diff_max={float(bf16_diff.max()):.6g} int4_diff_max={float(int4_diff.max()):.6g} "
             f"strict_quant_ms={strict_quant_ms:.4f} strict_linear_ms={strict_linear_ms:.4f} "
-            f"strict_full_ms={strict_full_ms:.4f} bf16_ternary_ms={bf16_ternary_ms:.4f} "
+            f"strict_full_ms={strict_full_ms:.4f} strict64_quant_ms={strict64_quant_ms:.4f} "
+            f"strict64_linear_ms={strict64_linear_ms:.4f} strict64_full_ms={strict64_full_ms:.4f} "
+            f"bf16_ternary_ms={bf16_ternary_ms:.4f} "
             f"cutlass_int4_ms={int4_ms:.4f} dense_ms={dense_ms:.4f} "
-            f"strict_speedup_vs_dense={dense_ms / strict_full_ms:.4f}"
+            f"strict_speedup_vs_dense={dense_ms / strict_full_ms:.4f} "
+            f"strict64_speedup_vs_dense={dense_ms / strict64_full_ms:.4f}"
         )
 
 
