@@ -67,3 +67,19 @@ The direct packer is fast and exact for these shapes. The remaining loss is the
 CUTLASS mixed BF16xINT4 GEMM itself versus cuBLAS BF16 dense GEMM on the PG MLP
 matrices, so this path must remain opt-in until a different GEMM mainloop or
 training fusion beats dense.
+
+True ternary mask baseline, measured on H100 2026-05-01 with
+`bench_ternary_mask_linear.py` after shared activation staging:
+
+| Shape | Mask Pack | Ternary Linear | Pack+Linear | Dense BF16 | Result |
+|---|---:|---:|---:|---:|---|
+| `M=65536 K=1024 N=2048` | 0.0075 ms | 97.9041 ms | 97.1964 ms | 0.3849 ms | loses, 0.0040x |
+| `M=65536 K=2048 N=1024` | 0.0073 ms | 97.8922 ms | 97.9303 ms | 0.3482 ms | loses, 0.0036x |
+
+This path is true ternary in the sense that it consumes separate positive and
+negative bitmasks and computes add/sub reductions, not generic INT4 multiply.
+It is not a winning PG training kernel. The bottleneck is the per-output
+bitwalk/reduction algorithm: it cannot compete with H100 BF16 tensor cores for
+large dense training GEMMs. Keep it behind
+`MODEL_STACK_TRAINABLE_BITNET_TERNARY_MASK_FORWARD=1` as a correctness and
+profiling baseline while developing a different ternary training algorithm.

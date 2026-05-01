@@ -1302,6 +1302,36 @@ def cutlass_int4_pack_shuffled(qweight: torch.Tensor) -> torch.Tensor:
     return module.cutlass_int4_pack_shuffled_forward(qweight_cast)
 
 
+def bitnet_ternary_pack_masks(qweight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    module = native_module()
+    if module is None or not hasattr(module, "bitnet_ternary_pack_masks_forward"):
+        raise RuntimeError("bitnet_ternary_pack_masks requires the native CUDA backend")
+    qweight_cast = qweight.to(dtype=torch.int8).contiguous()
+    if not qweight_cast.is_cuda:
+        raise RuntimeError("bitnet_ternary_pack_masks requires CUDA qweight")
+    pos_masks, neg_masks = module.bitnet_ternary_pack_masks_forward(qweight_cast)
+    return pos_masks, neg_masks
+
+
+def bitnet_ternary_linear(
+    x: torch.Tensor,
+    pos_masks: torch.Tensor,
+    neg_masks: torch.Tensor,
+    row_scale: torch.Tensor,
+) -> torch.Tensor:
+    module = native_module()
+    if module is None or not hasattr(module, "bitnet_ternary_linear_forward"):
+        raise RuntimeError("bitnet_ternary_linear requires the native CUDA backend")
+    if not x.is_cuda:
+        raise RuntimeError("bitnet_ternary_linear requires CUDA activations")
+    return module.bitnet_ternary_linear_forward(
+        x.contiguous(),
+        pos_masks.to(device=x.device, dtype=torch.int32).contiguous(),
+        neg_masks.to(device=x.device, dtype=torch.int32).contiguous(),
+        row_scale.to(device=x.device, dtype=torch.float32).contiguous(),
+    )
+
+
 def bitnet_linear(
     x: torch.Tensor,
     packed_weight: torch.Tensor,

@@ -243,6 +243,7 @@ def native_extensions():
         sources.append("runtime/csrc/backend/cuda_int4_linear.cu")
         sources.append("runtime/csrc/backend/cuda_nf4_linear.cu")
         sources.append("runtime/csrc/backend/bitnet/bitnet_pack.cu")
+        sources.append("runtime/csrc/backend/bitnet/bitnet_ternary_linear.cu")
         sources.append("runtime/csrc/backend/bitnet/bitnet_frontend.cu")
         sources.append("runtime/csrc/backend/bitnet/bitnet_linear_decode.cu")
         sources.append("runtime/csrc/backend/bitnet/bitnet_linear_prefill.cu")
