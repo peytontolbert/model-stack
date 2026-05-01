@@ -1332,6 +1332,48 @@ def bitnet_ternary_linear(
     )
 
 
+def bitnet_ternary_quantize_activation(
+    x: torch.Tensor,
+    *,
+    eps: float = 1.0e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    module = native_module()
+    if module is None or not hasattr(module, "bitnet_ternary_quantize_activation_forward"):
+        raise RuntimeError("bitnet_ternary_quantize_activation requires the native CUDA backend")
+    if not x.is_cuda:
+        raise RuntimeError("bitnet_ternary_quantize_activation requires CUDA activations")
+    pos_masks, neg_masks, row_scale = module.bitnet_ternary_quantize_activation_forward(
+        x.contiguous(),
+        float(eps),
+    )
+    return pos_masks, neg_masks, row_scale
+
+
+def bitnet_strict_ternary_linear(
+    x_pos_masks: torch.Tensor,
+    x_neg_masks: torch.Tensor,
+    x_row_scale: torch.Tensor,
+    w_pos_masks: torch.Tensor,
+    w_neg_masks: torch.Tensor,
+    w_row_scale: torch.Tensor,
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    module = native_module()
+    if module is None or not hasattr(module, "bitnet_strict_ternary_linear_forward"):
+        raise RuntimeError("bitnet_strict_ternary_linear requires the native CUDA backend")
+    target_device = x_pos_masks.device
+    return module.bitnet_strict_ternary_linear_forward(
+        x_pos_masks.to(device=target_device, dtype=torch.int32).contiguous(),
+        x_neg_masks.to(device=target_device, dtype=torch.int32).contiguous(),
+        x_row_scale.to(device=target_device, dtype=torch.float32).contiguous(),
+        w_pos_masks.to(device=target_device, dtype=torch.int32).contiguous(),
+        w_neg_masks.to(device=target_device, dtype=torch.int32).contiguous(),
+        w_row_scale.to(device=target_device, dtype=torch.float32).contiguous(),
+        out_dtype,
+    )
+
+
 def bitnet_linear(
     x: torch.Tensor,
     packed_weight: torch.Tensor,

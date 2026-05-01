@@ -79,12 +79,47 @@ True ternary mask baseline, measured on H100 2026-05-01 with
 | 4-lane cooperative K reduction | `M=65536 K=2048 N=1024` | 0.0070 ms | 87.5188 ms | 87.5237 ms | 0.3484 ms | loses, 0.0040x |
 | 8-lane cooperative K reduction | `M=65536 K=1024 N=2048` | 0.0072 ms | 88.9800 ms | 88.9894 ms | 0.3854 ms | loses, 0.0043x |
 | 8-lane cooperative K reduction | `M=65536 K=2048 N=1024` | 0.0074 ms | 90.1932 ms | 90.1952 ms | 0.3486 ms | loses, 0.0039x |
+| shared masks, 4-row CTA, 16 cols | `M=65536 K=1024 N=2048` | 0.0075 ms | 85.0156 ms | 85.0245 ms | 0.3854 ms | loses, 0.0045x |
+| shared masks, 4-row CTA, 16 cols | `M=65536 K=2048 N=1024` | 0.0071 ms | 84.8776 ms | 84.8824 ms | 0.3488 ms | loses, 0.0041x |
+| shared masks, 2-row CTA, 16 cols | `M=65536 K=1024 N=2048` | 0.0072 ms | 84.5093 ms | 84.5147 ms | 0.3854 ms | loses, 0.0046x |
+| shared masks, 2-row CTA, 16 cols | `M=65536 K=2048 N=1024` | 0.0070 ms | 84.2773 ms | 84.2811 ms | 0.3485 ms | loses, 0.0041x |
+| flattened 1-row CTA, 16 cols | `M=65536 K=1024 N=2048` | 0.0074 ms | 84.1631 ms | 84.1539 ms | 0.3855 ms | loses, 0.0046x |
+| flattened 1-row CTA, 16 cols | `M=65536 K=2048 N=1024` | 0.0072 ms | 83.8043 ms | 83.8090 ms | 0.3483 ms | loses, 0.0042x |
+| flattened 1-row CTA, 32 cols | `M=65536 K=1024 N=2048` | 0.0074 ms | 83.0434 ms | 83.0431 ms | 0.3859 ms | loses, 0.0046x |
+| flattened 1-row CTA, 32 cols | `M=65536 K=2048 N=1024` | 0.0070 ms | 82.6662 ms | 82.6721 ms | 0.3489 ms | loses, 0.0042x |
+| flattened 1-row CTA, 64 cols | `M=65536 K=1024 N=2048` | 0.0073 ms | 82.6387 ms | 82.6528 ms | 0.3852 ms | loses, 0.0047x |
+| flattened 1-row CTA, 64 cols | `M=65536 K=2048 N=1024` | 0.0073 ms | 82.7397 ms | 82.7457 ms | 0.3484 ms | loses, 0.0042x |
+| flattened 1-row CTA, 128 cols | `M=65536 K=1024 N=2048` | 0.0075 ms | 85.6787 ms | 85.6855 ms | 0.3857 ms | loses, 0.0045x |
+| flattened 1-row CTA, 128 cols | `M=65536 K=2048 N=1024` | 0.0074 ms | 85.0452 ms | 85.0648 ms | 0.3486 ms | loses, 0.0041x |
 
 This path is true ternary in the sense that it consumes separate positive and
 negative bitmasks and computes add/sub reductions, not generic INT4 multiply.
-It is not a winning PG training kernel. The 4-lane cooperative reduction is the
-best measured ternary mask layout so far, but the bottleneck remains the
+It is not a winning PG training kernel. The best measured ternary mask layout
+so far is flattened 1-row CTAs with 64 output columns, shared mask staging, and
+a 4-lane cooperative K reduction. The bottleneck remains the
 per-output bitwalk/reduction algorithm: it cannot compete with H100 BF16 tensor
 cores for large dense training GEMMs. Keep it behind
 `MODEL_STACK_TRAINABLE_BITNET_TERNARY_MASK_FORWARD=1` as a correctness and
 profiling baseline while developing a different ternary training algorithm.
+
+Strict ternary activation + weight path, measured on H100 2026-05-01 with
+`bench_strict_ternary_linear.py`:
+
+| Strategy | Shape | Act Quant | Strict Ternary Linear | Full Strict | BF16 Ternary | CUTLASS INT4 | Dense BF16 | Result |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| 4-lane, 64 cols | `M=65536 K=1024 N=2048` | 0.2597 ms | 9.8623 ms | 10.1244 ms | 82.6440 ms | 0.5749 ms | 0.3850 ms | loses, 0.0380x |
+| 4-lane, 64 cols | `M=65536 K=2048 N=1024` | 0.4014 ms | 9.5731 ms | 9.9209 ms | 82.1286 ms | 0.5474 ms | 0.3483 ms | loses, 0.0351x |
+| 8-lane, 32 cols | `M=65536 K=1024 N=2048` | 0.2593 ms | 8.8436 ms | 9.1323 ms | 82.6473 ms | 0.5836 ms | 0.3850 ms | loses, 0.0422x |
+| 8-lane, 32 cols | `M=65536 K=2048 N=1024` | 0.4009 ms | 6.8086 ms | 7.2784 ms | 82.7447 ms | 0.5477 ms | 0.3484 ms | loses, 0.0479x |
+| 16-lane, 16 cols | `M=65536 K=1024 N=2048` | 0.2596 ms | 15.7242 ms | 16.0486 ms | 83.2635 ms | 0.5746 ms | 0.3853 ms | loses, 0.0240x |
+| 16-lane, 16 cols | `M=65536 K=2048 N=1024` | 0.4054 ms | 8.7037 ms | 9.1692 ms | 82.7401 ms | 0.5448 ms | 0.3484 ms | loses, 0.0380x |
+| 8-lane, 64 cols | `M=65536 K=1024 N=2048` | 0.2609 ms | 9.4156 ms | 9.7240 ms | 83.2736 ms | 0.5840 ms | 0.3852 ms | loses, 0.0396x |
+| 8-lane, 64 cols | `M=65536 K=2048 N=1024` | 0.4046 ms | 7.1678 ms | 7.6155 ms | 82.1280 ms | 0.5451 ms | 0.3483 ms | loses, 0.0457x |
+| 8-lane, 16 cols | `M=65536 K=1024 N=2048` | 0.2606 ms | 9.1641 ms | 9.3671 ms | 83.2650 ms | 0.5778 ms | 0.3854 ms | loses, 0.0411x |
+| 8-lane, 16 cols | `M=65536 K=2048 N=1024` | 0.4013 ms | 6.5941 ms | 7.0901 ms | 82.1199 ms | 0.5494 ms | 0.3481 ms | loses, 0.0491x |
+
+The selected strict ternary layout is 8 lanes per output and 32 output columns
+per CTA. It is the best measured overall MLP-pair tradeoff. This is the first
+strict path that is meaningfully faster than the BF16-activation ternary
+baseline, because compute is now bitset/popcount on ternary activation masks
+and ternary weight masks. It is still slower than dense BF16 and CUTLASS INT4.

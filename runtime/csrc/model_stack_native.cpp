@@ -458,11 +458,22 @@ std::tuple<torch::Tensor, torch::Tensor> CudaBitNetRuntimeRowQuantizeForward(
     const torch::Tensor& weight,
     double eps);
 std::vector<torch::Tensor> CudaBitNetTernaryPackMasksForward(const torch::Tensor& qweight);
+std::vector<torch::Tensor> CudaBitNetTernaryQuantizeActivationForward(
+    const torch::Tensor& x,
+    double eps);
 torch::Tensor CudaBitNetTernaryLinearForward(
     const torch::Tensor& x,
     const torch::Tensor& pos_masks,
     const torch::Tensor& neg_masks,
     const torch::Tensor& row_scale);
+torch::Tensor CudaBitNetStrictTernaryLinearForward(
+    const torch::Tensor& x_pos_masks,
+    const torch::Tensor& x_neg_masks,
+    const torch::Tensor& x_row_scale,
+    const torch::Tensor& w_pos_masks,
+    const torch::Tensor& w_neg_masks,
+    const torch::Tensor& w_row_scale,
+    torch::ScalarType out_dtype);
 std::vector<torch::Tensor> CudaBitNetFusedQkvPackedHeadsProjectionForward(
     const torch::Tensor& x,
     const torch::Tensor& packed_weight,
@@ -5810,6 +5821,23 @@ py::tuple BitNetTernaryPackMasksForward(const torch::Tensor& qweight) {
   TORCH_CHECK(false, "bitnet_ternary_pack_masks_forward: CUDA native backend is required");
 }
 
+py::tuple BitNetTernaryQuantizeActivationForward(
+    const torch::Tensor& x,
+    double eps) {
+  TORCH_CHECK(x.defined(), "bitnet_ternary_quantize_activation_forward: x must be defined");
+  TORCH_CHECK(x.dim() >= 2, "bitnet_ternary_quantize_activation_forward: x must have rank >= 2");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
+                  x.scalar_type() == torch::kBFloat16,
+              "bitnet_ternary_quantize_activation_forward: unsupported x dtype");
+#if MODEL_STACK_WITH_CUDA
+  if (x.is_cuda() && t10::bitnet::HasCudaBitNetLinearKernel()) {
+    auto quantized = t10::bitnet::CudaBitNetTernaryQuantizeActivationForward(x, eps);
+    return py::make_tuple(quantized[0], quantized[1], quantized[2]);
+  }
+#endif
+  TORCH_CHECK(false, "bitnet_ternary_quantize_activation_forward: CUDA native backend is required");
+}
+
 torch::Tensor BitNetTernaryLinearForward(
     const torch::Tensor& x,
     const torch::Tensor& pos_masks,
@@ -5834,6 +5862,46 @@ torch::Tensor BitNetTernaryLinearForward(
   }
 #endif
   TORCH_CHECK(false, "bitnet_ternary_linear_forward: CUDA native backend is required");
+  return torch::Tensor();
+}
+
+torch::Tensor BitNetStrictTernaryLinearForward(
+    const torch::Tensor& x_pos_masks,
+    const torch::Tensor& x_neg_masks,
+    const torch::Tensor& x_row_scale,
+    const torch::Tensor& w_pos_masks,
+    const torch::Tensor& w_neg_masks,
+    const torch::Tensor& w_row_scale,
+    const c10::optional<torch::ScalarType>& out_dtype) {
+  TORCH_CHECK(x_pos_masks.defined() && x_neg_masks.defined() && x_row_scale.defined() &&
+                  w_pos_masks.defined() && w_neg_masks.defined() && w_row_scale.defined(),
+              "bitnet_strict_ternary_linear_forward: all inputs must be defined");
+  TORCH_CHECK(x_pos_masks.dim() == 2 && x_neg_masks.dim() == 2 &&
+                  w_pos_masks.dim() == 2 && w_neg_masks.dim() == 2,
+              "bitnet_strict_ternary_linear_forward: masks must be rank-2");
+  TORCH_CHECK(x_pos_masks.scalar_type() == torch::kInt32 && x_neg_masks.scalar_type() == torch::kInt32 &&
+                  w_pos_masks.scalar_type() == torch::kInt32 && w_neg_masks.scalar_type() == torch::kInt32,
+              "bitnet_strict_ternary_linear_forward: masks must use int32 storage");
+  TORCH_CHECK(x_row_scale.dim() == 1 && w_row_scale.dim() == 1,
+              "bitnet_strict_ternary_linear_forward: scales must be rank-1");
+  TORCH_CHECK(x_row_scale.scalar_type() == torch::kFloat32 && w_row_scale.scalar_type() == torch::kFloat32,
+              "bitnet_strict_ternary_linear_forward: scales must be float32");
+  const auto dtype = out_dtype.value_or(torch::kBFloat16);
+#if MODEL_STACK_WITH_CUDA
+  if (x_pos_masks.is_cuda() && x_neg_masks.is_cuda() && x_row_scale.is_cuda() &&
+      w_pos_masks.is_cuda() && w_neg_masks.is_cuda() && w_row_scale.is_cuda() &&
+      t10::bitnet::HasCudaBitNetLinearKernel()) {
+    return t10::bitnet::CudaBitNetStrictTernaryLinearForward(
+        x_pos_masks,
+        x_neg_masks,
+        x_row_scale,
+        w_pos_masks,
+        w_neg_masks,
+        w_row_scale,
+        dtype);
+  }
+#endif
+  TORCH_CHECK(false, "bitnet_strict_ternary_linear_forward: CUDA native backend is required");
   return torch::Tensor();
 }
 
@@ -10700,8 +10768,13 @@ PYBIND11_MODULE(_model_stack_native, m) {
       py::arg("weight"),
       py::arg("eps") = 1.0e-8);
   m.def("bitnet_ternary_pack_masks_forward", &BitNetTernaryPackMasksForward, py::arg("qweight"));
+  m.def("bitnet_ternary_quantize_activation_forward", &BitNetTernaryQuantizeActivationForward, py::arg("x"),
+        py::arg("eps") = 1.0e-8);
   m.def("bitnet_ternary_linear_forward", &BitNetTernaryLinearForward, py::arg("x"),
         py::arg("pos_masks"), py::arg("neg_masks"), py::arg("row_scale"));
+  m.def("bitnet_strict_ternary_linear_forward", &BitNetStrictTernaryLinearForward, py::arg("x_pos_masks"),
+        py::arg("x_neg_masks"), py::arg("x_row_scale"), py::arg("w_pos_masks"), py::arg("w_neg_masks"),
+        py::arg("w_row_scale"), py::arg("out_dtype") = py::none());
   m.def("pack_linear_weight_forward", &PackLinearWeightForward, py::arg("weight"), py::arg("bias") = py::none());
   m.def("mlp_forward", &MlpForward, py::arg("x"), py::arg("w_in_weight"), py::arg("w_in_bias") = py::none(),
         py::arg("w_out_weight"), py::arg("w_out_bias") = py::none(), py::arg("activation") = "gelu",
