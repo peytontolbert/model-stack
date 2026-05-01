@@ -13,7 +13,11 @@ namespace {
 
 constexpr int kTernaryPackThreads = 256;
 constexpr int kTernaryLinearBlockRows = 8;
-constexpr int kTernaryLinearBlockCols = 32;
+constexpr int kTernaryLinearBlockCols = 16;
+constexpr int kTernaryLinearGroupLanes = 4;
+constexpr int kTernaryLinearChunkWords = 4;
+constexpr int kTernaryLinearChunkValues = kTernaryLinearChunkWords * 32;
+constexpr int kTernaryLinearThreadsX = kTernaryLinearBlockCols * kTernaryLinearGroupLanes;
 
 __global__ void bitnet_ternary_pack_masks_kernel(
     const int8_t* __restrict__ qweight,
@@ -56,47 +60,54 @@ __global__ void bitnet_ternary_linear_kernel(
     int64_t k,
     int64_t n,
     int64_t word_cols) {
-  __shared__ scalar_t x_tile[kTernaryLinearBlockRows][32];
+  __shared__ scalar_t x_tile[kTernaryLinearBlockRows][kTernaryLinearChunkValues];
   const int row_in_block = static_cast<int>(threadIdx.y);
-  const int col_in_block = static_cast<int>(threadIdx.x);
+  const int lane_in_group = static_cast<int>(threadIdx.x) & (kTernaryLinearGroupLanes - 1);
+  const int col_in_block = static_cast<int>(threadIdx.x) / kTernaryLinearGroupLanes;
   const int64_t row = static_cast<int64_t>(blockIdx.y) * kTernaryLinearBlockRows + row_in_block;
   const int64_t col = static_cast<int64_t>(blockIdx.x) * kTernaryLinearBlockCols + col_in_block;
   const bool valid_row = row < m;
+  const bool valid_col = col < n;
 
   float acc = 0.0f;
   const int64_t x_row = row * k;
   const int64_t mask_row = col * word_cols;
-  for (int64_t word_col = 0; word_col < word_cols; ++word_col) {
-    const int64_t k_base = word_col * 32;
-    const int64_t kk_load = k_base + col_in_block;
-    x_tile[row_in_block][col_in_block] =
-        (valid_row && kk_load < k) ? x[x_row + kk_load] : static_cast<scalar_t>(0.0f);
+  for (int64_t word_base = 0; word_base < word_cols; word_base += kTernaryLinearChunkWords) {
+    for (int load = static_cast<int>(threadIdx.x); load < kTernaryLinearChunkValues; load += kTernaryLinearThreadsX) {
+      const int64_t kk_load = word_base * 32 + load;
+      x_tile[row_in_block][load] =
+          (valid_row && kk_load < k) ? x[x_row + kk_load] : static_cast<scalar_t>(0.0f);
+    }
     __syncthreads();
-    if (!valid_row || col >= n) {
-      __syncthreads();
-      continue;
-    }
-    uint32_t pos = pos_masks[mask_row + word_col];
-    uint32_t neg = neg_masks[mask_row + word_col];
-    while (pos != 0) {
-      const int bit = __ffs(pos) - 1;
-      const int64_t kk = k_base + bit;
-      if (kk < k) {
-        acc += static_cast<float>(x_tile[row_in_block][bit]);
+
+    const int64_t word_col = word_base + lane_in_group;
+    if (valid_row && valid_col && word_col < word_cols) {
+      uint32_t pos = pos_masks[mask_row + word_col];
+      uint32_t neg = neg_masks[mask_row + word_col];
+      const int tile_base = lane_in_group * 32;
+      while (pos != 0) {
+        const int bit = __ffs(pos) - 1;
+        const int64_t kk = word_col * 32 + bit;
+        if (kk < k) {
+          acc += static_cast<float>(x_tile[row_in_block][tile_base + bit]);
+        }
+        pos &= pos - 1;
       }
-      pos &= pos - 1;
-    }
-    while (neg != 0) {
-      const int bit = __ffs(neg) - 1;
-      const int64_t kk = k_base + bit;
-      if (kk < k) {
-        acc -= static_cast<float>(x_tile[row_in_block][bit]);
+      while (neg != 0) {
+        const int bit = __ffs(neg) - 1;
+        const int64_t kk = word_col * 32 + bit;
+        if (kk < k) {
+          acc -= static_cast<float>(x_tile[row_in_block][tile_base + bit]);
+        }
+        neg &= neg - 1;
       }
-      neg &= neg - 1;
     }
     __syncthreads();
   }
-  if (valid_row && col < n) {
+
+  acc += __shfl_down_sync(0xffffffff, acc, 2, kTernaryLinearGroupLanes);
+  acc += __shfl_down_sync(0xffffffff, acc, 1, kTernaryLinearGroupLanes);
+  if (valid_row && valid_col && lane_in_group == 0) {
     out[row * n + col] = static_cast<scalar_t>(acc * row_scale[col]);
   }
 }
@@ -177,7 +188,7 @@ torch::Tensor CudaBitNetTernaryLinearForward(
     return out;
   }
 
-  const dim3 threads(kTernaryLinearBlockCols, kTernaryLinearBlockRows);
+  const dim3 threads(kTernaryLinearThreadsX, kTernaryLinearBlockRows);
   const dim3 blocks(
       static_cast<unsigned int>((n + kTernaryLinearBlockCols - 1) / kTernaryLinearBlockCols),
       static_cast<unsigned int>((rows + kTernaryLinearBlockRows - 1) / kTernaryLinearBlockRows));

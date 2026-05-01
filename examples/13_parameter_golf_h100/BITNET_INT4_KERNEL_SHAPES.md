@@ -69,17 +69,22 @@ matrices, so this path must remain opt-in until a different GEMM mainloop or
 training fusion beats dense.
 
 True ternary mask baseline, measured on H100 2026-05-01 with
-`bench_ternary_mask_linear.py` after shared activation staging:
+`bench_ternary_mask_linear.py`.
 
-| Shape | Mask Pack | Ternary Linear | Pack+Linear | Dense BF16 | Result |
-|---|---:|---:|---:|---:|---|
-| `M=65536 K=1024 N=2048` | 0.0075 ms | 97.9041 ms | 97.1964 ms | 0.3849 ms | loses, 0.0040x |
-| `M=65536 K=2048 N=1024` | 0.0073 ms | 97.8922 ms | 97.9303 ms | 0.3482 ms | loses, 0.0036x |
+| Strategy | Shape | Mask Pack | Ternary Linear | Pack+Linear | Dense BF16 | Result |
+|---|---|---:|---:|---:|---:|---|
+| shared activation staging | `M=65536 K=1024 N=2048` | 0.0075 ms | 97.9041 ms | 97.1964 ms | 0.3849 ms | loses, 0.0040x |
+| shared activation staging | `M=65536 K=2048 N=1024` | 0.0073 ms | 97.8922 ms | 97.9303 ms | 0.3482 ms | loses, 0.0036x |
+| 4-lane cooperative K reduction | `M=65536 K=1024 N=2048` | 0.0073 ms | 87.2686 ms | 87.1575 ms | 0.3852 ms | loses, 0.0044x |
+| 4-lane cooperative K reduction | `M=65536 K=2048 N=1024` | 0.0070 ms | 87.5188 ms | 87.5237 ms | 0.3484 ms | loses, 0.0040x |
+| 8-lane cooperative K reduction | `M=65536 K=1024 N=2048` | 0.0072 ms | 88.9800 ms | 88.9894 ms | 0.3854 ms | loses, 0.0043x |
+| 8-lane cooperative K reduction | `M=65536 K=2048 N=1024` | 0.0074 ms | 90.1932 ms | 90.1952 ms | 0.3486 ms | loses, 0.0039x |
 
 This path is true ternary in the sense that it consumes separate positive and
 negative bitmasks and computes add/sub reductions, not generic INT4 multiply.
-It is not a winning PG training kernel. The bottleneck is the per-output
-bitwalk/reduction algorithm: it cannot compete with H100 BF16 tensor cores for
-large dense training GEMMs. Keep it behind
+It is not a winning PG training kernel. The 4-lane cooperative reduction is the
+best measured ternary mask layout so far, but the bottleneck remains the
+per-output bitwalk/reduction algorithm: it cannot compete with H100 BF16 tensor
+cores for large dense training GEMMs. Keep it behind
 `MODEL_STACK_TRAINABLE_BITNET_TERNARY_MASK_FORWARD=1` as a correctness and
 profiling baseline while developing a different ternary training algorithm.
