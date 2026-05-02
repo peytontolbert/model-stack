@@ -21,6 +21,8 @@ class ModelConfig:
     # attention options
     attention_bias: bool = False
     attn_dropout: float = 0.0
+    mlp_dropout: float = 0.0
+    resid_dropout: float = 0.0
     # optional sliding-window length for KV cache during generation
     sliding_window: Optional[int] = None
     version: int = 1
@@ -47,3 +49,10 @@ class ModelConfig:
     # this disabled; AgentKernel Lite enables it so evidence/title order is
     # visible to cross-attention.
     encoder_position_embeddings: bool = False
+    # Optional encoder-side retrieval heads. When enabled, the encoder can emit
+    # normalized query/document vectors for browser-local memory search instead
+    # of relying on a separate embedding model.
+    retrieval_head_dim: Optional[int] = None
+    # Optional AgentKernel controller heads over the encoded state. These are
+    # scalar policy/calibration outputs such as OOD and retrieval coverage.
+    agent_policy_heads: bool = False

@@ -43,6 +43,27 @@ class EncoderDecoderLM(nn.Module):
         self.enc_norm = nn.LayerNorm(cfg.d_model)
         self.dec_norm = nn.LayerNorm(cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, vocab, bias=False)
+        retrieval_head_dim = int(getattr(cfg, "retrieval_head_dim", None) or 0)
+        if retrieval_head_dim > 0:
+            self.retrieval_query_head = nn.Linear(cfg.d_model, retrieval_head_dim, bias=False)
+            self.retrieval_doc_head = nn.Linear(cfg.d_model, retrieval_head_dim, bias=False)
+        else:
+            self.retrieval_query_head = None
+            self.retrieval_doc_head = None
+        if bool(getattr(cfg, "agent_policy_heads", False)):
+            self.agent_policy_heads = nn.ModuleDict(
+                {
+                    "query_confidence": nn.Linear(cfg.d_model, 1),
+                    "retrieval_coverage": nn.Linear(cfg.d_model, 1),
+                    "ood_query": nn.Linear(cfg.d_model, 1),
+                    "ood_evidence": nn.Linear(cfg.d_model, 1),
+                    "answer_confidence": nn.Linear(cfg.d_model, 1),
+                    "needs_verification": nn.Linear(cfg.d_model, 1),
+                    "paper_action_validity": nn.Linear(cfg.d_model, 1),
+                }
+            )
+        else:
+            self.agent_policy_heads = None
         if init_recipe_enc is not None:
             init_transformer_stack(self.encoder, recipe=init_recipe_enc)
         if init_recipe_dec is not None:
@@ -67,6 +88,43 @@ class EncoderDecoderLM(nn.Module):
             x = x + runtime_embedding(self.enc_pos_embed.weight, positions, self.enc_pos_embed.padding_idx)
         x = execute_encoder_stack(self.encoder, x, padding_mask)
         return apply_native_norm(x, self.enc_norm)
+
+    def encode_pooled(self, input_ids: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        hidden = self.encode(input_ids, padding_mask)
+        if padding_mask is None:
+            return hidden.mean(dim=1)
+        mask = padding_mask.to(device=hidden.device, dtype=hidden.dtype).unsqueeze(-1)
+        return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+
+    def retrieval_query_embedding(
+        self,
+        input_ids: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        pooled = self.encode_pooled(input_ids, padding_mask)
+        if self.retrieval_query_head is not None:
+            pooled = self.retrieval_query_head(pooled)
+        return torch.nn.functional.normalize(pooled.float(), dim=-1)
+
+    def retrieval_doc_embedding(
+        self,
+        input_ids: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        pooled = self.encode_pooled(input_ids, padding_mask)
+        if self.retrieval_doc_head is not None:
+            pooled = self.retrieval_doc_head(pooled)
+        return torch.nn.functional.normalize(pooled.float(), dim=-1)
+
+    def agent_policy_logits(
+        self,
+        input_ids: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if self.agent_policy_heads is None:
+            return {}
+        pooled = self.encode_pooled(input_ids, padding_mask)
+        return {name: head(pooled).squeeze(-1).float() for name, head in self.agent_policy_heads.items()}
 
     def decode(
         self,
