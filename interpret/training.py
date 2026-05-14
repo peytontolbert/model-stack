@@ -102,3 +102,96 @@ def training_step_diagnostics(model: nn.Module, before: dict[str, torch.Tensor] 
     if before is not None:
         diagnostics["parameter_drift"] = parameter_drift_summary(before, snapshot_parameters(model))
     return diagnostics
+
+
+def gradient_vector(model: nn.Module) -> torch.Tensor:
+    chunks = []
+    for param in model.parameters():
+        if param.grad is None:
+            chunks.append(torch.zeros(param.numel(), device=param.device, dtype=torch.float32))
+        else:
+            chunks.append(param.grad.detach().float().flatten())
+    return torch.cat(chunks) if chunks else torch.empty(0)
+
+
+def gradient_cosine_similarity(grads_a: torch.Tensor, grads_b: torch.Tensor) -> torch.Tensor:
+    if grads_a.numel() != grads_b.numel():
+        raise ValueError("gradient vectors must have the same length")
+    denom = grads_a.float().norm() * grads_b.float().norm()
+    if float(denom.item()) == 0.0:
+        return torch.tensor(0.0)
+    return torch.dot(grads_a.float(), grads_b.float()) / denom
+
+
+def gradient_alignment_between_losses(
+    model: nn.Module,
+    loss_a: Callable[[], torch.Tensor],
+    loss_b: Callable[[], torch.Tensor],
+) -> dict[str, float]:
+    model.zero_grad(set_to_none=True)
+    la = loss_a()
+    la.backward()
+    ga = gradient_vector(model).detach().cpu()
+    model.zero_grad(set_to_none=True)
+    lb = loss_b()
+    lb.backward()
+    gb = gradient_vector(model).detach().cpu()
+    model.zero_grad(set_to_none=True)
+    return {
+        "loss_a": float(la.detach().cpu().item()),
+        "loss_b": float(lb.detach().cpu().item()),
+        "cosine": float(gradient_cosine_similarity(ga, gb).item()),
+        "grad_norm_a": float(ga.norm().item()),
+        "grad_norm_b": float(gb.norm().item()),
+    }
+
+
+def optimizer_state_summary(optimizer: torch.optim.Optimizer) -> dict[str, float]:
+    tensor_count = 0
+    total_numel = 0
+    total_norm = 0.0
+    max_abs = 0.0
+    for state in optimizer.state.values():
+        for value in state.values():
+            if not isinstance(value, torch.Tensor):
+                continue
+            tensor = value.detach().float()
+            tensor_count += 1
+            total_numel += tensor.numel()
+            total_norm += float(tensor.norm().item())
+            max_abs = max(max_abs, float(tensor.abs().max().item()) if tensor.numel() else 0.0)
+    return {
+        "state_tensors": float(tensor_count),
+        "state_numel": float(total_numel),
+        "state_norm_sum": total_norm,
+        "state_max_abs": max_abs,
+    }
+
+
+def update_gradient_alignment(
+    before: dict[str, torch.Tensor],
+    after: dict[str, torch.Tensor],
+    grads: dict[str, torch.Tensor],
+) -> dict[str, float]:
+    update_chunks = []
+    grad_chunks = []
+    for name, old in before.items():
+        new = after.get(name)
+        grad = grads.get(name)
+        if not isinstance(new, torch.Tensor) or not isinstance(grad, torch.Tensor) or old.shape != new.shape or old.shape != grad.shape:
+            continue
+        update_chunks.append((new.detach().float() - old.detach().float()).flatten())
+        grad_chunks.append(grad.detach().float().flatten())
+    if not update_chunks:
+        return {"cosine": 0.0, "update_norm": 0.0, "grad_norm": 0.0}
+    update = torch.cat(update_chunks)
+    grad = torch.cat(grad_chunks)
+    return {
+        "cosine": float(gradient_cosine_similarity(update, grad).item()),
+        "update_norm": float(update.norm().item()),
+        "grad_norm": float(grad.norm().item()),
+    }
+
+
+def snapshot_gradients(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {name: param.grad.detach().clone() for name, param in model.named_parameters() if param.grad is not None}

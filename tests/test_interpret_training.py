@@ -10,14 +10,20 @@ from interpret import (
     capture_activation_gradients,
     diffusion_noise_prediction_metrics,
     diffusion_velocity_target,
+    gradient_alignment_between_losses,
+    gradient_cosine_similarity,
+    gradient_vector,
     gradient_norm_summary,
+    optimizer_state_summary,
     parameter_drift_summary,
     sequence_loss_attribution,
+    snapshot_gradients,
     snapshot_parameters,
     timestep_loss_buckets,
     token_cross_entropy_map,
     token_loss_summary,
     training_step_diagnostics,
+    update_gradient_alignment,
 )
 from runtime.causal import CausalLM
 from specs.config import ModelConfig
@@ -40,16 +46,37 @@ def test_training_gradient_and_parameter_diagnostics() -> None:
         logits = model(input_ids)
         loss = token_cross_entropy_map(logits, target).mean()
         loss.backward()
+    grads = snapshot_gradients(model)
+    grad_vec = gradient_vector(model)
+    assert gradient_cosine_similarity(grad_vec, grad_vec).item() > 0.99
     assert "blocks.0" in activation_gradient_summary(records)
     assert gradient_norm_summary(model)
     diag = training_step_diagnostics(model, before=before)
     assert "gradients" in diag
+    opt = torch.optim.AdamW(model.parameters(), lr=0.01)
+    opt.step()
+    assert optimizer_state_summary(opt)["state_tensors"] > 0
     with torch.no_grad():
         for param in model.parameters():
             if param.grad is not None:
                 param -= 0.01 * param.grad
     drift = parameter_drift_summary(before, snapshot_parameters(model))
     assert any(row["delta_l2"] > 0 for row in drift.values())
+    assert update_gradient_alignment(before, snapshot_parameters(model), grads)["update_norm"] > 0
+
+    ids_a = torch.randint(0, model.cfg.vocab_size, (1, 4))
+    ids_b = torch.randint(0, model.cfg.vocab_size, (1, 4))
+    tgt_a = torch.randint(0, model.cfg.vocab_size, (1, 4))
+    tgt_b = torch.randint(0, model.cfg.vocab_size, (1, 4))
+
+    def loss_a():
+        return token_cross_entropy_map(model(ids_a), tgt_a).mean()
+
+    def loss_b():
+        return token_cross_entropy_map(model(ids_b), tgt_b).mean()
+
+    alignment = gradient_alignment_between_losses(model, loss_a, loss_b)
+    assert "cosine" in alignment
 
 
 def test_sequence_and_diffusion_training_metrics() -> None:

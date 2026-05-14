@@ -80,7 +80,21 @@ from .search.circuit import greedy_module_circuit, module_recovery_scores, summa
 from .importance.moe import MoETarget, capture_moe_router_logits, expert_usage_from_logits, find_moe_targets, summarize_moe_router_usage
 from .reports import render_interpretability_html_report, save_interpretability_html_report
 from .safety import token_trigger_append_scan, token_trigger_position_scan
-from .training import activation_gradient_summary, capture_activation_gradients, fisher_diagonal_from_grads, gradient_norm_summary, parameter_drift_summary, snapshot_parameters, training_step_diagnostics
+from .training import (
+    activation_gradient_summary,
+    capture_activation_gradients,
+    fisher_diagonal_from_grads,
+    gradient_alignment_between_losses,
+    gradient_cosine_similarity,
+    gradient_norm_summary,
+    gradient_vector,
+    optimizer_state_summary,
+    parameter_drift_summary,
+    snapshot_gradients,
+    snapshot_parameters,
+    training_step_diagnostics,
+    update_gradient_alignment,
+)
 from .attribution.direct import (
     component_logit_attribution,
     head_logit_attribution,
@@ -280,10 +294,16 @@ __all__ = [
     "activation_gradient_summary",
     "capture_activation_gradients",
     "fisher_diagonal_from_grads",
+    "gradient_alignment_between_losses",
+    "gradient_cosine_similarity",
     "gradient_norm_summary",
+    "gradient_vector",
+    "optimizer_state_summary",
     "parameter_drift_summary",
+    "snapshot_gradients",
     "snapshot_parameters",
     "training_step_diagnostics",
+    "update_gradient_alignment",
     "DiffusionInputs",
     "DiffusionModelAdapter",
     "DiffusionPatchResult",

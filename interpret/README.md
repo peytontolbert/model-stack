@@ -21,6 +21,7 @@ Highlights
 - Deeper stack diagnostics for block internals, attention patterns, logit-prism components, and activation outliers
 - Tuned-lens primitives, interchange interventions, and integrated attribution patching
 - Training-time diagnostics for parameter drift, gradient flow, activation gradients, token losses, and diffusion timestep losses
+- Optimizer-state summaries, gradient alignment, and update-to-gradient alignment for training dynamics
 - MLP lens: project MLP outputs through `lm_head` to get per-layer token predictions
 - Attention head ablation (EagerAttention) via context manager
 - Probe dataset builders, train/validation splits, and dataset-scale activation mining
@@ -207,6 +208,7 @@ API Overview
 - `interchange_intervention_effect(...)`: causal-abstraction style source-to-base activation interchange.
 - `module_integrated_attribution_patching(...)`: integrated-gradient attribution patching over activation deltas.
 - `snapshot_parameters(...)`, `parameter_drift_summary(...)`, `gradient_norm_summary(...)`, `capture_activation_gradients(...)`: training-loop diagnostics.
+- `gradient_alignment_between_losses(...)`, `optimizer_state_summary(...)`, `update_gradient_alignment(...)`: multi-objective and optimizer/update diagnostics.
 - `token_cross_entropy_map(...)`, `sequence_loss_attribution(...)`: decoder/seq2seq token-loss interpretability.
 - `diffusion_noise_prediction_metrics(...)`, `timestep_loss_buckets(...)`, `diffusion_velocity_target(...)`: diffusion training diagnostics by timestep/noise objective.
 
