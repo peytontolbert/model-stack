@@ -19,6 +19,7 @@ from .metrics import cosine_distance, extract_tensor_output, mse_distance, resol
 from .objectives import attention_entropy, classifier_logit_score, clip_similarity_score, tensor_mean_score, tensor_region_score
 from .phases import collect_diffusion_attention_maps, diffusion_attention_phase_summary
 from .reporting import summarize_diffusion_steps, summarize_prompt_token_attribution, summarize_token_heatmaps
+from .training import diffusion_noise_prediction_metrics, diffusion_velocity_target, timestep_loss_buckets
 from .tracing import DiffusionStepRecord, DiffusionTracer, trace_diffusion_generation
 
 __all__ = [
@@ -39,6 +40,8 @@ __all__ = [
     "cosine_distance",
     "diffusion_attention_phase_summary",
     "diffusion_module_patch_sweep",
+    "diffusion_noise_prediction_metrics",
+    "diffusion_velocity_target",
     "extract_tensor_output",
     "get_diffusion_adapter",
     "is_likely_cross_attention",
@@ -55,6 +58,7 @@ __all__ = [
     "summarize_token_heatmaps",
     "tensor_mean_score",
     "tensor_region_score",
+    "timestep_loss_buckets",
     "token_region_attribution",
     "trace_diffusion_generation",
     "trace_prompt_dataset",

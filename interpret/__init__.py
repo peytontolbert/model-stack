@@ -68,6 +68,7 @@ from .causal.attribution_patching import module_attribution_patching, module_int
 from .causal.interchange import interchange_intervention_effect
 from .features.circuits import feature_activation_jaccard, feature_correlation_graph, summarize_feature_circuit
 from .metrics.sequence import sequence_perplexity, sequence_negative_log_likelihood
+from .metrics.loss import sequence_loss_attribution, token_cross_entropy_map, token_loss_summary
 from .metrics.faithfulness import (
     area_over_curve,
     faithfulness_summary,
@@ -79,6 +80,7 @@ from .search.circuit import greedy_module_circuit, module_recovery_scores, summa
 from .importance.moe import MoETarget, capture_moe_router_logits, expert_usage_from_logits, find_moe_targets, summarize_moe_router_usage
 from .reports import render_interpretability_html_report, save_interpretability_html_report
 from .safety import token_trigger_append_scan, token_trigger_position_scan
+from .training import activation_gradient_summary, capture_activation_gradients, fisher_diagonal_from_grads, gradient_norm_summary, parameter_drift_summary, snapshot_parameters, training_step_diagnostics
 from .attribution.direct import (
     component_logit_attribution,
     head_logit_attribution,
@@ -100,6 +102,8 @@ from .diffusion import (
     cosine_distance,
     diffusion_module_patch_sweep,
     diffusion_attention_phase_summary,
+    diffusion_noise_prediction_metrics,
+    diffusion_velocity_target,
     get_diffusion_adapter,
     mse_distance,
     patch_denoiser_latents,
@@ -112,6 +116,7 @@ from .diffusion import (
     summarize_prompt_token_attribution,
     tensor_mean_score,
     tensor_region_score,
+    timestep_loss_buckets,
     token_region_attribution,
     trace_diffusion_generation,
     trace_prompt_dataset,
@@ -250,6 +255,9 @@ __all__ = [
     "summarize_feature_circuit",
     "sequence_perplexity",
     "sequence_negative_log_likelihood",
+    "sequence_loss_attribution",
+    "token_cross_entropy_map",
+    "token_loss_summary",
     "area_over_curve",
     "faithfulness_summary",
     "spearman_rank_correlation",
@@ -269,6 +277,13 @@ __all__ = [
     "save_interpretability_html_report",
     "token_trigger_append_scan",
     "token_trigger_position_scan",
+    "activation_gradient_summary",
+    "capture_activation_gradients",
+    "fisher_diagonal_from_grads",
+    "gradient_norm_summary",
+    "parameter_drift_summary",
+    "snapshot_parameters",
+    "training_step_diagnostics",
     "DiffusionInputs",
     "DiffusionModelAdapter",
     "DiffusionPatchResult",
@@ -281,6 +296,8 @@ __all__ = [
     "cosine_distance",
     "diffusion_module_patch_sweep",
     "diffusion_attention_phase_summary",
+    "diffusion_noise_prediction_metrics",
+    "diffusion_velocity_target",
     "get_diffusion_adapter",
     "mse_distance",
     "patch_denoiser_latents",
@@ -293,6 +310,7 @@ __all__ = [
     "summarize_prompt_token_attribution",
     "tensor_mean_score",
     "tensor_region_score",
+    "timestep_loss_buckets",
     "token_region_attribution",
     "trace_diffusion_generation",
     "trace_prompt_dataset",
