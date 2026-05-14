@@ -6,6 +6,7 @@ import torch
 pytest.importorskip("torch.nn")
 
 from interpret import (
+    AffineTunedLens,
     attention_mask_summary,
     attention_receptive_field,
     attention_pattern_summary,
@@ -30,6 +31,7 @@ from interpret import (
     logit_prism_components,
     greedy_module_circuit,
     module_attribution_patching,
+    module_integrated_attribution_patching,
     module_recovery_scores,
     randomization_rank_baseline,
     render_interpretability_html_report,
@@ -49,6 +51,8 @@ from interpret import (
     token_embedding_similarity,
     token_trigger_append_scan,
     token_trigger_position_scan,
+    tuned_lens_logits,
+    tuned_lens_topk,
 )
 from runtime.causal import CausalLM
 from specs.config import ModelConfig
@@ -173,6 +177,14 @@ def test_representation_similarity_and_concept_effects() -> None:
     )
     assert attr["scores"].shape == (2,)
     assert isinstance(summarize_attribution_patching(attr), list)
+    integrated = module_integrated_attribution_patching(
+        model,
+        clean_input_ids=input_ids,
+        corrupted_input_ids=input_ids.clone(),
+        candidate_modules=["blocks.0"],
+        steps=2,
+    )
+    assert integrated["scores"].shape == (1,)
 
     graph = feature_correlation_graph(torch.randn(8, 3), torch.randn(8, 4), topk=3)
     assert len(summarize_feature_circuit(graph)) == 3
@@ -225,3 +237,13 @@ def test_deeper_stack_standalone_diagnostics() -> None:
     prism = logit_prism_components(comps, lm_head, target_token_id=1, baseline_token_id=2)
     assert set(prism) == {"a", "b"}
     assert len(summarize_logit_prism(prism)) == 2
+
+
+def test_tuned_lens_primitives() -> None:
+    hidden = {0: torch.randn(1, 2, 4), 1: torch.randn(1, 2, 4)}
+    lm_head = torch.randn(6, 4)
+    lens = AffineTunedLens(2, 4)
+    logits = tuned_lens_logits(hidden, lm_head, lens=lens)
+    assert logits[0].shape == (1, 2, 6)
+    top = tuned_lens_topk(hidden, lm_head, lens=lens, topk=3)
+    assert top[0][0].shape[-1] == 3

@@ -1,6 +1,7 @@
 from .activation_cache import ActivationCache, CaptureSpec
 from .tracer import ActivationTracer
 from .logit_lens import logit_lens
+from .tuned_lens import AffineTunedLens, collect_layer_hidden_from_cache, tuned_lens_logits, tuned_lens_topk, tuned_lens_training_pairs
 from .generation import generation_logit_trace, summarize_generation_trace
 from .model_adapter import ModelAdapter, ModelInputs
 
@@ -63,7 +64,8 @@ from .attn.masks import attention_mask_summary, attention_receptive_field, causa
 from .attn.patterns import attention_diagonal_score, attention_distance, attention_pattern_summary, attention_prefix_mass, attention_previous_token_score
 from .attribution.logit_prism import logit_prism_components, summarize_logit_prism, unembed_vector_scores
 from .causal.concept import boost_direction, concept_direction_effect, concept_direction_from_means, erase_direction, patch_module_direction
-from .causal.attribution_patching import module_attribution_patching, summarize_attribution_patching
+from .causal.attribution_patching import module_attribution_patching, module_integrated_attribution_patching, summarize_attribution_patching
+from .causal.interchange import interchange_intervention_effect
 from .features.circuits import feature_activation_jaccard, feature_correlation_graph, summarize_feature_circuit
 from .metrics.sequence import sequence_perplexity, sequence_negative_log_likelihood
 from .metrics.faithfulness import (
@@ -127,6 +129,11 @@ __all__ = [
     "CaptureSpec",
     "ActivationTracer",
     "logit_lens",
+    "AffineTunedLens",
+    "collect_layer_hidden_from_cache",
+    "tuned_lens_logits",
+    "tuned_lens_topk",
+    "tuned_lens_training_pairs",
     "generation_logit_trace",
     "summarize_generation_trace",
     "ModelAdapter",
@@ -235,7 +242,9 @@ __all__ = [
     "erase_direction",
     "patch_module_direction",
     "module_attribution_patching",
+    "module_integrated_attribution_patching",
     "summarize_attribution_patching",
+    "interchange_intervention_effect",
     "feature_activation_jaccard",
     "feature_correlation_graph",
     "summarize_feature_circuit",

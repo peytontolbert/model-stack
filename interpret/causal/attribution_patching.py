@@ -115,3 +115,100 @@ def summarize_attribution_patching(result: dict[str, object], *, topk: int = 10)
         return []
     order = torch.argsort(scores.abs(), descending=True)[: int(topk)]
     return [{"module": names[int(idx)], "score": float(scores[int(idx)].item())} for idx in order]
+
+
+def module_integrated_attribution_patching(
+    model: nn.Module,
+    *,
+    candidate_modules: Iterable[str],
+    clean_inputs: Optional[ModelInputs] = None,
+    corrupted_inputs: Optional[ModelInputs] = None,
+    clean_input_ids: Optional[torch.Tensor] = None,
+    corrupted_input_ids: Optional[torch.Tensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    steps: int = 8,
+    position: int = -1,
+    target_token_id: Optional[int] = None,
+    target_feature_index: Optional[int] = None,
+    score_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+) -> dict[str, object]:
+    """Integrated-gradient variant of attribution patching over activation deltas."""
+
+    adapter = get_model_adapter(model)
+    names = [name for name in candidate_modules if name]
+    clean_inputs, corrupted_inputs = _coerce_pair(model, clean_inputs, corrupted_inputs, clean_input_ids, corrupted_input_ids, attention_mask)
+
+    clean_tracer = ActivationTracer(model, spec=CaptureSpec(move_to_cpu=False))
+    clean_tracer.add_modules(names)
+    with torch.no_grad():
+        with clean_tracer.trace() as clean_cache:
+            _ = adapter.forward(clean_inputs)
+
+    corrupted_tracer = ActivationTracer(model, spec=CaptureSpec(move_to_cpu=False))
+    corrupted_tracer.add_modules(names)
+    with torch.no_grad():
+        with corrupted_tracer.trace() as corrupted_cache:
+            _ = adapter.forward(corrupted_inputs)
+
+    modules = dict(model.named_modules())
+    totals = torch.zeros(len(names), dtype=torch.float32)
+    valid: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for name in names:
+        clean_act = clean_cache.get(name)
+        corrupted_act = corrupted_cache.get(name)
+        if isinstance(clean_act, torch.Tensor) and isinstance(corrupted_act, torch.Tensor) and clean_act.shape == corrupted_act.shape:
+            valid[name] = (clean_act, corrupted_act)
+
+    alpha_values = torch.linspace(0.0, 1.0, steps=max(2, int(steps)))
+    for alpha in alpha_values:
+        handles: list[torch.utils.hooks.RemovableHandle] = []
+        patched_acts: dict[str, torch.Tensor] = {}
+
+        def _make_hook(name: str):
+            def _hook(_module: nn.Module, _inputs, output):
+                if name not in valid or not isinstance(output, torch.Tensor):
+                    return output
+                clean_act, corrupted_act = valid[name]
+                delta = clean_act.to(device=output.device, dtype=output.dtype) - corrupted_act.to(device=output.device, dtype=output.dtype)
+                patched = corrupted_act.to(device=output.device, dtype=output.dtype) + float(alpha.item()) * delta
+                patched = patched.detach().requires_grad_(True)
+                patched.retain_grad()
+                patched_acts[name] = patched
+                return patched
+
+            return _hook
+
+        for name in names:
+            module = modules.get(name)
+            if module is not None:
+                handles.append(module.register_forward_hook(_make_hook(name)))
+        try:
+            model.zero_grad(set_to_none=True)
+            outputs = adapter.forward(corrupted_inputs)
+            score, target_token_id, target_feature_index = resolve_model_score(
+                model,
+                outputs,
+                position=position,
+                target_token_id=target_token_id,
+                target_feature_index=target_feature_index,
+                score_fn=score_fn,
+            )
+            score.backward()
+            for idx, name in enumerate(names):
+                patched = patched_acts.get(name)
+                if patched is None or patched.grad is None or name not in valid:
+                    continue
+                clean_act, corrupted_act = valid[name]
+                delta = clean_act.to(device=patched.device, dtype=patched.dtype) - corrupted_act.to(device=patched.device, dtype=patched.dtype)
+                totals[idx] += float((delta * patched.grad).sum().detach().cpu().item())
+        finally:
+            for handle in handles:
+                handle.remove()
+    totals = totals / float(max(1, len(alpha_values)))
+    model.zero_grad(set_to_none=True)
+    return {
+        "names": names,
+        "scores": totals,
+        "target_token_id": target_token_id,
+        "target_feature_index": target_feature_index,
+    }

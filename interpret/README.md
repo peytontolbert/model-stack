@@ -19,6 +19,7 @@ Highlights
 - Standalone model-stack diagnostics for embeddings, norms, residual update ratios, and attention masks
 - Generation-time logit traces for entropy, margins, top-k alternatives, and decoded-token trajectories
 - Deeper stack diagnostics for block internals, attention patterns, logit-prism components, and activation outliers
+- Tuned-lens primitives, interchange interventions, and integrated attribution patching
 - MLP lens: project MLP outputs through `lm_head` to get per-layer token predictions
 - Attention head ablation (EagerAttention) via context manager
 - Probe dataset builders, train/validation splits, and dataset-scale activation mining
@@ -201,6 +202,9 @@ API Overview
 - `attention_pattern_summary(...)`, `attention_distance(...)`, `attention_previous_token_score(...)`: head pattern diagnostics.
 - `logit_prism_components(...)`, `unembed_vector_scores(...)`: unembedding/logit-prism component scoring.
 - `channel_outlier_scores(...)`, `activation_kurtosis(...)`, `summarize_activation_outliers(...)`: activation outlier diagnostics useful for quantization and instability checks.
+- `AffineTunedLens(...)`, `tuned_lens_logits(...)`, `tuned_lens_topk(...)`: tuned-lens style translated vocabulary projections.
+- `interchange_intervention_effect(...)`: causal-abstraction style source-to-base activation interchange.
+- `module_integrated_attribution_patching(...)`: integrated-gradient attribution patching over activation deltas.
 
 Notes
 - Works with causal, encoder-only, and encoder-decoder runtime stacks through `ModelAdapter`.
