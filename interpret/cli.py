@@ -25,6 +25,12 @@ from .analysis.flops import estimate_layer_costs
 from .analysis.mask_effects import logit_change_with_mask
 from .reporting import summarize_patch_sweep, summarize_path_patch_sweep
 from .model_adapter import ModelInputs
+from .analysis.similarity import compare_model_representations
+from .causal.attribution_patching import module_attribution_patching, summarize_attribution_patching
+from .diffusion import DiffusionTracer, diffusion_attention_phase_summary, patch_denoiser_latents, prompt_token_occlusion_importance, summarize_diffusion_steps, summarize_prompt_token_attribution
+from .metrics.faithfulness import faithfulness_summary, token_deletion_insertion_curves
+from .search.circuit import greedy_module_circuit, summarize_module_circuit
+from .safety.triggers import token_trigger_append_scan
 
 
 def load_model(factory_path: str):
@@ -60,6 +66,11 @@ def maybe_parse_tokens(s: str | None, device: torch.device) -> torch.Tensor | No
     if s is None:
         return None
     return parse_tokens(s).to(device)
+
+
+def parse_floats(s: str) -> torch.Tensor:
+    values = [float(x) for x in s.split(",") if x.strip()]
+    return torch.tensor([values], dtype=torch.float32)
 
 
 def add_forward_input_args(parser: argparse.ArgumentParser, *, include_stack: bool = False, include_kind: bool = False) -> None:
@@ -342,6 +353,150 @@ def build_parser():
         )
         print(summarize_path_patch_sweep(out, topk=a.topk))
     p19.set_defaults(func=_run_path_sweep)
+
+    p20 = sub.add_parser("diffusion-trace", help="Trace denoiser timesteps, latents, and cross-attention for a text-to-image pipeline")
+    p20.add_argument("--model", required=True, help="Module:function that returns a callable diffusion pipeline")
+    p20.add_argument("--prompt", required=True)
+    p20.add_argument("--steps", type=int, default=20)
+    def _run_diffusion_trace(a):
+        pipe = load_model(a.model)
+        tracer = DiffusionTracer(pipe)
+        _output, cache, records = tracer.trace_generation(a.prompt, num_inference_steps=a.steps)
+        keys = list(cache.keys())
+        print({"trace": summarize_diffusion_steps(records), "keys": keys})
+    p20.set_defaults(func=_run_diffusion_trace)
+
+    p21 = sub.add_parser("diffusion-occlude", help="Rank prompt tokens by text-to-image output change under token removal")
+    p21.add_argument("--model", required=True, help="Module:function that returns a callable diffusion pipeline")
+    p21.add_argument("--prompt", required=True)
+    p21.add_argument("--steps", type=int, default=20)
+    p21.add_argument("--topk", type=int, default=10)
+    def _run_diffusion_occlude(a):
+        pipe = load_model(a.model)
+        rows = prompt_token_occlusion_importance(
+            pipe,
+            a.prompt,
+            generation_kwargs={"num_inference_steps": a.steps},
+        )
+        print(summarize_prompt_token_attribution(rows, topk=a.topk))
+    p21.set_defaults(func=_run_diffusion_occlude)
+
+    p22 = sub.add_parser("diffusion-patch-latents", help="Patch clean denoiser latents into a corrupted text-to-image run")
+    p22.add_argument("--model", required=True, help="Module:function that returns a callable diffusion pipeline")
+    p22.add_argument("--clean-prompt", required=True)
+    p22.add_argument("--corrupted-prompt", required=True)
+    p22.add_argument("--steps", type=int, default=20)
+    p22.add_argument("--patch-steps", default="", help="Comma-separated denoising step indices; empty patches all available steps")
+    def _run_diffusion_patch_latents(a):
+        pipe = load_model(a.model)
+        patch_steps = [int(x) for x in a.patch_steps.split(",") if x.strip()] or None
+        result = patch_denoiser_latents(
+            pipe,
+            clean_prompt=a.clean_prompt,
+            corrupted_prompt=a.corrupted_prompt,
+            patch_steps=patch_steps,
+            num_inference_steps=a.steps,
+        )
+        print(
+            {
+                "clean_corrupted_distance": result.clean_corrupted_distance,
+                "clean_patched_distance": result.clean_patched_distance,
+                "recovery_fraction": result.recovery_fraction,
+                "patched_keys": list(result.patched_keys),
+            }
+        )
+    p22.set_defaults(func=_run_diffusion_patch_latents)
+
+    p23 = sub.add_parser("faithfulness", help="Deletion/insertion faithfulness curves for token scores")
+    p23.add_argument("--model", required=True)
+    p23.add_argument("--tokens", required=True, help="Comma-separated token ids")
+    p23.add_argument("--scores", required=True, help="Comma-separated token explanation scores aligned to --tokens")
+    p23.add_argument("--baseline-token", type=int, default=0)
+    def _run_faithfulness(a):
+        m = load_model(a.model)
+        device = model_device(m)
+        tokens = parse_tokens(a.tokens).to(device)
+        scores = parse_floats(a.scores).to(device)
+        curves = token_deletion_insertion_curves(m, tokens, scores, baseline_token_id=a.baseline_token)
+        summary = faithfulness_summary(curves)
+        print({**summary, "order": curves["order"].tolist()})
+    p23.set_defaults(func=_run_faithfulness)
+
+    p24 = sub.add_parser("module-circuit", help="Greedily select modules that recover clean behavior under activation patching")
+    p24.add_argument("--model", required=True)
+    add_pair_input_args(p24)
+    p24.add_argument("--candidates", required=True, help="Comma-separated module names")
+    p24.add_argument("--k", type=int, default=5)
+    p24.add_argument("--topk", type=int, default=10)
+    def _run_module_circuit(a):
+        m = load_model(a.model)
+        result = greedy_module_circuit(
+            m,
+            candidate_modules=[x.strip() for x in a.candidates.split(",") if x.strip()],
+            k=a.k,
+            **load_pair_kwargs(a, m),
+        )
+        print({"selected": result["selected"], "curve": result["curve"], "top": summarize_module_circuit(result, topk=a.topk)})
+    p24.set_defaults(func=_run_module_circuit)
+
+    p25 = sub.add_parser("attribution-patch", help="Rank modules with first-order attribution patching")
+    p25.add_argument("--model", required=True)
+    add_pair_input_args(p25)
+    p25.add_argument("--candidates", required=True, help="Comma-separated module names")
+    p25.add_argument("--topk", type=int, default=10)
+    def _run_attribution_patch(a):
+        m = load_model(a.model)
+        result = module_attribution_patching(
+            m,
+            candidate_modules=[x.strip() for x in a.candidates.split(",") if x.strip()],
+            **load_pair_kwargs(a, m),
+        )
+        print(summarize_attribution_patching(result, topk=a.topk))
+    p25.set_defaults(func=_run_attribution_patch)
+
+    p26 = sub.add_parser("trigger-append", help="Scan appended trigger token ids by target score delta")
+    p26.add_argument("--model", required=True)
+    p26.add_argument("--tokens", required=True)
+    p26.add_argument("--triggers", required=True, help="Comma-separated candidate trigger token ids")
+    def _run_trigger_append(a):
+        m = load_model(a.model)
+        device = model_device(m)
+        rows = token_trigger_append_scan(
+            m,
+            parse_tokens(a.tokens).to(device),
+            [int(x) for x in a.triggers.split(",") if x.strip()],
+        )
+        print(rows)
+    p26.set_defaults(func=_run_trigger_append)
+
+    p27 = sub.add_parser("compare-representations", help="Compare module representations between two model factories")
+    p27.add_argument("--model-a", required=True)
+    p27.add_argument("--model-b", required=True)
+    p27.add_argument("--tokens", required=True)
+    p27.add_argument("--modules", required=True, help="Comma-separated module names to compare")
+    def _run_compare_representations(a):
+        ma = load_model(a.model_a)
+        mb = load_model(a.model_b)
+        device = model_device(ma)
+        out = compare_model_representations(
+            ma,
+            mb,
+            input_ids=parse_tokens(a.tokens).to(device),
+            module_names=[x.strip() for x in a.modules.split(",") if x.strip()],
+        )
+        print(out)
+    p27.set_defaults(func=_run_compare_representations)
+
+    p28 = sub.add_parser("diffusion-phase", help="Summarize cross-attention entropy/change over diffusion denoising steps")
+    p28.add_argument("--model", required=True, help="Module:function that returns a callable diffusion pipeline")
+    p28.add_argument("--prompt", required=True)
+    p28.add_argument("--steps", type=int, default=20)
+    def _run_diffusion_phase(a):
+        pipe = load_model(a.model)
+        tracer = DiffusionTracer(pipe)
+        _output, cache, _records = tracer.trace_generation(a.prompt, num_inference_steps=a.steps)
+        print(diffusion_attention_phase_summary(cache))
+    p28.set_defaults(func=_run_diffusion_phase)
 
     return p
 

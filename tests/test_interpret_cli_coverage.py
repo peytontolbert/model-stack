@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 import torch
+
+pytest.importorskip("torch.nn")
 import torch.nn as nn
 
 import interpret.cli as cli
