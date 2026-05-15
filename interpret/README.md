@@ -23,6 +23,7 @@ Highlights
 - Training-time diagnostics for parameter drift, gradient flow, activation gradients, token losses, and diffusion timestep losses
 - Optimizer-state summaries, gradient alignment, and update-to-gradient alignment for training dynamics
 - Reduced-order / balanced-renormalization diagnostics for teacher-student dynamics
+- Learned renormalization-loss operators: PSD metric critics, dynamic loss weights, and cost-to-go critics
 - MLP lens: project MLP outputs through `lm_head` to get per-layer token predictions
 - Attention head ablation (EagerAttention) via context manager
 - Probe dataset builders, train/validation splits, and dataset-scale activation mining
@@ -215,6 +216,8 @@ API Overview
 - `empirical_controllability_gramian(...)`, `empirical_observability_gramian(...)`, `balanced_projection(...)`: balanced truncation-style relevance directions.
 - `rg_commutation_error(...)`, `block_grouping_dynamic_program(...)`: teacher-block to student-block dynamical grouping diagnostics.
 - `closure_residual(...)`, `closure_residual_metrics(...)`, `reduced_order_certification(...)`: closure and reduced-order validity metrics.
+- `PSDMetricLossCritic(...)`, `DynamicLossWeightNet(...)`, `CostToGoCritic(...)`: constrained learned loss operators.
+- `learned_renormalization_loss(...)`, `inspect_psd_metric(...)`, `outer_validation_objective(...)`: learned-loss diagnostics and meta-objective helpers.
 
 Notes
 - Works with causal, encoder-only, and encoder-decoder runtime stacks through `ModelAdapter`.

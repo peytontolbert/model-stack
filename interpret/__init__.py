@@ -1,6 +1,18 @@
 from .activation_cache import ActivationCache, CaptureSpec
 from .tracer import ActivationTracer
 from .logit_lens import logit_lens
+from .losses import (
+    CostToGoCritic,
+    DynamicLossWeightNet,
+    MetricInspection,
+    PSDMetricLossCritic,
+    cost_to_go_targets,
+    inspect_psd_metric,
+    learned_renormalization_loss,
+    outer_validation_objective,
+    psd_metric_quadratic,
+    weighted_loss_operator,
+)
 from .tuned_lens import AffineTunedLens, collect_layer_hidden_from_cache, tuned_lens_logits, tuned_lens_topk, tuned_lens_training_pairs
 from .generation import generation_logit_trace, summarize_generation_trace
 from .model_adapter import ModelAdapter, ModelInputs
@@ -165,6 +177,16 @@ __all__ = [
     "CaptureSpec",
     "ActivationTracer",
     "logit_lens",
+    "CostToGoCritic",
+    "DynamicLossWeightNet",
+    "MetricInspection",
+    "PSDMetricLossCritic",
+    "cost_to_go_targets",
+    "inspect_psd_metric",
+    "learned_renormalization_loss",
+    "outer_validation_objective",
+    "psd_metric_quadratic",
+    "weighted_loss_operator",
     "AffineTunedLens",
     "collect_layer_hidden_from_cache",
     "tuned_lens_logits",
