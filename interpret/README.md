@@ -22,6 +22,7 @@ Highlights
 - Tuned-lens primitives, interchange interventions, and integrated attribution patching
 - Training-time diagnostics for parameter drift, gradient flow, activation gradients, token losses, and diffusion timestep losses
 - Optimizer-state summaries, gradient alignment, and update-to-gradient alignment for training dynamics
+- Reduced-order / balanced-renormalization diagnostics for teacher-student dynamics
 - MLP lens: project MLP outputs through `lm_head` to get per-layer token predictions
 - Attention head ablation (EagerAttention) via context manager
 - Probe dataset builders, train/validation splits, and dataset-scale activation mining
@@ -211,6 +212,9 @@ API Overview
 - `gradient_alignment_between_losses(...)`, `optimizer_state_summary(...)`, `update_gradient_alignment(...)`: multi-objective and optimizer/update diagnostics.
 - `token_cross_entropy_map(...)`, `sequence_loss_attribution(...)`: decoder/seq2seq token-loss interpretability.
 - `diffusion_noise_prediction_metrics(...)`, `timestep_loss_buckets(...)`, `diffusion_velocity_target(...)`: diffusion training diagnostics by timestep/noise objective.
+- `empirical_controllability_gramian(...)`, `empirical_observability_gramian(...)`, `balanced_projection(...)`: balanced truncation-style relevance directions.
+- `rg_commutation_error(...)`, `block_grouping_dynamic_program(...)`: teacher-block to student-block dynamical grouping diagnostics.
+- `closure_residual(...)`, `closure_residual_metrics(...)`, `reduced_order_certification(...)`: closure and reduced-order validity metrics.
 
 Notes
 - Works with causal, encoder-only, and encoder-decoder runtime stacks through `ModelAdapter`.

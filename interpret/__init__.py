@@ -79,6 +79,23 @@ from .metrics.stability import explanation_stability, randomization_rank_baselin
 from .search.circuit import greedy_module_circuit, module_recovery_scores, summarize_module_circuit
 from .importance.moe import MoETarget, capture_moe_router_logits, expert_usage_from_logits, find_moe_targets, summarize_moe_router_usage
 from .reports import render_interpretability_html_report, save_interpretability_html_report
+from .reduction import (
+    balanced_energy_retained,
+    balanced_hankel_singular_values,
+    balanced_projection,
+    block_grouping_dynamic_program,
+    closure_residual,
+    closure_residual_metrics,
+    closure_target,
+    empirical_controllability_gramian,
+    empirical_gramian,
+    empirical_observability_gramian,
+    offpolicy_error_growth,
+    project_onto_basis,
+    reconstruct_from_basis,
+    reduced_order_certification,
+    rg_commutation_error,
+)
 from .safety import token_trigger_append_scan, token_trigger_position_scan
 from .training import (
     activation_gradient_summary,
@@ -288,6 +305,21 @@ __all__ = [
     "find_moe_targets",
     "summarize_moe_router_usage",
     "render_interpretability_html_report",
+    "balanced_energy_retained",
+    "balanced_hankel_singular_values",
+    "balanced_projection",
+    "block_grouping_dynamic_program",
+    "closure_residual",
+    "closure_residual_metrics",
+    "closure_target",
+    "empirical_controllability_gramian",
+    "empirical_gramian",
+    "empirical_observability_gramian",
+    "offpolicy_error_growth",
+    "project_onto_basis",
+    "reconstruct_from_basis",
+    "reduced_order_certification",
+    "rg_commutation_error",
     "save_interpretability_html_report",
     "token_trigger_append_scan",
     "token_trigger_position_scan",
