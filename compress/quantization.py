@@ -3592,8 +3592,6 @@ class _TrainableBitNetPackedInt4STEFunction(torch.autograd.Function):
         row_scale = row_scale.to(device=x_local.device, dtype=torch.float32).contiguous()
         bias_local = None if bias is None else bias.to(device=x_local.device, dtype=target_dtype)
         if _env_flag_enabled("MODEL_STACK_TRAINABLE_BITNET_STRICT_TERNARY_FORWARD"):
-            if bias_local is not None:
-                raise RuntimeError("Strict ternary BitNet training forward does not support bias yet")
             qweight_cuda = qweight.to(device=x_local.device, dtype=torch.int8).contiguous()
             w_pos_masks, w_neg_masks = runtime_bitnet_ternary_pack_masks(qweight_cuda)
             x_pos_masks, x_neg_masks, x_row_scale = runtime_bitnet_ternary_quantize_activation(x_local, eps=float(eps))
@@ -3606,12 +3604,14 @@ class _TrainableBitNetPackedInt4STEFunction(torch.autograd.Function):
                 row_scale,
                 out_dtype=x_local.dtype,
             ).view(*x_local.shape[:-1], qweight.shape[0])
-        elif _env_flag_enabled("MODEL_STACK_TRAINABLE_BITNET_TERNARY_MASK_FORWARD"):
             if bias_local is not None:
-                raise RuntimeError("Ternary-mask BitNet training forward does not support bias yet")
+                out = out + bias_local
+        elif _env_flag_enabled("MODEL_STACK_TRAINABLE_BITNET_TERNARY_MASK_FORWARD"):
             qweight_cuda = qweight.to(device=x_local.device, dtype=torch.int8).contiguous()
             pos_masks, neg_masks = runtime_bitnet_ternary_pack_masks(qweight_cuda)
             out = runtime_bitnet_ternary_linear(x_local, pos_masks, neg_masks, row_scale)
+            if bias_local is not None:
+                out = out + bias_local
         elif _env_flag_enabled("MODEL_STACK_TRAINABLE_BITNET_CUTLASS_INT4_FORWARD"):
             if bias_local is not None:
                 raise RuntimeError("CUTLASS packed INT4 BitNet training forward does not support bias yet")

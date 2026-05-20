@@ -278,9 +278,33 @@ def _graph_manifest(model: torch.nn.Module, layers: list[dict[str, Any]]) -> dic
             "encode": True,
             "decode": True,
             "cross_attention": True,
+            "retrieval_embeddings": bool(int(getattr(cfg, "retrieval_head_dim", 0) or 0)),
+            "agent_policy_heads": bool(getattr(cfg, "agent_policy_heads", False)),
             "kv_cache": False,
             "batch_size": 1,
         }
+        retrieval_head_dim = int(getattr(cfg, "retrieval_head_dim", 0) or 0)
+        if retrieval_head_dim > 0:
+            graph["retrieval"] = {
+                "dim": retrieval_head_dim,
+                "query_head": "retrieval_query_head",
+                "doc_head": "retrieval_doc_head",
+                "pooling": "masked_mean",
+                "normalization": "l2",
+            }
+        if bool(getattr(cfg, "agent_policy_heads", False)):
+            graph["agent_policy_heads"] = {
+                "pooling": "masked_mean",
+                "heads": [
+                    "query_confidence",
+                    "retrieval_coverage",
+                    "ood_query",
+                    "ood_evidence",
+                    "answer_confidence",
+                    "needs_verification",
+                    "paper_action_validity",
+                ],
+            }
     return graph
 
 

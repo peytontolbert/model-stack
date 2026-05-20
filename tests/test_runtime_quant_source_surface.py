@@ -2,12 +2,21 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _read(relpath: str) -> str:
     return (REPO_ROOT / relpath).read_text(encoding="utf-8")
+
+
+def _read_optional(relpath: str) -> str:
+    path = REPO_ROOT / relpath
+    if not path.exists():
+        pytest.skip(f"optional source tree is not present: {relpath}")
+    return path.read_text(encoding="utf-8")
 
 
 def test_quantization_source_uses_channelwise_reduction_and_cache_invalidation() -> None:
@@ -231,7 +240,7 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "--block-fused-qkv" in training_bench_source
     assert "--no-preset-shapes" in training_bench_source
     assert "--grad-weight-mode" in training_bench_source
-    assert 'BITNET_STE_MODES = ("dynamic_int8_ste", "dynamic_int4_ste")' in training_bench_source
+    assert 'BITNET_STE_MODES = ("dynamic_int8_ste", "dynamic_int4_ste", "packed_int4_ste")' in training_bench_source
     assert "def _bitnet_optimized_training_env(" in training_bench_source
     assert '"MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT",' in training_bench_source
     assert '"MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT",' in training_bench_source
@@ -261,12 +270,12 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE=\"${MODEL_STACK_TRAINABLE_BITNET_SHAPE_GATE:-pg_h100_mlp}\"" in pg_run_source
     assert (
         "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT="
-        "\"${MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT:-dynamic_int8_explicit_scale}\""
+        "\"${MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_INPUT:-dense}\""
         in pg_run_source
     )
     assert (
         "MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT="
-        "\"${MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT:-dynamic_int8_transpose}\""
+        "\"${MODEL_STACK_TRAINABLE_BITNET_BACKWARD_GRAD_WEIGHT:-dense}\""
         in pg_run_source
     )
     assert "MODEL_STACK_ATTENTION_REPEAT_KV=\"${MODEL_STACK_ATTENTION_REPEAT_KV:-}\"" in pg_run_source
@@ -304,7 +313,7 @@ def test_runtime_sources_use_module_aware_linear_quantization_path() -> None:
     assert "repeat_contiguous" in attention_variants_source
     assert "expand_reshape" in attention_variants_source
     assert "speedup_vs_gqa" in attention_variants_source
-    train_gpt_source = _read("other_repos/parameter-golf/train_gpt.py")
+    train_gpt_source = _read_optional("other_repos/parameter-golf/train_gpt.py")
     assert "MODEL_STACK_ATTENTION_REPEAT_KV" in train_gpt_source
     assert "def maybe_repeat_kv_heads(" in train_gpt_source
     assert "k, v, enable_gqa = maybe_repeat_kv_heads(" in train_gpt_source
