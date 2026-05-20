@@ -39,6 +39,10 @@ Guidelines
 - Names are lowercase and can be namespaced with dots, e.g., `attn.flash2`.
 - Prefer `register_lazy` for optional backends; raise only on actual use.
 - Keep wrappers thin and shape-safe; avoid mixing policy with kernels.
+- Repository-owned CUDA/C++ kernels are documented in
+  [`docs/custom-kernel-architecture.md`](../docs/custom-kernel-architecture.md),
+  including native extension dispatch, backend layout, BitNet formats, attention
+  policy, runtime flags, validation, and the checklist for adding a new kernel.
 
 Benchmark
 

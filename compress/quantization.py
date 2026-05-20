@@ -764,8 +764,8 @@ def _flatten_calibration_inputs(
 
 
 def _quant_max(bits: int) -> int:
-    if bits < 2:
-        raise ValueError("bits must be >= 2")
+    if bits < 2 or bits > 8:
+        raise ValueError("bits must be in [2, 8]")
     return (1 << (bits - 1)) - 1
 
 

@@ -1,5 +1,5 @@
 let wasmModulePromise = null;
-const WASM_RUNTIME_VERSION = "20260520-vocos-istft-simd-wasm-v2";
+const WASM_RUNTIME_VERSION = "20260520-f5-step-progress-wasm-v3";
 
 function resolveUrl(path, baseUrl) {
   return new URL(path, baseUrl).toString();

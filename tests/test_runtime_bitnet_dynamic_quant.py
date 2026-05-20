@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import torch.nn as nn
 import torch
+import pytest
 
 from compress.quantization import QuantizedLinearBitNet, TrainableBitNetLinear, _trainable_bitnet_activation_quant
-from runtime.ops import bitnet_transform_input
-from runtime.quant import bitnet_int8_linear_from_float
+from runtime.ops import bitnet_transform_input, pack_bitnet_weight
+from runtime.quant import bitnet_int8_linear_from_float, bitnet_linear, bitnet_linear_compute_packed, quantize_activation_int8_rowwise
 
 
 def test_bitnet_dynamic_transform_uses_row_local_scales_on_python_fallback() -> None:
@@ -38,6 +39,45 @@ def test_bitnet_dynamic_int8_from_float_uses_row_local_scales_on_python_fallback
 
     expected = torch.tensor([[0.0, 2.0], [0.0, 200.0]], dtype=torch.float32)
     torch.testing.assert_close(out, expected)
+
+
+def test_bitnet_activation_quant_rejects_bits_above_int8_range_on_python_fallback() -> None:
+    x = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=r"\[2, 8\]"):
+        quantize_activation_int8_rowwise(x, bits=9)
+
+    with pytest.raises(ValueError, match=r"\[2, 8\]"):
+        bitnet_transform_input(x, act_quant_mode="dynamic_int8", act_quant_bits=9)
+
+
+def test_bitnet_compute_packed_python_fallback_preserves_out_dtype() -> None:
+    x = torch.tensor([[1.0, -2.0, 0.5, 3.0]], dtype=torch.float32)
+    weight = torch.tensor([[1.0, -0.5, 0.25, 2.0], [-1.0, 0.5, -0.25, -2.0]], dtype=torch.float32)
+    packed_weight, scale_values, layout_header, segment_offsets = pack_bitnet_weight(weight)
+    compute_words = torch.empty((1, 1, 1), dtype=torch.int32)
+    compute_scales = torch.empty((1, 1), dtype=torch.float32)
+    decode_nz = torch.empty((1, 1, 1), dtype=torch.int32)
+    decode_sign = torch.empty((1, 1, 1), dtype=torch.int32)
+    decode_scales = torch.empty((1, 1), dtype=torch.float32)
+
+    expected = bitnet_linear(x, packed_weight, scale_values, layout_header, segment_offsets).to(torch.float16)
+    actual = bitnet_linear_compute_packed(
+        x,
+        packed_weight,
+        scale_values,
+        layout_header,
+        segment_offsets,
+        compute_words,
+        compute_scales,
+        decode_nz,
+        decode_sign,
+        decode_scales,
+        out_dtype=torch.float16,
+    )
+
+    assert actual.dtype == torch.float16
+    torch.testing.assert_close(actual, expected)
 
 
 def test_quantized_linear_bitnet_shared_int8_input_uses_row_local_dynamic_scales() -> None:

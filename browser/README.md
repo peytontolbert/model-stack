@@ -34,9 +34,19 @@ WASM path keeps the compact packed ternary model files instead of expanding to
 dense ONNX weights.
 
 The v1 WASM fallback uses a packed-byte tiled kernel and builds with WASM SIMD
-enabled. The generation runtime also reuses encoder memory plus decoder
-self-attention and cross-attention caches between generated tokens. WebGPU still
-remains the faster path.
+enabled. It validates packed layout metadata, scale metadata, bias length, and
+activation quantization bits before execution. The generation runtime also
+reuses encoder memory plus decoder self-attention and cross-attention caches
+between generated tokens. WebGPU still remains the faster path.
+
+Standalone loader helpers are exported from `browser/bitnet/encdec_runtime.js`:
+
+- `loadBitNetEncoderDecoderWASM(manifestUrl, options)`
+- `loadBitNetEncoderDecoderWebGPU(manifestUrl, options)`
+- `loadBitNetEncoderDecoder(manifestUrl, options)`
+
+The last helper attempts WebGPU first and falls back to the packed WASM runtime
+when WebGPU is unavailable.
 
 Safari deployment notes:
 

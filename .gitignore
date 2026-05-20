@@ -12,7 +12,8 @@ __pycache__/
 .pytest_cache/
 build/
 browser/bitnet_wasm/target/
-experiments/
+experiments/*
+!experiments/README.md
 checkpoints/
 artifacts/
 cloned-repos/

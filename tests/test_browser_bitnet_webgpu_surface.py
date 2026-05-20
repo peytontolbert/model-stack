@@ -38,6 +38,10 @@ def test_bitnet_webgpu_wrapper_rejects_non_v1_layouts() -> None:
     assert "header[1] !== 16" in source
     assert "header[2] !== 32" in source
     assert "header[9] !== 1" in source
+    assert "BitNet padded input features must be divisible by 4" in source
+    assert "validateLayerTensors" in source
+    assert "validateInputQuantization" in source
+    assert "input_quant_bits must be in [2, 8]" in source
 
 
 def test_bitnet_webgpu_wrapper_is_plain_browser_module() -> None:
@@ -53,6 +57,9 @@ def test_encoder_decoder_browser_runtime_has_required_execution_surface() -> Non
 
     assert "class BitNetEncoderDecoderWebGPU" in source
     assert "class BitNetEncoderDecoderWASM" in source
+    assert "this.wasmOps" in source
+    assert "bitnet_linear3_f32" in source
+    assert "DecoderLayerHandle" in source
     assert "async encode" in source
     assert "async decode" in source
     assert "async forward" in source
@@ -74,6 +81,9 @@ def test_bitnet_wasm_runtime_uses_packed_kernel() -> None:
 
     assert "model_stack_bitnet_wasm.js" in source
     assert "bitnet_linear_f32" in source
+    assert "BitnetLinearHandle" in source
+    assert "this.handle?.run" in source
+    assert "ensureBitNetWasm()" in source
     assert "packedWeight" in source
     assert "scaleValues" in source
     assert "segmentOffsets" in source
@@ -87,3 +97,9 @@ def test_bitnet_wasm_kernel_has_tiled_simd_surface() -> None:
     assert "dot_packed_row_noquant_simd" in source
     assert "target_feature = \"simd128\"" in source
     assert "f32x4_mul" in source
+    assert "BitnetLinearHandle" in source
+    assert "build_sparse_indices" in source
+    assert "build_row_scales" in source
+    assert "Q4_BYTE_DOT_TABLE" in source
+    assert "q4_linear3_f32" in source
+    assert "F5Q4DiTSession" in source

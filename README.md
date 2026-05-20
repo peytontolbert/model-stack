@@ -112,6 +112,11 @@ MODEL_STACK_MAX_JOBS=4 \
 python setup.py build_ext --inplace
 ```
 
+For the detailed architecture of the Python dispatch layer, native extension
+ABI, CUDA backend families, BitNet packed formats, attention policy, runtime
+flags, and the process for adding new kernels, see
+[docs/custom-kernel-architecture.md](docs/custom-kernel-architecture.md).
+
 ## Runtime Flags
 
 Common dispatch controls:

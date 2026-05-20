@@ -698,8 +698,8 @@ def _coerce_optional_row_scale(
 
 
 def _bitnet_quant_max(bits: int) -> int:
-    if bits < 2:
-        raise ValueError("bits must be >= 2")
+    if bits < 2 or bits > 8:
+        raise ValueError("bits must be in [2, 8]")
     return (1 << (bits - 1)) - 1
 
 
@@ -1476,15 +1476,17 @@ def bitnet_linear_compute_packed(
                 bias_cast,
                 out_dtype,
             )
-    return bitnet_linear(
+    out = bitnet_linear(
         x_cast,
         packed_cast,
         scales_cast,
         header_cast,
         offsets_cast,
         bias_cast,
-        out_dtype=out_dtype,
     )
+    if out_dtype is not None and out.dtype != out_dtype:
+        out = out.to(out_dtype)
+    return out
 
 
 def bitnet_linear_from_float(

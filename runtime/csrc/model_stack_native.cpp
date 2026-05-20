@@ -6525,7 +6525,7 @@ bool TryLoadBitNetModuleState(const py::object& module, BitNetModuleState* state
 }
 
 int64_t BitNetQuantMax(int64_t bits) {
-  TORCH_CHECK(bits >= 2, "BitNet activation quantization bits must be >= 2");
+  TORCH_CHECK(bits >= 2 && bits <= 8, "BitNet activation quantization bits must be in [2, 8]");
   return (static_cast<int64_t>(1) << (bits - 1)) - 1;
 }
 

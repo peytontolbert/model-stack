@@ -63,7 +63,20 @@ inline bool SupportsScaleGranularity(const LayoutInfo& layout) {
 }
 
 inline int BitNetQuantMax(int64_t bits) {
+  TORCH_CHECK(bits >= 2 && bits <= 8, "BitNet activation quant bits must be in [2, 8] (got ", bits, ")");
   return (static_cast<int>(1) << (static_cast<int>(bits) - 1)) - 1;
+}
+
+inline void CheckSameCudaDevice(
+    const torch::Tensor& reference,
+    const torch::Tensor& tensor,
+    const char* context,
+    const char* name) {
+  TORCH_CHECK(tensor.device() == reference.device(),
+              context,
+              ": ",
+              name,
+              " must be on the same CUDA device as x");
 }
 
 template <typename scalar_t>

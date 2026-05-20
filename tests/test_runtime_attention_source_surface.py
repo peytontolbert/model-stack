@@ -248,3 +248,21 @@ def test_decode_fused_dense_qkv_rotary_paged_append_is_guarded() -> None:
     assert "HopperDenseBitNetDecodeFusedAppendMaxCacheLength()" in native_source
     assert "MODEL_STACK_HOPPER_DENSE_DECODE_FUSED_APPEND_MAX_CACHE_LENGTH" in native_source
     assert "bitnet_hopper_dense_decode_fused_append_default_max_cache_length" in native_source
+
+
+def test_bitnet_cuda_entrypoints_reject_unsafe_kernel_inputs() -> None:
+    common_source = _read("runtime/csrc/backend/bitnet/bitnet_common.cuh")
+    formats_source = _read("runtime/csrc/backend/bitnet/bitnet_formats.h")
+    dispatch_source = _read("runtime/csrc/backend/bitnet/bitnet_linear_dispatch.cu")
+    frontend_source = _read("runtime/csrc/backend/bitnet/bitnet_frontend.cu")
+
+    assert "bits >= 2 && bits <= 8" in common_source
+    assert "CheckSameCudaDevice" in common_source
+    assert "tensor.device() == reference.device()" in common_source
+    assert "info.tile_n > 0 && info.tile_k > 0" in formats_source
+    assert "Unsupported bitnet scale_granularity" in formats_source
+    assert "c10::isFloatingType(scale_values.scalar_type())" in formats_source
+    assert 'CheckSameCudaDevice(x, packed_weight, "CudaBitNetLinearForward", "packed_weight")' in dispatch_source
+    assert 'CheckSameCudaDevice(x, segment_offsets, "CudaBitNetLinearFromFloatForward", "segment_offsets")' in dispatch_source
+    assert "CudaBitNetCalibrateInputScaleForward: act_quant_bits must be in [2, 8]" in frontend_source
+    assert 'CheckSameCudaDevice(x, qweight, "CudaBitNetInt8LinearFromFloatRow1Forward", "qweight")' in frontend_source

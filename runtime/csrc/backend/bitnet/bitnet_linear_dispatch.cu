@@ -53,6 +53,10 @@ torch::Tensor CudaBitNetLinearForward(
   TORCH_CHECK(x.dim() >= 2, "CudaBitNetLinearForward: x must have rank >= 2");
   TORCH_CHECK(IsSupportedLinearDtype(x.scalar_type()),
               "CudaBitNetLinearForward: x must use float32, float16, or bfloat16");
+  CheckSameCudaDevice(x, packed_weight, "CudaBitNetLinearForward", "packed_weight");
+  CheckSameCudaDevice(x, scale_values, "CudaBitNetLinearForward", "scale_values");
+  CheckSameCudaDevice(x, layout_header, "CudaBitNetLinearForward", "layout_header");
+  CheckSameCudaDevice(x, segment_offsets, "CudaBitNetLinearForward", "segment_offsets");
 
   c10::cuda::CUDAGuard device_guard(x.device());
 
@@ -137,6 +141,8 @@ torch::Tensor CudaBitNetLinearForwardComputePacked(
   TORCH_CHECK(x.dim() >= 2, "CudaBitNetLinearForwardComputePacked: x must have rank >= 2");
   TORCH_CHECK(IsSupportedLinearDtype(x.scalar_type()),
               "CudaBitNetLinearForwardComputePacked: x must use float32, float16, or bfloat16");
+  CheckSameCudaDevice(x, compute_packed_words, "CudaBitNetLinearForwardComputePacked", "compute_packed_words");
+  CheckSameCudaDevice(x, compute_row_scales, "CudaBitNetLinearForwardComputePacked", "compute_row_scales");
 
   c10::cuda::CUDAGuard device_guard(x.device());
 
@@ -438,6 +444,7 @@ std::vector<torch::Tensor> CudaBitNetAddRmsNormLinearForwardDecodeRows(
               "CudaBitNetAddRmsNormLinearForwardDecodeRows: x and update dtype mismatch");
   TORCH_CHECK(IsSupportedLinearDtype(x.scalar_type()),
               "CudaBitNetAddRmsNormLinearForwardDecodeRows: x must use float32, float16, or bfloat16");
+  CheckSameCudaDevice(x, update, "CudaBitNetAddRmsNormLinearForwardDecodeRows", "update");
   TORCH_CHECK(std::isfinite(residual_scale),
               "CudaBitNetAddRmsNormLinearForwardDecodeRows: residual_scale must be finite");
   TORCH_CHECK(std::isfinite(eps) && eps > 0.0,
@@ -595,6 +602,9 @@ torch::Tensor CudaBitNetRmsNormLinearForwardRow1(
   TORCH_CHECK(x.dim() >= 2, "CudaBitNetRmsNormLinearForwardRow1: x must have rank >= 2");
   TORCH_CHECK(IsSupportedLinearDtype(x.scalar_type()),
               "CudaBitNetRmsNormLinearForwardRow1: x must use float32, float16, or bfloat16");
+  CheckSameCudaDevice(x, decode_nz_masks, "CudaBitNetRmsNormLinearForwardRow1", "decode_nz_masks");
+  CheckSameCudaDevice(x, decode_sign_masks, "CudaBitNetRmsNormLinearForwardRow1", "decode_sign_masks");
+  CheckSameCudaDevice(x, decode_row_scales, "CudaBitNetRmsNormLinearForwardRow1", "decode_row_scales");
   TORCH_CHECK(std::isfinite(eps) && eps > 0.0,
               "CudaBitNetRmsNormLinearForwardRow1: eps must be positive and finite");
 
@@ -706,6 +716,10 @@ std::vector<torch::Tensor> CudaBitNetAddRmsNormLinearForwardRow1(
               "CudaBitNetAddRmsNormLinearForwardRow1: x and update dtype mismatch");
   TORCH_CHECK(IsSupportedLinearDtype(x.scalar_type()),
               "CudaBitNetAddRmsNormLinearForwardRow1: x must use float32, float16, or bfloat16");
+  CheckSameCudaDevice(x, update, "CudaBitNetAddRmsNormLinearForwardRow1", "update");
+  CheckSameCudaDevice(x, decode_nz_masks, "CudaBitNetAddRmsNormLinearForwardRow1", "decode_nz_masks");
+  CheckSameCudaDevice(x, decode_sign_masks, "CudaBitNetAddRmsNormLinearForwardRow1", "decode_sign_masks");
+  CheckSameCudaDevice(x, decode_row_scales, "CudaBitNetAddRmsNormLinearForwardRow1", "decode_row_scales");
   TORCH_CHECK(std::isfinite(residual_scale),
               "CudaBitNetAddRmsNormLinearForwardRow1: residual_scale must be finite");
   TORCH_CHECK(std::isfinite(eps) && eps > 0.0,
@@ -829,6 +843,10 @@ torch::Tensor CudaBitNetLinearFromFloatForward(
   TORCH_CHECK(x.dim() >= 2, "CudaBitNetLinearFromFloatForward: x must have rank >= 2");
   TORCH_CHECK(IsSupportedLinearDtype(x.scalar_type()),
               "CudaBitNetLinearFromFloatForward: x must use float32, float16, or bfloat16");
+  CheckSameCudaDevice(x, packed_weight, "CudaBitNetLinearFromFloatForward", "packed_weight");
+  CheckSameCudaDevice(x, scale_values, "CudaBitNetLinearFromFloatForward", "scale_values");
+  CheckSameCudaDevice(x, layout_header, "CudaBitNetLinearFromFloatForward", "layout_header");
+  CheckSameCudaDevice(x, segment_offsets, "CudaBitNetLinearFromFloatForward", "segment_offsets");
 
   c10::cuda::CUDAGuard device_guard(x.device());
 

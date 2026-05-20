@@ -467,7 +467,8 @@ torch::Tensor CudaBitNetCalibrateInputScaleForward(
   TORCH_CHECK(IsSupportedLinearDtype(x.scalar_type()),
               "CudaBitNetCalibrateInputScaleForward: x must use float32, float16, or bfloat16");
   TORCH_CHECK(x.dim() >= 1, "CudaBitNetCalibrateInputScaleForward: x must have rank >= 1");
-  TORCH_CHECK(act_quant_bits >= 2, "CudaBitNetCalibrateInputScaleForward: act_quant_bits must be >= 2");
+  TORCH_CHECK(act_quant_bits >= 2 && act_quant_bits <= 8,
+              "CudaBitNetCalibrateInputScaleForward: act_quant_bits must be in [2, 8]");
 
   c10::cuda::CUDAGuard device_guard{x.device()};
   const auto cols = x.size(-1);
@@ -544,7 +545,8 @@ torch::Tensor CudaBitNetTransformInputForward(
   const bool apply_quant = !(mode_name.empty() || mode_name == "none" || mode_name == "off");
   c10::optional<torch::Tensor> provided_scale = c10::nullopt;
   if (apply_quant) {
-    TORCH_CHECK(act_quant_bits >= 2, "CudaBitNetTransformInputForward: act_quant_bits must be >= 2");
+    TORCH_CHECK(act_quant_bits >= 2 && act_quant_bits <= 8,
+                "CudaBitNetTransformInputForward: act_quant_bits must be in [2, 8]");
     if (mode_name == "static_int8") {
       TORCH_CHECK(act_scale.has_value() && act_scale.value().defined(),
                   "CudaBitNetTransformInputForward: static_int8 requires act_scale");
@@ -808,6 +810,8 @@ torch::Tensor CudaBitNetInt8LinearFromFloatRow1Forward(
   TORCH_CHECK(x.dim() >= 2, "CudaBitNetInt8LinearFromFloatRow1Forward: x must have rank >= 2");
   TORCH_CHECK(qweight.is_cuda() && inv_scale.is_cuda(),
               "CudaBitNetInt8LinearFromFloatRow1Forward: qweight and inv_scale must be CUDA tensors");
+  CheckSameCudaDevice(x, qweight, "CudaBitNetInt8LinearFromFloatRow1Forward", "qweight");
+  CheckSameCudaDevice(x, inv_scale, "CudaBitNetInt8LinearFromFloatRow1Forward", "inv_scale");
   TORCH_CHECK(qweight.scalar_type() == torch::kInt8,
               "CudaBitNetInt8LinearFromFloatRow1Forward: qweight must use int8 storage");
   TORCH_CHECK(inv_scale.scalar_type() == torch::kFloat32,
