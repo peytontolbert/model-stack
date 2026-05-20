@@ -65,6 +65,52 @@ async function fetchBuffer(url, label = "binary asset") {
   }
 }
 
+async function fetchChunkedBuffer(baseUrl, chunks, label = "chunked binary asset", expectedBytes = null) {
+  const chunkList = chunks.map((chunk) => (typeof chunk === "string" ? { path: chunk } : chunk));
+  const totalBytes = Number.isFinite(Number(expectedBytes)) ? Number(expectedBytes) : null;
+  if (totalBytes !== null) {
+    const output = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (let i = 0; i < chunkList.length; i += 1) {
+      const chunk = chunkList[i];
+      const path = chunk.path || chunk.file || chunk.url;
+      if (!path) {
+        throw new Error(`${label} has chunk ${i} without a path`);
+      }
+      const bytes = new Uint8Array(await fetchBuffer(resolveUrl(path, baseUrl), `${label} chunk ${i + 1}/${chunkList.length}`));
+      if (offset + bytes.byteLength > output.byteLength) {
+        throw new Error(`${label} exceeded expected byte length ${totalBytes}`);
+      }
+      output.set(bytes, offset);
+      offset += bytes.byteLength;
+    }
+    if (offset !== output.byteLength) {
+      throw new Error(`${label} expected ${output.byteLength} bytes but loaded ${offset}`);
+    }
+    return output.buffer;
+  }
+
+  const loaded = [];
+  let total = 0;
+  for (let i = 0; i < chunkList.length; i += 1) {
+    const chunk = chunkList[i];
+    const path = chunk.path || chunk.file || chunk.url;
+    if (!path) {
+      throw new Error(`${label} has chunk ${i} without a path`);
+    }
+    const bytes = new Uint8Array(await fetchBuffer(resolveUrl(path, baseUrl), `${label} chunk ${i + 1}/${chunkList.length}`));
+    loaded.push(bytes);
+    total += bytes.byteLength;
+  }
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const bytes of loaded) {
+    output.set(bytes, offset);
+    offset += bytes.byteLength;
+  }
+  return output.buffer;
+}
+
 function xhrArrayBuffer(url) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
@@ -137,7 +183,9 @@ export class Q4TensorBundleWASM {
       ensureQ4Wasm(),
       fetchJson(resolveUrl(manifest.files.q4_index, baseUrl), "Q4 tensor index"),
       fetchJson(resolveUrl(manifest.files.dense_index, baseUrl), "dense tensor index"),
-      fetchBuffer(resolveUrl(manifest.files.q4, baseUrl), "Q4 tensor buffer"),
+      Array.isArray(manifest.files.q4_chunks)
+        ? fetchChunkedBuffer(baseUrl, manifest.files.q4_chunks, "Q4 tensor buffer", manifest.files.q4_nbytes)
+        : fetchBuffer(resolveUrl(manifest.files.q4, baseUrl), "Q4 tensor buffer"),
       fetchBuffer(resolveUrl(manifest.files.dense, baseUrl), "dense tensor buffer"),
     ]);
     return new Q4TensorBundleWASM({ manifest, q4Index, denseIndex, q4Buffer, denseBuffer, wasm });
