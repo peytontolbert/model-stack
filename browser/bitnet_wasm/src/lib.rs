@@ -1883,31 +1883,34 @@ fn attention_impl_kv_head_major(
                 }
                 continue;
             }
-            for qi in 0..q_len {
-                let mut max_score = f32::NEG_INFINITY;
-                let q_base = qi * model_dim + head * head_dim;
-                for kj in 0..kv_len {
-                    let k_base = head_base + kj * head_dim;
-                    let score = dot_scaled_64(&q[q_base..q_base + 64], &k_head[k_base..k_base + 64], scale);
-                    scores[kj] = score;
-                    if score > max_score {
-                        max_score = score;
+            #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+            {
+                for qi in 0..q_len {
+                    let mut max_score = f32::NEG_INFINITY;
+                    let q_base = qi * model_dim + head * head_dim;
+                    for kj in 0..kv_len {
+                        let k_base = head_base + kj * head_dim;
+                        let score = dot_scaled_64(&q[q_base..q_base + 64], &k_head[k_base..k_base + 64], scale);
+                        scores[kj] = score;
+                        if score > max_score {
+                            max_score = score;
+                        }
                     }
-                }
-                let mut denom = 0.0f32;
-                for score in scores.iter_mut().take(kv_len) {
-                    *score = (*score - max_score).exp();
-                    denom += *score;
-                }
-                let denom = denom.max(1.0e-20);
-                let out_base = qi * model_dim + head * head_dim;
-                for kj in 0..kv_len {
-                    let v_base = head_base + kj * head_dim;
-                    add_weighted_64(
-                        &mut output[out_base..out_base + 64],
-                        &v_head[v_base..v_base + 64],
-                        scores[kj] / denom,
-                    );
+                    let mut denom = 0.0f32;
+                    for score in scores.iter_mut().take(kv_len) {
+                        *score = (*score - max_score).exp();
+                        denom += *score;
+                    }
+                    let denom = denom.max(1.0e-20);
+                    let out_base = qi * model_dim + head * head_dim;
+                    for kj in 0..kv_len {
+                        let v_base = head_base + kj * head_dim;
+                        add_weighted_64(
+                            &mut output[out_base..out_base + 64],
+                            &v_head[v_base..v_base + 64],
+                            scores[kj] / denom,
+                        );
+                    }
                 }
             }
         }
