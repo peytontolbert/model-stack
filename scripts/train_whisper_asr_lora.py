@@ -146,7 +146,12 @@ def load_training_dataset(
     datasets = []
     for spec in specs:
         name, config, split, text_column = parse_dataset_spec(spec)
-        dataset = load_dataset(name, config, split=split) if config else load_dataset(name, split=split)
+        if name == "parquet":
+            if not config:
+                raise ValueError("Parquet specs must be parquet:/path/file.parquet:split:text_column")
+            dataset = load_dataset("parquet", data_files=config, split=split)
+        else:
+            dataset = load_dataset(name, config, split=split) if config else load_dataset(name, split=split)
         if "audio" not in dataset.column_names:
             raise ValueError(f"{spec} does not include an 'audio' column")
         if text_column not in dataset.column_names:
