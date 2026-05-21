@@ -550,6 +550,92 @@ unsafe fn add_weighted_64_simd(output: &mut [f32], values: &[f32], weight: f32) 
     }
 }
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[target_feature(enable = "simd128")]
+unsafe fn dot4_queries_scaled_64_simd(
+    q0: *const f32,
+    q1: *const f32,
+    q2: *const f32,
+    q3: *const f32,
+    k: *const f32,
+    scale: f32,
+) -> [f32; 4] {
+    use core::arch::wasm32::*;
+
+    let mut s0 = f32x4_splat(0.0);
+    let mut s1 = f32x4_splat(0.0);
+    let mut s2 = f32x4_splat(0.0);
+    let mut s3 = f32x4_splat(0.0);
+    let mut i = 0usize;
+    while i + 7 < 64 {
+        let kv = v128_load(k.add(i) as *const v128);
+        let kv_next = v128_load(k.add(i + 4) as *const v128);
+        let q0v = v128_load(q0.add(i) as *const v128);
+        let q1v = v128_load(q1.add(i) as *const v128);
+        let q2v = v128_load(q2.add(i) as *const v128);
+        let q3v = v128_load(q3.add(i) as *const v128);
+        let q0n = v128_load(q0.add(i + 4) as *const v128);
+        let q1n = v128_load(q1.add(i + 4) as *const v128);
+        let q2n = v128_load(q2.add(i + 4) as *const v128);
+        let q3n = v128_load(q3.add(i + 4) as *const v128);
+        s0 = f32x4_add(f32x4_add(s0, f32x4_mul(q0v, kv)), f32x4_mul(q0n, kv_next));
+        s1 = f32x4_add(f32x4_add(s1, f32x4_mul(q1v, kv)), f32x4_mul(q1n, kv_next));
+        s2 = f32x4_add(f32x4_add(s2, f32x4_mul(q2v, kv)), f32x4_mul(q2n, kv_next));
+        s3 = f32x4_add(f32x4_add(s3, f32x4_mul(q3v, kv)), f32x4_mul(q3n, kv_next));
+        i += 8;
+    }
+    [
+        (f32x4_extract_lane::<0>(s0) + f32x4_extract_lane::<1>(s0) + f32x4_extract_lane::<2>(s0) + f32x4_extract_lane::<3>(s0)) * scale,
+        (f32x4_extract_lane::<0>(s1) + f32x4_extract_lane::<1>(s1) + f32x4_extract_lane::<2>(s1) + f32x4_extract_lane::<3>(s1)) * scale,
+        (f32x4_extract_lane::<0>(s2) + f32x4_extract_lane::<1>(s2) + f32x4_extract_lane::<2>(s2) + f32x4_extract_lane::<3>(s2)) * scale,
+        (f32x4_extract_lane::<0>(s3) + f32x4_extract_lane::<1>(s3) + f32x4_extract_lane::<2>(s3) + f32x4_extract_lane::<3>(s3)) * scale,
+    ]
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[target_feature(enable = "simd128")]
+unsafe fn add_weighted_64_four_simd(
+    output: *mut f32,
+    out0: usize,
+    out1: usize,
+    out2: usize,
+    out3: usize,
+    values: *const f32,
+    w0: f32,
+    w1: f32,
+    w2: f32,
+    w3: f32,
+) {
+    use core::arch::wasm32::*;
+
+    let ww0 = f32x4_splat(w0);
+    let ww1 = f32x4_splat(w1);
+    let ww2 = f32x4_splat(w2);
+    let ww3 = f32x4_splat(w3);
+    let mut i = 0usize;
+    while i + 7 < 64 {
+        let v = v128_load(values.add(i) as *const v128);
+        let v_next = v128_load(values.add(i + 4) as *const v128);
+        let o0 = output.add(out0 + i);
+        let o1 = output.add(out1 + i);
+        let o2 = output.add(out2 + i);
+        let o3 = output.add(out3 + i);
+        let o0_next = output.add(out0 + i + 4);
+        let o1_next = output.add(out1 + i + 4);
+        let o2_next = output.add(out2 + i + 4);
+        let o3_next = output.add(out3 + i + 4);
+        v128_store(o0 as *mut v128, f32x4_add(v128_load(o0 as *const v128), f32x4_mul(ww0, v)));
+        v128_store(o1 as *mut v128, f32x4_add(v128_load(o1 as *const v128), f32x4_mul(ww1, v)));
+        v128_store(o2 as *mut v128, f32x4_add(v128_load(o2 as *const v128), f32x4_mul(ww2, v)));
+        v128_store(o3 as *mut v128, f32x4_add(v128_load(o3 as *const v128), f32x4_mul(ww3, v)));
+        v128_store(o0_next as *mut v128, f32x4_add(v128_load(o0_next as *const v128), f32x4_mul(ww0, v_next)));
+        v128_store(o1_next as *mut v128, f32x4_add(v128_load(o1_next as *const v128), f32x4_mul(ww1, v_next)));
+        v128_store(o2_next as *mut v128, f32x4_add(v128_load(o2_next as *const v128), f32x4_mul(ww2, v_next)));
+        v128_store(o3_next as *mut v128, f32x4_add(v128_load(o3_next as *const v128), f32x4_mul(ww3, v_next)));
+        i += 8;
+    }
+}
+
 fn apply_rotary_one(q: &mut [f32], k: &mut [f32], position: usize, n_heads: usize, head_dim: usize, base_theta: f32) {
     if base_theta <= 0.0 || head_dim % 2 != 0 {
         return;
