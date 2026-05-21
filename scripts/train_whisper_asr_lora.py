@@ -221,6 +221,41 @@ def filter_transcript_quality(
     return dataset.filter(keep, desc="Filtering transcript quality")
 
 
+def mix_with_offset(base: np.ndarray, overlay: np.ndarray, *, rng: np.random.Generator) -> np.ndarray:
+    if len(base) == 0 or len(overlay) == 0:
+        return base
+    output = base.copy()
+    if len(overlay) > len(output):
+        start = int(rng.integers(0, len(overlay) - len(output) + 1))
+        output += overlay[start : start + len(output)]
+        return output
+    start = int(rng.integers(0, len(output) - len(overlay) + 1))
+    output[start : start + len(overlay)] += overlay
+    return output
+
+
+def apply_train_audio_augmentation(
+    audio_array: np.ndarray,
+    *,
+    rng: np.random.Generator,
+    gain_db_min: float,
+    gain_db_max: float,
+    noise_prob: float,
+    noise_snr_db_min: float,
+    noise_snr_db_max: float,
+) -> np.ndarray:
+    augmented = audio_array.astype(np.float32, copy=True)
+    if gain_db_min != 0.0 or gain_db_max != 0.0:
+        gain_db = float(rng.uniform(gain_db_min, gain_db_max))
+        augmented *= float(10 ** (gain_db / 20.0))
+    if noise_prob > 0 and rng.random() < noise_prob and len(augmented) > 0:
+        signal_rms = float(np.sqrt(np.mean(np.square(augmented))) + 1e-8)
+        snr_db = float(rng.uniform(noise_snr_db_min, noise_snr_db_max))
+        noise_rms = signal_rms / float(10 ** (snr_db / 20.0))
+        augmented += rng.normal(0.0, noise_rms, size=augmented.shape).astype(np.float32)
+    return np.clip(augmented, -1.0, 1.0)
+
+
 @dataclass
 class WhisperDataCollator:
     processor: Any
@@ -328,6 +363,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-label-length", type=int, default=192)
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--train-gain-db-min", type=float, default=0.0)
+    parser.add_argument("--train-gain-db-max", type=float, default=0.0)
+    parser.add_argument("--train-noise-prob", type=float, default=0.0)
+    parser.add_argument("--train-noise-snr-db-min", type=float, default=18.0)
+    parser.add_argument("--train-noise-snr-db-max", type=float, default=30.0)
+    parser.add_argument("--train-overlap-prob", type=float, default=0.0)
+    parser.add_argument("--train-overlap-gain-db-min", type=float, default=-18.0)
+    parser.add_argument("--train-overlap-gain-db-max", type=float, default=-8.0)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument(
         "--eval-only",
@@ -403,9 +446,31 @@ def main() -> None:
         eval_split = split["test"]
     processor = AutoProcessor.from_pretrained(args.model)
 
-    def prepare(example):
+    def prepare(example, index=None, *, augment: bool = False):
         audio = example["audio"]
         audio_array = np.asarray(audio["array"], dtype=np.float32)
+        if augment and index is not None:
+            rng = np.random.default_rng(args.seed + int(index))
+            if args.train_overlap_prob > 0 and rng.random() < args.train_overlap_prob and len(train_split) > 1:
+                overlay_index = int(rng.integers(0, len(train_split) - 1))
+                if overlay_index >= int(index):
+                    overlay_index += 1
+                overlay_example = train_split[overlay_index]["audio"]
+                overlay = np.asarray(overlay_example["array"], dtype=np.float32)
+                overlay_gain_db = float(
+                    rng.uniform(args.train_overlap_gain_db_min, args.train_overlap_gain_db_max)
+                )
+                overlay *= float(10 ** (overlay_gain_db / 20.0))
+                audio_array = mix_with_offset(audio_array, overlay, rng=rng)
+            audio_array = apply_train_audio_augmentation(
+                audio_array,
+                rng=rng,
+                gain_db_min=args.train_gain_db_min,
+                gain_db_max=args.train_gain_db_max,
+                noise_prob=args.train_noise_prob,
+                noise_snr_db_min=args.train_noise_snr_db_min,
+                noise_snr_db_max=args.train_noise_snr_db_max,
+            )
         if len(audio_array) < 480:
             audio_array = np.pad(audio_array, (0, 480 - len(audio_array)))
         features = processor.feature_extractor(
@@ -423,12 +488,13 @@ def main() -> None:
         }
 
     train_dataset = train_split.map(
-        prepare,
+        lambda example, index: prepare(example, index, augment=True),
+        with_indices=True,
         remove_columns=train_split.column_names,
         desc="Preparing train audio",
     )
     eval_dataset = eval_split.map(
-        prepare,
+        lambda example: prepare(example, augment=False),
         remove_columns=eval_split.column_names,
         desc="Preparing eval audio",
     )
