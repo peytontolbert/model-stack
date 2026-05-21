@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 import numpy as np
-from datasets import Audio, concatenate_datasets, load_dataset
+from datasets import Audio, Dataset, concatenate_datasets, load_dataset
 from peft import LoraConfig, get_peft_model
 from transformers import (
     AutoModelForSpeechSeq2Seq,
@@ -48,34 +48,177 @@ def parse_dataset_spec(spec: str) -> tuple[str, str | None, str, str]:
     if len(parts) == 3:
         name, split, text_column = parts
         return name, None, split, text_column
-    if len(parts) == 4:
-        name, config, split, text_column = parts
+    if len(parts) >= 4:
+        name = parts[0]
+        config = parts[1]
+        split = ":".join(parts[2:-1])
+        text_column = parts[-1]
         return name, config or None, split, text_column
     raise ValueError(
         "Dataset spec must be name:split:text_column or name:config:split:text_column"
     )
 
 
-def load_training_dataset(specs: list[str], *, limit_per_dataset: int, sample_rate: int):
+def build_conversation_windows(
+    dataset,
+    *,
+    group_columns: list[str],
+    max_duration_seconds: float,
+    max_gap_seconds: float,
+    min_words: int,
+    sample_rate: int,
+):
+    if max_duration_seconds <= 0:
+        return dataset
+    if "begin_time" not in dataset.column_names or "end_time" not in dataset.column_names:
+        return dataset
+    existing_group_columns = [column for column in group_columns if column in dataset.column_names]
+
+    def sort_key(index: int):
+        row = dataset[index]
+        group = tuple(str(row.get(column, "")) for column in existing_group_columns)
+        return (*group, float(row["begin_time"] or 0), float(row["end_time"] or 0))
+
+    rows = []
+    active_group = None
+    active_audio: list[np.ndarray] = []
+    active_text: list[str] = []
+    active_duration = 0.0
+    active_end = 0.0
+
+    def flush() -> None:
+        nonlocal active_audio, active_text, active_duration
+        text = " ".join(piece.strip() for piece in active_text if piece.strip()).strip()
+        if active_audio and len(text.split()) >= min_words:
+            audio_array = np.concatenate(active_audio).astype(np.float32)
+            rows.append(
+                {
+                    "audio": {"array": audio_array, "sampling_rate": sample_rate},
+                    "text": text,
+                }
+            )
+        active_audio = []
+        active_text = []
+        active_duration = 0.0
+
+    for index in sorted(range(len(dataset)), key=sort_key):
+        row = dataset[index]
+        group = tuple(str(row.get(column, "")) for column in existing_group_columns)
+        begin = float(row["begin_time"] or 0)
+        end = float(row["end_time"] or begin)
+        audio = row["audio"]
+        audio_array = np.asarray(audio["array"], dtype=np.float32)
+        duration = len(audio_array) / float(audio.get("sampling_rate") or sample_rate)
+        gap = max(0.0, begin - active_end) if active_audio else 0.0
+        should_flush = (
+            bool(active_audio)
+            and (
+                group != active_group
+                or gap > max_gap_seconds
+                or active_duration + min(gap, max_gap_seconds) + duration > max_duration_seconds
+            )
+        )
+        if should_flush:
+            flush()
+        if active_audio and gap > 0:
+            active_audio.append(np.zeros(int(min(gap, max_gap_seconds) * sample_rate), dtype=np.float32))
+            active_duration += min(gap, max_gap_seconds)
+        active_group = group
+        active_audio.append(audio_array)
+        active_text.append(str(row["text"] or ""))
+        active_duration += duration
+        active_end = end
+    flush()
+    return Dataset.from_list(rows)
+
+
+def load_training_dataset(
+    specs: list[str],
+    *,
+    limit_per_dataset: int,
+    sample_rate: int,
+    shuffle_seed: int,
+    conversation_window_seconds: float,
+    conversation_window_gap_seconds: float,
+    conversation_window_group_columns: list[str],
+    conversation_window_min_words: int,
+):
     datasets = []
     for spec in specs:
         name, config, split, text_column = parse_dataset_spec(spec)
         dataset = load_dataset(name, config, split=split) if config else load_dataset(name, split=split)
-        if limit_per_dataset > 0:
-            dataset = dataset.select(range(min(limit_per_dataset, len(dataset))))
         if "audio" not in dataset.column_names:
             raise ValueError(f"{spec} does not include an 'audio' column")
         if text_column not in dataset.column_names:
             raise ValueError(f"{spec} does not include text column {text_column!r}")
+        if limit_per_dataset > 0 and conversation_window_seconds <= 0:
+            dataset = dataset.shuffle(seed=shuffle_seed).select(
+                range(min(limit_per_dataset, len(dataset)))
+            )
         dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
-        keep = {"audio", text_column}
-        dataset = dataset.remove_columns([column for column in dataset.column_names if column not in keep])
         if text_column != "text":
             dataset = dataset.rename_column(text_column, "text")
+        dataset = build_conversation_windows(
+            dataset,
+            group_columns=conversation_window_group_columns,
+            max_duration_seconds=conversation_window_seconds,
+            max_gap_seconds=conversation_window_gap_seconds,
+            min_words=conversation_window_min_words,
+            sample_rate=sample_rate,
+        )
+        if limit_per_dataset > 0 and conversation_window_seconds > 0:
+            dataset = dataset.shuffle(seed=shuffle_seed).select(
+                range(min(limit_per_dataset, len(dataset)))
+            )
+        keep = {"audio", "text"}
+        dataset = dataset.remove_columns([column for column in dataset.column_names if column not in keep])
+        dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
         datasets.append(dataset)
     if not datasets:
         raise ValueError("At least one dataset is required")
     return datasets[0] if len(datasets) == 1 else concatenate_datasets(datasets)
+
+
+def filter_transcript_quality(
+    dataset,
+    *,
+    sample_rate: int,
+    min_words: int,
+    min_duration_seconds: float,
+    max_duration_seconds: float,
+    min_chars_per_second: float,
+    max_chars_per_second: float,
+):
+    if (
+        min_words <= 0
+        and min_duration_seconds <= 0
+        and max_duration_seconds <= 0
+        and min_chars_per_second <= 0
+        and max_chars_per_second <= 0
+    ):
+        return dataset
+
+    def keep(example):
+        text = str(example["text"] or "").strip()
+        word_count = len(text.split())
+        if word_count < min_words:
+            return False
+        audio = example["audio"]
+        duration_seconds = len(audio["array"]) / float(audio.get("sampling_rate") or sample_rate)
+        if duration_seconds <= 0:
+            return False
+        if min_duration_seconds > 0 and duration_seconds < min_duration_seconds:
+            return False
+        if max_duration_seconds > 0 and duration_seconds > max_duration_seconds:
+            return False
+        chars_per_second = len(text) / duration_seconds
+        if min_chars_per_second > 0 and chars_per_second < min_chars_per_second:
+            return False
+        if max_chars_per_second > 0 and chars_per_second > max_chars_per_second:
+            return False
+        return True
+
+    return dataset.filter(keep, desc="Filtering transcript quality")
 
 
 @dataclass
@@ -100,7 +243,17 @@ def evaluate_samples(model, processor, dataset, *, max_eval_samples: int, max_ne
         dtype = next(model.parameters()).dtype
         inputs = torch.tensor(example["input_features"], dtype=dtype).unsqueeze(0).to(model.device)
         with torch.inference_mode():
-            predicted = model.generate(inputs, max_new_tokens=max_new_tokens)
+            predicted = model.generate(
+                inputs,
+                max_new_tokens=max_new_tokens,
+                num_beams=1,
+                do_sample=False,
+                temperature=0.0,
+                condition_on_prev_tokens=False,
+                compression_ratio_threshold=2.4,
+                logprob_threshold=-1.0,
+                no_speech_threshold=0.6,
+            )
         hypothesis = processor.batch_decode(predicted, skip_special_tokens=True)[0]
         label_ids = [token for token in example["labels"] if token != -100]
         reference = processor.tokenizer.decode(label_ids, skip_special_tokens=True)
@@ -142,6 +295,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-limit-per-dataset", type=int, default=0)
     parser.add_argument("--eval-size", type=int, default=64)
     parser.add_argument("--eval-samples", type=int, default=32)
+    parser.add_argument("--min-words", type=int, default=0)
+    parser.add_argument("--min-duration-seconds", type=float, default=0.0)
+    parser.add_argument("--max-duration-seconds", type=float, default=0.0)
+    parser.add_argument("--min-chars-per-second", type=float, default=0.0)
+    parser.add_argument("--max-chars-per-second", type=float, default=0.0)
+    parser.add_argument(
+        "--conversation-window-seconds",
+        type=float,
+        default=0.0,
+        help="Join timestamped adjacent utterances into ASR windows up to this duration.",
+    )
+    parser.add_argument("--conversation-window-gap-seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--conversation-window-group-columns",
+        default="meeting_id,microphone_id",
+        help="Comma-separated metadata columns that must match when joining utterances.",
+    )
+    parser.add_argument("--conversation-window-min-words", type=int, default=8)
     parser.add_argument("--sample-rate", type=int, default=16_000)
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -150,9 +321,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--lora-target-modules",
+        default="q_proj,v_proj",
+        help="Comma-separated module names for LoRA injection.",
+    )
     parser.add_argument("--max-label-length", type=int, default=192)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Evaluate the base model on the prepared eval split without LoRA training.",
+    )
+    parser.add_argument(
+        "--selection-seed",
+        type=int,
+        default=17,
+        help="Seed used when shuffling before per-dataset row limits.",
+    )
     return parser.parse_args()
 
 
@@ -163,6 +350,24 @@ def main() -> None:
         args.dataset,
         limit_per_dataset=args.limit_per_dataset,
         sample_rate=args.sample_rate,
+        shuffle_seed=args.selection_seed,
+        conversation_window_seconds=args.conversation_window_seconds,
+        conversation_window_gap_seconds=args.conversation_window_gap_seconds,
+        conversation_window_group_columns=[
+            column.strip()
+            for column in args.conversation_window_group_columns.split(",")
+            if column.strip()
+        ],
+        conversation_window_min_words=args.conversation_window_min_words,
+    )
+    dataset = filter_transcript_quality(
+        dataset,
+        sample_rate=args.sample_rate,
+        min_words=args.min_words,
+        min_duration_seconds=args.min_duration_seconds,
+        max_duration_seconds=args.max_duration_seconds,
+        min_chars_per_second=args.min_chars_per_second,
+        max_chars_per_second=args.max_chars_per_second,
     )
     if args.eval_dataset:
         train_split = dataset
@@ -170,6 +375,24 @@ def main() -> None:
             args.eval_dataset,
             limit_per_dataset=args.eval_limit_per_dataset or args.eval_size,
             sample_rate=args.sample_rate,
+            shuffle_seed=args.selection_seed + 1,
+            conversation_window_seconds=args.conversation_window_seconds,
+            conversation_window_gap_seconds=args.conversation_window_gap_seconds,
+            conversation_window_group_columns=[
+                column.strip()
+                for column in args.conversation_window_group_columns.split(",")
+                if column.strip()
+            ],
+            conversation_window_min_words=args.conversation_window_min_words,
+        )
+        eval_split = filter_transcript_quality(
+            eval_split,
+            sample_rate=args.sample_rate,
+            min_words=args.min_words,
+            min_duration_seconds=args.min_duration_seconds,
+            max_duration_seconds=args.max_duration_seconds,
+            min_chars_per_second=args.min_chars_per_second,
+            max_chars_per_second=args.max_chars_per_second,
         )
     else:
         split = dataset.train_test_split(
@@ -221,7 +444,11 @@ def main() -> None:
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         bias="none",
-        target_modules=["q_proj", "v_proj"],
+        target_modules=[
+            module.strip()
+            for module in args.lora_target_modules.split(",")
+            if module.strip()
+        ],
     )
     model = get_peft_model(model, lora)
     model.print_trainable_parameters()
@@ -256,6 +483,19 @@ def main() -> None:
         max_eval_samples=min(args.eval_samples, len(eval_dataset)),
         max_new_tokens=args.max_new_tokens,
     )
+    if args.eval_only:
+        print(
+            json.dumps(
+                {
+                    "output_dir": None,
+                    "merged_output_dir": None,
+                    "before": before,
+                    "after": before,
+                },
+                indent=2,
+            )
+        )
+        return
     trainer.train()
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
