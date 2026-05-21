@@ -131,9 +131,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune Whisper ASR with LoRA adapters.")
     parser.add_argument("--model", default="openai/whisper-small.en")
     parser.add_argument("--dataset", action="append", required=True)
+    parser.add_argument(
+        "--eval-dataset",
+        action="append",
+        help="Optional held-out dataset spec. Uses a train/test split from --dataset when omitted.",
+    )
     parser.add_argument("--output-dir", default="/data/model/bddy-whisper-asr-lora")
+    parser.add_argument("--merged-output-dir", default="")
     parser.add_argument("--limit-per-dataset", type=int, default=600)
+    parser.add_argument("--eval-limit-per-dataset", type=int, default=0)
     parser.add_argument("--eval-size", type=int, default=64)
+    parser.add_argument("--eval-samples", type=int, default=32)
     parser.add_argument("--sample-rate", type=int, default=16_000)
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -156,10 +164,20 @@ def main() -> None:
         limit_per_dataset=args.limit_per_dataset,
         sample_rate=args.sample_rate,
     )
-    split = dataset.train_test_split(
-        test_size=min(args.eval_size, max(1, len(dataset) // 5)),
-        seed=args.seed,
-    )
+    if args.eval_dataset:
+        train_split = dataset
+        eval_split = load_training_dataset(
+            args.eval_dataset,
+            limit_per_dataset=args.eval_limit_per_dataset or args.eval_size,
+            sample_rate=args.sample_rate,
+        )
+    else:
+        split = dataset.train_test_split(
+            test_size=min(args.eval_size, max(1, len(dataset) // 5)),
+            seed=args.seed,
+        )
+        train_split = split["train"]
+        eval_split = split["test"]
     processor = AutoProcessor.from_pretrained(args.model)
 
     def prepare(example):
@@ -181,14 +199,14 @@ def main() -> None:
             "labels": labels,
         }
 
-    train_dataset = split["train"].map(
+    train_dataset = train_split.map(
         prepare,
-        remove_columns=split["train"].column_names,
+        remove_columns=train_split.column_names,
         desc="Preparing train audio",
     )
-    eval_dataset = split["test"].map(
+    eval_dataset = eval_split.map(
         prepare,
-        remove_columns=split["test"].column_names,
+        remove_columns=eval_split.column_names,
         desc="Preparing eval audio",
     )
 
@@ -235,20 +253,36 @@ def main() -> None:
         model,
         processor,
         eval_dataset,
-        max_eval_samples=min(16, len(eval_dataset)),
+        max_eval_samples=min(args.eval_samples, len(eval_dataset)),
         max_new_tokens=args.max_new_tokens,
     )
     trainer.train()
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
+    merged_output_dir = args.merged_output_dir
+    if merged_output_dir:
+        merged_model = model.merge_and_unload()
+        merged_model.save_pretrained(merged_output_dir, safe_serialization=True)
+        processor.save_pretrained(merged_output_dir)
+        model = merged_model
     after = evaluate_samples(
         model,
         processor,
         eval_dataset,
-        max_eval_samples=min(32, len(eval_dataset)),
+        max_eval_samples=min(args.eval_samples, len(eval_dataset)),
         max_new_tokens=args.max_new_tokens,
     )
-    print(json.dumps({"output_dir": args.output_dir, "before": before, "after": after}, indent=2))
+    print(
+        json.dumps(
+            {
+                "output_dir": args.output_dir,
+                "merged_output_dir": merged_output_dir or None,
+                "before": before,
+                "after": after,
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
