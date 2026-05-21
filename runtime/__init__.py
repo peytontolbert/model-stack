@@ -230,6 +230,18 @@ _EXPORTS = {
     "resolve_linear_backend": "runtime.native",
     "runtime_info": "runtime.native",
     "runtime_status": "runtime.native",
+    "AsrAudioChunk": "runtime.asr",
+    "AsrDecodeOptions": "runtime.asr",
+    "AsrDecodeState": "runtime.asr",
+    "AsrFeatureConfig": "runtime.asr",
+    "AsrRuntime": "runtime.asr",
+    "AsrStreamConfig": "runtime.asr",
+    "AsrStreamState": "runtime.asr",
+    "AsrTranscript": "runtime.asr",
+    "apply_asr_logit_policy": "runtime.asr",
+    "create_mel_filterbank": "runtime.asr",
+    "greedy_decode_step": "runtime.asr",
+    "pcm_to_log_mel": "runtime.asr",
 }
 
 __all__ = sorted(_EXPORTS)
