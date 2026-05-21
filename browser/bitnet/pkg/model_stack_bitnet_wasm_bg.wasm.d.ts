@@ -25,6 +25,7 @@ export const gated_add_rows_f32: (a: number, b: number, c: number, d: number, e:
 export const q4_conv1d_f32: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
 export const q4_depthwise_conv1d_f32: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
 export const q4_grouped_conv1d_f32: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
+export const vocos_istft_head_f32: (a: number, b: number, c: number) => [number, number, number, number];
 export const attention_f32: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
 export const __wbg_attentionkvcache_free: (a: number, b: number) => void;
 export const attentionkvcache_new: (a: number, b: number) => number;
@@ -54,8 +55,11 @@ export const f5q4ditsession_debug_dit_block: (a: number, b: number, c: number, d
 export const f5q4ditsession_debug_dit_block_profile_json: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
 export const f5q4ditsession_debug_final_ada_norm: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const f5q4ditsession_sample_mel: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => [number, number, number, number];
+export const f5q4ditsession_sample_mel_with_progress: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: any) => [number, number, number, number];
 export const activate_f32: (a: number, b: number, c: number, d: number) => [number, number];
 export const gated_activation_f32: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+export const __wbindgen_exn_store: (a: number) => void;
+export const __externref_table_alloc: () => number;
 export const __wbindgen_externrefs: WebAssembly.Table;
 export const __wbindgen_malloc: (a: number, b: number) => number;
 export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

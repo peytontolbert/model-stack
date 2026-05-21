@@ -44,6 +44,7 @@ export class F5Q4DiTSession {
     forward(x: Float32Array, cond: Float32Array, text_ids: Int32Array, time: number, drop_audio_cond: boolean, drop_text: boolean): Float32Array;
     constructor();
     sample_mel(cond_mel: Float32Array, cond_seq_len: number, text_ids: Int32Array, duration: number, steps: number, cfg_strength: number, sway_sampling_coef: number, seed: number): Float32Array;
+    sample_mel_with_progress(cond_mel: Float32Array, cond_seq_len: number, text_ids: Int32Array, duration: number, steps: number, cfg_strength: number, sway_sampling_coef: number, seed: number, progress: Function): Float32Array;
 }
 
 export class Q4LinearHandle {
@@ -99,6 +100,8 @@ export function q4_mlp_f32(first: Q4LinearHandle, second: Q4LinearHandle, input:
 
 export function q4_symmetric_linear_f32(input: Float32Array, packed_weight: Uint8Array, row_scales_f16: Uint16Array, bias_values: Float32Array, rows: number, in_dim: number, out_dim: number): Float32Array;
 
+export function vocos_istft_head_f32(stft_rows: Float32Array, frames: number): Float32Array;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -127,6 +130,7 @@ export interface InitOutput {
     readonly q4_conv1d_f32: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
     readonly q4_depthwise_conv1d_f32: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
     readonly q4_grouped_conv1d_f32: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
+    readonly vocos_istft_head_f32: (a: number, b: number, c: number) => [number, number, number, number];
     readonly attention_f32: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
     readonly __wbg_attentionkvcache_free: (a: number, b: number) => void;
     readonly attentionkvcache_new: (a: number, b: number) => number;
@@ -156,8 +160,11 @@ export interface InitOutput {
     readonly f5q4ditsession_debug_dit_block_profile_json: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
     readonly f5q4ditsession_debug_final_ada_norm: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly f5q4ditsession_sample_mel: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => [number, number, number, number];
+    readonly f5q4ditsession_sample_mel_with_progress: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: any) => [number, number, number, number];
     readonly activate_f32: (a: number, b: number, c: number, d: number) => [number, number];
     readonly gated_activation_f32: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly __wbindgen_exn_store: (a: number) => void;
+    readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
