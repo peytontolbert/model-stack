@@ -7,8 +7,13 @@ import math
 import os
 import random
 import sys
+import time
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable
+
+# CUDA must be masked before importing torch. Override from the shell with
+# CUDA_VISIBLE_DEVICES=... when a different training GPU is intended.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2")
 
 import numpy as np
 import soundfile as sf
@@ -20,7 +25,7 @@ import torch.nn.utils.parametrize as parametrize
 
 DEFAULT_CHECKPOINT = "/data/resumebot/checkpoints/final_finetuned_model.pt"
 DEFAULT_VOCAB = "/data/resumebot/checkpoints/F5TTS_Base_vocab.txt"
-DEFAULT_OUTPUT = "/data/transformer_10/checkpoints/f5tts_peyton_q4_12to4_distill"
+DEFAULT_OUTPUT = "/data/transformer_10/checkpoints/f5tts_q4_12to4_distill"
 
 
 class RowwiseQ4STE(nn.Module):
@@ -31,6 +36,14 @@ class RowwiseQ4STE(nn.Module):
         quantized = torch.round(flat / scale[:, None]).clamp(-8, 7)
         dequantized = (quantized * scale[:, None]).reshape_as(weight).to(original_dtype)
         return weight + (dequantized - weight).detach()
+
+
+def rowwise_q4_dequantize(weight: torch.Tensor) -> torch.Tensor:
+    original_dtype = weight.dtype
+    flat = weight.detach().float().reshape(weight.shape[0], -1)
+    scale = flat.abs().amax(dim=1).clamp_min(1e-8) / 7.0
+    quantized = torch.round(flat / scale[:, None]).clamp(-8, 7)
+    return (quantized * scale[:, None]).reshape_as(weight).to(original_dtype)
 
 
 def split_csv(value: str) -> tuple[str, ...]:
@@ -83,14 +96,24 @@ def should_q4_module(name: str, module: nn.Module, include: tuple[str, ...], exc
     return hasattr(module, "weight") and module.weight.ndim >= 2
 
 
-def apply_q4_parametrizations(model: nn.Module, *, include: tuple[str, ...], exclude: tuple[str, ...]) -> tuple[int, int]:
+def apply_q4_parametrizations(
+    model: nn.Module,
+    *,
+    include: tuple[str, ...],
+    exclude: tuple[str, ...],
+    ste_include: tuple[str, ...] = (),
+) -> tuple[int, int]:
     modules = 0
     params = 0
     for name, module in model.named_modules():
         if should_q4_module(name, module, include, exclude):
-            parametrize.register_parametrization(module, "weight", RowwiseQ4STE())
+            if not ste_include or any(item in name for item in ste_include):
+                parametrize.register_parametrization(module, "weight", RowwiseQ4STE())
+            else:
+                with torch.no_grad():
+                    module.weight.copy_(rowwise_q4_dequantize(module.weight))
             modules += 1
-            params += int(module.parametrizations.weight.original.numel())
+            params += int(module.weight.numel())
     return modules, params
 
 
@@ -115,6 +138,28 @@ def configure_trainable_parameters(
     return tensors, params
 
 
+def trainable_anchor_parameters(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+
+
+def anchor_weight_loss(model: nn.Module, anchors: dict[str, torch.Tensor]) -> torch.Tensor:
+    loss: torch.Tensor | None = None
+    terms = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad or name not in anchors:
+            continue
+        term = F.mse_loss(parameter, anchors[name].to(device=parameter.device, dtype=parameter.dtype))
+        loss = term if loss is None else loss + term
+        terms += 1
+    if loss is None:
+        return next(model.parameters()).new_zeros(())
+    return loss / float(max(1, terms))
+
+
 def materialized_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     state: dict[str, torch.Tensor] = {}
     for name, tensor in model.state_dict().items():
@@ -136,10 +181,25 @@ def save_checkpoint(model: nn.Module, path: Path, *, step: int, args: argparse.N
             "teacher_steps": int(args.teacher_steps),
             "student_steps": int(args.student_steps),
             "cfg_strength": float(args.cfg_strength),
+            "teacher_cfg_strength": float(args.teacher_cfg_strength),
+            "student_cfg_strength": float(args.student_cfg_strength),
             "mode": "f5tts_q4_12to4_rollout_distill",
         },
     }
     torch.save(payload, path)
+
+
+def append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True) + "\n")
+        handle.flush()
+
+
+def scheduled_weight(base: float, *, step: int, max_steps: int, warmup_steps: int = 0, final: float | None = None) -> float:
+    if final is None or int(warmup_steps) <= 0:
+        return float(base)
+    progress = min(1.0, max(0.0, float(step) / float(max(1, min(int(warmup_steps), int(max_steps))))))
+    return float(base) + (float(final) - float(base)) * progress
 
 
 def stream_hf_rows(args: argparse.Namespace) -> Iterable[dict[str, Any]]:
@@ -246,7 +306,16 @@ def make_time_grid(steps: int, sway_sampling_coef: float, device: torch.device, 
     return torch.tensor(values, device=device, dtype=dtype)
 
 
-def cfg_flow(model, y: torch.Tensor, cond: torch.Tensor, text_ids: torch.Tensor, time: torch.Tensor, cfg_strength: float) -> torch.Tensor:
+def cfg_flow(
+    model,
+    y: torch.Tensor,
+    cond: torch.Tensor,
+    text_ids: torch.Tensor,
+    time: torch.Tensor,
+    cfg_strength: float,
+    *,
+    detach_null_grad: bool = False,
+) -> torch.Tensor:
     pred = model.transformer(
         x=y,
         cond=cond,
@@ -265,6 +334,8 @@ def cfg_flow(model, y: torch.Tensor, cond: torch.Tensor, text_ids: torch.Tensor,
         drop_audio_cond=True,
         drop_text=True,
     )
+    if detach_null_grad:
+        null_pred = null_pred.detach()
     return pred + (pred - null_pred) * float(cfg_strength)
 
 
@@ -280,7 +351,9 @@ def rollout_sample(
     cond_frames: int,
     collect_flow_loss: bool = False,
     teacher_model=None,
+    teacher_cfg_strength: float | None = None,
     loss_mask: torch.Tensor | None = None,
+    detach_null_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     y = noise.clone()
     times = make_time_grid(steps, sway_sampling_coef, y.device, y.dtype)
@@ -290,10 +363,17 @@ def rollout_sample(
         t = times[step]
         dt = times[step + 1] - times[step]
         time = torch.full((y.shape[0],), float(t.detach().cpu()), device=y.device, dtype=y.dtype)
-        flow = cfg_flow(model, y, cond, text_ids, time, cfg_strength)
+        flow = cfg_flow(model, y, cond, text_ids, time, cfg_strength, detach_null_grad=detach_null_grad)
         if collect_flow_loss and teacher_model is not None and loss_mask is not None:
             with torch.no_grad():
-                teacher_flow = cfg_flow(teacher_model, y.detach(), cond, text_ids, time, cfg_strength)
+                teacher_flow = cfg_flow(
+                    teacher_model,
+                    y.detach(),
+                    cond,
+                    text_ids,
+                    time,
+                    float(cfg_strength if teacher_cfg_strength is None else teacher_cfg_strength),
+                )
             flow_loss = flow_loss + F.mse_loss(flow[loss_mask], teacher_flow[loss_mask])
             flow_terms += 1
         y = y + dt * flow
@@ -311,6 +391,49 @@ def build_loss_mask(lens: torch.Tensor, cond_frames: int, frames: int, device: t
     return valid & generated
 
 
+def temporal_delta_loss(student_y: torch.Tensor, teacher_y: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+    first_mask = loss_mask[:, 1:] & loss_mask[:, :-1]
+    if not bool(first_mask.any()):
+        return student_y.new_zeros(())
+    student_delta = student_y[:, 1:, :] - student_y[:, :-1, :]
+    teacher_delta = teacher_y[:, 1:, :] - teacher_y[:, :-1, :]
+    loss = F.mse_loss(student_delta[first_mask], teacher_delta[first_mask])
+
+    second_mask = first_mask[:, 1:] & first_mask[:, :-1]
+    if bool(second_mask.any()):
+        student_accel = student_delta[:, 1:, :] - student_delta[:, :-1, :]
+        teacher_accel = teacher_delta[:, 1:, :] - teacher_delta[:, :-1, :]
+        loss = loss + 0.5 * F.mse_loss(student_accel[second_mask], teacher_accel[second_mask])
+    return loss
+
+
+def mel_energy_loss(student_y: torch.Tensor, teacher_y: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+    if not bool(loss_mask.any()):
+        return student_y.new_zeros(())
+    student_energy = student_y.float().pow(2).mean(dim=-1)
+    teacher_energy = teacher_y.float().pow(2).mean(dim=-1)
+    return F.mse_loss(student_energy[loss_mask], teacher_energy[loss_mask])
+
+
+def high_mel_excess_loss(student_y: torch.Tensor, teacher_y: torch.Tensor, loss_mask: torch.Tensor, start_bin: int = 80) -> torch.Tensor:
+    if not bool(loss_mask.any()):
+        return student_y.new_zeros(())
+    start = max(0, min(int(start_bin), int(student_y.shape[-1]) - 1))
+    student_band = student_y[..., start:].float().pow(2).mean(dim=-1)
+    teacher_band = teacher_y[..., start:].float().pow(2).mean(dim=-1)
+    excess = F.relu(student_band - teacher_band)
+    return (excess[loss_mask]).pow(2).mean()
+
+
+def high_mel_match_loss(student_y: torch.Tensor, teacher_y: torch.Tensor, loss_mask: torch.Tensor, start_bin: int = 80) -> torch.Tensor:
+    if not bool(loss_mask.any()):
+        return student_y.new_zeros(())
+    start = max(0, min(int(start_bin), int(student_y.shape[-1]) - 1))
+    student_band = student_y[..., start:].float()
+    teacher_band = teacher_y[..., start:].float()
+    return F.smooth_l1_loss(student_band[loss_mask], teacher_band[loss_mask], beta=0.25)
+
+
 def train(args: argparse.Namespace) -> None:
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     if args.cuda_visible_devices:
@@ -323,13 +446,14 @@ def train(args: argparse.Namespace) -> None:
     teacher = build_model(Path(args.vocab), device)
     student = build_model(Path(args.vocab), device)
     load_checkpoint_state(teacher, Path(args.checkpoint))
-    load_checkpoint_state(student, Path(args.checkpoint))
+    load_checkpoint_state(student, Path(args.student_checkpoint or args.checkpoint))
     teacher.eval().requires_grad_(False)
 
     q4_modules, q4_params = apply_q4_parametrizations(
         student,
         include=split_csv(args.q4_include),
         exclude=split_csv(args.q4_exclude),
+        ste_include=split_csv(args.q4_ste_include),
     )
     train_tensors, train_params = configure_trainable_parameters(
         student,
@@ -345,21 +469,44 @@ def train(args: argparse.Namespace) -> None:
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
     )
+    anchor_parameters = trainable_anchor_parameters(student) if float(args.anchor_weight_loss_weight) > 0.0 else {}
 
     local_rows = load_local_samples(args.local_samples)
     use_hf_stream = bool(args.dataset) and float(args.local_sample_prob) < 1.0
     row_iter = iter(stream_hf_rows(args)) if use_hf_stream else iter(())
-    print(json.dumps({
+    setup_row = {
         "device": str(device),
+        "dataset": args.dataset,
+        "config": args.config,
+        "split": args.split,
+        "use_hf_stream": use_hf_stream,
         "q4_modules": q4_modules,
         "q4_params": q4_params,
         "train_tensors": train_tensors,
         "train_params": train_params,
         "teacher_steps": args.teacher_steps,
         "student_steps": args.student_steps,
+        "teacher_checkpoint": args.checkpoint,
+        "student_checkpoint": args.student_checkpoint or args.checkpoint,
         "cfg_strength": args.cfg_strength,
-        "local_samples": len(local_rows),
-    }, indent=2))
+        "teacher_cfg_strength": args.teacher_cfg_strength,
+        "student_cfg_strength": args.student_cfg_strength,
+        "anchor_weight_loss_weight": args.anchor_weight_loss_weight,
+        "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
+        "mel_energy_loss_weight": args.mel_energy_loss_weight,
+        "high_mel_excess_loss_weight": args.high_mel_excess_loss_weight,
+        "high_mel_match_loss_weight": args.high_mel_match_loss_weight,
+        "high_mel_start_bin": args.high_mel_start_bin,
+        "detach_null_grad": bool(args.detach_null_grad),
+        "local_profile_samples_available": len(local_rows),
+        "local_sample_prob": float(args.local_sample_prob),
+        "local_profile_samples_enabled": bool(local_rows) and float(args.local_sample_prob) > 0.0,
+    }
+    print(json.dumps(setup_row, indent=2), flush=True)
+    metrics_path = output_dir / "metrics.jsonl"
+    append_jsonl(metrics_path, {"event": "setup", "time": time.time(), **setup_row})
+    if bool(args.dry_run_init):
+        return
 
     pending: list[dict[str, Any]] = []
     best_loss = float("inf")
@@ -401,7 +548,7 @@ def train(args: argparse.Namespace) -> None:
                 cond=cond,
                 text_ids=text_ids,
                 steps=int(args.teacher_steps),
-                cfg_strength=float(args.cfg_strength),
+                cfg_strength=float(args.teacher_cfg_strength),
                 sway_sampling_coef=float(args.sway_sampling_coef),
                 cond_frames=cond_frames,
             )
@@ -411,19 +558,39 @@ def train(args: argparse.Namespace) -> None:
             cond=cond,
             text_ids=text_ids,
             steps=int(args.student_steps),
-            cfg_strength=float(args.cfg_strength),
+            cfg_strength=float(args.student_cfg_strength),
             sway_sampling_coef=float(args.sway_sampling_coef),
             cond_frames=cond_frames,
             collect_flow_loss=float(args.teacher_flow_loss_weight) > 0,
             teacher_model=teacher,
+            teacher_cfg_strength=float(args.teacher_cfg_strength),
             loss_mask=loss_mask,
+            detach_null_grad=bool(args.detach_null_grad),
         )
         rollout_loss = F.mse_loss(student_y[loss_mask], teacher_y[loss_mask])
         real_mel_loss = F.l1_loss(student_y[loss_mask], mel[loss_mask])
+        delta_loss = temporal_delta_loss(student_y, teacher_y, loss_mask)
+        energy_loss = mel_energy_loss(student_y, teacher_y, loss_mask)
+        high_mel_loss = high_mel_excess_loss(student_y, teacher_y, loss_mask, start_bin=int(args.high_mel_start_bin))
+        high_mel_match = high_mel_match_loss(student_y, teacher_y, loss_mask, start_bin=int(args.high_mel_start_bin))
+        rollout_weight = scheduled_weight(float(args.rollout_loss_weight), step=step, max_steps=int(args.max_steps), warmup_steps=int(args.loss_schedule_steps), final=args.rollout_loss_weight_final)
+        teacher_flow_weight = scheduled_weight(float(args.teacher_flow_loss_weight), step=step, max_steps=int(args.max_steps), warmup_steps=int(args.loss_schedule_steps), final=args.teacher_flow_loss_weight_final)
+        real_mel_weight = scheduled_weight(float(args.real_mel_loss_weight), step=step, max_steps=int(args.max_steps), warmup_steps=int(args.loss_schedule_steps), final=args.real_mel_loss_weight_final)
+        anchor_weight = scheduled_weight(float(args.anchor_weight_loss_weight), step=step, max_steps=int(args.max_steps), warmup_steps=int(args.loss_schedule_steps), final=args.anchor_weight_loss_weight_final)
+        delta_weight = scheduled_weight(float(args.temporal_delta_loss_weight), step=step, max_steps=int(args.max_steps), warmup_steps=int(args.loss_schedule_steps), final=args.temporal_delta_loss_weight_final)
+        energy_weight = scheduled_weight(float(args.mel_energy_loss_weight), step=step, max_steps=int(args.max_steps), warmup_steps=int(args.loss_schedule_steps), final=args.mel_energy_loss_weight_final)
+        high_mel_weight = scheduled_weight(float(args.high_mel_excess_loss_weight), step=step, max_steps=int(args.max_steps), warmup_steps=int(args.loss_schedule_steps), final=args.high_mel_excess_loss_weight_final)
+        high_mel_match_weight = scheduled_weight(float(args.high_mel_match_loss_weight), step=step, max_steps=int(args.max_steps), warmup_steps=int(args.loss_schedule_steps), final=args.high_mel_match_loss_weight_final)
+        parameter_anchor_loss = anchor_weight_loss(student, anchor_parameters) if anchor_parameters else mel.new_zeros(())
         loss = (
-            float(args.rollout_loss_weight) * rollout_loss
-            + float(args.teacher_flow_loss_weight) * flow_loss
-            + float(args.real_mel_loss_weight) * real_mel_loss
+            rollout_weight * rollout_loss
+            + teacher_flow_weight * flow_loss
+            + real_mel_weight * real_mel_loss
+            + delta_weight * delta_loss
+            + energy_weight * energy_loss
+            + high_mel_weight * high_mel_loss
+            + high_mel_match_weight * high_mel_match
+            + anchor_weight * parameter_anchor_loss
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -437,30 +604,76 @@ def train(args: argparse.Namespace) -> None:
             best_loss = loss_value
             if args.save_best:
                 save_checkpoint(student, output_dir / "model_q4_12to4_best.pt", step=step, args=args)
+                (output_dir / "best_metrics.json").write_text(
+                    json.dumps(
+                        {
+                            "step": step,
+                            "loss": loss_value,
+                            "rollout_loss": float(rollout_loss.detach().cpu()),
+                            "teacher_flow_loss": float(flow_loss.detach().cpu()),
+                            "real_mel_loss": float(real_mel_loss.detach().cpu()),
+                            "temporal_delta_loss": float(delta_loss.detach().cpu()),
+                            "mel_energy_loss": float(energy_loss.detach().cpu()),
+                            "high_mel_excess_loss": float(high_mel_loss.detach().cpu()),
+                            "high_mel_match_loss": float(high_mel_match.detach().cpu()),
+                            "rollout_weight": rollout_weight,
+                            "teacher_flow_weight": teacher_flow_weight,
+                            "real_mel_weight": real_mel_weight,
+                            "temporal_delta_weight": delta_weight,
+                            "mel_energy_weight": energy_weight,
+                            "high_mel_excess_weight": high_mel_weight,
+                            "high_mel_match_weight": high_mel_match_weight,
+                            "parameter_anchor_loss": float(parameter_anchor_loss.detach().cpu()),
+                            "anchor_weight": anchor_weight,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
         if step % int(args.log_every) == 0:
-            print(json.dumps({
+            metrics_row = {
                 "step": step,
                 "loss": loss_value,
                 "rollout_loss": float(rollout_loss.detach().cpu()),
                 "teacher_flow_loss": float(flow_loss.detach().cpu()),
                 "real_mel_loss": float(real_mel_loss.detach().cpu()),
+                "temporal_delta_loss": float(delta_loss.detach().cpu()),
+                "mel_energy_loss": float(energy_loss.detach().cpu()),
+                "high_mel_excess_loss": float(high_mel_loss.detach().cpu()),
+                "high_mel_match_loss": float(high_mel_match.detach().cpu()),
+                "rollout_weight": rollout_weight,
+                "teacher_flow_weight": teacher_flow_weight,
+                "real_mel_weight": real_mel_weight,
+                "temporal_delta_weight": delta_weight,
+                "mel_energy_weight": energy_weight,
+                "high_mel_excess_weight": high_mel_weight,
+                "high_mel_match_weight": high_mel_match_weight,
+                "parameter_anchor_loss": float(parameter_anchor_loss.detach().cpu()),
+                "anchor_weight": anchor_weight,
                 "best_loss": best_loss,
                 "frames": int(mel.shape[1]),
                 "cond_frames": int(cond_frames),
-            }))
+            }
+            print(json.dumps(metrics_row), flush=True)
+            append_jsonl(metrics_path, {"event": "train", "time": time.time(), **metrics_row})
         if step % int(args.save_every) == 0:
             path = output_dir / f"model_q4_12to4_step_{step}.pt"
             save_checkpoint(student, path, step=step, args=args)
-            print(f"saved={path}")
+            print(f"saved={path}", flush=True)
+            append_jsonl(metrics_path, {"event": "save", "time": time.time(), "step": step, "path": str(path)})
 
     final_path = output_dir / "model_q4_12to4_last.pt"
     save_checkpoint(student, final_path, step=step, args=args)
-    print(f"saved={final_path}")
+    print(f"saved={final_path}", flush=True)
+    append_jsonl(metrics_path, {"event": "save_final", "time": time.time(), "step": step, "path": str(final_path)})
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Distill Peyton F5TTS Q4 from 12-step CFG teacher quality into 4-step CFG rollout.")
+    parser = argparse.ArgumentParser(description="Distill F5TTS Q4 from 12-step CFG teacher quality into 4-step CFG rollout.")
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--student-checkpoint", default="")
     parser.add_argument("--vocab", default=DEFAULT_VOCAB)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     parser.add_argument("--dataset", default="librispeech_asr")
@@ -480,10 +693,27 @@ def main() -> None:
     parser.add_argument("--teacher-steps", type=int, default=12)
     parser.add_argument("--student-steps", type=int, default=4)
     parser.add_argument("--cfg-strength", type=float, default=2.0)
+    parser.add_argument("--teacher-cfg-strength", type=float, default=None)
+    parser.add_argument("--student-cfg-strength", type=float, default=None)
     parser.add_argument("--sway-sampling-coef", type=float, default=-1.0)
     parser.add_argument("--rollout-loss-weight", type=float, default=1.0)
     parser.add_argument("--teacher-flow-loss-weight", type=float, default=0.25)
     parser.add_argument("--real-mel-loss-weight", type=float, default=0.05)
+    parser.add_argument("--anchor-weight-loss-weight", type=float, default=0.0)
+    parser.add_argument("--temporal-delta-loss-weight", type=float, default=0.0)
+    parser.add_argument("--mel-energy-loss-weight", type=float, default=0.0)
+    parser.add_argument("--high-mel-excess-loss-weight", type=float, default=0.0)
+    parser.add_argument("--high-mel-match-loss-weight", type=float, default=0.0)
+    parser.add_argument("--high-mel-start-bin", type=int, default=80)
+    parser.add_argument("--loss-schedule-steps", type=int, default=0)
+    parser.add_argument("--rollout-loss-weight-final", type=float, default=None)
+    parser.add_argument("--teacher-flow-loss-weight-final", type=float, default=None)
+    parser.add_argument("--real-mel-loss-weight-final", type=float, default=None)
+    parser.add_argument("--anchor-weight-loss-weight-final", type=float, default=None)
+    parser.add_argument("--temporal-delta-loss-weight-final", type=float, default=None)
+    parser.add_argument("--mel-energy-loss-weight-final", type=float, default=None)
+    parser.add_argument("--high-mel-excess-loss-weight-final", type=float, default=None)
+    parser.add_argument("--high-mel-match-loss-weight-final", type=float, default=None)
     parser.add_argument("--lr", type=float, default=5e-7)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -494,15 +724,27 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--q4-include", default="")
     parser.add_argument("--q4-exclude", default="text_embed.text_embed,mel_spec")
+    parser.add_argument("--q4-ste-include", default="", help="Optional module-name filter for STE fake quant. Other Q4 modules are materialized once to reduce memory.")
     parser.add_argument("--local-samples", default="/data/resumebot/voice_profiles/Peyton/samples.txt")
-    parser.add_argument("--local-sample-prob", type=float, default=0.5)
+    parser.add_argument(
+        "--local-sample-prob",
+        type=float,
+        default=0.0,
+        help="Optional probability of sampling a voice-profile manifest. Keep 0 for base model distillation; use profile samples for eval/adaptation only.",
+    )
     parser.add_argument(
         "--train-include",
         default="transformer.transformer_blocks.18,transformer.transformer_blocks.19,transformer.transformer_blocks.20,transformer.transformer_blocks.21,transformer.norm_out,transformer.proj_out",
     )
     parser.add_argument("--train-exclude", default="")
+    parser.add_argument("--detach-null-grad", action="store_true", help="For CFG student training, detach the null branch to reduce activation memory while preserving CFG inference math.")
     parser.add_argument("--save-best", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dry-run-init", action="store_true", help="Initialize model/data/training state, print the setup, then exit.")
     args = parser.parse_args()
+    if args.teacher_cfg_strength is None:
+        args.teacher_cfg_strength = float(args.cfg_strength)
+    if args.student_cfg_strength is None:
+        args.student_cfg_strength = float(args.cfg_strength)
     torch.manual_seed(int(args.seed))
     random.seed(int(args.seed))
     np.random.seed(int(args.seed))

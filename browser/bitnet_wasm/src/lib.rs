@@ -2216,12 +2216,7 @@ unsafe fn dot8_unpacked_i8_f32_simd(input: &[f32], row: usize, in_dim: usize, we
     let mut acc7 = f32x4_splat(0.0);
     let mut col = 0usize;
     while col + 3 < in_dim {
-        let w = f32x4(
-            *weight_row.get_unchecked(col) as f32,
-            *weight_row.get_unchecked(col + 1) as f32,
-            *weight_row.get_unchecked(col + 2) as f32,
-            *weight_row.get_unchecked(col + 3) as f32,
-        );
+        let w = load_i8x4_as_f32(weight_row.as_ptr().add(col));
         acc0 = f32x4_add(acc0, f32x4_mul(v128_load(input.as_ptr().add(row * in_dim + col) as *const v128), w));
         acc1 = f32x4_add(acc1, f32x4_mul(v128_load(input.as_ptr().add((row + 1) * in_dim + col) as *const v128), w));
         acc2 = f32x4_add(acc2, f32x4_mul(v128_load(input.as_ptr().add((row + 2) * in_dim + col) as *const v128), w));
@@ -2312,18 +2307,8 @@ unsafe fn dot8_unpacked_i8_f32_pair_simd(
     let mut b7 = f32x4_splat(0.0);
     let mut col = 0usize;
     while col + 3 < in_dim {
-        let wa = f32x4(
-            *weight_a.get_unchecked(col) as f32,
-            *weight_a.get_unchecked(col + 1) as f32,
-            *weight_a.get_unchecked(col + 2) as f32,
-            *weight_a.get_unchecked(col + 3) as f32,
-        );
-        let wb = f32x4(
-            *weight_b.get_unchecked(col) as f32,
-            *weight_b.get_unchecked(col + 1) as f32,
-            *weight_b.get_unchecked(col + 2) as f32,
-            *weight_b.get_unchecked(col + 3) as f32,
-        );
+        let wa = load_i8x4_as_f32(weight_a.as_ptr().add(col));
+        let wb = load_i8x4_as_f32(weight_b.as_ptr().add(col));
         let x0 = v128_load(input.as_ptr().add(row * in_dim + col) as *const v128);
         let x1 = v128_load(input.as_ptr().add((row + 1) * in_dim + col) as *const v128);
         let x2 = v128_load(input.as_ptr().add((row + 2) * in_dim + col) as *const v128);
@@ -3119,6 +3104,16 @@ unsafe fn sum_f32x4(value: core::arch::wasm32::v128) -> f32 {
         + f32x4_extract_lane::<1>(value)
         + f32x4_extract_lane::<2>(value)
         + f32x4_extract_lane::<3>(value)
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+unsafe fn load_i8x4_as_f32(ptr: *const i8) -> core::arch::wasm32::v128 {
+    use core::arch::wasm32::*;
+    let bytes = v128_load(ptr as *const v128);
+    let i16s = i16x8_extend_low_i8x16(bytes);
+    let i32s = i32x4_extend_low_i16x8(i16s);
+    f32x4_convert_i32x4(i32s)
 }
 
 fn dot8_unpacked_i8_f32_triple(
@@ -4964,6 +4959,7 @@ pub struct F5Q4DiTSession {
     q4: HashMap<String, Q4LinearHandle>,
     q4_raw: HashMap<String, Q4RawTensor>,
     dense: HashMap<String, Vec<f32>>,
+    block_names: Vec<F5BlockTensorNames>,
     dim: usize,
     text_dim: usize,
     mel_dim: usize,
@@ -4972,20 +4968,47 @@ pub struct F5Q4DiTSession {
     depth: usize,
 }
 
+struct F5BlockTensorNames {
+    attn_norm: String,
+    to_q: String,
+    to_k: String,
+    to_v: String,
+    to_out: String,
+    ff_in: String,
+    ff_out: String,
+}
+
+impl F5BlockTensorNames {
+    fn new(block: usize) -> F5BlockTensorNames {
+        let prefix = format!("transformer.transformer_blocks.{}", block);
+        F5BlockTensorNames {
+            attn_norm: format!("{}.attn_norm.linear.weight", prefix),
+            to_q: format!("{}.attn.to_q.weight", prefix),
+            to_k: format!("{}.attn.to_k.weight", prefix),
+            to_v: format!("{}.attn.to_v.weight", prefix),
+            to_out: format!("{}.attn.to_out.0.weight", prefix),
+            ff_in: format!("{}.ff.ff.0.0.weight", prefix),
+            ff_out: format!("{}.ff.ff.2.weight", prefix),
+        }
+    }
+}
+
 #[wasm_bindgen]
 impl F5Q4DiTSession {
     #[wasm_bindgen(constructor)]
     pub fn new() -> F5Q4DiTSession {
+        let depth = 22usize;
         F5Q4DiTSession {
             q4: HashMap::new(),
             q4_raw: HashMap::new(),
             dense: HashMap::new(),
+            block_names: (0..depth).map(F5BlockTensorNames::new).collect(),
             dim: 1024,
             text_dim: 512,
             mel_dim: 100,
             heads: 16,
             head_dim: 64,
-            depth: 22,
+            depth,
         }
     }
 
@@ -5125,14 +5148,14 @@ impl F5Q4DiTSession {
         if input.len() != seq_len * self.dim {
             return Err(JsValue::from_str("F5 debug block profile input shape mismatch"));
         }
-        let prefix = format!("transformer.transformer_blocks.{}", block);
-        let attn_norm = self.q4(&format!("{}.attn_norm.linear.weight", prefix))?;
-        let to_q = self.q4(&format!("{}.attn.to_q.weight", prefix))?;
-        let to_k = self.q4(&format!("{}.attn.to_k.weight", prefix))?;
-        let to_v = self.q4(&format!("{}.attn.to_v.weight", prefix))?;
-        let to_out = self.q4(&format!("{}.attn.to_out.0.weight", prefix))?;
-        let ff_in = self.q4(&format!("{}.ff.ff.0.0.weight", prefix))?;
-        let ff_out = self.q4(&format!("{}.ff.ff.2.weight", prefix))?;
+        let names = self.block_names.get(block).ok_or_else(|| JsValue::from_str("F5 block index out of range"))?;
+        let attn_norm = self.q4(&names.attn_norm)?;
+        let to_q = self.q4(&names.to_q)?;
+        let to_k = self.q4(&names.to_k)?;
+        let to_v = self.q4(&names.to_v)?;
+        let to_out = self.q4(&names.to_out)?;
+        let ff_in = self.q4(&names.ff_in)?;
+        let ff_out = self.q4(&names.ff_out)?;
         let mut marks: Vec<(&str, f64)> = Vec::new();
         let started = date_now();
 
@@ -5287,7 +5310,7 @@ impl F5Q4DiTSession {
             for value in &mut t_silu {
                 *value = silu_scalar(*value);
             }
-            let block_modulations = self.block_modulations(&t_silu)?;
+            let block_modulations = self.block_modulations_flat(&t_silu)?;
             let final_modulation = self.linear("transformer.norm_out.linear.weight", &t_silu, 1)?;
             let x_projection = self.input_x_projection(&y, duration)?;
             if let Some(null_projected_base) = null_projected_base.as_ref() {
@@ -5412,17 +5435,20 @@ impl F5Q4DiTSession {
         &self,
         x_projection: &[f32],
         projected_base: &[f32],
-        block_modulations: &[Vec<f32>],
+        block_modulations: &[f32],
         final_modulation: &[f32],
         rotary_cos: &[f32],
         rotary_sin: &[f32],
     ) -> Result<Vec<f32>, JsValue> {
-        if x_projection.len() % self.dim != 0 || projected_base.len() != x_projection.len() || block_modulations.len() != self.depth {
+        let modulation_dim = self.dim * 6;
+        if x_projection.len() % self.dim != 0 || projected_base.len() != x_projection.len() || block_modulations.len() < self.depth * modulation_dim {
             return Err(JsValue::from_str("F5Q4DiTSession projected-part forward shape mismatch"));
         }
         let seq_len = x_projection.len() / self.dim;
         let mut hidden = self.input_embedding_from_projected_parts(x_projection, projected_base, seq_len)?;
-        for (block, modulation) in block_modulations.iter().enumerate() {
+        for block in 0..self.depth {
+            let start = block * modulation_dim;
+            let modulation = &block_modulations[start..start + modulation_dim];
             hidden = self.dit_block_cached_rotary_with_modulation(
                 block,
                 &hidden,
@@ -5574,15 +5600,15 @@ impl F5Q4DiTSession {
         rotary_cos: &[f32],
         rotary_sin: &[f32],
     ) -> Result<Vec<f32>, JsValue> {
-        let prefix = format!("transformer.transformer_blocks.{}", block);
+        let names = self.block_names.get(block).ok_or_else(|| JsValue::from_str("F5 block index out of range"))?;
         f5_dit_block_silu_t_cached_rotary(
-            self.q4(&format!("{}.attn_norm.linear.weight", prefix))?,
-            self.q4(&format!("{}.attn.to_q.weight", prefix))?,
-            self.q4(&format!("{}.attn.to_k.weight", prefix))?,
-            self.q4(&format!("{}.attn.to_v.weight", prefix))?,
-            self.q4(&format!("{}.attn.to_out.0.weight", prefix))?,
-            self.q4(&format!("{}.ff.ff.0.0.weight", prefix))?,
-            self.q4(&format!("{}.ff.ff.2.weight", prefix))?,
+            self.q4(&names.attn_norm)?,
+            self.q4(&names.to_q)?,
+            self.q4(&names.to_k)?,
+            self.q4(&names.to_v)?,
+            self.q4(&names.to_out)?,
+            self.q4(&names.ff_in)?,
+            self.q4(&names.ff_out)?,
             input,
             t_silu,
             seq_len,
@@ -5596,14 +5622,20 @@ impl F5Q4DiTSession {
     }
 
     fn block_modulation(&self, block: usize, t_silu: &[f32]) -> Result<Vec<f32>, JsValue> {
-        let prefix = format!("transformer.transformer_blocks.{}", block);
-        self.linear(&format!("{}.attn_norm.linear.weight", prefix), t_silu, 1)
+        let names = self.block_names.get(block).ok_or_else(|| JsValue::from_str("F5 block index out of range"))?;
+        self.linear(&names.attn_norm, t_silu, 1)
     }
 
-    fn block_modulations(&self, t_silu: &[f32]) -> Result<Vec<Vec<f32>>, JsValue> {
-        let mut modulations = Vec::with_capacity(self.depth);
+    fn block_modulations_flat(&self, t_silu: &[f32]) -> Result<Vec<f32>, JsValue> {
+        let modulation_dim = self.dim * 6;
+        let mut modulations = vec![0.0f32; self.depth * modulation_dim];
         for block in 0..self.depth {
-            modulations.push(self.block_modulation(block, t_silu)?);
+            let modulation = self.block_modulation(block, t_silu)?;
+            if modulation.len() < modulation_dim {
+                return Err(JsValue::from_str("F5 block modulation shape mismatch"));
+            }
+            let start = block * modulation_dim;
+            modulations[start..start + modulation_dim].copy_from_slice(&modulation[..modulation_dim]);
         }
         Ok(modulations)
     }
@@ -5617,14 +5649,14 @@ impl F5Q4DiTSession {
         rotary_cos: &[f32],
         rotary_sin: &[f32],
     ) -> Result<Vec<f32>, JsValue> {
-        let prefix = format!("transformer.transformer_blocks.{}", block);
+        let names = self.block_names.get(block).ok_or_else(|| JsValue::from_str("F5 block index out of range"))?;
         f5_dit_block_modulation_cached_rotary(
-            self.q4(&format!("{}.attn.to_q.weight", prefix))?,
-            self.q4(&format!("{}.attn.to_k.weight", prefix))?,
-            self.q4(&format!("{}.attn.to_v.weight", prefix))?,
-            self.q4(&format!("{}.attn.to_out.0.weight", prefix))?,
-            self.q4(&format!("{}.ff.ff.0.0.weight", prefix))?,
-            self.q4(&format!("{}.ff.ff.2.weight", prefix))?,
+            self.q4(&names.to_q)?,
+            self.q4(&names.to_k)?,
+            self.q4(&names.to_v)?,
+            self.q4(&names.to_out)?,
+            self.q4(&names.ff_in)?,
+            self.q4(&names.ff_out)?,
             input,
             modulation,
             seq_len,
@@ -5661,16 +5693,15 @@ impl F5Q4DiTSession {
         }
         let mut output = vec![0.0f32; seq_len * channels];
         for ch in 0..channels {
-            let scale = handle.row_scales[ch];
-            let weight_row = handle.unpacked_row(ch);
             let bias = handle.bias_values.get(ch).copied().unwrap_or(0.0);
+            let scaled_weight_row = handle.scaled_row(ch);
             for pos in 0..seq_len {
                 let mut sum = bias;
                 let k_start = padding.saturating_sub(pos);
                 let k_end = kernel.min(seq_len + padding - pos);
-                for (k, &w) in weight_row.iter().enumerate().take(k_end).skip(k_start) {
+                for (k, &w) in scaled_weight_row.iter().enumerate().take(k_end).skip(k_start) {
                     let src_pos = pos + k - padding;
-                    sum += input[src_pos * channels + ch] * w as f32 * scale;
+                    sum += input[src_pos * channels + ch] * w;
                 }
                 output[pos * channels + ch] = sum;
             }
@@ -5696,8 +5727,7 @@ impl F5Q4DiTSession {
             let group = out_ch / group_in;
             let in_start = group * group_in;
             let bias = handle.bias_values.get(out_ch).copied().unwrap_or(0.0);
-            let scale = handle.row_scales[out_ch];
-            let weight_row = handle.unpacked_row(out_ch);
+            let scaled_weight_row = handle.scaled_row(out_ch);
             if out_ch + 7 < channels && (out_ch + 7) / group_in == group {
                 let bias_b = handle.bias_values.get(out_ch + 1).copied().unwrap_or(0.0);
                 let bias_c = handle.bias_values.get(out_ch + 2).copied().unwrap_or(0.0);
@@ -5706,20 +5736,13 @@ impl F5Q4DiTSession {
                 let bias_f = handle.bias_values.get(out_ch + 5).copied().unwrap_or(0.0);
                 let bias_g = handle.bias_values.get(out_ch + 6).copied().unwrap_or(0.0);
                 let bias_h = handle.bias_values.get(out_ch + 7).copied().unwrap_or(0.0);
-                let scale_b = handle.row_scales[out_ch + 1];
-                let scale_c = handle.row_scales[out_ch + 2];
-                let scale_d = handle.row_scales[out_ch + 3];
-                let scale_e = handle.row_scales[out_ch + 4];
-                let scale_f = handle.row_scales[out_ch + 5];
-                let scale_g = handle.row_scales[out_ch + 6];
-                let scale_h = handle.row_scales[out_ch + 7];
-                let weight_b = handle.unpacked_row(out_ch + 1);
-                let weight_c = handle.unpacked_row(out_ch + 2);
-                let weight_d = handle.unpacked_row(out_ch + 3);
-                let weight_e = handle.unpacked_row(out_ch + 4);
-                let weight_f = handle.unpacked_row(out_ch + 5);
-                let weight_g = handle.unpacked_row(out_ch + 6);
-                let weight_h = handle.unpacked_row(out_ch + 7);
+                let weight_b = handle.scaled_row(out_ch + 1);
+                let weight_c = handle.scaled_row(out_ch + 2);
+                let weight_d = handle.scaled_row(out_ch + 3);
+                let weight_e = handle.scaled_row(out_ch + 4);
+                let weight_f = handle.scaled_row(out_ch + 5);
+                let weight_g = handle.scaled_row(out_ch + 6);
+                let weight_h = handle.scaled_row(out_ch + 7);
                 for pos in 0..seq_len {
                     let mut sum = bias;
                     let mut sum_b = bias_b;
@@ -5738,14 +5761,14 @@ impl F5Q4DiTSession {
                             let col = local_in * kernel + k;
                             unsafe {
                                 let value = *input.get_unchecked(input_base + local_in);
-                                sum += value * *weight_row.get_unchecked(col) as f32 * scale;
-                                sum_b += value * *weight_b.get_unchecked(col) as f32 * scale_b;
-                                sum_c += value * *weight_c.get_unchecked(col) as f32 * scale_c;
-                                sum_d += value * *weight_d.get_unchecked(col) as f32 * scale_d;
-                                sum_e += value * *weight_e.get_unchecked(col) as f32 * scale_e;
-                                sum_f += value * *weight_f.get_unchecked(col) as f32 * scale_f;
-                                sum_g += value * *weight_g.get_unchecked(col) as f32 * scale_g;
-                                sum_h += value * *weight_h.get_unchecked(col) as f32 * scale_h;
+                                sum += value * *scaled_weight_row.get_unchecked(col);
+                                sum_b += value * *weight_b.get_unchecked(col);
+                                sum_c += value * *weight_c.get_unchecked(col);
+                                sum_d += value * *weight_d.get_unchecked(col);
+                                sum_e += value * *weight_e.get_unchecked(col);
+                                sum_f += value * *weight_f.get_unchecked(col);
+                                sum_g += value * *weight_g.get_unchecked(col);
+                                sum_h += value * *weight_h.get_unchecked(col);
                             }
                         }
                     }
@@ -5768,12 +5791,9 @@ impl F5Q4DiTSession {
                 let bias_b = handle.bias_values.get(out_ch + 1).copied().unwrap_or(0.0);
                 let bias_c = handle.bias_values.get(out_ch + 2).copied().unwrap_or(0.0);
                 let bias_d = handle.bias_values.get(out_ch + 3).copied().unwrap_or(0.0);
-                let scale_b = handle.row_scales[out_ch + 1];
-                let scale_c = handle.row_scales[out_ch + 2];
-                let scale_d = handle.row_scales[out_ch + 3];
-                let weight_b = handle.unpacked_row(out_ch + 1);
-                let weight_c = handle.unpacked_row(out_ch + 2);
-                let weight_d = handle.unpacked_row(out_ch + 3);
+                let weight_b = handle.scaled_row(out_ch + 1);
+                let weight_c = handle.scaled_row(out_ch + 2);
+                let weight_d = handle.scaled_row(out_ch + 3);
                 for pos in 0..seq_len {
                     let mut sum = bias;
                     let mut sum_b = bias_b;
@@ -5788,10 +5808,10 @@ impl F5Q4DiTSession {
                             let col = local_in * kernel + k;
                             unsafe {
                                 let value = *input.get_unchecked(src_pos * channels + input_base);
-                                sum += value * *weight_row.get_unchecked(col) as f32 * scale;
-                                sum_b += value * *weight_b.get_unchecked(col) as f32 * scale_b;
-                                sum_c += value * *weight_c.get_unchecked(col) as f32 * scale_c;
-                                sum_d += value * *weight_d.get_unchecked(col) as f32 * scale_d;
+                                sum += value * *scaled_weight_row.get_unchecked(col);
+                                sum_b += value * *weight_b.get_unchecked(col);
+                                sum_c += value * *weight_c.get_unchecked(col);
+                                sum_d += value * *weight_d.get_unchecked(col);
                             }
                         }
                     }
@@ -5808,8 +5828,7 @@ impl F5Q4DiTSession {
             }
             if out_ch + 1 < channels && (out_ch + 1) / group_in == group {
                 let bias_b = handle.bias_values.get(out_ch + 1).copied().unwrap_or(0.0);
-                let scale_b = handle.row_scales[out_ch + 1];
-                let weight_b = handle.unpacked_row(out_ch + 1);
+                let weight_b = handle.scaled_row(out_ch + 1);
                 for pos in 0..seq_len {
                     let mut sum = bias;
                     let mut sum_b = bias_b;
@@ -5821,8 +5840,8 @@ impl F5Q4DiTSession {
                             let src_pos = pos + k - padding;
                             let col = local_in * kernel + k;
                             let value = input[src_pos * channels + input_base];
-                            sum += value * weight_row[col] as f32 * scale;
-                            sum_b += value * weight_b[col] as f32 * scale_b;
+                            sum += value * scaled_weight_row[col];
+                            sum_b += value * weight_b[col];
                         }
                     }
                     let dst = pos * channels + out_ch;
@@ -5841,7 +5860,7 @@ impl F5Q4DiTSession {
                     for k in k_start..k_end {
                         let src_pos = pos + k - padding;
                         let col = local_in * kernel + k;
-                        sum += input[src_pos * channels + input_base] * weight_row[col] as f32 * scale;
+                        sum += input[src_pos * channels + input_base] * scaled_weight_row[col];
                     }
                 }
                 output[pos * channels + out_ch] = sum;
@@ -5853,8 +5872,7 @@ impl F5Q4DiTSession {
 }
 
 struct Q4RawTensor {
-    unpacked_weight: Vec<i8>,
-    row_scales: Vec<f32>,
+    scaled_weight: Vec<f32>,
     bias_values: Vec<f32>,
     in_dim: usize,
     out_dim: usize,
@@ -5874,20 +5892,22 @@ impl Q4RawTensor {
         if packed_weight.len() < (out_dim * in_dim).div_ceil(2) || row_scales_f16.len() < out_dim {
             return Err(JsValue::from_str("Q4RawTensor shape mismatch"));
         }
-        let mut unpacked_weight = vec![0i8; out_dim * in_dim];
+        let row_scales: Vec<f32> = row_scales_f16.iter().take(out_dim).map(|bits| f16_to_f32(*bits)).collect();
+        let mut scaled_weight = vec![0.0f32; out_dim * in_dim];
         for row in 0..out_dim {
             let row_offset = row * in_dim;
+            let scale = row_scales[row];
             for col in 0..in_dim {
                 let index = row_offset + col;
                 let packed = packed_weight[index >> 1];
                 let nibble = if index & 1 == 0 { packed & 0x0f } else { packed >> 4 };
                 let q = nibble as i8;
-                unpacked_weight[index] = if q >= 8 { q - 16 } else { q };
+                let value = if q >= 8 { q - 16 } else { q };
+                scaled_weight[index] = value as f32 * scale;
             }
         }
         Ok(Q4RawTensor {
-            unpacked_weight,
-            row_scales: row_scales_f16.iter().take(out_dim).map(|bits| f16_to_f32(*bits)).collect(),
+            scaled_weight,
             bias_values: bias_values.to_vec(),
             in_dim,
             out_dim,
@@ -5895,8 +5915,8 @@ impl Q4RawTensor {
     }
 
     #[inline(always)]
-    fn unpacked_row(&self, row: usize) -> &[i8] {
-        &self.unpacked_weight[row * self.in_dim..(row + 1) * self.in_dim]
+    fn scaled_row(&self, row: usize) -> &[f32] {
+        &self.scaled_weight[row * self.in_dim..(row + 1) * self.in_dim]
     }
 }
 

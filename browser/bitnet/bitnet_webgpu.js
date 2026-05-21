@@ -46,24 +46,6 @@ function normalizeLayout(layoutHeader) {
   if (header[0] !== 1 || header[1] !== 16 || header[2] !== 32 || header[9] !== 1) {
     throw new Error("Unsupported BitNet browser layout; expected v1 16x32 interleave mode 1");
   }
-  if (header[3] <= 0 || header[4] <= 0) {
-    throw new Error("BitNet logical dimensions must be positive");
-  }
-  if (header[5] < header[3] || header[6] < header[4]) {
-    throw new Error("BitNet padded dimensions must be greater than or equal to logical dimensions");
-  }
-  if (header[6] % 4 !== 0) {
-    throw new Error("BitNet padded input features must be divisible by 4");
-  }
-  if (![0, 1, 2].includes(header[7])) {
-    throw new Error("Unsupported BitNet scale_granularity");
-  }
-  if (header[7] === 1 && header[11] <= 0) {
-    throw new Error("BitNet per-segment scaling requires segment_count > 0");
-  }
-  if (header[7] === 2 && header[8] <= 0) {
-    throw new Error("BitNet per-output-group scaling requires scale_group_size > 0");
-  }
   return {
     logicalOut: header[3],
     logicalIn: header[4],
@@ -73,58 +55,6 @@ function normalizeLayout(layoutHeader) {
     scaleGroupSize: header[8],
     segmentCount: header[11],
   };
-}
-
-function validateLayerTensors(layout, bundle) {
-  const rowStrideBytes = layout.paddedIn / 4;
-  const expectedPackedBytes = layout.logicalOut * rowStrideBytes;
-  if (bundle.packedWeight.length < expectedPackedBytes) {
-    throw new Error("BitNet packed_weight is shorter than layout requires");
-  }
-  if (bundle.bias && bundle.bias.length > 0 && bundle.bias.length < layout.logicalOut) {
-    throw new Error("BitNet bias length must be zero or at least logicalOut");
-  }
-  if (layout.scaleGranularity === 0 && bundle.scaleValues.length < 1) {
-    throw new Error("BitNet per-matrix scaling requires one scale value");
-  }
-  if (layout.scaleGranularity === 1) {
-    if (bundle.scaleValues.length < layout.segmentCount) {
-      throw new Error("BitNet per-segment scaling has too few scale values");
-    }
-    if (bundle.segmentOffsets.length < layout.segmentCount + 1) {
-      throw new Error("BitNet per-segment scaling has too few segment offsets");
-    }
-    if (bundle.segmentOffsets[0] !== 0 || bundle.segmentOffsets[layout.segmentCount] !== layout.logicalOut) {
-      throw new Error("BitNet segment offsets must span [0, logicalOut]");
-    }
-    for (let i = 0; i < layout.segmentCount; i += 1) {
-      if (bundle.segmentOffsets[i] > bundle.segmentOffsets[i + 1]) {
-        throw new Error("BitNet segment offsets must be non-decreasing");
-      }
-    }
-  }
-  if (layout.scaleGranularity === 2) {
-    const expectedGroups = Math.ceil(layout.logicalOut / layout.scaleGroupSize);
-    if (bundle.scaleValues.length < expectedGroups) {
-      throw new Error("BitNet per-output-group scaling has too few scale values");
-    }
-  }
-}
-
-function validateInputQuantization(inputScales, rows, inputQuantMode, inputQuantBits, inputScaleRows) {
-  if (inputQuantMode === 0) return;
-  if (inputQuantMode !== 1) {
-    throw new Error("Unsupported BitNet input_quant_mode");
-  }
-  if (inputQuantBits < 2 || inputQuantBits > 8) {
-    throw new Error("BitNet input_quant_bits must be in [2, 8]");
-  }
-  if (inputScaleRows !== 1 && inputScaleRows !== rows) {
-    throw new Error("BitNet input_scale_rows must be 1 or rows");
-  }
-  if (inputScales.length < inputScaleRows) {
-    throw new Error("BitNet input_scales has too few values");
-  }
 }
 
 function resolveUrl(path, baseUrl) {
@@ -239,10 +169,10 @@ export class BitNetLinearWebGPU {
   constructor(device, bundle) {
     this.device = device;
     this.layout = normalizeLayout(bundle.layoutHeader);
+    this.hasBias = bundle.bias != null;
     this.inputQuantMode = bundle.inputQuantMode ?? 0;
     this.inputQuantBits = bundle.inputQuantBits ?? 8;
     this.inputScaleRows = bundle.inputScaleRows ?? 1;
-    this.inputScales = bundle.inputScales ? new Float32Array(bundle.inputScales) : new Float32Array([1]);
 
     if (!bundle.shaderCode && !bundle.pipeline) {
       throw new Error("BitNetLinearWebGPU requires shaderCode or pipeline; use fromManifestLayer() or fromManifestUrl()");
@@ -258,35 +188,17 @@ export class BitNetLinearWebGPU {
       });
     }
 
-    const packedWeight = bundle.packedWeight instanceof Uint8Array
-      ? bundle.packedWeight
-      : new Uint8Array(bundle.packedWeight);
-    const scaleValues = bundle.scaleValues instanceof Float32Array
-      ? bundle.scaleValues
-      : new Float32Array(bundle.scaleValues);
-    const segmentOffsets = bundle.segmentOffsets instanceof Int32Array
-      ? bundle.segmentOffsets
-      : Int32Array.from(bundle.segmentOffsets || []);
-    const hasBiasInput = bundle.bias != null;
-    const bias = hasBiasInput
-      ? (bundle.bias instanceof Float32Array ? bundle.bias : new Float32Array(bundle.bias))
-      : new Float32Array(0);
-    this.hasBias = bias.length > 0;
-    validateLayerTensors(this.layout, {
-      packedWeight,
-      scaleValues,
-      segmentOffsets,
-      bias,
-    });
-
-    this.packedWeightBuffer = createStorageBuffer(device, packedWeightToWords(packedWeight));
-    this.scaleBuffer = createStorageBuffer(device, scaleValues);
-    this.segmentOffsetBuffer = createStorageBuffer(device, new Uint32Array(segmentOffsets));
+    this.packedWeightBuffer = createStorageBuffer(device, packedWeightToWords(bundle.packedWeight));
+    this.scaleBuffer = createStorageBuffer(device, new Float32Array(bundle.scaleValues));
+    this.segmentOffsetBuffer = createStorageBuffer(device, new Uint32Array(bundle.segmentOffsets));
     this.biasBuffer = createStorageBuffer(
       device,
-      this.hasBias ? bias : new Float32Array([0]),
+      this.hasBias ? new Float32Array(bundle.bias) : new Float32Array([0]),
     );
-    this.inputScaleBuffer = createStorageBuffer(device, this.inputScales);
+    this.inputScaleBuffer = createStorageBuffer(
+      device,
+      bundle.inputScales ? new Float32Array(bundle.inputScales) : new Float32Array([1]),
+    );
     this.paramsBuffer = device.createBuffer({
       size: PARAM_BUFFER_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -351,13 +263,6 @@ export class BitNetLinearWebGPU {
     if (x.length !== rows * this.layout.logicalIn) {
       throw new Error(`BitNet input length mismatch: got ${x.length}, expected ${rows * this.layout.logicalIn}`);
     }
-    validateInputQuantization(
-      this.inputScales,
-      rows,
-      this.inputQuantMode,
-      this.inputQuantBits,
-      this.inputScaleRows,
-    );
 
     const outputLength = rows * this.layout.logicalOut;
     const inputBytes = x.byteLength;
