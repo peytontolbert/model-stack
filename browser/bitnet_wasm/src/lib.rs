@@ -2437,54 +2437,14 @@ unsafe fn dot4_unpacked_i8_f32_quad_simd(
     let mut d3 = f32x4_splat(0.0);
     let mut col = 0usize;
     while col + 7 < in_dim {
-        let wa = f32x4(
-            *weight_a.get_unchecked(col) as f32,
-            *weight_a.get_unchecked(col + 1) as f32,
-            *weight_a.get_unchecked(col + 2) as f32,
-            *weight_a.get_unchecked(col + 3) as f32,
-        );
-        let wb = f32x4(
-            *weight_b.get_unchecked(col) as f32,
-            *weight_b.get_unchecked(col + 1) as f32,
-            *weight_b.get_unchecked(col + 2) as f32,
-            *weight_b.get_unchecked(col + 3) as f32,
-        );
-        let wc = f32x4(
-            *weight_c.get_unchecked(col) as f32,
-            *weight_c.get_unchecked(col + 1) as f32,
-            *weight_c.get_unchecked(col + 2) as f32,
-            *weight_c.get_unchecked(col + 3) as f32,
-        );
-        let wd = f32x4(
-            *weight_d.get_unchecked(col) as f32,
-            *weight_d.get_unchecked(col + 1) as f32,
-            *weight_d.get_unchecked(col + 2) as f32,
-            *weight_d.get_unchecked(col + 3) as f32,
-        );
-        let wa_next = f32x4(
-            *weight_a.get_unchecked(col + 4) as f32,
-            *weight_a.get_unchecked(col + 5) as f32,
-            *weight_a.get_unchecked(col + 6) as f32,
-            *weight_a.get_unchecked(col + 7) as f32,
-        );
-        let wb_next = f32x4(
-            *weight_b.get_unchecked(col + 4) as f32,
-            *weight_b.get_unchecked(col + 5) as f32,
-            *weight_b.get_unchecked(col + 6) as f32,
-            *weight_b.get_unchecked(col + 7) as f32,
-        );
-        let wc_next = f32x4(
-            *weight_c.get_unchecked(col + 4) as f32,
-            *weight_c.get_unchecked(col + 5) as f32,
-            *weight_c.get_unchecked(col + 6) as f32,
-            *weight_c.get_unchecked(col + 7) as f32,
-        );
-        let wd_next = f32x4(
-            *weight_d.get_unchecked(col + 4) as f32,
-            *weight_d.get_unchecked(col + 5) as f32,
-            *weight_d.get_unchecked(col + 6) as f32,
-            *weight_d.get_unchecked(col + 7) as f32,
-        );
+        let wa = load_i8x4_as_f32(weight_a.as_ptr().add(col));
+        let wb = load_i8x4_as_f32(weight_b.as_ptr().add(col));
+        let wc = load_i8x4_as_f32(weight_c.as_ptr().add(col));
+        let wd = load_i8x4_as_f32(weight_d.as_ptr().add(col));
+        let wa_next = load_i8x4_as_f32(weight_a.as_ptr().add(col + 4));
+        let wb_next = load_i8x4_as_f32(weight_b.as_ptr().add(col + 4));
+        let wc_next = load_i8x4_as_f32(weight_c.as_ptr().add(col + 4));
+        let wd_next = load_i8x4_as_f32(weight_d.as_ptr().add(col + 4));
         let x0 = v128_load(input.as_ptr().add(row * in_dim + col) as *const v128);
         let x1 = v128_load(input.as_ptr().add((row + 1) * in_dim + col) as *const v128);
         let x2 = v128_load(input.as_ptr().add((row + 2) * in_dim + col) as *const v128);
@@ -2512,30 +2472,10 @@ unsafe fn dot4_unpacked_i8_f32_quad_simd(
         col += 8;
     }
     while col + 3 < in_dim {
-        let wa = f32x4(
-            *weight_a.get_unchecked(col) as f32,
-            *weight_a.get_unchecked(col + 1) as f32,
-            *weight_a.get_unchecked(col + 2) as f32,
-            *weight_a.get_unchecked(col + 3) as f32,
-        );
-        let wb = f32x4(
-            *weight_b.get_unchecked(col) as f32,
-            *weight_b.get_unchecked(col + 1) as f32,
-            *weight_b.get_unchecked(col + 2) as f32,
-            *weight_b.get_unchecked(col + 3) as f32,
-        );
-        let wc = f32x4(
-            *weight_c.get_unchecked(col) as f32,
-            *weight_c.get_unchecked(col + 1) as f32,
-            *weight_c.get_unchecked(col + 2) as f32,
-            *weight_c.get_unchecked(col + 3) as f32,
-        );
-        let wd = f32x4(
-            *weight_d.get_unchecked(col) as f32,
-            *weight_d.get_unchecked(col + 1) as f32,
-            *weight_d.get_unchecked(col + 2) as f32,
-            *weight_d.get_unchecked(col + 3) as f32,
-        );
+        let wa = load_i8x4_as_f32(weight_a.as_ptr().add(col));
+        let wb = load_i8x4_as_f32(weight_b.as_ptr().add(col));
+        let wc = load_i8x4_as_f32(weight_c.as_ptr().add(col));
+        let wd = load_i8x4_as_f32(weight_d.as_ptr().add(col));
         let x0 = v128_load(input.as_ptr().add(row * in_dim + col) as *const v128);
         let x1 = v128_load(input.as_ptr().add((row + 1) * in_dim + col) as *const v128);
         let x2 = v128_load(input.as_ptr().add((row + 2) * in_dim + col) as *const v128);
