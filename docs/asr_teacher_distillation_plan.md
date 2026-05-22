@@ -58,6 +58,25 @@ python scripts/build_whisper_teacher_dataset.py \
   --output /data/model/bddy-whisper-teacher/ami_teacher_v1.parquet
 ```
 
+Build teacher labels for meeting windows. This is the preferred path for bddy
+coaching/JARVIS ASR because the app transcribes rolling conversation context,
+not only isolated one-second fragments:
+
+```bash
+python scripts/build_whisper_teacher_dataset.py \
+  --teacher-model openai/whisper-large-v3-turbo \
+  --dataset 'edinburghcstr/ami:sdm:train[:3000]:text' \
+  --output /data/model/bddy-whisper-teacher/ami_sdm_window_large_turbo_teacher_v1.parquet \
+  --limit-per-dataset 120 \
+  --conversation-window-seconds 18 \
+  --conversation-window-gap-seconds 1.0 \
+  --conversation-window-min-words 20 \
+  --min-words 8 \
+  --min-duration-seconds 5 \
+  --max-duration-seconds 24 \
+  --max-new-tokens 192
+```
+
 Train a lightweight student from the teacher Parquet:
 
 ```bash

@@ -320,3 +320,67 @@ Decision: reject. The window-trained adapter did not improve the window eval and
 regressed the short-utterance promotion gate. The likely issue is that the
 training target uses noisy AMI room-mic labels directly; future window training
 should use higher-quality teacher labels or a cleaner meeting corpus.
+
+## Not Promoted: `bddy-distil-medium-ami-window-teacher-lora-v10`
+
+Teacher data:
+
+```text
+/data/model/bddy-whisper-teacher/ami_sdm_window_large_turbo_teacher_v1.parquet
+```
+
+Teacher-labeling summary:
+
+- teacher: `openai/whisper-large-v3-turbo`;
+- source: AMI SDM train windows;
+- window length: up to 18 seconds;
+- requested windows: 120;
+- accepted windows: 115;
+- rejected too short: 2;
+- rejected too short audio: 1;
+- rejected repetitive: 2.
+
+Training summary:
+
+- base model: `distil-whisper/distil-medium.en`;
+- target text: `teacher_text` for AMI window pseudo-labels;
+- LibriTTS real conversation mix included as robustness data;
+- train rows after filtering: 167;
+- LoRA target modules: `q_proj,k_proj,v_proj,out_proj`;
+- LoRA rank: 8;
+- trainable params: 1,835,008;
+- max steps: 80;
+- learning rate: `4e-6`;
+- merged model: `/data/model/bddy-distil-medium-ami-window-teacher-lora-v10-merged`.
+
+Internal trainer eval, 6 samples:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| mean WER | 0.3147 | 0.3100 |
+
+AMI SDM conversation-window smoke eval, 6 windows from `validation[:600]`:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4951 | 0.4951 |
+| median WER | 0.4900 | 0.4900 |
+| p90 WER | 0.6977 | 0.6977 |
+| median latency | 7.16s | 7.55s |
+| question recall | 0.6250 | 0.6250 |
+
+External AMI SDM short-utterance eval, 40 filtered rows:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4449 | 0.4449 |
+| median WER | 0.4226 | 0.4226 |
+| p90 WER | 0.7500 | 0.7500 |
+| median latency | 5.98s | 6.35s |
+| question recall | 0.7778 | 0.7778 |
+
+Decision: do not promote. The large-teacher meeting-window dataset path works,
+and the internal eval moved slightly, but 115 teacher windows is too small to
+move the external gates. The next meaningful improvement is to scale teacher
+window generation into the low thousands, then train with a held-out meeting
+window promotion gate.
