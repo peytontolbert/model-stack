@@ -1123,6 +1123,7 @@ export class Q4TensorBundleWebGPU {
   runVocosIstftHead(...args) { return this.base.runVocosIstftHead(...args); }
   prepareF5Session() {
     if (!this.f5GpuSession) {
+      this.installWebGpuErrorLogging();
       this.f5GpuSession = {
         backend: 'webgpu',
         modelId: this.manifest?.model_id || 'f5tts-q4',
@@ -1143,6 +1144,52 @@ export class Q4TensorBundleWebGPU {
       this.prewarmF5LinearHandles();
     }
     return this.f5GpuSession;
+  }
+
+  installWebGpuErrorLogging() {
+    if (this.webGpuErrorLoggingInstalled) return;
+    this.webGpuErrorLoggingInstalled = true;
+    if (typeof this.device.addEventListener === 'function') {
+      this.device.addEventListener('uncapturederror', (event) => {
+        const message = event?.error?.message || String(event?.error || 'unknown WebGPU validation error');
+        console.error(`Model Stack WebGPU uncaptured error: ${message}`);
+      });
+    }
+    if (this.device.lost && typeof this.device.lost.then === 'function') {
+      this.device.lost.then((info) => {
+        console.error(`Model Stack WebGPU device lost: ${info?.reason || 'unknown'} ${info?.message || ''}`.trim());
+      });
+    }
+  }
+
+  precompileF5Pipelines() {
+    this.activationComputePipeline();
+    this.layerNormAffineComputePipeline();
+    this.rotaryAttentionComputePipeline();
+    this.gatedAddComputePipeline();
+    this.tensorAddComputePipeline();
+    this.q4Conv1dComputePipeline();
+    this.f5InputEmbedComposeComputePipeline();
+    this.f5SamplerUpdateComputePipeline();
+    this.f5CopyPrefixComputePipeline();
+  }
+
+  async validateF5KernelsAsync() {
+    if (!this.device.pushErrorScope || !this.device.popErrorScope) {
+      this.precompileF5Pipelines();
+      return;
+    }
+    this.device.pushErrorScope('validation');
+    try {
+      this.precompileF5Pipelines();
+    } catch (error) {
+      await this.device.popErrorScope().catch(() => null);
+      throw error;
+    }
+    const validationError = await this.device.popErrorScope();
+    if (validationError) {
+      throw new Error(`F5 WebGPU kernel validation failed: ${validationError.message || String(validationError)}`);
+    }
   }
 
   prewarmF5LinearHandles() {
