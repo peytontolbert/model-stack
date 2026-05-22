@@ -994,6 +994,9 @@ export class Q4TensorBundleWebGPU {
   }
 
   async runQ4GroupedConv1dAsync(weightName, biasName, input, seqLen, channels, kernel, padding, groups) {
+    if (!(input instanceof WebGPUTensorF32)) {
+      return this.base.runQ4GroupedConv1d(weightName, biasName, input, seqLen, channels, kernel, padding, groups);
+    }
     return (await this.runQ4GroupedConv1dGpu(weightName, biasName, input, seqLen, channels, kernel, padding, groups)).readback(`Q4 conv1d ${weightName}`);
   }
 
@@ -1244,7 +1247,7 @@ export class Q4TensorBundleWebGPU {
 
   async runQ4LinearAsync(name, input, rows = 1, biasName = '') {
     if (input instanceof WebGPUTensorF32) return (await this.runQ4LinearGpu(name, input, rows, biasName)).readback(`Q4 linear ${name}`);
-    return this.q4LinearHandle(name, biasName).forward(input instanceof Float32Array ? input : new Float32Array(input), rows);
+    return this.base.runQ4Linear(name, input instanceof Float32Array ? input : new Float32Array(input), rows, biasName);
   }
 
   async runQ4Linear3Gpu(first, second, third, input, rows = 1) {

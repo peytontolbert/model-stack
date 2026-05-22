@@ -281,9 +281,23 @@ export class F5TTSQ4DiTRuntime {
       try {
         return await this.sampleMelResidentAsync({ condMel, condSeqLen, textIds, duration, steps, cfgStrength, swaySamplingCoef, seed, onProgress });
       } catch (error) {
-        const message = `F5 resident WebGPU sampler failed; falling back to staged WebGPU path: ${error?.message || String(error)}`;
+        const message = `F5 resident WebGPU sampler failed: ${error?.message || String(error)}`;
         console.error(message);
         if (typeof onStatus === "function") onStatus(message);
+        if (this.bundle.base?.runF5SampleMel) {
+          const wasmMessage = "F5 resident WebGPU failed; using fused WASM sampler instead of staged WebGPU readbacks.";
+          console.error(wasmMessage);
+          if (typeof onStatus === "function") onStatus(wasmMessage);
+          const wasmRuntime = new F5TTSQ4DiTRuntime(this.bundle.base, {
+            dim: this.dim,
+            textDim: this.textDim,
+            melDim: this.melDim,
+            heads: this.heads,
+            headDim: this.headDim,
+            depth: this.depth,
+          });
+          return wasmRuntime.sampleMel({ condMel, condSeqLen, textIds, duration, steps, cfgStrength, swaySamplingCoef, seed, onProgress });
+        }
       }
     }
     const cond = new Float32Array(duration * this.melDim);
