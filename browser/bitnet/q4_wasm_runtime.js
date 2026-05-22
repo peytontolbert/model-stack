@@ -1093,9 +1093,14 @@ export class Q4TensorBundleWebGPU {
   }
 
   static async fromManifestUrl(manifestUrl, options = {}) {
-    if (!globalThis.navigator?.gpu) throw new Error('WebGPU is not available in this browser');
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) throw new Error('WebGPU adapter request failed');
+    if (!globalThis.navigator?.gpu) {
+      throw new Error('WebGPU is not exposed by this browser. Use a WebGPU-enabled Chrome/Edge build with your NVIDIA driver backend enabled.');
+    }
+    const adapterOptions = options.adapterOptions || { powerPreference: 'high-performance' };
+    const adapter = options.adapter || await navigator.gpu.requestAdapter(adapterOptions);
+    if (!adapter) {
+      throw new Error('WebGPU adapter request failed. The browser did not expose a high-performance GPU adapter.');
+    }
     const device = options.device || await adapter.requestDevice();
     const shaderModule = device.createShaderModule({ code: q4ShaderSource() });
     const descriptor = { layout: 'auto', compute: { module: shaderModule, entryPoint: 'q4_linear_main' } };
