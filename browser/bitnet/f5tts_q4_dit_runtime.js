@@ -268,6 +268,7 @@ export class F5TTSQ4DiTRuntime {
     swaySamplingCoef = -1.0,
     seed = 1337,
     onProgress = null,
+    onStatus = null,
   }) {
     if (duration < condSeqLen) throw new Error("duration must be >= condSeqLen");
     if (condMel.length !== condSeqLen * this.melDim) throw new Error("condMel length must match condSeqLen * melDim");
@@ -277,7 +278,13 @@ export class F5TTSQ4DiTRuntime {
       this.bundle.runF5InputEmbeddingComposeGpu &&
       this.bundle.runQ4LinearGpu
     ) {
-      return this.sampleMelResidentAsync({ condMel, condSeqLen, textIds, duration, steps, cfgStrength, swaySamplingCoef, seed, onProgress });
+      try {
+        return await this.sampleMelResidentAsync({ condMel, condSeqLen, textIds, duration, steps, cfgStrength, swaySamplingCoef, seed, onProgress });
+      } catch (error) {
+        const message = `F5 resident WebGPU sampler failed; falling back to staged WebGPU path: ${error?.message || String(error)}`;
+        console.error(message);
+        if (typeof onStatus === "function") onStatus(message);
+      }
     }
     const cond = new Float32Array(duration * this.melDim);
     cond.set(condMel);
