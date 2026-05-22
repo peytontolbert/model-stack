@@ -327,7 +327,14 @@ def case_group(name: str) -> str:
     return name.rsplit("_", 1)[0]
 
 
-def transcribe_cases(model_id: str, cases: Iterable[EvalCase], *, max_new_tokens: int, device: str) -> dict:
+def transcribe_cases(
+    model_id: str,
+    cases: Iterable[EvalCase],
+    *,
+    max_new_tokens: int,
+    device: str,
+    num_beams: int,
+) -> dict:
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
@@ -350,7 +357,7 @@ def transcribe_cases(model_id: str, cases: Iterable[EvalCase], *, max_new_tokens
             predicted_ids = model.generate(
                 inputs["input_features"],
                 max_new_tokens=max_new_tokens,
-                num_beams=1,
+                num_beams=num_beams,
                 do_sample=False,
                 temperature=0.0,
                 condition_on_prev_tokens=False,
@@ -381,6 +388,7 @@ def transcribe_cases(model_id: str, cases: Iterable[EvalCase], *, max_new_tokens
     return {
         "model": model_id,
         "device": device,
+        "num_beams": num_beams,
         "params_m": round(params / 1_000_000, 1),
         "summary": summarize(rows),
         "groups": {key: summarize(value) for key, value in sorted(by_group.items())},
@@ -401,6 +409,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-duration-seconds", type=float, default=0.0)
     parser.add_argument("--perturb", action="store_true", help="Add 20dB noise, 10dB noise, and 1.15x speed cases.")
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--num-beams", type=int, default=1)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--output-json", default="", help="Optional path to write the full eval JSON report.")
     parser.add_argument(
@@ -450,7 +459,13 @@ def main() -> None:
     else:
         cases = build_cases(dataset, perturb=bool(args.perturb))
     results = [
-        transcribe_cases(model_id, cases, max_new_tokens=args.max_new_tokens, device=args.device)
+        transcribe_cases(
+            model_id,
+            cases,
+            max_new_tokens=args.max_new_tokens,
+            device=args.device,
+            num_beams=args.num_beams,
+        )
         for model_id in args.model
     ]
     report = {"dataset": args.dataset, "config": args.config, "split": args.split, "cases": len(cases), "results": results}

@@ -765,3 +765,37 @@ main bottleneck is no longer just sample selection. Next work should improve
 the training objective or data representation: deletion-weighted loss,
 timestamp/window-boundary cleanup, and speaker/channel segmentation before
 ASR.
+
+## Decode Probe: `distil-medium.en` Beam Search
+
+Changing decode settings produced a larger gain than the v14/v15 LoRA attempts.
+This does not replace model training, but it is an immediate runtime lever.
+
+Fixed AMI SDM short eval, 120 rows:
+
+| Metric | Greedy | Beam 3 |
+| --- | ---: | ---: |
+| mean WER | 0.3685 | 0.3659 |
+| median WER | 0.2857 | 0.2818 |
+| p90 WER | 0.8750 | 0.8571 |
+| substitution rate | 0.1062 | 0.1014 |
+| deletion rate | 0.1784 | 0.1749 |
+| insertion rate | 0.0334 | 0.0368 |
+| question recall | 0.8571 | 0.8095 |
+
+Fixed AMI SDM window eval, 60 windows:
+
+| Metric | Greedy | Beam 3 |
+| --- | ---: | ---: |
+| mean WER | 0.2873 | 0.2808 |
+| median WER | 0.2710 | 0.2596 |
+| p90 WER | 0.5000 | 0.5238 |
+| substitution rate | 0.0875 | 0.0848 |
+| deletion rate | 0.1554 | 0.1502 |
+| insertion rate | 0.0211 | 0.0242 |
+| question recall | 0.8421 | 0.8421 |
+
+Decision: beam 3 is worth considering for desktop-quality transcription when
+latency allows. It improves mean WER and deletion/substitution rates, but it
+can lower short-turn question recall and increases latency. Runtime should make
+this a quality mode rather than the universal default.
