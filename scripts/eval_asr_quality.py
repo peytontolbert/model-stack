@@ -33,10 +33,133 @@ def edit_distance(left: list[str], right: list[str]) -> int:
     return row[-1]
 
 
+def word_error_counts(reference: str, hypothesis: str) -> dict[str, int]:
+    ref_words = normalize_text(reference).split()
+    hyp_words = normalize_text(hypothesis).split()
+    rows = len(ref_words) + 1
+    cols = len(hyp_words) + 1
+    dp = [[0] * cols for _ in range(rows)]
+    back = [[""] * cols for _ in range(rows)]
+    for i in range(1, rows):
+        dp[i][0] = i
+        back[i][0] = "delete"
+    for j in range(1, cols):
+        dp[0][j] = j
+        back[0][j] = "insert"
+    for i in range(1, rows):
+        for j in range(1, cols):
+            if ref_words[i - 1] == hyp_words[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+                back[i][j] = "match"
+                continue
+            choices = [
+                (dp[i - 1][j] + 1, "delete"),
+                (dp[i][j - 1] + 1, "insert"),
+                (dp[i - 1][j - 1] + 1, "substitute"),
+            ]
+            dp[i][j], back[i][j] = min(choices, key=lambda item: item[0])
+    i = len(ref_words)
+    j = len(hyp_words)
+    counts = {"substitutions": 0, "deletions": 0, "insertions": 0, "ref_words": len(ref_words)}
+    while i > 0 or j > 0:
+        action = back[i][j]
+        if action == "match":
+            i -= 1
+            j -= 1
+        elif action == "substitute":
+            counts["substitutions"] += 1
+            i -= 1
+            j -= 1
+        elif action == "delete":
+            counts["deletions"] += 1
+            i -= 1
+        elif action == "insert":
+            counts["insertions"] += 1
+            j -= 1
+        else:
+            break
+    return counts
+
+
 def word_error_rate(reference: str, hypothesis: str) -> float:
     ref_words = normalize_text(reference).split()
     hyp_words = normalize_text(hypothesis).split()
     return edit_distance(ref_words, hyp_words) / max(1, len(ref_words))
+
+
+QUESTION_PATTERNS = (
+    "what",
+    "why",
+    "how",
+    "when",
+    "where",
+    "who",
+    "which",
+    "can you",
+    "could you",
+    "would you",
+    "do you",
+    "did you",
+    "are you",
+    "is there",
+)
+
+CONVERSATION_CRITICAL_PATTERNS = (
+    "not sure",
+    "don't know",
+    "do not know",
+    "unclear",
+    "confused",
+    "explain",
+    "clarify",
+    "repeat",
+    "concern",
+    "issue",
+    "problem",
+    "expensive",
+    "budget",
+    "timeline",
+    "risk",
+    "blocked",
+    "maybe",
+    "depends",
+)
+
+
+def pattern_hits(text: str, patterns: tuple[str, ...]) -> set[str]:
+    normalized = normalize_text(text)
+    return {pattern for pattern in patterns if pattern in normalized}
+
+
+def pattern_recall(reference: str, hypothesis: str, patterns: tuple[str, ...]) -> float | None:
+    ref_hits = pattern_hits(reference, patterns)
+    if not ref_hits:
+        return None
+    hyp_hits = pattern_hits(hypothesis, patterns)
+    return len(ref_hits & hyp_hits) / len(ref_hits)
+
+
+def is_repetitive_transcript(text: str) -> bool:
+    words = normalize_text(text).split()
+    if len(words) < 16:
+        return False
+    if len(set(words)) / max(1, len(words)) <= 0.2:
+        return True
+    for gram_size in range(1, 9):
+        index = 0
+        while index + gram_size * 3 <= len(words):
+            phrase = words[index : index + gram_size]
+            repeats = 1
+            while (
+                index + repeats * gram_size + gram_size <= len(words)
+                and words[index + repeats * gram_size : index + (repeats + 1) * gram_size]
+                == phrase
+            ):
+                repeats += 1
+            if repeats >= 4 or (gram_size >= 3 and repeats >= 3):
+                return True
+            index += max(1, repeats * gram_size)
+    return False
 
 
 def add_white_noise(audio, snr_db: float, seed: int):
@@ -77,9 +200,45 @@ def build_cases(dataset, *, perturb: bool) -> list[EvalCase]:
     return cases
 
 
+def filter_dataset(
+    dataset,
+    *,
+    min_words: int,
+    min_duration_seconds: float,
+    max_duration_seconds: float,
+):
+    if min_words <= 0 and min_duration_seconds <= 0 and max_duration_seconds <= 0:
+        return dataset
+
+    def keep(example):
+        text = str(example["text"] or "")
+        if len(normalize_text(text).split()) < min_words:
+            return False
+        audio = example["audio"]
+        duration = len(audio["array"]) / float(audio.get("sampling_rate") or 16_000)
+        if min_duration_seconds > 0 and duration < min_duration_seconds:
+            return False
+        if max_duration_seconds > 0 and duration > max_duration_seconds:
+            return False
+        return True
+
+    return dataset.filter(keep, desc="Filtering ASR eval rows")
+
+
 def summarize(rows: list[dict]) -> dict:
     wers = [float(row["wer"]) for row in rows]
     latencies = [float(row["latency_ms"]) for row in rows]
+    ref_words = sum(int(row["ref_words"]) for row in rows)
+    question_recalls = [
+        float(row["question_recall"])
+        for row in rows
+        if row["question_recall"] is not None
+    ]
+    critical_recalls = [
+        float(row["critical_recall"])
+        for row in rows
+        if row["critical_recall"] is not None
+    ]
     if not rows:
         return {"n": 0}
     p90_index = max(0, min(len(rows) - 1, math.ceil(len(rows) * 0.9) - 1))
@@ -90,6 +249,16 @@ def summarize(rows: list[dict]) -> dict:
         "p90_wer": round(sorted(wers)[p90_index], 4),
         "median_latency_ms": round(statistics.median(latencies), 1),
         "p90_latency_ms": round(sorted(latencies)[p90_index], 1),
+        "substitution_rate": round(sum(int(row["substitutions"]) for row in rows) / max(1, ref_words), 4),
+        "deletion_rate": round(sum(int(row["deletions"]) for row in rows) / max(1, ref_words), 4),
+        "insertion_rate": round(sum(int(row["insertions"]) for row in rows) / max(1, ref_words), 4),
+        "repetition_rate": round(sum(1 for row in rows if row["repetitive"]) / len(rows), 4),
+        "question_recall": round(sum(question_recalls) / len(question_recalls), 4)
+        if question_recalls
+        else None,
+        "critical_term_recall": round(sum(critical_recalls) / len(critical_recalls), 4)
+        if critical_recalls
+        else None,
     }
 
 
@@ -110,15 +279,30 @@ def transcribe_cases(model_id: str, cases: Iterable[EvalCase], *, max_new_tokens
         inputs = processor(case.audio, sampling_rate=case.sample_rate, return_tensors="pt")
         started = time.perf_counter()
         with torch.inference_mode():
-            predicted_ids = model.generate(inputs.input_features, max_new_tokens=max_new_tokens)
+            predicted_ids = model.generate(
+                inputs.input_features,
+                max_new_tokens=max_new_tokens,
+                num_beams=1,
+                do_sample=False,
+                temperature=0.0,
+                condition_on_prev_tokens=False,
+                compression_ratio_threshold=2.4,
+                logprob_threshold=-1.0,
+                no_speech_threshold=0.6,
+            )
         latency_ms = (time.perf_counter() - started) * 1000.0
         hypothesis = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+        counts = word_error_counts(case.reference, hypothesis)
         rows.append(
             {
                 "case": case.name,
                 "seconds": round(len(case.audio) / case.sample_rate, 2),
                 "latency_ms": round(latency_ms, 1),
                 "wer": round(word_error_rate(case.reference, hypothesis), 4),
+                **counts,
+                "repetitive": is_repetitive_transcript(hypothesis),
+                "question_recall": pattern_recall(case.reference, hypothesis, QUESTION_PATTERNS),
+                "critical_recall": pattern_recall(case.reference, hypothesis, CONVERSATION_CRITICAL_PATTERNS),
                 "ref": case.reference,
                 "hyp": hypothesis,
             }
@@ -141,7 +325,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default="hf-internal-testing/librispeech_asr_dummy")
     parser.add_argument("--config", default="clean")
     parser.add_argument("--split", default="validation")
+    parser.add_argument("--text-column", default="text")
     parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--min-words", type=int, default=0)
+    parser.add_argument("--min-duration-seconds", type=float, default=0.0)
+    parser.add_argument("--max-duration-seconds", type=float, default=0.0)
     parser.add_argument("--perturb", action="store_true", help="Add 20dB noise, 10dB noise, and 1.15x speed cases.")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     return parser.parse_args()
@@ -150,6 +338,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     dataset = load_dataset(args.dataset, args.config, split=args.split)
+    if args.text_column != "text":
+        dataset = dataset.rename_column(args.text_column, "text")
+    dataset = filter_dataset(
+        dataset,
+        min_words=args.min_words,
+        min_duration_seconds=args.min_duration_seconds,
+        max_duration_seconds=args.max_duration_seconds,
+    )
     if args.limit > 0:
         dataset = dataset.select(range(min(args.limit, len(dataset))))
     cases = build_cases(dataset, perturb=bool(args.perturb))
