@@ -264,8 +264,10 @@ class WebGPUTensorF32 {
       await readbackBuffer.mapAsync(gpuMapMode().READ);
       const result = new Float32Array(readbackBuffer.getMappedRange().slice(0, bytes));
       readbackBuffer.unmap();
+      if (typeof readbackBuffer.destroy === 'function') readbackBuffer.destroy();
       return result;
     } catch (error) {
+      if (typeof readbackBuffer.destroy === 'function') readbackBuffer.destroy();
       throw new Error(`${label} readback mapAsync failed: ${error?.message || String(error)}`);
     }
   }
@@ -289,11 +291,20 @@ class WebGPUTensorF32 {
         await readbackBuffer.mapAsync(gpuMapMode().READ);
         result.set(new Float32Array(readbackBuffer.getMappedRange().slice(0, bytes)), offset);
         readbackBuffer.unmap();
+        if (typeof readbackBuffer.destroy === 'function') readbackBuffer.destroy();
       } catch (error) {
+        if (typeof readbackBuffer.destroy === 'function') readbackBuffer.destroy();
         throw new Error(`${label} chunked readback mapAsync failed at ${offset}/${total}: ${error?.message || String(error)}`);
       }
     }
     return result;
+  }
+
+  destroy() {
+    if (this.buffer && typeof this.buffer.destroy === 'function') {
+      this.buffer.destroy();
+    }
+    this.buffer = null;
   }
 }
 
@@ -835,6 +846,7 @@ export class Q4TensorBundleWebGPU {
     this.q4Index = baseBundle.q4Index;
     this.denseIndex = baseBundle.denseIndex;
     this.q4LinearHandleCache = new Map();
+    this.q4ConvBufferCache = new Map();
     this.f5GpuSession = null;
     this.backend = 'webgpu';
   }
@@ -985,16 +997,12 @@ export class Q4TensorBundleWebGPU {
   }
 
   async runQ4GroupedConv1dGpu(weightName, biasName, input, seqLen, channels, kernel, padding, groups) {
-    const tensor = this.q4Tensor(weightName);
-    const rowSize = tensor.entry.shape.slice(1).reduce((acc, value) => acc * Number(value), 1);
+    const { rowSize, weightBuffer, scaleBuffer, biasBuffer } = this.q4ConvBuffers(weightName, biasName);
     const groupIn = channels / groups;
     const source = this.uploadF32Tensor(input, seqLen, channels);
     const bufferUsage = gpuBufferUsage();
     const outputBytes = seqLen * channels * Float32Array.BYTES_PER_ELEMENT;
     const outputBuffer = this.device.createBuffer({ size: align4(outputBytes), usage: bufferUsage.STORAGE | bufferUsage.COPY_SRC });
-    const weightBuffer = createGpuStorageBuffer(this.device, tensor.packedWeight);
-    const scaleBuffer = createGpuStorageBuffer(this.device, f32ScalesFromF16(tensor.rowScalesF16));
-    const biasBuffer = createGpuStorageBuffer(this.device, this.denseF32Tensor(biasName));
     const paramsBuffer = this.device.createBuffer({ size: 32, usage: bufferUsage.UNIFORM | bufferUsage.COPY_DST });
     this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([seqLen, channels, kernel, padding, groups, groupIn, rowSize, 0]));
     const pipeline = this.q4Conv1dComputePipeline();
@@ -1265,6 +1273,21 @@ export class Q4TensorBundleWebGPU {
     handle = new Q4LinearWebGPUHandle(this.device, this.pipeline, tensor, bias, inDim, outDim);
     this.q4LinearHandleCache.set(key, handle);
     return handle;
+  }
+
+  q4ConvBuffers(weightName, biasName = '') {
+    const key = `${weightName}:${biasName || ''}`;
+    let cached = this.q4ConvBufferCache.get(key);
+    if (cached) return cached;
+    const tensor = this.q4Tensor(weightName);
+    cached = {
+      rowSize: tensor.entry.shape.slice(1).reduce((acc, value) => acc * Number(value), 1),
+      weightBuffer: createGpuStorageBuffer(this.device, tensor.packedWeight),
+      scaleBuffer: createGpuStorageBuffer(this.device, f32ScalesFromF16(tensor.rowScalesF16)),
+      biasBuffer: createGpuStorageBuffer(this.device, this.denseF32Tensor(biasName)),
+    };
+    this.q4ConvBufferCache.set(key, cached);
+    return cached;
   }
 
   async runQ4LinearGpu(name, input, rows = 1, biasName = '') {

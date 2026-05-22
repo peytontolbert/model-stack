@@ -349,13 +349,20 @@ export class F5TTSQ4DiTRuntime {
         nullPredGpu = await this.forwardResidentAsync({ x: yGpu, cond: condGpu, textIds, time: t, dropAudioCond: true, dropText: true });
         cfg = cfgStrength;
       }
+      const previousY = yGpu;
       yGpu = await this.bundle.runF5SamplerUpdateGpu(yGpu, predGpu, nullPredGpu, dt, cfg);
+      destroyTensor(predGpu);
+      if (nullPredGpu !== predGpu) destroyTensor(nullPredGpu);
+      destroyTensor(previousY);
       if (typeof onProgress === "function") onProgress(step + 1, steps);
     }
     await this.bundle.runF5CopyPrefixGpu(condGpu, yGpu, condSeqLen * this.melDim);
-    return typeof yGpu.readbackChunked === "function"
-      ? yGpu.readbackChunked("F5 sampled mel", 16384)
-      : yGpu.readback("F5 sampled mel");
+    destroyTensor(condGpu);
+    const result = typeof yGpu.readbackChunked === "function"
+      ? await yGpu.readbackChunked("F5 sampled mel", 16384)
+      : await yGpu.readback("F5 sampled mel");
+    destroyTensor(yGpu);
+    return result;
   }
 
   async forwardAsync({ x, cond, textIds, time = 0.5, dropAudioCond = false, dropText = false }) {
@@ -379,7 +386,9 @@ export class F5TTSQ4DiTRuntime {
     let hidden = await this.inputEmbeddingResidentAsync(x, cond, text, seqLen, dropAudioCond);
     for (let block = 0; block < this.depth; block += 1) hidden = await this.ditBlockResidentAsync(block, hidden, t, seqLen);
     hidden = await this.finalAdaNormResidentAsync(hidden, t, seqLen);
-    return this.bundle.runQ4LinearGpu("transformer.proj_out.weight", hidden, seqLen, "transformer.proj_out.bias");
+    const out = await this.bundle.runQ4LinearGpu("transformer.proj_out.weight", hidden, seqLen, "transformer.proj_out.bias");
+    destroyTensor(hidden);
+    return out;
   }
 
   async timeEmbeddingAsync(time) {
@@ -451,11 +460,17 @@ export class F5TTSQ4DiTRuntime {
   async inputEmbeddingResidentAsync(x, cond, text, seqLen, dropAudioCond) {
     const joined = await this.bundle.runF5InputEmbeddingComposeGpu(x, cond, text, seqLen, this.melDim, this.textDim, dropAudioCond);
     const projected = await this.bundle.runQ4LinearGpu("transformer.input_embed.proj.weight", joined, seqLen, "transformer.input_embed.proj.bias");
+    destroyTensor(joined);
     let pos = await this.bundle.runQ4GroupedConv1dGpu("transformer.input_embed.conv_pos_embed.conv1d.0.weight", "transformer.input_embed.conv_pos_embed.conv1d.0.bias", projected, seqLen, this.dim, 31, 15, 16);
     this.bundle.runActivationInPlace(pos, "mish");
-    pos = await this.bundle.runQ4GroupedConv1dGpu("transformer.input_embed.conv_pos_embed.conv1d.2.weight", "transformer.input_embed.conv_pos_embed.conv1d.2.bias", pos, seqLen, this.dim, 31, 15, 16);
+    const firstPos = pos;
+    pos = await this.bundle.runQ4GroupedConv1dGpu("transformer.input_embed.conv_pos_embed.conv1d.2.weight", "transformer.input_embed.conv_pos_embed.conv1d.2.bias", firstPos, seqLen, this.dim, 31, 15, 16);
+    destroyTensor(firstPos);
     this.bundle.runActivationInPlace(pos, "mish");
-    return this.bundle.runTensorAddGpu(pos, projected, seqLen, this.dim);
+    const out = await this.bundle.runTensorAddGpu(pos, projected, seqLen, this.dim);
+    destroyTensor(pos);
+    destroyTensor(projected);
+    return out;
   }
 
   async ditBlockAsync(block, input, t, seqLen) {
@@ -533,9 +548,14 @@ export class F5TTSQ4DiTRuntime {
       norm,
       seqLen,
     );
-    let attn = await this.bundle.runRotaryAttentionGpu(q, k, v, seqLen, this.heads, this.headDim);
-    attn = await this.bundle.runQ4LinearGpu(`${prefix}.attn.to_out.0.weight`, attn, seqLen, `${prefix}.attn.to_out.0.bias`);
+    destroyTensor(norm);
+    const rotaryAttn = await this.bundle.runRotaryAttentionGpu(q, k, v, seqLen, this.heads, this.headDim);
+    destroyTensors(q, k, v);
+    const attn = await this.bundle.runQ4LinearGpu(`${prefix}.attn.to_out.0.weight`, rotaryAttn, seqLen, `${prefix}.attn.to_out.0.bias`);
+    destroyTensor(rotaryAttn);
     const x = await this.bundle.runGatedAddRowsAsync(input, attn, gateMsa, seqLen, this.dim);
+    destroyTensor(input);
+    destroyTensor(attn);
     norm = await this.bundle.runLayerNormAffineAsync(x, shiftMlp, scaleMlp, seqLen, this.dim, EPS);
     const ff = await this.bundle.runQ4MlpGpu(
       { weightName: `${prefix}.ff.ff.0.0.weight`, biasName: `${prefix}.ff.ff.0.0.bias` },
@@ -544,7 +564,11 @@ export class F5TTSQ4DiTRuntime {
       seqLen,
       "gelu",
     );
-    return this.bundle.runGatedAddRowsAsync(x, ff, gateMlp, seqLen, this.dim);
+    destroyTensor(norm);
+    const out = await this.bundle.runGatedAddRowsAsync(x, ff, gateMlp, seqLen, this.dim);
+    destroyTensor(x);
+    destroyTensor(ff);
+    return out;
   }
 
   async finalAdaNormAsync(input, t, seqLen) {
@@ -560,7 +584,9 @@ export class F5TTSQ4DiTRuntime {
     const mod = await this.linearAsync("transformer.norm_out.linear.weight", "transformer.norm_out.linear.bias", siluCopy(t), 1);
     const scale = mod.subarray(0, this.dim);
     const shift = mod.subarray(this.dim, this.dim * 2);
-    return this.bundle.runLayerNormAffineAsync(input, shift, scale, seqLen, this.dim, EPS);
+    const out = await this.bundle.runLayerNormAffineAsync(input, shift, scale, seqLen, this.dim, EPS);
+    destroyTensor(input);
+    return out;
   }
 
   linearAsync(weightName, biasName, input, rows) {
@@ -583,6 +609,16 @@ function addTextSinusoidalPos(x, seqLen, dim) {
       x[base + i + half] += Math.sin(angle);
     }
   }
+}
+
+function destroyTensor(tensor) {
+  if (tensor && typeof tensor.destroy === "function") {
+    tensor.destroy();
+  }
+}
+
+function destroyTensors(...tensors) {
+  for (const tensor of tensors) destroyTensor(tensor);
 }
 
 function makeTimeGrid(steps, swaySamplingCoef) {
