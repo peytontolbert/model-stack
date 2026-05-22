@@ -250,17 +250,24 @@ class WebGPUTensorF32 {
     this.cols = cols;
   }
 
-  async readback() {
+  async readback(label = 'WebGPU tensor') {
     const bufferUsage = gpuBufferUsage();
     const bytes = this.length * Float32Array.BYTES_PER_ELEMENT;
     const readbackBuffer = this.device.createBuffer({ size: align4(bytes), usage: bufferUsage.MAP_READ | bufferUsage.COPY_DST });
     const encoder = this.device.createCommandEncoder();
     encoder.copyBufferToBuffer(this.buffer, 0, readbackBuffer, 0, bytes);
     this.device.queue.submit([encoder.finish()]);
-    await readbackBuffer.mapAsync(gpuMapMode().READ);
-    const result = new Float32Array(readbackBuffer.getMappedRange().slice(0, bytes));
-    readbackBuffer.unmap();
-    return result;
+    if (typeof this.device.queue.onSubmittedWorkDone === 'function') {
+      await this.device.queue.onSubmittedWorkDone();
+    }
+    try {
+      await readbackBuffer.mapAsync(gpuMapMode().READ);
+      const result = new Float32Array(readbackBuffer.getMappedRange().slice(0, bytes));
+      readbackBuffer.unmap();
+      return result;
+    } catch (error) {
+      throw new Error(`${label} readback mapAsync failed: ${error?.message || String(error)}`);
+    }
   }
 }
 
@@ -744,7 +751,6 @@ class Q4LinearWebGPUHandle {
       const bufferUsage = gpuBufferUsage();
       const inputBuffer = this.device.createBuffer({ size: align4(inputBytes), usage: bufferUsage.STORAGE | bufferUsage.COPY_DST });
       const outputBuffer = this.device.createBuffer({ size: align4(outputBytes), usage: bufferUsage.STORAGE | bufferUsage.COPY_SRC });
-      const readbackBuffer = this.device.createBuffer({ size: align4(outputBytes), usage: bufferUsage.MAP_READ | bufferUsage.COPY_DST });
       const bindGroup = this.device.createBindGroup({
         layout: this.pipeline.getBindGroupLayout(0),
         entries: [
@@ -756,23 +762,32 @@ class Q4LinearWebGPUHandle {
           { binding: 5, resource: { buffer: this.paramsBuffer } },
         ],
       });
-      cache = { inputBuffer, outputBuffer, readbackBuffer, bindGroup };
+      cache = { inputBuffer, outputBuffer, bindGroup };
       this.runCache.set(cacheKey, cache);
     }
     this.device.queue.writeBuffer(cache.inputBuffer, 0, x.buffer, x.byteOffset, x.byteLength);
     this.device.queue.writeBuffer(this.paramsBuffer, 0, new Uint32Array([rows, this.inDim, this.outDim, this.hasBias ? 1 : 0]));
+    const bufferUsage = gpuBufferUsage();
+    const readbackBuffer = this.device.createBuffer({ size: align4(outputBytes), usage: bufferUsage.MAP_READ | bufferUsage.COPY_DST });
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginComputePass();
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, cache.bindGroup);
     pass.dispatchWorkgroups(Math.ceil(this.outDim / 8), Math.ceil(rows / 8), 1);
     pass.end();
-    encoder.copyBufferToBuffer(cache.outputBuffer, 0, cache.readbackBuffer, 0, outputBytes);
+    encoder.copyBufferToBuffer(cache.outputBuffer, 0, readbackBuffer, 0, outputBytes);
     this.device.queue.submit([encoder.finish()]);
-    await cache.readbackBuffer.mapAsync(gpuMapMode().READ);
-    const result = new Float32Array(cache.readbackBuffer.getMappedRange().slice(0, outputBytes));
-    cache.readbackBuffer.unmap();
-    return result;
+    if (typeof this.device.queue.onSubmittedWorkDone === 'function') {
+      await this.device.queue.onSubmittedWorkDone();
+    }
+    try {
+      await readbackBuffer.mapAsync(gpuMapMode().READ);
+      const result = new Float32Array(readbackBuffer.getMappedRange().slice(0, outputBytes));
+      readbackBuffer.unmap();
+      return result;
+    } catch (error) {
+      throw new Error(`Q4 linear ${rows}x${this.inDim}->${this.outDim} readback mapAsync failed: ${error?.message || String(error)}`);
+    }
   }
 }
 
@@ -979,7 +994,7 @@ export class Q4TensorBundleWebGPU {
   }
 
   async runQ4GroupedConv1dAsync(weightName, biasName, input, seqLen, channels, kernel, padding, groups) {
-    return (await this.runQ4GroupedConv1dGpu(weightName, biasName, input, seqLen, channels, kernel, padding, groups)).readback();
+    return (await this.runQ4GroupedConv1dGpu(weightName, biasName, input, seqLen, channels, kernel, padding, groups)).readback(`Q4 conv1d ${weightName}`);
   }
 
   async runQ4DepthwiseConv1dAsync(weightName, biasName, input, seqLen, channels, kernel, padding) {
@@ -1089,7 +1104,7 @@ export class Q4TensorBundleWebGPU {
   }
 
   async runRotaryAttentionAsync(q, k, v, seqLen, heads, headDim) {
-    return (await this.runRotaryAttentionGpu(q, k, v, seqLen, heads, headDim)).readback();
+    return (await this.runRotaryAttentionGpu(q, k, v, seqLen, heads, headDim)).readback('rotary attention');
   }
 
   static async fromManifestUrl(manifestUrl, options = {}) {
@@ -1229,7 +1244,7 @@ export class Q4TensorBundleWebGPU {
   }
 
   async runQ4LinearAsync(name, input, rows = 1, biasName = '') {
-    if (input instanceof WebGPUTensorF32) return (await this.runQ4LinearGpu(name, input, rows, biasName)).readback();
+    if (input instanceof WebGPUTensorF32) return (await this.runQ4LinearGpu(name, input, rows, biasName)).readback(`Q4 linear ${name}`);
     return this.q4LinearHandle(name, biasName).forward(input instanceof Float32Array ? input : new Float32Array(input), rows);
   }
 
@@ -1244,7 +1259,11 @@ export class Q4TensorBundleWebGPU {
 
   async runQ4Linear3Async(first, second, third, input, rows = 1) {
     const [aGpu, bGpu, cGpu] = await this.runQ4Linear3Gpu(first, second, third, input, rows);
-    const [a, b, c] = await Promise.all([aGpu.readback(), bGpu.readback(), cGpu.readback()]);
+    const [a, b, c] = await Promise.all([
+      aGpu.readback(`Q4 linear ${first.weightName}`),
+      bGpu.readback(`Q4 linear ${second.weightName}`),
+      cGpu.readback(`Q4 linear ${third.weightName}`),
+    ]);
     const out = new Float32Array(a.length + b.length + c.length);
     out.set(a, 0);
     out.set(b, a.length);
@@ -1259,7 +1278,7 @@ export class Q4TensorBundleWebGPU {
   }
 
   async runQ4MlpAsync(first, second, input, rows = 1, activation = 'gelu') {
-    return (await this.runQ4MlpGpu(first, second, input, rows, activation)).readback();
+    return (await this.runQ4MlpGpu(first, second, input, rows, activation)).readback(`Q4 MLP ${second.weightName}`);
   }
 
   async runF5InputEmbeddingComposeGpu(x, cond, text, seqLen, melDim, textDim, dropAudioCond = false) {

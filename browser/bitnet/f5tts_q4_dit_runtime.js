@@ -339,7 +339,7 @@ export class F5TTSQ4DiTRuntime {
       if (typeof onProgress === "function") onProgress(step + 1, steps);
     }
     await this.bundle.runF5CopyPrefixGpu(condGpu, yGpu, condSeqLen * this.melDim);
-    return yGpu.readback();
+    return yGpu.readback("F5 sampled mel");
   }
 
   async forwardAsync({ x, cond, textIds, time = 0.5, dropAudioCond = false, dropText = false }) {
