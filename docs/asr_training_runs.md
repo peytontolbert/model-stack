@@ -619,3 +619,67 @@ Decision: use this suite for v14+ promotion gates. The SDM window set is the
 primary room-mic conversational gate. The IHM window set is a secondary clean
 meeting gate that helps identify whether a change improved language handling or
 only overfit room acoustics.
+
+## Not Promoted: `medium_multisource_fixed_eval_v14`
+
+Run directory:
+
+```text
+/data/model/bddy-asr-runs/medium_multisource_fixed_eval_v14
+```
+
+Training summary:
+
+- base model: `distil-whisper/distil-medium.en`;
+- training data:
+  - v13 AMI SDM/IHM teacher windows;
+  - v13 Earnings22 streamed teacher rows;
+  - LibriTTS real conversation mix v2;
+- filtered training rows: 907;
+- LoRA target modules: `q_proj,k_proj,v_proj,out_proj,fc1,fc2`;
+- trainable params: 3,964,928;
+- max steps: 220;
+- learning rate: `2e-6`;
+- augmentation: very light gain/noise, no overlap augmentation;
+- merged model: `/data/model/bddy-asr-runs/medium_multisource_fixed_eval_v14/merged`.
+
+Internal trainer eval, 12 fixed SDM window examples:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| mean WER | 0.2699 | 0.2699 |
+| median WER | 0.2500 | 0.2500 |
+
+External fixed AMI SDM short eval, 120 rows:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.3685 | 0.3708 |
+| median WER | 0.2857 | 0.2887 |
+| p90 WER | 0.8750 | 0.8750 |
+| substitution rate | 0.1062 | 0.1062 |
+| deletion rate | 0.1784 | 0.1804 |
+| insertion rate | 0.0334 | 0.0334 |
+| question recall | 0.8571 | 0.8095 |
+| critical-term recall | 0.7778 | 0.7778 |
+
+External fixed AMI SDM window eval, 60 windows:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.2873 | 0.2863 |
+| median WER | 0.2710 | 0.2774 |
+| p90 WER | 0.5000 | 0.5000 |
+| substitution rate | 0.0875 | 0.0875 |
+| deletion rate | 0.1554 | 0.1554 |
+| insertion rate | 0.0211 | 0.0211 |
+| question recall | 0.8421 | 0.8421 |
+| critical-term recall | 1.0000 | 1.0000 |
+
+Decision: do not promote. The candidate slightly improved mean WER on the
+fixed SDM windows but regressed the fixed short-turn gate, deletion rate, and
+question recall. This confirms that simply lowering augmentation pressure is
+not enough. The next improvement should target the failure modes directly:
+hard-case mining from the fixed suite, deletion-focused loss/reweighting, and a
+separate segmentation/diarization path for mixed speakers before more LoRA
+capacity.
