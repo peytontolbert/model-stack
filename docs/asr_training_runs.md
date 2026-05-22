@@ -384,3 +384,66 @@ and the internal eval moved slightly, but 115 teacher windows is too small to
 move the external gates. The next meaningful improvement is to scale teacher
 window generation into the low thousands, then train with a held-out meeting
 window promotion gate.
+
+## Not Promoted: `medium_teacher_windows_v11`
+
+Run directory:
+
+```text
+/data/model/bddy-asr-runs/medium_teacher_windows_v11
+```
+
+Teacher-labeling summary:
+
+- teacher: `openai/whisper-large-v3-turbo`;
+- source: `edinburghcstr/ami:sdm:train[:6000]:text`;
+- window length: up to 18 seconds;
+- requested windows: 300;
+- accepted windows: 285;
+- rejected too short: 9;
+- rejected too short audio: 1;
+- rejected repetitive: 5.
+
+Training summary:
+
+- base model: `distil-whisper/distil-medium.en`;
+- target text: `teacher_text` for AMI window pseudo-labels;
+- LibriTTS real conversation mix included as robustness data;
+- train rows after filtering: 437;
+- LoRA target modules: `q_proj,k_proj,v_proj,out_proj`;
+- LoRA rank: 8;
+- trainable params: 1,835,008;
+- max steps: 120;
+- learning rate: `4e-6`;
+- merged model: `/data/model/bddy-asr-runs/medium_teacher_windows_v11/merged`.
+
+Internal trainer eval, 11 samples:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| mean WER | 0.1340 | 0.1302 |
+| median WER | 0.1071 | 0.1071 |
+
+External AMI SDM short-utterance eval, 40 filtered rows:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4449 | 0.4449 |
+| median WER | 0.4226 | 0.4226 |
+| p90 WER | 0.7500 | 0.7500 |
+| question recall | 0.7778 | 0.7778 |
+
+AMI SDM conversation-window eval, 8 windows from `validation[:1200]`:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4562 | 0.4562 |
+| median WER | 0.4462 | 0.4462 |
+| p90 WER | 0.6977 | 0.6977 |
+| question recall | 0.7000 | 0.7000 |
+
+Decision: do not promote. Scaling from 115 to 285 teacher windows produced a
+cleaner internal eval but still did not move the external gates. This confirms
+the repeatable experiment environment works, but the next accuracy gain likely
+requires more diverse meeting data, better segmentation/channel handling, or
+training more decoder/encoder capacity than the current small LoRA target.
