@@ -184,6 +184,29 @@ python scripts/run_bddy_asr_teacher_window_experiment.py \
   --train-steps 180
 ```
 
+For a higher-capacity desktop-quality experiment, the runner can widen LoRA
+targets beyond attention projections while keeping the base model frozen:
+
+```bash
+python scripts/run_bddy_asr_teacher_window_experiment.py \
+  --run-name medium_multisource_capacity_v13 \
+  --source-dataset 'edinburghcstr/ami:sdm:train[:8000]:text' \
+  --source-dataset 'edinburghcstr/ami:ihm:train[:8000]:text' \
+  --streaming-row-source-dataset 'distil-whisper/earnings22:chunked:test:transcription' \
+  --limit-windows 350 \
+  --limit-streaming-rows 120 \
+  --train-steps 180 \
+  --learning-rate 3e-6 \
+  --lora-r 8 \
+  --lora-alpha 16 \
+  --lora-target-modules q_proj,k_proj,v_proj,out_proj,fc1,fc2 \
+  --train-noise-prob 0.15 \
+  --train-overlap-prob 0.08
+```
+
+Do not promote a checkpoint just because this larger adapter improves internal
+teacher eval. It must improve held-out AMI short and conversation-window gates.
+
 For very large row-level corpora, stream from Hugging Face instead of
 materializing a full split. Streaming is intentionally row-level only; timestamp
 window building still materializes rows so they can be sorted by meeting/time:

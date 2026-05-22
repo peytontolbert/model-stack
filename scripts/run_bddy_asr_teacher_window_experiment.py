@@ -69,6 +69,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-windows", type=int, default=500)
     parser.add_argument("--limit-streaming-rows", type=int, default=1000)
     parser.add_argument("--train-steps", type=int, default=180)
+    parser.add_argument("--learning-rate", type=float, default=4e-6)
+    parser.add_argument("--lora-r", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--lora-target-modules",
+        default="q_proj,k_proj,v_proj,out_proj",
+        help=(
+            "Comma-separated LoRA module names. For higher-capacity ASR runs, "
+            "include decoder MLP modules such as fc1,fc2 after validating memory."
+        ),
+    )
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--train-gain-db-min", type=float, default=-2.0)
+    parser.add_argument("--train-gain-db-max", type=float, default=2.0)
+    parser.add_argument("--train-noise-prob", type=float, default=0.1)
+    parser.add_argument("--train-noise-snr-db-min", type=float, default=16.0)
+    parser.add_argument("--train-noise-snr-db-max", type=float, default=28.0)
+    parser.add_argument("--train-overlap-prob", type=float, default=0.0)
+    parser.add_argument("--train-overlap-gain-db-min", type=float, default=-18.0)
+    parser.add_argument("--train-overlap-gain-db-max", type=float, default=-8.0)
     parser.add_argument("--eval-limit", type=int, default=40)
     parser.add_argument("--window-eval-limit", type=int, default=12)
     parser.add_argument("--window-seconds", type=float, default=18.0)
@@ -113,6 +135,21 @@ def main() -> None:
         "limit_windows": args.limit_windows,
         "limit_streaming_rows": args.limit_streaming_rows,
         "train_steps": args.train_steps,
+        "learning_rate": args.learning_rate,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
+        "lora_target_modules": args.lora_target_modules,
+        "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "train_gain_db_min": args.train_gain_db_min,
+        "train_gain_db_max": args.train_gain_db_max,
+        "train_noise_prob": args.train_noise_prob,
+        "train_noise_snr_db_min": args.train_noise_snr_db_min,
+        "train_noise_snr_db_max": args.train_noise_snr_db_max,
+        "train_overlap_prob": args.train_overlap_prob,
+        "train_overlap_gain_db_min": args.train_overlap_gain_db_min,
+        "train_overlap_gain_db_max": args.train_overlap_gain_db_max,
         "window_seconds": args.window_seconds,
     }
     (run_dir / "run_config.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -208,29 +245,35 @@ def main() -> None:
             "--max-steps",
             str(args.train_steps),
             "--batch-size",
-            "2",
+            str(args.batch_size),
             "--gradient-accumulation-steps",
-            "8",
+            str(args.gradient_accumulation_steps),
             "--learning-rate",
-            "4e-6",
+            str(args.learning_rate),
             "--lora-r",
-            "8",
+            str(args.lora_r),
             "--lora-alpha",
-            "16",
+            str(args.lora_alpha),
             "--lora-dropout",
-            "0.05",
+            str(args.lora_dropout),
             "--lora-target-modules",
-            "q_proj,k_proj,v_proj,out_proj",
+            args.lora_target_modules,
             "--train-gain-db-min",
-            "-2",
+            str(args.train_gain_db_min),
             "--train-gain-db-max",
-            "2",
+            str(args.train_gain_db_max),
             "--train-noise-prob",
-            "0.1",
+            str(args.train_noise_prob),
             "--train-noise-snr-db-min",
-            "16",
+            str(args.train_noise_snr_db_min),
             "--train-noise-snr-db-max",
-            "28",
+            str(args.train_noise_snr_db_max),
+            "--train-overlap-prob",
+            str(args.train_overlap_prob),
+            "--train-overlap-gain-db-min",
+            str(args.train_overlap_gain_db_min),
+            "--train-overlap-gain-db-max",
+            str(args.train_overlap_gain_db_max),
             "--max-label-length",
             "256",
             "--max-new-tokens",

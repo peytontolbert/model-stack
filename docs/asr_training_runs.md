@@ -505,3 +505,80 @@ amount of Earnings22 row-level data did not improve AMI meeting transcription
 and slightly regressed the short gate. Next runs should either scale the
 diverse row data substantially with per-source balancing, or change the training
 capacity/objective instead of adding small unbalanced data slices.
+
+## Not Promoted: `medium_multisource_capacity_v13`
+
+Run directory:
+
+```text
+/data/model/bddy-asr-runs/medium_multisource_capacity_v13
+```
+
+Teacher-labeling summary:
+
+- teacher: `openai/whisper-large-v3-turbo`;
+- window sources:
+  - `edinburghcstr/ami:sdm:train[:8000]:text`;
+  - `edinburghcstr/ami:ihm:train[:8000]:text`;
+- streamed row-level source: `distil-whisper/earnings22:chunked:test:transcription`;
+- accepted AMI windows: 676;
+- accepted Earnings22 streamed rows: 62;
+- rejected AMI windows: 24 total, mostly short or short-audio windows;
+- rejected Earnings22 rows: 58 total, mostly short-audio rows;
+- LibriTTS real conversation mix included as robustness data.
+
+Training summary:
+
+- base model: `distil-whisper/distil-medium.en`;
+- LoRA target modules: `q_proj,k_proj,v_proj,out_proj,fc1,fc2`;
+- LoRA rank: 8;
+- trainable params: 3,964,928;
+- filtered training rows: 586;
+- max steps: 180;
+- learning rate: `3e-6`;
+- mild gain/noise augmentation plus 8% low-volume overlap augmentation;
+- merged model: `/data/model/bddy-asr-runs/medium_multisource_capacity_v13/merged`.
+
+Internal trainer eval, 11 samples:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| mean WER | 0.1340 | 0.1302 |
+| median WER | 0.1071 | 0.1071 |
+
+External AMI SDM short-utterance eval, 40 filtered rows:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4449 | 0.4464 |
+| median WER | 0.4226 | 0.4226 |
+| p90 WER | 0.7500 | 0.7500 |
+| median latency | 5.99s | 5.86s |
+| substitution rate | 0.1450 | 0.1450 |
+| deletion rate | 0.1727 | 0.1727 |
+| insertion rate | 0.0384 | 0.0405 |
+| question recall | 0.7778 | 0.7778 |
+
+AMI SDM conversation-window eval, 12 windows from `validation[:1200]`:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4739 | 0.4679 |
+| median WER | 0.4719 | 0.4719 |
+| p90 WER | 0.6977 | 0.6977 |
+| median latency | 7.28s | 7.54s |
+| substitution rate | 0.1951 | 0.1885 |
+| deletion rate | 0.1973 | 0.1996 |
+| insertion rate | 0.0732 | 0.0710 |
+| question recall | 0.7500 | 0.7500 |
+
+Decision: do not promote. The wider LoRA target and multisource teacher set
+finally moved the window metric in the right direction, mainly by reducing
+substitutions and insertions, but the short AMI gate regressed slightly and
+deletion rate did not improve. The next attempt should keep the configurable
+runner, but use a promotion objective that explicitly penalizes deletions on
+long windows and either:
+
+1. train from the accepted v13 teacher data with lower overlap/noise pressure;
+2. add a small curated hard-negative set from the worst validation windows; or
+3. improve segmentation/channel handling before additional LoRA capacity.

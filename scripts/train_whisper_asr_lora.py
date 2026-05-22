@@ -264,10 +264,12 @@ def apply_train_audio_augmentation(
 @dataclass
 class WhisperDataCollator:
     processor: Any
+    input_dtype: torch.dtype
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         input_features = [{"input_features": feature["input_features"]} for feature in features]
         batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+        batch["input_features"] = batch["input_features"].to(dtype=self.input_dtype)
         label_features = [{"input_ids": feature["labels"]} for feature in features]
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
@@ -504,9 +506,10 @@ def main() -> None:
         desc="Preparing eval audio",
     )
 
+    model_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         args.model,
-        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        dtype=model_dtype,
         low_cpu_mem_usage=True,
     )
     model.config.use_cache = False
@@ -544,7 +547,7 @@ def main() -> None:
         model=model,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=WhisperDataCollator(processor),
+        data_collator=WhisperDataCollator(processor, input_dtype=model_dtype),
         processing_class=processor,
     )
     before = evaluate_samples(
