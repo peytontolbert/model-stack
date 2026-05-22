@@ -271,6 +271,14 @@ export class F5TTSQ4DiTRuntime {
   }) {
     if (duration < condSeqLen) throw new Error("duration must be >= condSeqLen");
     if (condMel.length !== condSeqLen * this.melDim) throw new Error("condMel length must match condSeqLen * melDim");
+    if (
+      this.bundle.runF5SamplerUpdateGpu &&
+      this.bundle.runF5CopyPrefixGpu &&
+      this.bundle.runF5InputEmbeddingComposeGpu &&
+      this.bundle.runQ4LinearGpu
+    ) {
+      return this.sampleMelResidentAsync({ condMel, condSeqLen, textIds, duration, steps, cfgStrength, swaySamplingCoef, seed, onProgress });
+    }
     const cond = new Float32Array(duration * this.melDim);
     cond.set(condMel);
     let y = gaussianArray(duration * this.melDim, seed);
@@ -292,6 +300,41 @@ export class F5TTSQ4DiTRuntime {
     return y;
   }
 
+  async sampleMelResidentAsync({
+    condMel,
+    condSeqLen,
+    textIds,
+    duration,
+    steps = 8,
+    cfgStrength = 2.0,
+    swaySamplingCoef = -1.0,
+    seed = 1337,
+    onProgress = null,
+  }) {
+    if (duration < condSeqLen) throw new Error("duration must be >= condSeqLen");
+    if (condMel.length !== condSeqLen * this.melDim) throw new Error("condMel length must match condSeqLen * melDim");
+    const cond = new Float32Array(duration * this.melDim);
+    cond.set(condMel);
+    const condGpu = this.bundle.uploadF32Tensor(cond, duration, this.melDim);
+    let yGpu = this.bundle.uploadF32Tensor(gaussianArray(duration * this.melDim, seed), duration, this.melDim);
+    const times = makeTimeGrid(steps, swaySamplingCoef);
+    for (let step = 0; step < steps; step += 1) {
+      const t = times[step];
+      const dt = times[step + 1] - times[step];
+      const predGpu = await this.forwardResidentAsync({ x: yGpu, cond: condGpu, textIds, time: t, dropAudioCond: false, dropText: false });
+      let nullPredGpu = predGpu;
+      let cfg = 0;
+      if (cfgStrength >= 1e-5) {
+        nullPredGpu = await this.forwardResidentAsync({ x: yGpu, cond: condGpu, textIds, time: t, dropAudioCond: true, dropText: true });
+        cfg = cfgStrength;
+      }
+      yGpu = await this.bundle.runF5SamplerUpdateGpu(yGpu, predGpu, nullPredGpu, dt, cfg);
+      if (typeof onProgress === "function") onProgress(step + 1, steps);
+    }
+    await this.bundle.runF5CopyPrefixGpu(condGpu, yGpu, condSeqLen * this.melDim);
+    return yGpu.readback();
+  }
+
   async forwardAsync({ x, cond, textIds, time = 0.5, dropAudioCond = false, dropText = false }) {
     const seqLen = x.length / this.melDim;
     if (!Number.isInteger(seqLen) || seqLen <= 0) throw new Error("x must be a flat Float32Array with shape [seqLen, 100]");
@@ -302,6 +345,18 @@ export class F5TTSQ4DiTRuntime {
     for (let block = 0; block < this.depth; block += 1) hidden = await this.ditBlockAsync(block, hidden, t, seqLen);
     hidden = await this.finalAdaNormAsync(hidden, t, seqLen);
     return this.linearAsync("transformer.proj_out.weight", "transformer.proj_out.bias", hidden, seqLen);
+  }
+
+  async forwardResidentAsync({ x, cond, textIds, time = 0.5, dropAudioCond = false, dropText = false }) {
+    const seqLen = x.length / this.melDim;
+    if (!Number.isInteger(seqLen) || seqLen <= 0) throw new Error("x must be a flat tensor with shape [seqLen, 100]");
+    if (cond.length !== x.length) throw new Error("cond must match x shape");
+    const t = await this.timeEmbeddingAsync(time);
+    const text = await this.textEmbeddingAsync(textIds, seqLen, dropText);
+    let hidden = await this.inputEmbeddingResidentAsync(x, cond, text, seqLen, dropAudioCond);
+    for (let block = 0; block < this.depth; block += 1) hidden = await this.ditBlockResidentAsync(block, hidden, t, seqLen);
+    hidden = await this.finalAdaNormResidentAsync(hidden, t, seqLen);
+    return this.bundle.runQ4LinearGpu("transformer.proj_out.weight", hidden, seqLen, "transformer.proj_out.bias");
   }
 
   async timeEmbeddingAsync(time) {
@@ -370,6 +425,16 @@ export class F5TTSQ4DiTRuntime {
     return pos;
   }
 
+  async inputEmbeddingResidentAsync(x, cond, text, seqLen, dropAudioCond) {
+    const joined = await this.bundle.runF5InputEmbeddingComposeGpu(x, cond, text, seqLen, this.melDim, this.textDim, dropAudioCond);
+    const projected = await this.bundle.runQ4LinearGpu("transformer.input_embed.proj.weight", joined, seqLen, "transformer.input_embed.proj.bias");
+    let pos = await this.bundle.runQ4GroupedConv1dGpu("transformer.input_embed.conv_pos_embed.conv1d.0.weight", "transformer.input_embed.conv_pos_embed.conv1d.0.bias", projected, seqLen, this.dim, 31, 15, 16);
+    this.bundle.runActivationInPlace(pos, "mish");
+    pos = await this.bundle.runQ4GroupedConv1dGpu("transformer.input_embed.conv_pos_embed.conv1d.2.weight", "transformer.input_embed.conv_pos_embed.conv1d.2.bias", pos, seqLen, this.dim, 31, 15, 16);
+    this.bundle.runActivationInPlace(pos, "mish");
+    return this.bundle.runTensorAddGpu(pos, projected, seqLen, this.dim);
+  }
+
   async ditBlockAsync(block, input, t, seqLen) {
     const prefix = `transformer.transformer_blocks.${block}`;
     const mod = await this.linearAsync(`${prefix}.attn_norm.linear.weight`, `${prefix}.attn_norm.linear.bias`, siluCopy(t), 1);
@@ -428,6 +493,37 @@ export class F5TTSQ4DiTRuntime {
       : this.bundle.runGatedAddRows ? this.bundle.runGatedAddRows(x, ff, gateMlp, seqLen, this.dim) : gatedAddRows(x, ff, gateMlp, seqLen, this.dim);
   }
 
+  async ditBlockResidentAsync(block, input, t, seqLen) {
+    const prefix = `transformer.transformer_blocks.${block}`;
+    const mod = await this.linearAsync(`${prefix}.attn_norm.linear.weight`, `${prefix}.attn_norm.linear.bias`, siluCopy(t), 1);
+    const shiftMsa = mod.subarray(0, this.dim);
+    const scaleMsa = mod.subarray(this.dim, this.dim * 2);
+    const gateMsa = mod.subarray(this.dim * 2, this.dim * 3);
+    const shiftMlp = mod.subarray(this.dim * 3, this.dim * 4);
+    const scaleMlp = mod.subarray(this.dim * 4, this.dim * 5);
+    const gateMlp = mod.subarray(this.dim * 5, this.dim * 6);
+    let norm = await this.bundle.runLayerNormAffineAsync(input, shiftMsa, scaleMsa, seqLen, this.dim, EPS);
+    const [q, k, v] = await this.bundle.runQ4Linear3Gpu(
+      { weightName: `${prefix}.attn.to_q.weight`, biasName: `${prefix}.attn.to_q.bias` },
+      { weightName: `${prefix}.attn.to_k.weight`, biasName: `${prefix}.attn.to_k.bias` },
+      { weightName: `${prefix}.attn.to_v.weight`, biasName: `${prefix}.attn.to_v.bias` },
+      norm,
+      seqLen,
+    );
+    let attn = await this.bundle.runRotaryAttentionGpu(q, k, v, seqLen, this.heads, this.headDim);
+    attn = await this.bundle.runQ4LinearGpu(`${prefix}.attn.to_out.0.weight`, attn, seqLen, `${prefix}.attn.to_out.0.bias`);
+    const x = await this.bundle.runGatedAddRowsAsync(input, attn, gateMsa, seqLen, this.dim);
+    norm = await this.bundle.runLayerNormAffineAsync(x, shiftMlp, scaleMlp, seqLen, this.dim, EPS);
+    const ff = await this.bundle.runQ4MlpGpu(
+      { weightName: `${prefix}.ff.ff.0.0.weight`, biasName: `${prefix}.ff.ff.0.0.bias` },
+      { weightName: `${prefix}.ff.ff.2.weight`, biasName: `${prefix}.ff.ff.2.bias` },
+      norm,
+      seqLen,
+      "gelu",
+    );
+    return this.bundle.runGatedAddRowsAsync(x, ff, gateMlp, seqLen, this.dim);
+  }
+
   async finalAdaNormAsync(input, t, seqLen) {
     const mod = await this.linearAsync("transformer.norm_out.linear.weight", "transformer.norm_out.linear.bias", siluCopy(t), 1);
     const scale = mod.subarray(0, this.dim);
@@ -435,6 +531,13 @@ export class F5TTSQ4DiTRuntime {
     return this.bundle.runLayerNormAffineAsync
       ? this.bundle.runLayerNormAffineAsync(input, shift, scale, seqLen, this.dim, EPS)
       : this.bundle.runLayerNormAffine ? this.bundle.runLayerNormAffine(input, shift, scale, seqLen, this.dim, EPS) : layerNormAffineRows(input, shift, scale, seqLen, this.dim);
+  }
+
+  async finalAdaNormResidentAsync(input, t, seqLen) {
+    const mod = await this.linearAsync("transformer.norm_out.linear.weight", "transformer.norm_out.linear.bias", siluCopy(t), 1);
+    const scale = mod.subarray(0, this.dim);
+    const shift = mod.subarray(this.dim, this.dim * 2);
+    return this.bundle.runLayerNormAffineAsync(input, shift, scale, seqLen, this.dim, EPS);
   }
 
   linearAsync(weightName, biasName, input, rows) {

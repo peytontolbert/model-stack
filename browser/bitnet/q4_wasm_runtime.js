@@ -362,6 +362,114 @@ fn gated_add_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
 }
 
+function tensorAddShaderSource() {
+  return `
+struct TensorAddParams {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> lhs_values: array<f32>;
+@group(0) @binding(1) var<storage, read> rhs_values: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output_values: array<f32>;
+@group(0) @binding(3) var<uniform> params: TensorAddParams;
+
+@compute @workgroup_size(256, 1, 1)
+fn tensor_add_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.length) { return; }
+  output_values[idx] = lhs_values[idx] + rhs_values[idx];
+}
+`;
+}
+
+function f5InputEmbedComposeShaderSource() {
+  return `
+struct ComposeParams {
+  seq_len: u32,
+  mel_dim: u32,
+  text_dim: u32,
+  drop_audio_cond: u32,
+};
+
+@group(0) @binding(0) var<storage, read> x_values: array<f32>;
+@group(0) @binding(1) var<storage, read> cond_values: array<f32>;
+@group(0) @binding(2) var<storage, read> text_values: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output_values: array<f32>;
+@group(0) @binding(4) var<uniform> params: ComposeParams;
+
+@compute @workgroup_size(256, 1, 1)
+fn f5_input_embed_compose_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  let joined_dim = params.mel_dim * 2u + params.text_dim;
+  let total = params.seq_len * joined_dim;
+  if (idx >= total) { return; }
+  let row = idx / joined_dim;
+  let col = idx % joined_dim;
+  if (col < params.mel_dim) {
+    output_values[idx] = x_values[row * params.mel_dim + col];
+  } else if (col < params.mel_dim * 2u) {
+    let mel_col = col - params.mel_dim;
+    output_values[idx] = select(cond_values[row * params.mel_dim + mel_col], 0.0, params.drop_audio_cond != 0u);
+  } else {
+    let text_col = col - params.mel_dim * 2u;
+    output_values[idx] = text_values[row * params.text_dim + text_col];
+  }
+}
+`;
+}
+
+function f5SamplerUpdateShaderSource() {
+  return `
+struct SamplerUpdateParams {
+  length: u32,
+  _pad0: u32,
+  dt: f32,
+  cfg: f32,
+};
+
+@group(0) @binding(0) var<storage, read> y_values: array<f32>;
+@group(0) @binding(1) var<storage, read> pred_values: array<f32>;
+@group(0) @binding(2) var<storage, read> null_pred_values: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output_values: array<f32>;
+@group(0) @binding(4) var<uniform> params: SamplerUpdateParams;
+
+@compute @workgroup_size(256, 1, 1)
+fn f5_sampler_update_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.length) { return; }
+  let pred = pred_values[idx];
+  let null_pred = null_pred_values[idx];
+  let flow = pred + (pred - null_pred) * params.cfg;
+  output_values[idx] = y_values[idx] + params.dt * flow;
+}
+`;
+}
+
+function f5CopyPrefixShaderSource() {
+  return `
+struct CopyPrefixParams {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> source_values: array<f32>;
+@group(0) @binding(1) var<storage, read_write> target_values: array<f32>;
+@group(0) @binding(2) var<uniform> params: CopyPrefixParams;
+
+@compute @workgroup_size(256, 1, 1)
+fn f5_copy_prefix_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.length) { return; }
+  target_values[idx] = source_values[idx];
+}
+`;
+}
+
 function rotaryAttentionShaderSource() {
   return `
 struct AttentionParams {
@@ -677,7 +785,11 @@ export class Q4TensorBundleWebGPU {
     this.layerNormAffinePipeline = null;
     this.rotaryAttentionPipeline = null;
     this.gatedAddPipeline = null;
+    this.tensorAddPipeline = null;
     this.q4Conv1dPipeline = null;
+    this.f5InputEmbedComposePipeline = null;
+    this.f5SamplerUpdatePipeline = null;
+    this.f5CopyPrefixPipeline = null;
     this.manifest = baseBundle.manifest;
     this.q4Index = baseBundle.q4Index;
     this.denseIndex = baseBundle.denseIndex;
@@ -722,6 +834,15 @@ export class Q4TensorBundleWebGPU {
     return this.gatedAddPipeline;
   }
 
+  tensorAddComputePipeline() {
+    if (!this.tensorAddPipeline) {
+      const shaderModule = this.device.createShaderModule({ code: tensorAddShaderSource() });
+      const descriptor = { layout: 'auto', compute: { module: shaderModule, entryPoint: 'tensor_add_main' } };
+      this.tensorAddPipeline = this.device.createComputePipeline(descriptor);
+    }
+    return this.tensorAddPipeline;
+  }
+
   q4Conv1dComputePipeline() {
     if (!this.q4Conv1dPipeline) {
       const shaderModule = this.device.createShaderModule({ code: q4Conv1dShaderSource() });
@@ -729,6 +850,33 @@ export class Q4TensorBundleWebGPU {
       this.q4Conv1dPipeline = this.device.createComputePipeline(descriptor);
     }
     return this.q4Conv1dPipeline;
+  }
+
+  f5InputEmbedComposeComputePipeline() {
+    if (!this.f5InputEmbedComposePipeline) {
+      const shaderModule = this.device.createShaderModule({ code: f5InputEmbedComposeShaderSource() });
+      const descriptor = { layout: 'auto', compute: { module: shaderModule, entryPoint: 'f5_input_embed_compose_main' } };
+      this.f5InputEmbedComposePipeline = this.device.createComputePipeline(descriptor);
+    }
+    return this.f5InputEmbedComposePipeline;
+  }
+
+  f5SamplerUpdateComputePipeline() {
+    if (!this.f5SamplerUpdatePipeline) {
+      const shaderModule = this.device.createShaderModule({ code: f5SamplerUpdateShaderSource() });
+      const descriptor = { layout: 'auto', compute: { module: shaderModule, entryPoint: 'f5_sampler_update_main' } };
+      this.f5SamplerUpdatePipeline = this.device.createComputePipeline(descriptor);
+    }
+    return this.f5SamplerUpdatePipeline;
+  }
+
+  f5CopyPrefixComputePipeline() {
+    if (!this.f5CopyPrefixPipeline) {
+      const shaderModule = this.device.createShaderModule({ code: f5CopyPrefixShaderSource() });
+      const descriptor = { layout: 'auto', compute: { module: shaderModule, entryPoint: 'f5_copy_prefix_main' } };
+      this.f5CopyPrefixPipeline = this.device.createComputePipeline(descriptor);
+    }
+    return this.f5CopyPrefixPipeline;
   }
 
   runActivationInPlace(tensor, activation = 'gelu') {
@@ -795,7 +943,7 @@ export class Q4TensorBundleWebGPU {
     return this.runLayerNormAffineGpu(input, shift, scale, rows, cols, eps);
   }
 
-  async runQ4GroupedConv1dAsync(weightName, biasName, input, seqLen, channels, kernel, padding, groups) {
+  async runQ4GroupedConv1dGpu(weightName, biasName, input, seqLen, channels, kernel, padding, groups) {
     const tensor = this.q4Tensor(weightName);
     const rowSize = tensor.entry.shape.slice(1).reduce((acc, value) => acc * Number(value), 1);
     const groupIn = channels / groups;
@@ -827,11 +975,49 @@ export class Q4TensorBundleWebGPU {
     pass.dispatchWorkgroups(Math.ceil(channels / 8), Math.ceil(seqLen / 8), 1);
     pass.end();
     this.device.queue.submit([encoder.finish()]);
-    return new WebGPUTensorF32(this.device, outputBuffer, seqLen * channels, seqLen, channels).readback();
+    return new WebGPUTensorF32(this.device, outputBuffer, seqLen * channels, seqLen, channels);
+  }
+
+  async runQ4GroupedConv1dAsync(weightName, biasName, input, seqLen, channels, kernel, padding, groups) {
+    return (await this.runQ4GroupedConv1dGpu(weightName, biasName, input, seqLen, channels, kernel, padding, groups)).readback();
   }
 
   async runQ4DepthwiseConv1dAsync(weightName, biasName, input, seqLen, channels, kernel, padding) {
     return this.runQ4GroupedConv1dAsync(weightName, biasName, input, seqLen, channels, kernel, padding, channels);
+  }
+
+  async runQ4DepthwiseConv1dGpu(weightName, biasName, input, seqLen, channels, kernel, padding) {
+    return this.runQ4GroupedConv1dGpu(weightName, biasName, input, seqLen, channels, kernel, padding, channels);
+  }
+
+  async runTensorAddGpu(lhs, rhs, rows = 1, cols = 0) {
+    const lhsTensor = this.uploadF32Tensor(lhs, rows, cols);
+    const rhsTensor = this.uploadF32Tensor(rhs, rows, cols || lhsTensor.cols);
+    if (lhsTensor.length !== rhsTensor.length) {
+      throw new Error(`WebGPU tensor add length mismatch: ${lhsTensor.length}/${rhsTensor.length}`);
+    }
+    const bufferUsage = gpuBufferUsage();
+    const outputBuffer = this.device.createBuffer({ size: align4(lhsTensor.length * Float32Array.BYTES_PER_ELEMENT), usage: bufferUsage.STORAGE | bufferUsage.COPY_SRC });
+    const paramsBuffer = this.device.createBuffer({ size: 16, usage: bufferUsage.UNIFORM | bufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([lhsTensor.length, 0, 0, 0]));
+    const pipeline = this.tensorAddComputePipeline();
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: lhsTensor.buffer } },
+        { binding: 1, resource: { buffer: rhsTensor.buffer } },
+        { binding: 2, resource: { buffer: outputBuffer } },
+        { binding: 3, resource: { buffer: paramsBuffer } },
+      ],
+    });
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(lhsTensor.length / 256), 1, 1);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    return new WebGPUTensorF32(this.device, outputBuffer, lhsTensor.length, lhsTensor.rows, lhsTensor.cols);
   }
 
   async runGatedAddRowsAsync(input, src, gate, rows, cols) {
@@ -866,16 +1052,16 @@ export class Q4TensorBundleWebGPU {
     return new WebGPUTensorF32(this.device, outputBuffer, rows * cols, rows, cols);
   }
 
-  async runRotaryAttentionAsync(q, k, v, seqLen, heads, headDim) {
+  async runRotaryAttentionGpu(q, k, v, seqLen, heads, headDim) {
     const dim = heads * headDim;
     const expected = seqLen * dim;
-    if (q.length !== expected || k.length !== expected || v.length !== expected) {
-      throw new Error(`WebGPU attention length mismatch: expected ${expected}, got ${q.length}/${k.length}/${v.length}`);
+    const qTensor = this.uploadF32Tensor(q, seqLen, dim);
+    const kTensor = this.uploadF32Tensor(k, seqLen, dim);
+    const vTensor = this.uploadF32Tensor(v, seqLen, dim);
+    if (qTensor.length !== expected || kTensor.length !== expected || vTensor.length !== expected) {
+      throw new Error(`WebGPU attention length mismatch: expected ${expected}, got ${qTensor.length}/${kTensor.length}/${vTensor.length}`);
     }
     const bufferUsage = gpuBufferUsage();
-    const qBuffer = createGpuStorageBuffer(this.device, q instanceof Float32Array ? q : new Float32Array(q));
-    const kBuffer = createGpuStorageBuffer(this.device, k instanceof Float32Array ? k : new Float32Array(k));
-    const vBuffer = createGpuStorageBuffer(this.device, v instanceof Float32Array ? v : new Float32Array(v));
     const outputBytes = expected * Float32Array.BYTES_PER_ELEMENT;
     const outputBuffer = this.device.createBuffer({ size: align4(outputBytes), usage: bufferUsage.STORAGE | bufferUsage.COPY_SRC });
     const paramsBuffer = this.device.createBuffer({ size: 16, usage: bufferUsage.UNIFORM | bufferUsage.COPY_DST });
@@ -884,9 +1070,9 @@ export class Q4TensorBundleWebGPU {
     const bindGroup = this.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: qBuffer } },
-        { binding: 1, resource: { buffer: kBuffer } },
-        { binding: 2, resource: { buffer: vBuffer } },
+        { binding: 0, resource: { buffer: qTensor.buffer } },
+        { binding: 1, resource: { buffer: kTensor.buffer } },
+        { binding: 2, resource: { buffer: vTensor.buffer } },
         { binding: 3, resource: { buffer: outputBuffer } },
         { binding: 4, resource: { buffer: paramsBuffer } },
       ],
@@ -899,7 +1085,11 @@ export class Q4TensorBundleWebGPU {
     pass.end();
     const out = new WebGPUTensorF32(this.device, outputBuffer, expected, seqLen, dim);
     this.device.queue.submit([encoder.finish()]);
-    return out.readback();
+    return out;
+  }
+
+  async runRotaryAttentionAsync(q, k, v, seqLen, heads, headDim) {
+    return (await this.runRotaryAttentionGpu(q, k, v, seqLen, heads, headDim)).readback();
   }
 
   static async fromManifestUrl(manifestUrl, options = {}) {
@@ -933,7 +1123,7 @@ export class Q4TensorBundleWebGPU {
         modelId: this.manifest?.model_id || 'f5tts-q4',
         linearKernel: 'rowwise-q4-f32',
         sharedQkvInputUpload: true,
-        fusedLinearTriples: false,
+        fusedLinearTriples: true,
         residentWeights: true,
         gpuResidentMlp: true,
         fusedMlpActivation: 'webgpu-gelu',
@@ -941,7 +1131,9 @@ export class Q4TensorBundleWebGPU {
         gpuRotaryAttention: true,
         gpuGatedResidual: true,
         gpuQ4Conv1d: true,
-        remainingCpuOps: ['text-embedding', 'sampler-update'],
+        gpuInputCompose: true,
+        gpuSamplerUpdate: true,
+        remainingCpuOps: ['text-embedding'],
       };
       this.prewarmF5LinearHandles();
     }
@@ -989,13 +1181,17 @@ export class Q4TensorBundleWebGPU {
     return this.q4LinearHandle(name, biasName).forward(input instanceof Float32Array ? input : new Float32Array(input), rows);
   }
 
-  async runQ4Linear3Async(first, second, third, input, rows = 1) {
+  async runQ4Linear3Gpu(first, second, third, input, rows = 1) {
     const sharedInput = this.uploadF32Tensor(input, rows);
-    const [aGpu, bGpu, cGpu] = await Promise.all([
+    return Promise.all([
       this.runQ4LinearGpu(first.weightName, sharedInput, rows, first.biasName || ''),
       this.runQ4LinearGpu(second.weightName, sharedInput, rows, second.biasName || ''),
       this.runQ4LinearGpu(third.weightName, sharedInput, rows, third.biasName || ''),
     ]);
+  }
+
+  async runQ4Linear3Async(first, second, third, input, rows = 1) {
+    const [aGpu, bGpu, cGpu] = await this.runQ4Linear3Gpu(first, second, third, input, rows);
     const [a, b, c] = await Promise.all([aGpu.readback(), bGpu.readback(), cGpu.readback()]);
     const out = new Float32Array(a.length + b.length + c.length);
     out.set(a, 0);
@@ -1004,10 +1200,111 @@ export class Q4TensorBundleWebGPU {
     return out;
   }
 
-  async runQ4MlpAsync(first, second, input, rows = 1, activation = 'gelu') {
+  async runQ4MlpGpu(first, second, input, rows = 1, activation = 'gelu') {
     const hidden = await this.runQ4LinearGpu(first.weightName, input, rows, first.biasName || '');
     this.runActivationInPlace(hidden, activation);
-    return (await this.runQ4LinearGpu(second.weightName, hidden, rows, second.biasName || '')).readback();
+    return this.runQ4LinearGpu(second.weightName, hidden, rows, second.biasName || '');
+  }
+
+  async runQ4MlpAsync(first, second, input, rows = 1, activation = 'gelu') {
+    return (await this.runQ4MlpGpu(first, second, input, rows, activation)).readback();
+  }
+
+  async runF5InputEmbeddingComposeGpu(x, cond, text, seqLen, melDim, textDim, dropAudioCond = false) {
+    const xTensor = this.uploadF32Tensor(x, seqLen, melDim);
+    const condTensor = this.uploadF32Tensor(cond, seqLen, melDim);
+    const textTensor = this.uploadF32Tensor(text, seqLen, textDim);
+    const joinedDim = melDim * 2 + textDim;
+    const outputLength = seqLen * joinedDim;
+    const bufferUsage = gpuBufferUsage();
+    const outputBuffer = this.device.createBuffer({ size: align4(outputLength * Float32Array.BYTES_PER_ELEMENT), usage: bufferUsage.STORAGE | bufferUsage.COPY_SRC });
+    const paramsBuffer = this.device.createBuffer({ size: 16, usage: bufferUsage.UNIFORM | bufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([seqLen, melDim, textDim, dropAudioCond ? 1 : 0]));
+    const pipeline = this.f5InputEmbedComposeComputePipeline();
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: xTensor.buffer } },
+        { binding: 1, resource: { buffer: condTensor.buffer } },
+        { binding: 2, resource: { buffer: textTensor.buffer } },
+        { binding: 3, resource: { buffer: outputBuffer } },
+        { binding: 4, resource: { buffer: paramsBuffer } },
+      ],
+    });
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(outputLength / 256), 1, 1);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    return new WebGPUTensorF32(this.device, outputBuffer, outputLength, seqLen, joinedDim);
+  }
+
+  async runF5SamplerUpdateGpu(y, pred, nullPred, dt, cfgStrength) {
+    const yTensor = this.uploadF32Tensor(y);
+    const predTensor = this.uploadF32Tensor(pred);
+    const nullPredTensor = this.uploadF32Tensor(nullPred);
+    if (yTensor.length !== predTensor.length || yTensor.length !== nullPredTensor.length) {
+      throw new Error(`F5 sampler update length mismatch: ${yTensor.length}/${predTensor.length}/${nullPredTensor.length}`);
+    }
+    const bufferUsage = gpuBufferUsage();
+    const outputBuffer = this.device.createBuffer({ size: align4(yTensor.length * Float32Array.BYTES_PER_ELEMENT), usage: bufferUsage.STORAGE | bufferUsage.COPY_SRC });
+    const paramsBuffer = this.device.createBuffer({ size: 16, usage: bufferUsage.UNIFORM | bufferUsage.COPY_DST });
+    const params = new ArrayBuffer(16);
+    const paramsU32 = new Uint32Array(params);
+    const paramsF32 = new Float32Array(params);
+    paramsU32[0] = yTensor.length;
+    paramsF32[2] = dt;
+    paramsF32[3] = cfgStrength;
+    this.device.queue.writeBuffer(paramsBuffer, 0, params);
+    const pipeline = this.f5SamplerUpdateComputePipeline();
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: yTensor.buffer } },
+        { binding: 1, resource: { buffer: predTensor.buffer } },
+        { binding: 2, resource: { buffer: nullPredTensor.buffer } },
+        { binding: 3, resource: { buffer: outputBuffer } },
+        { binding: 4, resource: { buffer: paramsBuffer } },
+      ],
+    });
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(yTensor.length / 256), 1, 1);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    return new WebGPUTensorF32(this.device, outputBuffer, yTensor.length, yTensor.rows, yTensor.cols);
+  }
+
+  async runF5CopyPrefixGpu(source, target, length) {
+    const sourceTensor = this.uploadF32Tensor(source);
+    const targetTensor = this.uploadF32Tensor(target);
+    if (sourceTensor.length < length || targetTensor.length < length) {
+      throw new Error(`F5 copy prefix length mismatch: need ${length}, got ${sourceTensor.length}/${targetTensor.length}`);
+    }
+    const bufferUsage = gpuBufferUsage();
+    const paramsBuffer = this.device.createBuffer({ size: 16, usage: bufferUsage.UNIFORM | bufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([length, 0, 0, 0]));
+    const pipeline = this.f5CopyPrefixComputePipeline();
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: sourceTensor.buffer } },
+        { binding: 1, resource: { buffer: targetTensor.buffer } },
+        { binding: 2, resource: { buffer: paramsBuffer } },
+      ],
+    });
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(length / 256), 1, 1);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    return targetTensor;
   }
 }
 
