@@ -582,3 +582,40 @@ long windows and either:
 1. train from the accepted v13 teacher data with lower overlap/noise pressure;
 2. add a small curated hard-negative set from the worst validation windows; or
 3. improve segmentation/channel handling before additional LoRA capacity.
+
+## Eval Suite: `bddy-asr-eval/v14`
+
+Run directory:
+
+```text
+/data/model/bddy-asr-eval/v14
+```
+
+Purpose: create a fixed held-out Parquet evaluation suite so every ASR
+checkpoint is judged against the same meeting cases.
+
+Artifacts:
+
+| Artifact | Rows | Seconds | Words |
+| --- | ---: | ---: | ---: |
+| `ami_sdm_validation_short.parquet` | 120 | 480.15 | 1469 |
+| `ami_sdm_validation_windows.parquet` | 60 | 626.39 | 1898 |
+| `ami_ihm_validation_short.parquet` | 120 | 448.08 | 1436 |
+| `ami_ihm_validation_windows.parquet` | 60 | 648.69 | 2000 |
+
+Smoke eval on `ami_sdm_validation_windows.parquet`, first 3 cases, with
+`distil-whisper/distil-small.en`:
+
+| Metric | Value |
+| --- | ---: |
+| mean WER | 0.4370 |
+| median WER | 0.3953 |
+| p90 WER | 0.6000 |
+| substitution rate | 0.2051 |
+| deletion rate | 0.2222 |
+| insertion rate | 0.0513 |
+
+Decision: use this suite for v14+ promotion gates. The SDM window set is the
+primary room-mic conversational gate. The IHM window set is a secondary clean
+meeting gate that helps identify whether a change improved language handling or
+only overfit room acoustics.

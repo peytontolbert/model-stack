@@ -132,3 +132,53 @@ Promote only if the candidate improves:
 
 Rejected checkpoints are still useful as training evidence, but they must not
 become the default runtime model.
+
+## Fixed Eval Suite
+
+The current blocker is not only training volume; it is also evaluation
+stability. New checkpoints must be compared against the same held-out meeting
+cases so we can tell whether a change truly improved transcription instead of
+moving on a small ad hoc sample.
+
+Build the v14 Parquet eval suite:
+
+```bash
+python scripts/build_bddy_asr_eval_suite.py \
+  --output-dir /data/model/bddy-asr-eval/v14 \
+  --short-limit-per-source 120 \
+  --window-limit-per-source 60 \
+  --window-seconds 18 \
+  --window-min-words 16
+```
+
+Artifacts:
+
+```text
+/data/model/bddy-asr-eval/v14/ami_sdm_validation_short.parquet
+/data/model/bddy-asr-eval/v14/ami_sdm_validation_windows.parquet
+/data/model/bddy-asr-eval/v14/ami_ihm_validation_short.parquet
+/data/model/bddy-asr-eval/v14/ami_ihm_validation_windows.parquet
+/data/model/bddy-asr-eval/v14/manifest.json
+```
+
+The window files are timestamp and meeting-group aware. They should be used as
+the primary promotion gate for coaching/JARVIS conversational transcription
+because Bddy transcribes rolling conversation context, not isolated snippets.
+
+Run a fixed-suite eval:
+
+```bash
+python scripts/eval_asr_quality.py \
+  --model distil-whisper/distil-small.en \
+  --dataset parquet \
+  --config /data/model/bddy-asr-eval/v14/ami_sdm_validation_windows.parquet \
+  --split train \
+  --text-column text \
+  --limit 60 \
+  --max-new-tokens 192
+```
+
+Use `ami_sdm_validation_windows.parquet` as the hardest room-mic gate and
+`ami_ihm_validation_windows.parquet` to separate language quality from room
+acoustics. A model should not be promoted if it improves clean IHM but regresses
+SDM room-mic meeting windows.

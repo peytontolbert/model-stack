@@ -155,6 +155,39 @@ repetition, question recall, and conversational critical-term recall. These
 metrics matter because they measure whether the transcript preserves the actual
 conversation, including uncertainty, objections, clarifications, and questions.
 
+Build a fixed held-out eval suite before comparing new checkpoints. This keeps
+promotion decisions stable across runs and uses timestamp-aware meeting windows
+instead of concatenating arbitrary adjacent rows:
+
+```bash
+python scripts/build_bddy_asr_eval_suite.py \
+  --output-dir /data/model/bddy-asr-eval/v14 \
+  --short-limit-per-source 120 \
+  --window-limit-per-source 60 \
+  --window-seconds 18 \
+  --window-min-words 16
+```
+
+Run the experiment loop against the fixed suite:
+
+```bash
+python scripts/run_bddy_asr_teacher_window_experiment.py \
+  --run-name medium_multisource_fixed_eval_v14 \
+  --source-dataset 'edinburghcstr/ami:sdm:train[:8000]:text' \
+  --source-dataset 'edinburghcstr/ami:ihm:train[:8000]:text' \
+  --streaming-row-source-dataset 'distil-whisper/earnings22:chunked:test:transcription' \
+  --limit-windows 350 \
+  --limit-streaming-rows 120 \
+  --train-steps 180 \
+  --short-eval-parquet /data/model/bddy-asr-eval/v14/ami_sdm_validation_short.parquet \
+  --window-eval-parquet /data/model/bddy-asr-eval/v14/ami_sdm_validation_windows.parquet \
+  --eval-limit 120 \
+  --window-eval-limit 60
+```
+
+If this fixed SDM gate regresses, do not promote the checkpoint even if the
+trainer's internal teacher eval improves.
+
 Run the full bddy teacher-window experiment loop. This is the preferred
 repeatable environment for improving transcription accuracy because it creates
 teacher-cleaned meeting windows, trains the LoRA student, merges it, and writes
@@ -331,6 +364,19 @@ The latest plain LoRA and augmented LoRA runs did not pass this gate, so those
 checkpoints are rejected. The current baseline `distil-whisper/distil-small.en`
 on a filtered AMI SDM meeting slice is still around `0.43` WER, so meeting ASR
 quality remains the active blocker.
+
+The current training diagnosis is:
+
+- the held-out gate must be fixed and larger before interpreting small WER
+  movements;
+- augmentation should stay conservative until the model improves real SDM
+  windows, because early noise/overlap pressure has caused short-turn
+  regressions;
+- hard-case mining should come from the fixed-suite worst examples, especially
+  deletions, substitutions, questions, and critical meeting terms;
+- overlap and many-speaker robustness also need segmentation/diarization
+  upstream, because a Whisper LoRA alone cannot perfectly recover multiple
+  simultaneous speakers from one mixed channel.
 
 See `docs/asr_training_runs.md` for the current run ledger. The latest
 LibriTTS real-conversation LoRA attempts, `v5` and `v6`, are rejected because

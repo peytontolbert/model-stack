@@ -192,11 +192,12 @@ def build_cases(dataset, *, perturb: bool) -> list[EvalCase]:
         array = audio["array"].astype("float32")
         sample_rate = int(audio["sampling_rate"])
         reference = str(example["text"])
-        cases.append(EvalCase(f"clean_{idx}", array, sample_rate, reference))
+        case_id = str(example.get("case_id") or f"clean_{idx}")
+        cases.append(EvalCase(case_id, array, sample_rate, reference))
         if perturb:
-            cases.append(EvalCase(f"noise20db_{idx}", add_white_noise(array, 20.0, idx), sample_rate, reference))
-            cases.append(EvalCase(f"noise10db_{idx}", add_white_noise(array, 10.0, idx), sample_rate, reference))
-            cases.append(EvalCase(f"fast115_{idx}", speed_audio(array, 1.15), sample_rate, reference))
+            cases.append(EvalCase(f"noise20db_{case_id}", add_white_noise(array, 20.0, idx), sample_rate, reference))
+            cases.append(EvalCase(f"noise10db_{case_id}", add_white_noise(array, 10.0, idx), sample_rate, reference))
+            cases.append(EvalCase(f"fast115_{case_id}", speed_audio(array, 1.15), sample_rate, reference))
     return cases
 
 

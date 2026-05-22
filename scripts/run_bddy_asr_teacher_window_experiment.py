@@ -93,6 +93,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-overlap-gain-db-max", type=float, default=-8.0)
     parser.add_argument("--eval-limit", type=int, default=40)
     parser.add_argument("--window-eval-limit", type=int, default=12)
+    parser.add_argument("--short-eval-parquet", default="", help="Optional fixed short-form eval Parquet built by build_bddy_asr_eval_suite.py")
+    parser.add_argument("--window-eval-parquet", default="", help="Optional fixed conversation-window eval Parquet built by build_bddy_asr_eval_suite.py")
     parser.add_argument("--window-seconds", type=float, default=18.0)
     parser.add_argument("--window-gap-seconds", type=float, default=1.0)
     parser.add_argument("--window-min-words", type=int, default=20)
@@ -288,68 +290,81 @@ def main() -> None:
         merge_lora(base_model=args.base_model, adapter_dir=adapter_dir, merged_dir=merged_dir)
 
     if not args.skip_eval:
-        run(
-            [
-                sys.executable,
-                "scripts/eval_asr_quality.py",
-                "--model",
-                args.base_model,
-                "--model",
-                str(merged_dir),
-                "--dataset",
-                "edinburghcstr/ami",
-                "--config",
-                "sdm",
-                "--split",
-                "validation[:1500]",
-                "--text-column",
-                "text",
-                "--limit",
-                str(args.eval_limit),
-                "--min-words",
-                "4",
-                "--min-duration-seconds",
-                "1.0",
-                "--max-duration-seconds",
-                "24",
-                "--max-new-tokens",
-                "128",
-                "--output-json",
-                str(reports_dir / "short_ami_eval.json"),
-            ]
-        )
-        run(
-            [
-                sys.executable,
-                "scripts/eval_asr_quality.py",
-                "--model",
-                args.base_model,
-                "--model",
-                str(merged_dir),
-                "--dataset",
-                "edinburghcstr/ami",
-                "--config",
-                "sdm",
-                "--split",
-                "validation[:1200]",
-                "--text-column",
-                "text",
-                "--limit",
-                str(args.window_eval_limit),
-                "--min-words",
-                "1",
-                "--min-duration-seconds",
-                "0.5",
-                "--max-duration-seconds",
-                "12",
-                "--conversation-window-seconds",
-                str(args.window_seconds),
-                "--max-new-tokens",
-                "192",
-                "--output-json",
-                str(reports_dir / "window_ami_eval.json"),
-            ]
-        )
+        short_eval_command = [
+            sys.executable,
+            "scripts/eval_asr_quality.py",
+            "--model",
+            args.base_model,
+            "--model",
+            str(merged_dir),
+            "--text-column",
+            "text",
+            "--limit",
+            str(args.eval_limit),
+            "--max-new-tokens",
+            "128",
+            "--output-json",
+            str(reports_dir / "short_ami_eval.json"),
+        ]
+        if args.short_eval_parquet:
+            short_eval_command.extend(["--dataset", "parquet", "--config", args.short_eval_parquet, "--split", "train"])
+        else:
+            short_eval_command.extend(
+                [
+                    "--dataset",
+                    "edinburghcstr/ami",
+                    "--config",
+                    "sdm",
+                    "--split",
+                    "validation[:1500]",
+                    "--min-words",
+                    "4",
+                    "--min-duration-seconds",
+                    "1.0",
+                    "--max-duration-seconds",
+                    "24",
+                ]
+            )
+        run(short_eval_command)
+
+        window_eval_command = [
+            sys.executable,
+            "scripts/eval_asr_quality.py",
+            "--model",
+            args.base_model,
+            "--model",
+            str(merged_dir),
+            "--text-column",
+            "text",
+            "--limit",
+            str(args.window_eval_limit),
+            "--max-new-tokens",
+            "192",
+            "--output-json",
+            str(reports_dir / "window_ami_eval.json"),
+        ]
+        if args.window_eval_parquet:
+            window_eval_command.extend(["--dataset", "parquet", "--config", args.window_eval_parquet, "--split", "train"])
+        else:
+            window_eval_command.extend(
+                [
+                    "--dataset",
+                    "edinburghcstr/ami",
+                    "--config",
+                    "sdm",
+                    "--split",
+                    "validation[:1200]",
+                    "--min-words",
+                    "1",
+                    "--min-duration-seconds",
+                    "0.5",
+                    "--max-duration-seconds",
+                    "12",
+                    "--conversation-window-seconds",
+                    str(args.window_seconds),
+                ]
+            )
+        run(window_eval_command)
 
     print(json.dumps({"run_dir": str(run_dir), "teacher_path": str(teacher_path), "adapter_dir": str(adapter_dir), "merged_dir": str(merged_dir)}, indent=2))
 
