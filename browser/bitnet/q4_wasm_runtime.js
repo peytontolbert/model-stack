@@ -269,6 +269,32 @@ class WebGPUTensorF32 {
       throw new Error(`${label} readback mapAsync failed: ${error?.message || String(error)}`);
     }
   }
+
+  async readbackChunked(label = 'WebGPU tensor', chunkFloats = 16384) {
+    const total = this.length;
+    const result = new Float32Array(total);
+    const bufferUsage = gpuBufferUsage();
+    const floatsPerChunk = Math.max(1, Math.floor(chunkFloats));
+    for (let offset = 0; offset < total; offset += floatsPerChunk) {
+      const count = Math.min(floatsPerChunk, total - offset);
+      const bytes = count * Float32Array.BYTES_PER_ELEMENT;
+      const readbackBuffer = this.device.createBuffer({ size: align4(bytes), usage: bufferUsage.MAP_READ | bufferUsage.COPY_DST });
+      const encoder = this.device.createCommandEncoder();
+      encoder.copyBufferToBuffer(this.buffer, offset * Float32Array.BYTES_PER_ELEMENT, readbackBuffer, 0, bytes);
+      this.device.queue.submit([encoder.finish()]);
+      if (typeof this.device.queue.onSubmittedWorkDone === 'function') {
+        await this.device.queue.onSubmittedWorkDone();
+      }
+      try {
+        await readbackBuffer.mapAsync(gpuMapMode().READ);
+        result.set(new Float32Array(readbackBuffer.getMappedRange().slice(0, bytes)), offset);
+        readbackBuffer.unmap();
+      } catch (error) {
+        throw new Error(`${label} chunked readback mapAsync failed at ${offset}/${total}: ${error?.message || String(error)}`);
+      }
+    }
+    return result;
+  }
 }
 
 
