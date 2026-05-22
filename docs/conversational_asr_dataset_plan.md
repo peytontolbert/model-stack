@@ -33,6 +33,11 @@ promotion still depends on Tier 1.
 | `kensho/spgispeech` | Financial/business speech | Gated. Similar role to Earnings22, with commercial/business vocabulary. |
 | `sanchit-gandhi/tedlium-data` | Clean public speaking | Useful for speaker/accent diversity and clean references. Less meeting-like. |
 
+Use streaming for large row-level corpora so the training pipeline can sample
+from many sources without downloading entire splits. Timestamped meeting-window
+sources still need materialized rows so the builder can sort by meeting/time
+before concatenating utterances.
+
 ### Tier 3: F5TTS Synthetic Stress Augmentation
 
 Use `/data/agent_kernel_lite/artifacts/hf_releases/f5tts-4bit-distill` to render

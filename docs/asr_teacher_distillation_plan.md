@@ -168,6 +168,38 @@ python scripts/run_bddy_asr_teacher_window_experiment.py \
   --train-steps 180
 ```
 
+Use multiple sources for a more diverse conversational run. Timestamped meeting
+datasets such as AMI SDM/IHM can become windows; long-form chunked corpora such
+as Earnings22 are included as row-level teacher examples when they do not expose
+AMI-style timestamps:
+
+```bash
+python scripts/run_bddy_asr_teacher_window_experiment.py \
+  --run-name medium_diverse_teacher_windows_v1 \
+  --source-dataset 'edinburghcstr/ami:sdm:train[:8000]:text' \
+  --source-dataset 'edinburghcstr/ami:ihm:train[:8000]:text' \
+  --source-dataset 'distil-whisper/earnings22:chunked:test[:5000]:transcription' \
+  --limit-windows 500 \
+  --train-steps 180
+```
+
+For very large row-level corpora, stream from Hugging Face instead of
+materializing a full split. Streaming is intentionally row-level only; timestamp
+window building still materializes rows so they can be sorted by meeting/time:
+
+```bash
+python scripts/build_whisper_teacher_dataset.py \
+  --streaming \
+  --teacher-model openai/whisper-large-v3-turbo \
+  --dataset 'distil-whisper/earnings22:chunked:test:transcription' \
+  --output /data/model/bddy-whisper-teacher/earnings22_stream_teacher.parquet \
+  --limit-per-dataset 1000 \
+  --conversation-window-seconds 0 \
+  --min-words 8 \
+  --min-duration-seconds 5 \
+  --max-duration-seconds 24
+```
+
 Build F5TTS render jobs without JSONL:
 
 ```bash

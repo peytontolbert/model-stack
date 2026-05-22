@@ -160,6 +160,7 @@ def load_audio_rows(
     limit_per_dataset: int,
     sample_rate: int,
     seed: int,
+    streaming: bool,
     conversation_window_seconds: float,
     conversation_window_gap_seconds: float,
     conversation_window_group_columns: list[str],
@@ -168,12 +169,32 @@ def load_audio_rows(
     datasets = []
     for spec in specs:
         name, config, split, text_column = parse_dataset_spec(spec)
-        dataset = load_dataset(name, config, split=split) if config else load_dataset(name, split=split)
+        if streaming and conversation_window_seconds > 0:
+            raise ValueError("Streaming teacher loading is only supported for row-level sources, not timestamp windows")
+        dataset = (
+            load_dataset(name, config, split=split, streaming=streaming)
+            if config
+            else load_dataset(name, split=split, streaming=streaming)
+        )
         if "audio" not in dataset.column_names:
             raise ValueError(f"{spec} does not include an 'audio' column")
         if text_column not in dataset.column_names:
             raise ValueError(f"{spec} does not include text column {text_column!r}")
         dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
+        if streaming:
+            rows: list[dict[str, Any]] = []
+            for row in dataset:
+                rows.append(
+                    {
+                        "audio": row["audio"],
+                        "reference_text": str(row.get(text_column) or ""),
+                    }
+                )
+                if limit_per_dataset > 0 and len(rows) >= limit_per_dataset:
+                    break
+            dataset = Dataset.from_list(rows)
+            datasets.append(dataset)
+            continue
         if limit_per_dataset > 0 and conversation_window_seconds <= 0:
             dataset = dataset.shuffle(seed=seed).select(range(min(limit_per_dataset, len(dataset))))
         if text_column != "reference_text":
@@ -238,6 +259,7 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--limit-per-dataset", type=int, default=200)
     parser.add_argument("--sample-rate", type=int, default=16_000)
+    parser.add_argument("--streaming", action="store_true", help="Stream HF row-level sources instead of downloading the whole split")
     parser.add_argument("--max-new-tokens", type=int, default=160)
     parser.add_argument("--min-words", type=int, default=3)
     parser.add_argument("--min-duration-seconds", type=float, default=0.0)
@@ -256,6 +278,7 @@ def main() -> None:
         limit_per_dataset=args.limit_per_dataset,
         sample_rate=args.sample_rate,
         seed=args.seed,
+        streaming=bool(args.streaming),
         conversation_window_seconds=args.conversation_window_seconds,
         conversation_window_gap_seconds=args.conversation_window_gap_seconds,
         conversation_window_group_columns=[

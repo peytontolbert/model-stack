@@ -43,7 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--work-dir", default="/data/model/bddy-asr-runs")
     parser.add_argument("--teacher-model", default="openai/whisper-large-v3-turbo")
     parser.add_argument("--base-model", default="distil-whisper/distil-medium.en")
-    parser.add_argument("--source-dataset", default="edinburghcstr/ami:sdm:train[:8000]:text")
+    parser.add_argument(
+        "--source-dataset",
+        action="append",
+        default=[],
+        help="Teacher-label source dataset spec. Repeat for diverse corpora.",
+    )
     parser.add_argument("--eval-dataset", default="edinburghcstr/ami:sdm:validation[:1500]:text")
     parser.add_argument("--limit-windows", type=int, default=500)
     parser.add_argument("--train-steps", type=int, default=180)
@@ -52,7 +57,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-seconds", type=float, default=18.0)
     parser.add_argument("--window-gap-seconds", type=float, default=1.0)
     parser.add_argument("--window-min-words", type=int, default=20)
-    parser.add_argument("--extra-train-dataset", default="parquet:/data/model/bddy-real-mix-asr/libritts_conversation_mix_v2.parquet:train:text")
+    parser.add_argument(
+        "--extra-train-dataset",
+        action="append",
+        default=[],
+        help="Extra supervised/robustness dataset spec. Repeat to add more sources.",
+    )
+    parser.add_argument("--streaming-teacher-sources", action="store_true")
     parser.add_argument("--skip-teacher", action="store_true")
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--skip-eval", action="store_true")
@@ -61,6 +72,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    source_datasets = args.source_dataset or ["edinburghcstr/ami:sdm:train[:8000]:text"]
+    extra_train_datasets = args.extra_train_dataset or [
+        "parquet:/data/model/bddy-real-mix-asr/libritts_conversation_mix_v2.parquet:train:text"
+    ]
     run_dir = Path(args.work_dir) / args.run_name
     teacher_path = run_dir / "teacher_windows.parquet"
     adapter_dir = run_dir / "adapter"
@@ -72,22 +87,20 @@ def main() -> None:
         "run_name": args.run_name,
         "teacher_model": args.teacher_model,
         "base_model": args.base_model,
-        "source_dataset": args.source_dataset,
+        "source_datasets": source_datasets,
         "eval_dataset": args.eval_dataset,
+        "extra_train_datasets": extra_train_datasets,
         "limit_windows": args.limit_windows,
         "train_steps": args.train_steps,
         "window_seconds": args.window_seconds,
     }
     (run_dir / "run_config.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
-    run(
-        [
+    teacher_command = [
             sys.executable,
             "scripts/build_whisper_teacher_dataset.py",
             "--teacher-model",
             args.teacher_model,
-            "--dataset",
-            args.source_dataset,
             "--output",
             str(teacher_path),
             "--limit-per-dataset",
@@ -106,7 +119,13 @@ def main() -> None:
             "24",
             "--max-new-tokens",
             "192",
-        ],
+        ]
+    for dataset_spec in source_datasets:
+        teacher_command.extend(["--dataset", dataset_spec])
+    if args.streaming_teacher_sources:
+        teacher_command.append("--streaming")
+    run(
+        teacher_command,
         skip=args.skip_teacher and teacher_path.exists(),
     )
 
@@ -118,8 +137,8 @@ def main() -> None:
         "--dataset",
         f"parquet:{teacher_path}:train:teacher_text",
     ]
-    if args.extra_train_dataset:
-        train_command.extend(["--dataset", args.extra_train_dataset])
+    for dataset_spec in extra_train_datasets:
+        train_command.extend(["--dataset", dataset_spec])
     train_command.extend(
         [
             "--eval-dataset",
@@ -170,7 +189,7 @@ def main() -> None:
             str(adapter_dir),
         ]
     )
-    run(train_command, skip=args.skip_train and adapter_dir.exists())
+    run(train_command, skip=args.skip_train)
 
     if not args.skip_train:
         merge_lora(base_model=args.base_model, adapter_dir=adapter_dir, merged_dir=merged_dir)
