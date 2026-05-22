@@ -170,16 +170,17 @@ python scripts/run_bddy_asr_teacher_window_experiment.py \
 
 Use multiple sources for a more diverse conversational run. Timestamped meeting
 datasets such as AMI SDM/IHM can become windows; long-form chunked corpora such
-as Earnings22 are included as row-level teacher examples when they do not expose
-AMI-style timestamps:
+as Earnings22 should be streamed into a separate row-level teacher file when
+they do not expose AMI-style timestamps:
 
 ```bash
 python scripts/run_bddy_asr_teacher_window_experiment.py \
   --run-name medium_diverse_teacher_windows_v1 \
   --source-dataset 'edinburghcstr/ami:sdm:train[:8000]:text' \
   --source-dataset 'edinburghcstr/ami:ihm:train[:8000]:text' \
-  --source-dataset 'distil-whisper/earnings22:chunked:test[:5000]:transcription' \
+  --streaming-row-source-dataset 'distil-whisper/earnings22:chunked:test:transcription' \
   --limit-windows 500 \
+  --limit-streaming-rows 1000 \
   --train-steps 180
 ```
 

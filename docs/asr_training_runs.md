@@ -447,3 +447,61 @@ cleaner internal eval but still did not move the external gates. This confirms
 the repeatable experiment environment works, but the next accuracy gain likely
 requires more diverse meeting data, better segmentation/channel handling, or
 training more decoder/encoder capacity than the current small LoRA target.
+
+## Rejected: `medium_diverse_teacher_v12`
+
+Run directory:
+
+```text
+/data/model/bddy-asr-runs/medium_diverse_teacher_v12
+```
+
+Teacher-labeling summary:
+
+- teacher: `openai/whisper-large-v3-turbo`;
+- window source: `edinburghcstr/ami:sdm:train[:3000]:text`;
+- streamed row-level source: `distil-whisper/earnings22:chunked:test:transcription`;
+- accepted AMI windows: 115;
+- accepted Earnings22 streamed rows: 30;
+- LibriTTS real conversation mix included as robustness data;
+- final train rows after filtering: 197.
+
+Training summary:
+
+- base model: `distil-whisper/distil-medium.en`;
+- LoRA target modules: `q_proj,k_proj,v_proj,out_proj`;
+- LoRA rank: 8;
+- max steps: 80;
+- learning rate: `4e-6`;
+- merged model: `/data/model/bddy-asr-runs/medium_diverse_teacher_v12/merged`.
+
+Internal trainer eval, 11 samples:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| mean WER | 0.1340 | 0.1302 |
+| median WER | 0.1071 | 0.1071 |
+
+External AMI SDM short-utterance eval, 40 filtered rows:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4449 | 0.4464 |
+| median WER | 0.4226 | 0.4226 |
+| p90 WER | 0.7500 | 0.7500 |
+| question recall | 0.7778 | 0.7778 |
+
+AMI SDM conversation-window eval, 8 windows from `validation[:1200]`:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4562 | 0.4562 |
+| median WER | 0.4462 | 0.4462 |
+| p90 WER | 0.6977 | 0.6977 |
+| question recall | 0.7000 | 0.7000 |
+
+Decision: reject. The diverse streaming source path works, but adding a small
+amount of Earnings22 row-level data did not improve AMI meeting transcription
+and slightly regressed the short gate. Next runs should either scale the
+diverse row data substantially with per-source balancing, or change the training
+capacity/objective instead of adding small unbalanced data slices.

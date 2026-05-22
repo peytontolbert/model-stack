@@ -35,6 +35,16 @@ def merge_lora(*, base_model: str, adapter_dir: Path, merged_dir: Path) -> None:
     AutoProcessor.from_pretrained(str(adapter_dir)).save_pretrained(str(merged_dir))
 
 
+def parquet_num_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        return 1
+    return int(pq.ParquetFile(path).metadata.num_rows)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the bddy conversational ASR teacher-window training loop."
@@ -47,10 +57,17 @@ def parse_args() -> argparse.Namespace:
         "--source-dataset",
         action="append",
         default=[],
-        help="Teacher-label source dataset spec. Repeat for diverse corpora.",
+        help="Teacher-label timestamp/window source dataset spec. Repeat for diverse meeting corpora.",
+    )
+    parser.add_argument(
+        "--streaming-row-source-dataset",
+        action="append",
+        default=[],
+        help="Large row-level teacher source dataset spec to stream separately, such as Earnings22.",
     )
     parser.add_argument("--eval-dataset", default="edinburghcstr/ami:sdm:validation[:1500]:text")
     parser.add_argument("--limit-windows", type=int, default=500)
+    parser.add_argument("--limit-streaming-rows", type=int, default=1000)
     parser.add_argument("--train-steps", type=int, default=180)
     parser.add_argument("--eval-limit", type=int, default=40)
     parser.add_argument("--window-eval-limit", type=int, default=12)
@@ -63,8 +80,8 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Extra supervised/robustness dataset spec. Repeat to add more sources.",
     )
-    parser.add_argument("--streaming-teacher-sources", action="store_true")
     parser.add_argument("--skip-teacher", action="store_true")
+    parser.add_argument("--skip-row-teacher", action="store_true")
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--skip-eval", action="store_true")
     return parser.parse_args()
@@ -73,11 +90,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     source_datasets = args.source_dataset or ["edinburghcstr/ami:sdm:train[:8000]:text"]
+    streaming_row_source_datasets = args.streaming_row_source_dataset
     extra_train_datasets = args.extra_train_dataset or [
         "parquet:/data/model/bddy-real-mix-asr/libritts_conversation_mix_v2.parquet:train:text"
     ]
     run_dir = Path(args.work_dir) / args.run_name
     teacher_path = run_dir / "teacher_windows.parquet"
+    row_teacher_path = run_dir / "teacher_rows_streaming.parquet"
     adapter_dir = run_dir / "adapter"
     merged_dir = run_dir / "merged"
     reports_dir = run_dir / "reports"
@@ -88,9 +107,11 @@ def main() -> None:
         "teacher_model": args.teacher_model,
         "base_model": args.base_model,
         "source_datasets": source_datasets,
+        "streaming_row_source_datasets": streaming_row_source_datasets,
         "eval_dataset": args.eval_dataset,
         "extra_train_datasets": extra_train_datasets,
         "limit_windows": args.limit_windows,
+        "limit_streaming_rows": args.limit_streaming_rows,
         "train_steps": args.train_steps,
         "window_seconds": args.window_seconds,
     }
@@ -122,12 +143,39 @@ def main() -> None:
         ]
     for dataset_spec in source_datasets:
         teacher_command.extend(["--dataset", dataset_spec])
-    if args.streaming_teacher_sources:
-        teacher_command.append("--streaming")
     run(
         teacher_command,
         skip=args.skip_teacher and teacher_path.exists(),
     )
+
+    if streaming_row_source_datasets:
+        row_teacher_command = [
+            sys.executable,
+            "scripts/build_whisper_teacher_dataset.py",
+            "--streaming",
+            "--teacher-model",
+            args.teacher_model,
+            "--output",
+            str(row_teacher_path),
+            "--limit-per-dataset",
+            str(args.limit_streaming_rows),
+            "--conversation-window-seconds",
+            "0",
+            "--min-words",
+            "8",
+            "--min-duration-seconds",
+            "5",
+            "--max-duration-seconds",
+            "24",
+            "--max-new-tokens",
+            "192",
+        ]
+        for dataset_spec in streaming_row_source_datasets:
+            row_teacher_command.extend(["--dataset", dataset_spec])
+        run(
+            row_teacher_command,
+            skip=args.skip_row_teacher and row_teacher_path.exists(),
+        )
 
     train_command = [
         sys.executable,
@@ -137,6 +185,8 @@ def main() -> None:
         "--dataset",
         f"parquet:{teacher_path}:train:teacher_text",
     ]
+    if streaming_row_source_datasets and parquet_num_rows(row_teacher_path) > 0:
+        train_command.extend(["--dataset", f"parquet:{row_teacher_path}:train:teacher_text"])
     for dataset_spec in extra_train_datasets:
         train_command.extend(["--dataset", dataset_spec])
     train_command.extend(
