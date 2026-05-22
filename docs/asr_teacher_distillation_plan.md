@@ -42,6 +42,10 @@ duration_seconds: float
 Use `teacher_text` as the training target when the teacher is stronger than the
 provided transcript, especially for noisy conversational sources.
 
+See `docs/conversational_asr_dataset_plan.md` for the broader dataset map,
+including AMI, ICSI, VoxConverse, Earnings22, gated large-corpus options, and
+the F5TTS synthetic meeting augmentation path.
+
 ## Commands
 
 Build teacher labels:
@@ -113,10 +117,115 @@ python scripts/eval_asr_quality.py \
   --max-duration-seconds 24
 ```
 
+Run the same eval against synthetic meeting Parquet:
+
+```bash
+python scripts/eval_asr_quality.py \
+  --model distil-whisper/distil-small.en \
+  --dataset parquet \
+  --config /data/model/bddy-synthetic-asr/synthetic_meetings.parquet \
+  --split train \
+  --text-column text \
+  --limit 80 \
+  --min-words 4 \
+  --max-duration-seconds 24
+```
+
 The meeting eval reports WER plus substitution, deletion, insertion,
 repetition, question recall, and conversational critical-term recall. These
 metrics matter because they measure whether the transcript preserves the actual
 conversation, including uncertainty, objections, clarifications, and questions.
+
+Build F5TTS render jobs without JSONL:
+
+```bash
+python scripts/collect_conversational_asr_sources.py \
+  --dataset 'edinburghcstr/ami:ihm:train[:5000]:text:audio:speaker_id' \
+  --dataset 'distil-whisper/earnings22:chunked:test[:5000]:transcription:audio:file_id' \
+  --utterances-output /data/model/bddy-synthetic-asr/source_utterances.parquet \
+  --speaker-refs-output /data/model/bddy-synthetic-asr/speaker_refs.parquet \
+  --speaker-ref-dir /data/model/bddy-synthetic-asr/speaker_refs \
+  --limit-per-dataset 5000 \
+  --min-duration-seconds 7 \
+  --max-duration-seconds 12
+
+python scripts/build_synthetic_meeting_asr_dataset.py plan-f5 \
+  --texts-parquet /data/model/bddy-synthetic-asr/source_utterances.parquet \
+  --speaker-reference-manifest /data/model/bddy-synthetic-asr/speaker_refs.parquet \
+  --output /data/model/bddy-synthetic-asr/f5_render_jobs.parquet \
+  --render-output-dir /data/model/bddy-synthetic-asr/rendered_wavs \
+  --count 10000 \
+  --shuffle-texts \
+  --shuffle-speakers
+```
+
+After rendering those jobs with the local AgentKernel Lite F5TTS Q4 runtime,
+pack the rendered utterance paths into Parquet and mix hard meeting examples:
+
+```bash
+python scripts/render_f5tts_jobs_from_parquet.py \
+  --jobs /data/model/bddy-synthetic-asr/f5_render_jobs.parquet \
+  --output /data/model/bddy-synthetic-asr/rendered_utterances.parquet \
+  --limit 10000 \
+  --steps 24
+
+python scripts/build_synthetic_meeting_asr_dataset.py mix-rendered \
+  --rendered-utterances /data/model/bddy-synthetic-asr/rendered_utterances.parquet \
+  --output /data/model/bddy-synthetic-asr/synthetic_meetings.parquet \
+  --audio-output-dir /data/model/bddy-synthetic-asr/meeting_wavs \
+  --meetings 5000 \
+  --overlap-probability 0.25 \
+  --noise-probability 0.35
+
+python scripts/filter_synthetic_asr_with_teacher.py \
+  --input /data/model/bddy-synthetic-asr/synthetic_meetings.parquet \
+  --output /data/model/bddy-synthetic-asr/synthetic_meetings_verified.parquet \
+  --rejected-output /data/model/bddy-synthetic-asr/synthetic_meetings_rejected.parquet \
+  --teacher-model openai/whisper-large-v3-turbo \
+  --max-wer 0.25
+```
+
+Only train on `synthetic_meetings_verified.parquet`. F5TTS renders are
+augmentation candidates, not trusted labels. If the teacher transcript does not
+match the intended target closely, the row is rejected so it cannot poison ASR
+training.
+
+For F5TTS specifically, use original-style `24` step generation when building
+quality ASR augmentation and use 7-12 second speaker reference clips. Shorter
+speaker clips are useful for smoke tests only; they are not a fair TTS quality
+check.
+
+For a stronger no-TTS baseline, build difficult conversation mixtures directly
+from real LibriTTS utterances. This keeps exact labels and avoids synthetic
+voice mismatch:
+
+```bash
+python scripts/collect_conversational_asr_sources.py \
+  --dataset 'mythicinfinity/libritts:clean:train.clean.100:text_normalized:audio:speaker_id' \
+  --utterances-output /data/model/bddy-real-mix-asr/libritts_7_12s_utterances.parquet \
+  --speaker-refs-output /data/model/bddy-real-mix-asr/libritts_7_12s_speaker_refs.parquet \
+  --speaker-ref-dir /data/model/bddy-real-mix-asr/speaker_refs \
+  --utterance-audio-dir /data/model/bddy-real-mix-asr/utterance_wavs \
+  --limit-per-dataset 20000 \
+  --max-utterances-per-speaker 20 \
+  --min-duration-seconds 7 \
+  --max-duration-seconds 12
+
+python scripts/build_synthetic_meeting_asr_dataset.py mix-rendered \
+  --rendered-utterances /data/model/bddy-real-mix-asr/libritts_7_12s_utterances.parquet \
+  --output /data/model/bddy-real-mix-asr/libritts_conversation_mix.parquet \
+  --audio-output-dir /data/model/bddy-real-mix-asr/mixed_wavs \
+  --meetings 10000 \
+  --min-turns 3 \
+  --max-turns 8 \
+  --prefer-distinct-speakers \
+  --source-label libritts_real_conversation_mix \
+  --overlap-probability 0.3 \
+  --noise-probability 0.35
+```
+
+This real-audio mixture is a better first ASR training source than F5TTS when
+the goal is robust transcription under overlap, speaker changes, and noise.
 
 ## Promotion Gate
 
@@ -134,6 +243,10 @@ The latest plain LoRA and augmented LoRA runs did not pass this gate, so those
 checkpoints are rejected. The current baseline `distil-whisper/distil-small.en`
 on a filtered AMI SDM meeting slice is still around `0.43` WER, so meeting ASR
 quality remains the active blocker.
+
+See `docs/asr_training_runs.md` for the current run ledger. The latest
+LibriTTS real-conversation LoRA attempts, `v5` and `v6`, are rejected because
+they failed to improve AMI SDM room-mic validation.
 
 ## Runtime Boundary
 

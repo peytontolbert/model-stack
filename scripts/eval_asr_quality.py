@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 import torch
-from datasets import load_dataset
+from datasets import Audio, load_dataset
 from scipy.signal import resample_poly
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
@@ -200,6 +200,66 @@ def build_cases(dataset, *, perturb: bool) -> list[EvalCase]:
     return cases
 
 
+def build_conversation_window_cases(
+    dataset,
+    *,
+    target_seconds: float,
+    gap_seconds: float,
+    perturb: bool,
+) -> list[EvalCase]:
+    import numpy as np
+
+    cases: list[EvalCase] = []
+    window_audio: list[object] = []
+    window_text: list[str] = []
+    window_seconds = 0.0
+    window_start = 0
+    window_index = 0
+    current_sample_rate = 16_000
+
+    def flush() -> None:
+        nonlocal window_audio, window_text, window_seconds, window_start, window_index, current_sample_rate
+        if not window_audio or not window_text:
+            return
+        gap = np.zeros(max(0, int(round(gap_seconds * current_sample_rate))), dtype="float32")
+        chunks = []
+        for audio in window_audio:
+            if chunks and len(gap):
+                chunks.append(gap)
+            chunks.append(audio)
+        combined = np.concatenate(chunks).clip(-1.0, 1.0).astype("float32")
+        reference = " ".join(window_text)
+        name = f"window_{window_index}_rows_{window_start}_{window_start + len(window_text) - 1}"
+        cases.append(EvalCase(name, combined, current_sample_rate, reference))
+        if perturb:
+            cases.append(EvalCase(f"noise20db_{name}", add_white_noise(combined, 20.0, window_index), current_sample_rate, reference))
+            cases.append(EvalCase(f"noise10db_{name}", add_white_noise(combined, 10.0, window_index), current_sample_rate, reference))
+            cases.append(EvalCase(f"fast115_{name}", speed_audio(combined, 1.15), current_sample_rate, reference))
+        window_audio = []
+        window_text = []
+        window_seconds = 0.0
+        window_index += 1
+
+    for idx, example in enumerate(dataset):
+        audio = example["audio"]
+        array = audio["array"].astype("float32")
+        sample_rate = int(audio["sampling_rate"])
+        seconds = len(array) / float(sample_rate)
+        if sample_rate != current_sample_rate:
+            flush()
+            current_sample_rate = sample_rate
+        if not window_audio:
+            window_start = idx
+        if window_audio and window_seconds + gap_seconds + seconds > target_seconds:
+            flush()
+            window_start = idx
+        window_audio.append(array)
+        window_text.append(str(example["text"]))
+        window_seconds += seconds if len(window_audio) == 1 else gap_seconds + seconds
+    flush()
+    return cases
+
+
 def filter_dataset(
     dataset,
     *,
@@ -332,12 +392,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-duration-seconds", type=float, default=0.0)
     parser.add_argument("--perturb", action="store_true", help="Add 20dB noise, 10dB noise, and 1.15x speed cases.")
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--conversation-window-seconds",
+        type=float,
+        default=0.0,
+        help="Concatenate adjacent utterances into approximate conversation windows before evaluating.",
+    )
+    parser.add_argument(
+        "--conversation-window-gap-seconds",
+        type=float,
+        default=0.25,
+        help="Silence inserted between utterances when --conversation-window-seconds is set.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    dataset = load_dataset(args.dataset, args.config, split=args.split)
+    if args.dataset == "parquet":
+        dataset = load_dataset("parquet", data_files=args.config, split=args.split)
+    else:
+        dataset = load_dataset(args.dataset, args.config, split=args.split)
+    if "audio" not in dataset.column_names and "audio_path" in dataset.column_names:
+        dataset = dataset.rename_column("audio_path", "audio")
+    if "audio" in dataset.column_names:
+        dataset = dataset.cast_column("audio", Audio(sampling_rate=16_000))
     if args.text_column != "text":
         dataset = dataset.rename_column(args.text_column, "text")
     dataset = filter_dataset(
@@ -346,9 +425,19 @@ def main() -> None:
         min_duration_seconds=args.min_duration_seconds,
         max_duration_seconds=args.max_duration_seconds,
     )
-    if args.limit > 0:
+    if args.limit > 0 and args.conversation_window_seconds <= 0:
         dataset = dataset.select(range(min(args.limit, len(dataset))))
-    cases = build_cases(dataset, perturb=bool(args.perturb))
+    if args.conversation_window_seconds > 0:
+        cases = build_conversation_window_cases(
+            dataset,
+            target_seconds=args.conversation_window_seconds,
+            gap_seconds=args.conversation_window_gap_seconds,
+            perturb=bool(args.perturb),
+        )
+        if args.limit > 0:
+            cases = cases[: args.limit]
+    else:
+        cases = build_cases(dataset, perturb=bool(args.perturb))
     results = [transcribe_cases(model_id, cases, max_new_tokens=args.max_new_tokens) for model_id in args.model]
     print(json.dumps({"dataset": args.dataset, "config": args.config, "split": args.split, "cases": len(cases), "results": results}, indent=2))
 

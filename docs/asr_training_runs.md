@@ -1,0 +1,322 @@
+# ASR Training Runs
+
+## Current Rule
+
+Do not promote an ASR checkpoint unless it improves real conversational audio,
+especially AMI SDM room-mic validation. Synthetic or mixed data can be useful
+for training pressure, but it is not enough by itself.
+
+## Real LibriTTS Conversation Mix V1
+
+Source:
+
+```text
+/data/model/bddy-real-mix-asr/libritts_7_12s_utterances_v1.parquet
+/data/model/bddy-real-mix-asr/libritts_conversation_mix_v2.parquet
+```
+
+Build properties:
+
+- 600 real LibriTTS utterances;
+- 57 speakers;
+- utterance duration: 7-12 seconds;
+- 500 mixed conversation rows;
+- 2-3 turns per row;
+- distinct speakers preferred;
+- overlap probability: 0.35;
+- noise probability: 0.35.
+
+This data path is valid because it uses real speech and exact text labels. It
+is a better first ASR augmentation source than unverified F5TTS output.
+
+## Rejected: `bddy-distil-small-conversation-lora-v5`
+
+Output:
+
+```text
+/data/model/bddy-distil-small-conversation-lora-v5
+/data/model/bddy-distil-small-conversation-lora-v5-merged
+```
+
+Training summary:
+
+- base model: `distil-whisper/distil-small.en`;
+- train rows after filtering: 1,276;
+- LoRA target modules: `q_proj,v_proj`;
+- LoRA rank: 8;
+- trainable params: 491,520;
+- max steps: 180;
+- learning rate: `5e-6`.
+
+Internal held-out mix eval:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| mean WER | 0.0394 | 0.0398 |
+
+External AMI SDM eval, 30 filtered rows:
+
+| Metric | Base | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4412 | 0.4412 |
+| median WER | 0.4226 | 0.4226 |
+| p90 WER | 0.8333 | 0.8333 |
+| substitution rate | 0.1789 | 0.1789 |
+| deletion rate | 0.1320 | 0.1320 |
+| insertion rate | 0.0762 | 0.0762 |
+
+Decision: reject. The adapter did not improve the promotion gate.
+
+## Rejected: `bddy-distil-small-conversation-lora-v6`
+
+Output:
+
+```text
+/data/model/bddy-distil-small-conversation-lora-v6
+/data/model/bddy-distil-small-conversation-lora-v6-merged
+```
+
+Training summary:
+
+- base model: `distil-whisper/distil-small.en`;
+- train rows after filtering: 1,416;
+- LoRA target modules: `q_proj,k_proj,v_proj,out_proj`;
+- LoRA rank: 16;
+- trainable params: 1,966,080;
+- max steps: 220;
+- learning rate: `2e-5`.
+
+Internal held-out mix eval:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| mean WER | 0.0399 | 0.0401 |
+
+External AMI SDM eval, 30 filtered rows:
+
+| Metric | Base | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4412 | 0.4467 |
+| median WER | 0.4226 | 0.4286 |
+| p90 WER | 0.8333 | 0.8333 |
+| substitution rate | 0.1789 | 0.1848 |
+| deletion rate | 0.1320 | 0.1144 |
+| insertion rate | 0.0762 | 0.0850 |
+
+Decision: reject. The adapter moved the model, but it worsened AMI SDM mean WER
+and substitution rate.
+
+## Next Training Direction
+
+The two LoRA runs show that generic LibriTTS conversation mixing alone does not
+fix AMI room-mic conversational errors. The next useful run should focus on
+real room-mic meeting data:
+
+1. Build a larger teacher-labeled AMI SDM Parquet using
+   `openai/whisper-large-v3-turbo`.
+2. Keep LibriTTS conversation mixes at a low training weight.
+3. Train against teacher text for AMI SDM, not just the original short
+   normalized transcripts.
+4. Evaluate on held-out AMI SDM meetings that are not used in teacher labeling.
+5. Promote only if AMI SDM improves without hurting repetition rate or question
+   recall.
+
+## Rejected: `bddy-distil-small-ami-teacher-lora-v7`
+
+Teacher data:
+
+```text
+/data/model/bddy-whisper-teacher/ami_sdm_large_turbo_teacher_v1.parquet
+```
+
+Teacher-labeling summary:
+
+- teacher: `openai/whisper-large-v3-turbo`;
+- source: AMI SDM train slice;
+- requested rows: 450;
+- accepted rows: 304;
+- rejected as too short: 146.
+
+Training summary:
+
+- base model: `distil-whisper/distil-small.en`;
+- train rows after filtering: 439;
+- target text: `teacher_text` for AMI SDM pseudo-labels;
+- LibriTTS real conversation mix included as a smaller robustness component;
+- LoRA target modules: `q_proj,k_proj,v_proj,out_proj`;
+- LoRA rank: 16;
+- trainable params: 1,966,080;
+- max steps: 180;
+- learning rate: `1e-5`.
+
+Internal held-out eval:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| mean WER | 0.2256 | 0.2231 |
+
+External AMI SDM eval, 40 filtered rows:
+
+| Metric | Base | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4581 | 0.4581 |
+| median WER | 0.4524 | 0.4524 |
+| p90 WER | 0.8000 | 0.8000 |
+| substitution rate | 0.1812 | 0.1791 |
+| deletion rate | 0.1365 | 0.1386 |
+| insertion rate | 0.0682 | 0.0682 |
+| question recall | 0.7778 | 0.7778 |
+
+Decision: reject. The adapter slightly improved the trainer's mixed internal
+eval, but it did not improve the external AMI SDM promotion gate.
+
+## Updated Next Direction
+
+The teacher-label run did not improve the external room-mic gate. The next
+accuracy work should stop short-utterance LoRA on `distil-small.en` and focus on
+one of these:
+
+1. Evaluate a stronger runtime candidate, such as `distil-whisper/distil-medium.en`
+   or `openai/whisper-small.en`, on the same AMI SDM gate before more training.
+2. Build meeting windows from AMI SDM instead of individual short utterances, so
+   training and eval match 10-25 second conversational context.
+3. Train only after teacher labels are filtered by agreement with original AMI
+   text or manually reviewed meeting windows, because large-v3-turbo still
+   mistranscribes some short room-mic fragments.
+
+## Baseline Model Comparison
+
+External AMI SDM eval, 40 filtered rows:
+
+| Model | Params | Mean WER | Median WER | P90 WER | Median Latency | Question Recall | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `distil-whisper/distil-small.en` | 166.1M | 0.4581 | 0.4524 | 0.8000 | 2.67s | 0.7778 | Current lightweight baseline. |
+| `distil-whisper/distil-medium.en` | 394.4M | 0.4449 | 0.4226 | 0.7500 | 6.12s | 0.7778 | Best accuracy/latency tradeoff tested so far. |
+| `openai/whisper-small.en` | 241.7M | 0.4582 | 0.4584 | 0.8000 | 3.32s | 0.7778 | No meaningful improvement over distil-small. |
+| `openai/whisper-medium.en` | 763.9M | 0.4548 | 0.4226 | 0.9000 | 9.38s | 0.7222 | Slower and not better on this gate. |
+
+Decision: `distil-whisper/distil-medium.en` is the strongest runtime candidate
+tested so far for desktop-quality ASR. It improves mean WER and p90 WER versus
+`distil-small.en`, but roughly doubles latency. It should be treated as an
+optional higher-accuracy desktop mode, not a mobile/default runtime.
+
+## Candidate: `bddy-distil-medium-ami-teacher-lora-v8`
+
+Training data:
+
+```text
+/data/model/bddy-whisper-teacher/ami_sdm_large_turbo_teacher_v1.parquet
+/data/model/bddy-real-mix-asr/libritts_conversation_mix_v2.parquet
+```
+
+Training summary:
+
+- base model: `distil-whisper/distil-medium.en`;
+- target text: `teacher_text` for AMI SDM pseudo-labels, `text` for LibriTTS
+  real conversation mixes;
+- train rows after filtering: 439;
+- eval rows after filtering: 97;
+- LoRA target modules: `q_proj,k_proj,v_proj,out_proj`;
+- LoRA rank: 8;
+- trainable params: 1,835,008;
+- max steps: 140;
+- learning rate: `8e-6`;
+- finished epoch: 5.0;
+- merged model: `/data/model/bddy-distil-medium-ami-teacher-lora-v8-merged`.
+
+External AMI SDM eval, 40 filtered rows:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4449 | 0.4401 |
+| median WER | 0.4226 | 0.4226 |
+| p90 WER | 0.7500 | 0.7500 |
+| median latency | 5.65s | 5.42s |
+| p90 latency | 6.05s | 6.13s |
+| substitution rate | 0.1450 | 0.1450 |
+| deletion rate | 0.1727 | 0.1706 |
+| insertion rate | 0.0384 | 0.0405 |
+| question recall | 0.7778 | 0.7778 |
+
+Decision: keep as a candidate. This is the first tuning run that improved the
+external AMI SDM promotion gate, but the gain is small. It is acceptable for
+continued desktop-quality testing, while the production default should still be
+selected by runtime budget and real app measurements.
+
+AMI SDM conversation-window smoke eval, 6 windows from `validation[:600]`:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4951 | 0.4951 |
+| median WER | 0.4900 | 0.4900 |
+| p90 WER | 0.6977 | 0.6977 |
+| median latency | 6.42s | 6.60s |
+| question recall | 0.6250 | 0.6250 |
+
+The candidate does not improve the longer-window smoke test. This reinforces
+that the next training run should use meeting windows directly instead of only
+isolated short utterances.
+
+Next accuracy work:
+
+1. Add AMI conversation-window training/eval instead of relying on isolated
+   short utterances, because bddy streams transcript windows during coaching and
+   JARVIS.
+2. Evaluate on a separate long-form business/conversation set such as
+   `distil-whisper/earnings22` to ensure the adapter is not overfit to AMI.
+3. Keep F5TTS-generated rows out of ASR training unless they pass teacher
+   verification against the intended transcript.
+
+## Rejected: `bddy-distil-medium-ami-window-lora-v9`
+
+Training data:
+
+```text
+edinburghcstr/ami:sdm:train[:2500]:text
+```
+
+Training summary:
+
+- base model: `distil-whisper/distil-medium.en`;
+- timestamp-aware AMI windows up to 18 seconds;
+- training rows after filtering: 177;
+- eval rows after filtering: 39;
+- LoRA target modules: `q_proj,k_proj,v_proj,out_proj`;
+- LoRA rank: 8;
+- trainable params: 1,835,008;
+- max steps: 90;
+- learning rate: `5e-6`;
+- mild gain/noise augmentation plus 12% low-volume overlap augmentation;
+- merged model: `/data/model/bddy-distil-medium-ami-window-lora-v9-merged`.
+
+Internal trainer window eval, 12 samples:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| mean WER | 0.3934 | 0.3934 |
+| median WER | 0.3611 | 0.3611 |
+
+AMI SDM conversation-window smoke eval, 6 windows from `validation[:600]`:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4951 | 0.4951 |
+| median WER | 0.4900 | 0.4900 |
+| p90 WER | 0.6977 | 0.6977 |
+| median latency | 6.71s | 6.65s |
+| question recall | 0.6250 | 0.6250 |
+
+External AMI SDM short-utterance eval, 40 filtered rows:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.4449 | 0.4481 |
+| median WER | 0.4226 | 0.4226 |
+| p90 WER | 0.7500 | 0.7500 |
+| median latency | 5.50s | 5.56s |
+| question recall | 0.7778 | 0.7778 |
+
+Decision: reject. The window-trained adapter did not improve the window eval and
+regressed the short-utterance promotion gate. The likely issue is that the
+training target uses noisy AMI room-mic labels directly; future window training
+should use higher-quality teacher labels or a cleaner meeting corpus.
