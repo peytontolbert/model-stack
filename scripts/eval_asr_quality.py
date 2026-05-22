@@ -327,21 +327,28 @@ def case_group(name: str) -> str:
     return name.rsplit("_", 1)[0]
 
 
-def transcribe_cases(model_id: str, cases: Iterable[EvalCase], *, max_new_tokens: int) -> dict:
+def transcribe_cases(model_id: str, cases: Iterable[EvalCase], *, max_new_tokens: int, device: str) -> dict:
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
     processor = AutoProcessor.from_pretrained(model_id)
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         model_id,
-        dtype=torch.float32,
+        dtype=dtype,
         low_cpu_mem_usage=True,
-    ).eval()
+    ).to(device).eval()
     params = sum(parameter.numel() for parameter in model.parameters())
     rows = []
     for case in cases:
         inputs = processor(case.audio, sampling_rate=case.sample_rate, return_tensors="pt")
+        inputs = {
+            key: value.to(device, dtype=dtype) if key == "input_features" else value.to(device)
+            for key, value in inputs.items()
+        }
         started = time.perf_counter()
         with torch.inference_mode():
             predicted_ids = model.generate(
-                inputs.input_features,
+                inputs["input_features"],
                 max_new_tokens=max_new_tokens,
                 num_beams=1,
                 do_sample=False,
@@ -373,6 +380,7 @@ def transcribe_cases(model_id: str, cases: Iterable[EvalCase], *, max_new_tokens
         by_group.setdefault(case_group(str(row["case"])), []).append(row)
     return {
         "model": model_id,
+        "device": device,
         "params_m": round(params / 1_000_000, 1),
         "summary": summarize(rows),
         "groups": {key: summarize(value) for key, value in sorted(by_group.items())},
@@ -393,6 +401,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-duration-seconds", type=float, default=0.0)
     parser.add_argument("--perturb", action="store_true", help="Add 20dB noise, 10dB noise, and 1.15x speed cases.")
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--output-json", default="", help="Optional path to write the full eval JSON report.")
     parser.add_argument(
         "--conversation-window-seconds",
@@ -440,7 +449,10 @@ def main() -> None:
             cases = cases[: args.limit]
     else:
         cases = build_cases(dataset, perturb=bool(args.perturb))
-    results = [transcribe_cases(model_id, cases, max_new_tokens=args.max_new_tokens) for model_id in args.model]
+    results = [
+        transcribe_cases(model_id, cases, max_new_tokens=args.max_new_tokens, device=args.device)
+        for model_id in args.model
+    ]
     report = {"dataset": args.dataset, "config": args.config, "split": args.split, "cases": len(cases), "results": results}
     rendered = json.dumps(report, indent=2)
     if args.output_json:
