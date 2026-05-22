@@ -392,6 +392,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-duration-seconds", type=float, default=0.0)
     parser.add_argument("--perturb", action="store_true", help="Add 20dB noise, 10dB noise, and 1.15x speed cases.")
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--output-json", default="", help="Optional path to write the full eval JSON report.")
     parser.add_argument(
         "--conversation-window-seconds",
         type=float,
@@ -439,7 +440,15 @@ def main() -> None:
     else:
         cases = build_cases(dataset, perturb=bool(args.perturb))
     results = [transcribe_cases(model_id, cases, max_new_tokens=args.max_new_tokens) for model_id in args.model]
-    print(json.dumps({"dataset": args.dataset, "config": args.config, "split": args.split, "cases": len(cases), "results": results}, indent=2))
+    report = {"dataset": args.dataset, "config": args.config, "split": args.split, "cases": len(cases), "results": results}
+    rendered = json.dumps(report, indent=2)
+    if args.output_json:
+        from pathlib import Path
+
+        output = Path(args.output_json)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered + "\n", encoding="utf-8")
+    print(rendered)
 
 
 if __name__ == "__main__":

@@ -155,6 +155,19 @@ repetition, question recall, and conversational critical-term recall. These
 metrics matter because they measure whether the transcript preserves the actual
 conversation, including uncertainty, objections, clarifications, and questions.
 
+Run the full bddy teacher-window experiment loop. This is the preferred
+repeatable environment for improving transcription accuracy because it creates
+teacher-cleaned meeting windows, trains the LoRA student, merges it, and writes
+short/window promotion reports under one run directory:
+
+```bash
+python scripts/run_bddy_asr_teacher_window_experiment.py \
+  --run-name medium_teacher_windows_v1 \
+  --source-dataset 'edinburghcstr/ami:sdm:train[:8000]:text' \
+  --limit-windows 500 \
+  --train-steps 180
+```
+
 Build F5TTS render jobs without JSONL:
 
 ```bash
