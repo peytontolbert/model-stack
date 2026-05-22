@@ -212,6 +212,22 @@ diagnosis, but they are risky as supervised training rows because they often
 reflect segmentation or reference-window mismatch rather than normal acoustic
 confusion.
 
+The trainer supports weighted examples through an `example_weight` column. The
+hard-case miner writes this column automatically:
+
+```bash
+python scripts/train_whisper_asr_lora.py \
+  --model distil-whisper/distil-medium.en \
+  --dataset 'parquet:/data/model/bddy-asr-runs/medium_multisource_capacity_v13/teacher_windows.parquet:train:teacher_text' \
+  --dataset 'parquet:/data/model/bddy-asr-runs/hard_cases_weighted_v16.parquet:train:text' \
+  --example-weight-column example_weight \
+  --eval-dataset 'parquet:/data/model/bddy-asr-eval/v14/ami_sdm_validation_windows.parquet:train:text'
+```
+
+Weighted hard cases are cleaner than duplicating rows, but the v16 run showed
+that weights alone still do not improve the fixed SDM gate. Treat them as a
+tool for future experiments, not as a promoted recipe.
+
 Run the full bddy teacher-window experiment loop. This is the preferred
 repeatable environment for improving transcription accuracy because it creates
 teacher-cleaned meeting windows, trains the LoRA student, merges it, and writes

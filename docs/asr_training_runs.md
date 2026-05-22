@@ -799,3 +799,88 @@ Decision: beam 3 is worth considering for desktop-quality transcription when
 latency allows. It improves mean WER and deletion/substitution rates, but it
 can lower short-turn question recall and increases latency. Runtime should make
 this a quality mode rather than the universal default.
+
+## Not Promoted: `medium_weighted_hardcase_v16`
+
+Hard-case dataset:
+
+```text
+/data/model/bddy-asr-runs/hard_cases_weighted_v16.parquet
+```
+
+Mining summary:
+
+- source: v13 AMI SDM/IHM teacher windows plus v13 Earnings22 streamed teacher
+  rows;
+- scoring model: `distil-whisper/distil-medium.en`;
+- scored candidates after quality bounds: 309;
+- selected: 220;
+- written: 220;
+- weight column: `example_weight`, range `1.2083` to `3.0`, mean `1.4744`;
+- bounds: `0.12 <= WER <= 1.2`, insertion rate `<= 0.75`.
+
+Trainer change:
+
+- `scripts/train_whisper_asr_lora.py` now preserves `example_weight`;
+- the data collator batches weights;
+- `WeightedSeq2SeqTrainer` applies per-example weighted token CE loss.
+
+Run directory:
+
+```text
+/data/model/bddy-asr-runs/medium_weighted_hardcase_v16
+```
+
+Training summary:
+
+- base model: `distil-whisper/distil-medium.en`;
+- training data:
+  - v13 AMI SDM/IHM teacher windows;
+  - v13 Earnings22 streamed teacher rows;
+  - `hard_cases_weighted_v16.parquet`;
+  - LibriTTS real conversation mix v2;
+- filtered training rows: 1,177;
+- LoRA target modules: `q_proj,k_proj,v_proj,out_proj,fc1,fc2`;
+- trainable params: 3,964,928;
+- max steps: 240;
+- learning rate: `2e-6`;
+- augmentation: very light gain/noise, no overlap augmentation;
+- merged model: `/data/model/bddy-asr-runs/medium_weighted_hardcase_v16/merged`.
+
+Internal trainer eval, 12 fixed SDM window examples:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| mean WER | 0.2699 | 0.2699 |
+| median WER | 0.2500 | 0.2500 |
+
+External fixed AMI SDM short eval, 120 rows:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.3685 | 0.3685 |
+| median WER | 0.2857 | 0.2857 |
+| p90 WER | 0.8750 | 0.8750 |
+| substitution rate | 0.1062 | 0.1062 |
+| deletion rate | 0.1784 | 0.1784 |
+| insertion rate | 0.0334 | 0.0334 |
+| question recall | 0.8571 | 0.8571 |
+| critical-term recall | 0.7778 | 0.7778 |
+
+External fixed AMI SDM window eval, 60 windows:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.2873 | 0.2874 |
+| median WER | 0.2710 | 0.2828 |
+| p90 WER | 0.5000 | 0.5000 |
+| substitution rate | 0.0875 | 0.0875 |
+| deletion rate | 0.1554 | 0.1565 |
+| insertion rate | 0.0211 | 0.0211 |
+| question recall | 0.8421 | 0.8421 |
+| critical-term recall | 1.0000 | 1.0000 |
+
+Decision: do not promote. Weighted hard cases did not improve the fixed
+promotion gate. Keep the weighted-loss path for future work, but the next
+highest-leverage ASR improvement is runtime/decoding plus better segmentation
+and window construction, not more LoRA weighting on the current labels.

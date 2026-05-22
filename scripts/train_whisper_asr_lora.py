@@ -138,6 +138,7 @@ def load_training_dataset(
     limit_per_dataset: int,
     sample_rate: int,
     shuffle_seed: int,
+    example_weight_column: str,
     conversation_window_seconds: float,
     conversation_window_gap_seconds: float,
     conversation_window_group_columns: list[str],
@@ -163,6 +164,10 @@ def load_training_dataset(
         dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
         if text_column != "text":
             dataset = dataset.rename_column(text_column, "text")
+        if example_weight_column and example_weight_column in dataset.column_names and example_weight_column != "example_weight":
+            dataset = dataset.rename_column(example_weight_column, "example_weight")
+        if "example_weight" not in dataset.column_names:
+            dataset = dataset.add_column("example_weight", [1.0] * len(dataset))
         dataset = build_conversation_windows(
             dataset,
             group_columns=conversation_window_group_columns,
@@ -175,7 +180,7 @@ def load_training_dataset(
             dataset = dataset.shuffle(seed=shuffle_seed).select(
                 range(min(limit_per_dataset, len(dataset)))
             )
-        keep = {"audio", "text"}
+        keep = {"audio", "text", "example_weight"}
         dataset = dataset.remove_columns([column for column in dataset.column_names if column not in keep])
         dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
         datasets.append(dataset)
@@ -274,7 +279,31 @@ class WhisperDataCollator:
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
         batch["labels"] = labels
+        if any("example_weight" in feature for feature in features):
+            batch["example_weight"] = torch.tensor(
+                [float(feature.get("example_weight", 1.0)) for feature in features],
+                dtype=torch.float32,
+            )
         return batch
+
+
+class WeightedSeq2SeqTrainer(Seq2SeqTrainer):
+    def compute_loss(self, model, inputs, return_outputs: bool = False, num_items_in_batch=None):
+        weights = inputs.pop("example_weight", None)
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        if weights is None or labels is None:
+            loss = outputs.loss
+            return (loss, outputs) if return_outputs else loss
+
+        logits = outputs.logits
+        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+        token_loss = loss_fct(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1)).reshape(labels.shape)
+        mask = labels.ne(-100)
+        per_example_loss = (token_loss * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+        weights = weights.to(per_example_loss.device).clamp_min(0.0)
+        loss = (per_example_loss * weights).sum() / weights.sum().clamp_min(1.0)
+        return (loss, outputs) if return_outputs else loss
 
 
 def evaluate_samples(model, processor, dataset, *, max_eval_samples: int, max_new_tokens: int) -> dict:
@@ -337,6 +366,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-limit-per-dataset", type=int, default=0)
     parser.add_argument("--eval-size", type=int, default=64)
     parser.add_argument("--eval-samples", type=int, default=32)
+    parser.add_argument("--example-weight-column", default="example_weight")
     parser.add_argument("--min-words", type=int, default=0)
     parser.add_argument("--min-duration-seconds", type=float, default=0.0)
     parser.add_argument("--max-duration-seconds", type=float, default=0.0)
@@ -401,6 +431,7 @@ def main() -> None:
         limit_per_dataset=args.limit_per_dataset,
         sample_rate=args.sample_rate,
         shuffle_seed=args.selection_seed,
+        example_weight_column=args.example_weight_column,
         conversation_window_seconds=args.conversation_window_seconds,
         conversation_window_gap_seconds=args.conversation_window_gap_seconds,
         conversation_window_group_columns=[
@@ -426,6 +457,7 @@ def main() -> None:
             limit_per_dataset=args.eval_limit_per_dataset or args.eval_size,
             sample_rate=args.sample_rate,
             shuffle_seed=args.selection_seed + 1,
+            example_weight_column="",
             conversation_window_seconds=args.conversation_window_seconds,
             conversation_window_gap_seconds=args.conversation_window_gap_seconds,
             conversation_window_group_columns=[
@@ -492,6 +524,7 @@ def main() -> None:
         return {
             "input_features": features["input_features"][0],
             "labels": labels,
+            "example_weight": float(example.get("example_weight", 1.0)),
         }
 
     train_dataset = train_split.map(
@@ -542,7 +575,7 @@ def main() -> None:
         remove_unused_columns=False,
         label_names=["labels"],
     )
-    trainer = Seq2SeqTrainer(
+    trainer = WeightedSeq2SeqTrainer(
         args=training_args,
         model=model,
         train_dataset=train_dataset,

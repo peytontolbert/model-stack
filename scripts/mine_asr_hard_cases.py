@@ -248,10 +248,12 @@ def main() -> None:
         if wer < args.min_wer or wer > args.max_wer or insertion_rate > args.max_insertion_rate:
             continue
         score = hard_case_score(reference, hypothesis, counts)
+        example_weight = min(3.0, max(1.0, 1.0 + score))
         candidates.append(
             {
                 "audio": audio,
                 "text": reference,
+                "example_weight": example_weight,
                 "reference_text": row.get("reference_text"),
                 "source_rows": row.get("source_rows"),
                 "duration_seconds": duration,
