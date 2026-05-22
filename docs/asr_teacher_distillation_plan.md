@@ -188,6 +188,30 @@ python scripts/run_bddy_asr_teacher_window_experiment.py \
 If this fixed SDM gate regresses, do not promote the checkpoint even if the
 trainer's internal teacher eval improves.
 
+Mine recoverable hard cases from training data before the next fine-tune. The
+miner scores rows with the current base model and writes a Parquet dataset
+weighted toward high WER, deletions, missed questions, and missed critical
+meeting terms:
+
+```bash
+python scripts/mine_asr_hard_cases.py \
+  --model distil-whisper/distil-medium.en \
+  --dataset 'parquet:/data/model/bddy-asr-runs/medium_multisource_capacity_v13/teacher_windows.parquet:train:teacher_text' \
+  --dataset 'parquet:/data/model/bddy-asr-runs/medium_multisource_capacity_v13/teacher_rows_streaming.parquet:train:teacher_text' \
+  --output /data/model/bddy-asr-runs/hard_cases_v15.parquet \
+  --limit-per-dataset 700 \
+  --select 180 \
+  --repeat-selected 2 \
+  --min-wer 0.12 \
+  --max-wer 1.2 \
+  --max-insertion-rate 0.75
+```
+
+Keep the WER and insertion bounds. Extreme hallucination rows are useful for
+diagnosis, but they are risky as supervised training rows because they often
+reflect segmentation or reference-window mismatch rather than normal acoustic
+confusion.
+
 Run the full bddy teacher-window experiment loop. This is the preferred
 repeatable environment for improving transcription accuracy because it creates
 teacher-cleaned meeting windows, trains the LoRA student, merges it, and writes

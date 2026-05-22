@@ -683,3 +683,85 @@ not enough. The next improvement should target the failure modes directly:
 hard-case mining from the fixed suite, deletion-focused loss/reweighting, and a
 separate segmentation/diarization path for mixed speakers before more LoRA
 capacity.
+
+## Not Promoted: `medium_hardcase_v15`
+
+Hard-case dataset:
+
+```text
+/data/model/bddy-asr-runs/hard_cases_v15.parquet
+```
+
+Mining summary:
+
+- source: v13 AMI SDM/IHM teacher windows plus v13 Earnings22 streamed teacher
+  rows;
+- scoring model: `distil-whisper/distil-medium.en`;
+- scored candidates after quality bounds: 309;
+- selected: 180;
+- written after repeat weighting: 360;
+- bounds: `0.12 <= WER <= 1.2`, insertion rate `<= 0.75`;
+- hard-case score: WER plus deletion, missed-question, and missed-critical-term
+  bonuses.
+
+Run directory:
+
+```text
+/data/model/bddy-asr-runs/medium_hardcase_v15
+```
+
+Training summary:
+
+- base model: `distil-whisper/distil-medium.en`;
+- training data:
+  - v13 AMI SDM/IHM teacher windows;
+  - v13 Earnings22 streamed teacher rows;
+  - `hard_cases_v15.parquet`;
+  - LibriTTS real conversation mix v2;
+- filtered training rows: 1,317;
+- LoRA target modules: `q_proj,k_proj,v_proj,out_proj,fc1,fc2`;
+- trainable params: 3,964,928;
+- max steps: 260;
+- learning rate: `2.5e-6`;
+- augmentation: very light gain/noise, no overlap augmentation;
+- merged model: `/data/model/bddy-asr-runs/medium_hardcase_v15/merged`.
+
+Internal trainer eval, 12 fixed SDM window examples:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| mean WER | 0.2699 | 0.2699 |
+| median WER | 0.2500 | 0.2500 |
+
+External fixed AMI SDM short eval, 120 rows:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.3685 | 0.3722 |
+| median WER | 0.2857 | 0.2997 |
+| p90 WER | 0.8750 | 0.8750 |
+| substitution rate | 0.1062 | 0.1076 |
+| deletion rate | 0.1784 | 0.1797 |
+| insertion rate | 0.0334 | 0.0340 |
+| question recall | 0.8571 | 0.8095 |
+| critical-term recall | 0.7778 | 0.7778 |
+
+External fixed AMI SDM window eval, 60 windows:
+
+| Metric | Base `distil-medium.en` | Candidate |
+| --- | ---: | ---: |
+| mean WER | 0.2873 | 0.2862 |
+| median WER | 0.2710 | 0.2774 |
+| p90 WER | 0.5000 | 0.5000 |
+| substitution rate | 0.0875 | 0.0869 |
+| deletion rate | 0.1554 | 0.1565 |
+| insertion rate | 0.0211 | 0.0211 |
+| question recall | 0.8421 | 0.8421 |
+| critical-term recall | 1.0000 | 1.0000 |
+
+Decision: do not promote. Hard-case mining marginally reduced substitutions on
+fixed SDM windows, but short-turn performance and deletion rate worsened. The
+main bottleneck is no longer just sample selection. Next work should improve
+the training objective or data representation: deletion-weighted loss,
+timestamp/window-boundary cleanup, and speaker/channel segmentation before
+ASR.
