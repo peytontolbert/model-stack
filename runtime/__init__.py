@@ -242,6 +242,16 @@ _EXPORTS = {
     "create_mel_filterbank": "runtime.asr",
     "greedy_decode_step": "runtime.asr",
     "pcm_to_log_mel": "runtime.asr",
+    "DiarizationAudioChunk": "runtime.diarization",
+    "DiarizationReferenceConfig": "runtime.diarization",
+    "DiarizationSegment": "runtime.diarization",
+    "DiarizationStreamConfig": "runtime.diarization",
+    "DiarizationStreamState": "runtime.diarization",
+    "DiarizationVadConfig": "runtime.diarization",
+    "OnlineDiarizationState": "runtime.diarization",
+    "ReferenceStreamingDiarizationRuntime": "runtime.diarization",
+    "SpeakerTrackState": "runtime.diarization",
+    "StreamingDiarizationResult": "runtime.diarization",
 }
 
 __all__ = sorted(_EXPORTS)
