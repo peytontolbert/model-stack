@@ -59,6 +59,8 @@ kernel path to the SDPA-bridged native-cache path, reducing the 4096-context
 | `model/` and `runtime/` | model assembly, generation, native runtime dispatch |
 | `kernel/` and `runtime/csrc/` | CUDA/C++ kernels and extension bindings |
 | `compress/` | quantization, BitNet, LoRA, pruning, compression deltas |
+| `browser/` | WebGPU/WASM runtimes for packed BitNet, Q4 F5TTS, and Vocos bundles |
+| `native/` | native device backends such as the Apple Metal runtime scaffold |
 | `data/` and `corpus/` | tokenization, sharding, datasets, corpus tooling |
 | `train/` and `dist/` | training loops, optimizers, distributed launch helpers |
 | `eval/` and `tests/` | correctness, source-surface tests, perf harnesses |
@@ -117,6 +119,17 @@ ABI, CUDA backend families, BitNet packed formats, attention policy, runtime
 flags, and the process for adding new kernels, see
 [docs/custom-kernel-architecture.md](docs/custom-kernel-architecture.md).
 
+Browser and device runtime notes:
+
+- [browser/README.md](browser/README.md) covers packed BitNet WebGPU/WASM,
+  handle-backed encoder-decoder execution, Q4 F5TTS, and Vocos bundle loading.
+- [browser/bitnet_wasm/README.md](browser/bitnet_wasm/README.md) covers the
+  WASM kernel exports and SIMD fallback contracts.
+- [native/apple_metal/README.md](native/apple_metal/README.md) covers the
+  iPhone Metal backend scaffold and backend-selection gates.
+- [docs/asr_teacher_distillation_plan.md](docs/asr_teacher_distillation_plan.md)
+  covers the current ASR teacher-labeling and Whisper LoRA student workflow.
+
 ## Runtime Flags
 
 Common dispatch controls:
@@ -146,6 +159,7 @@ Important current examples:
 - `examples/11_compress_quantize/`: weight-only quantization demo
 - `examples/13_parameter_golf_h100/`: restartable 8xH100 Parameter Golf
   ternary training/export recipe
+- `examples/14_f5tts_peyton/`: F5TTS Q4 browser/iPhone distillation workflow
 
 Parameter Golf H100 quick start:
 

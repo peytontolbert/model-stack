@@ -46,84 +46,111 @@ function normalizeLayout(layoutHeader) {
   if (header[0] !== 1 || header[1] !== 16 || header[2] !== 32 || header[9] !== 1) {
     throw new Error("Unsupported BitNet browser layout; expected v1 16x32 interleave mode 1");
   }
-  if (header[3] <= 0 || header[4] <= 0) {
+  const logicalOut = header[3];
+  const logicalIn = header[4];
+  const paddedOut = header[5];
+  const paddedIn = header[6];
+  const scaleGranularity = header[7];
+  const scaleGroupSize = header[8];
+  const segmentCount = header[11];
+  if (logicalOut <= 0 || logicalIn <= 0) {
     throw new Error("BitNet logical dimensions must be positive");
   }
-  if (header[5] < header[3] || header[6] < header[4]) {
-    throw new Error("BitNet padded dimensions must be greater than or equal to logical dimensions");
+  if (paddedOut < logicalOut || paddedIn < logicalIn) {
+    throw new Error("BitNet padded dimensions must be at least the logical dimensions");
   }
-  if (header[6] % 4 !== 0) {
+  if (paddedOut % header[1] !== 0) {
+    throw new Error("BitNet padded output features must be tile aligned");
+  }
+  if (paddedIn % 4 !== 0) {
     throw new Error("BitNet padded input features must be divisible by 4");
   }
-  if (![0, 1, 2].includes(header[7])) {
-    throw new Error("Unsupported BitNet scale_granularity");
+  if (paddedIn % header[2] !== 0) {
+    throw new Error("BitNet padded input features must be tile aligned");
   }
-  if (header[7] === 1 && header[11] <= 0) {
-    throw new Error("BitNet per-segment scaling requires segment_count > 0");
+  if (![0, 1, 2].includes(scaleGranularity)) {
+    throw new Error(`Unsupported BitNet scale_granularity: ${scaleGranularity}`);
   }
-  if (header[7] === 2 && header[8] <= 0) {
-    throw new Error("BitNet per-output-group scaling requires scale_group_size > 0");
+  if (scaleGranularity === 2 && scaleGroupSize <= 0) {
+    throw new Error("BitNet per-output-group scaling requires a positive scale_group_size");
+  }
+  if (segmentCount <= 0) {
+    throw new Error("BitNet segment_count must be positive");
   }
   return {
-    logicalOut: header[3],
-    logicalIn: header[4],
-    paddedOut: header[5],
-    paddedIn: header[6],
-    scaleGranularity: header[7],
-    scaleGroupSize: header[8],
-    segmentCount: header[11],
+    logicalOut,
+    logicalIn,
+    paddedOut,
+    paddedIn,
+    scaleGranularity,
+    scaleGroupSize,
+    segmentCount,
   };
+}
+
+function validateSegmentOffsets(layout, segmentOffsets) {
+  if (!(segmentOffsets instanceof Int32Array) && !(segmentOffsets instanceof Uint32Array)) {
+    throw new Error("BitNet segment_offsets must use int32 storage");
+  }
+  if (segmentOffsets.length !== layout.segmentCount + 1) {
+    throw new Error("BitNet segment_offsets length mismatch");
+  }
+  if (segmentOffsets[0] !== 0) {
+    throw new Error("BitNet segment_offsets must start at 0");
+  }
+  if (segmentOffsets[layout.segmentCount] !== layout.logicalOut) {
+    throw new Error("BitNet segment_offsets must end at logical_out_features");
+  }
+  for (let idx = 1; idx < segmentOffsets.length; idx += 1) {
+    if (segmentOffsets[idx] < segmentOffsets[idx - 1]) {
+      throw new Error("BitNet segment_offsets must be non-decreasing");
+    }
+  }
+}
+
+function validateScaleValues(layout, scaleValues) {
+  if (!(scaleValues instanceof Float32Array)) {
+    throw new Error("BitNet scale_values must use float32 storage");
+  }
+  if (layout.scaleGranularity === 0 && scaleValues.length < 1) {
+    throw new Error("BitNet per-matrix scaling requires at least one value");
+  }
+  if (layout.scaleGranularity === 1 && scaleValues.length !== layout.segmentCount) {
+    throw new Error("BitNet per-segment scaling size mismatch");
+  }
+  if (layout.scaleGranularity === 2) {
+    const expectedGroups = Math.ceil(layout.logicalOut / layout.scaleGroupSize);
+    if (scaleValues.length !== expectedGroups) {
+      throw new Error("BitNet per-output-group scaling size mismatch");
+    }
+  }
+}
+
+function validateInputQuantization(inputQuantMode, inputQuantBits, inputScaleRows, inputScales) {
+  if (inputQuantMode === 0) {
+    return;
+  }
+  if (inputQuantBits < 2 || inputQuantBits > 8) {
+    throw new Error("BitNet input_quant_bits must be in [2, 8]");
+  }
+  if (inputScaleRows <= 0) {
+    throw new Error("BitNet input_scale_rows must be positive when input quantization is enabled");
+  }
+  if (!(inputScales instanceof Float32Array) || inputScales.length < inputScaleRows) {
+    throw new Error("BitNet input_scales length mismatch");
+  }
 }
 
 function validateLayerTensors(layout, bundle) {
   const rowStrideBytes = layout.paddedIn / 4;
   const expectedPackedBytes = layout.logicalOut * rowStrideBytes;
-  if (bundle.packedWeight.length < expectedPackedBytes) {
+  if (!(bundle.packedWeight instanceof Uint8Array) || bundle.packedWeight.length < expectedPackedBytes) {
     throw new Error("BitNet packed_weight is shorter than layout requires");
   }
-  if (bundle.bias && bundle.bias.length > 0 && bundle.bias.length < layout.logicalOut) {
-    throw new Error("BitNet bias length must be zero or at least logicalOut");
-  }
-  if (layout.scaleGranularity === 0 && bundle.scaleValues.length < 1) {
-    throw new Error("BitNet per-matrix scaling requires one scale value");
-  }
-  if (layout.scaleGranularity === 1) {
-    if (bundle.scaleValues.length < layout.segmentCount) {
-      throw new Error("BitNet per-segment scaling has too few scale values");
-    }
-    if (bundle.segmentOffsets.length < layout.segmentCount + 1) {
-      throw new Error("BitNet per-segment scaling has too few segment offsets");
-    }
-    if (bundle.segmentOffsets[0] !== 0 || bundle.segmentOffsets[layout.segmentCount] !== layout.logicalOut) {
-      throw new Error("BitNet segment offsets must span [0, logicalOut]");
-    }
-    for (let i = 0; i < layout.segmentCount; i += 1) {
-      if (bundle.segmentOffsets[i] > bundle.segmentOffsets[i + 1]) {
-        throw new Error("BitNet segment offsets must be non-decreasing");
-      }
-    }
-  }
-  if (layout.scaleGranularity === 2) {
-    const expectedGroups = Math.ceil(layout.logicalOut / layout.scaleGroupSize);
-    if (bundle.scaleValues.length < expectedGroups) {
-      throw new Error("BitNet per-output-group scaling has too few scale values");
-    }
-  }
-}
-
-function validateInputQuantization(inputScales, rows, inputQuantMode, inputQuantBits, inputScaleRows) {
-  if (inputQuantMode === 0) return;
-  if (inputQuantMode !== 1) {
-    throw new Error("Unsupported BitNet input_quant_mode");
-  }
-  if (inputQuantBits < 2 || inputQuantBits > 8) {
-    throw new Error("BitNet input_quant_bits must be in [2, 8]");
-  }
-  if (inputScaleRows !== 1 && inputScaleRows !== rows) {
-    throw new Error("BitNet input_scale_rows must be 1 or rows");
-  }
-  if (inputScales.length < inputScaleRows) {
-    throw new Error("BitNet input_scales has too few values");
+  validateScaleValues(layout, bundle.scaleValues);
+  validateSegmentOffsets(layout, bundle.segmentOffsets);
+  if (bundle.bias && bundle.bias.length > 0 && (!(bundle.bias instanceof Float32Array) || bundle.bias.length !== layout.logicalOut)) {
+    throw new Error("BitNet bias length mismatch");
   }
 }
 
@@ -242,7 +269,32 @@ export class BitNetLinearWebGPU {
     this.inputQuantMode = bundle.inputQuantMode ?? 0;
     this.inputQuantBits = bundle.inputQuantBits ?? 8;
     this.inputScaleRows = bundle.inputScaleRows ?? 1;
-    this.inputScales = bundle.inputScales ? new Float32Array(bundle.inputScales) : new Float32Array([1]);
+    const bias = bundle.bias == null
+      ? null
+      : (bundle.bias instanceof Float32Array ? bundle.bias : new Float32Array(bundle.bias));
+    this.hasBias = bias != null && bias.length > 0;
+    const normalizedBundle = {
+      packedWeight: bundle.packedWeight instanceof Uint8Array
+        ? bundle.packedWeight
+        : new Uint8Array(bundle.packedWeight),
+      scaleValues: bundle.scaleValues instanceof Float32Array
+        ? bundle.scaleValues
+        : new Float32Array(bundle.scaleValues),
+      segmentOffsets: bundle.segmentOffsets instanceof Int32Array
+        ? bundle.segmentOffsets
+        : Int32Array.from(bundle.segmentOffsets || []),
+      bias,
+      inputScales: bundle.inputScales
+        ? (bundle.inputScales instanceof Float32Array ? bundle.inputScales : new Float32Array(bundle.inputScales))
+        : new Float32Array([1]),
+    };
+    validateInputQuantization(
+      this.inputQuantMode,
+      this.inputQuantBits,
+      this.inputScaleRows,
+      normalizedBundle.inputScales,
+    );
+    validateLayerTensors(this.layout, normalizedBundle);
 
     if (!bundle.shaderCode && !bundle.pipeline) {
       throw new Error("BitNetLinearWebGPU requires shaderCode or pipeline; use fromManifestLayer() or fromManifestUrl()");
@@ -258,35 +310,17 @@ export class BitNetLinearWebGPU {
       });
     }
 
-    const packedWeight = bundle.packedWeight instanceof Uint8Array
-      ? bundle.packedWeight
-      : new Uint8Array(bundle.packedWeight);
-    const scaleValues = bundle.scaleValues instanceof Float32Array
-      ? bundle.scaleValues
-      : new Float32Array(bundle.scaleValues);
-    const segmentOffsets = bundle.segmentOffsets instanceof Int32Array
-      ? bundle.segmentOffsets
-      : Int32Array.from(bundle.segmentOffsets || []);
-    const hasBiasInput = bundle.bias != null;
-    const bias = hasBiasInput
-      ? (bundle.bias instanceof Float32Array ? bundle.bias : new Float32Array(bundle.bias))
-      : new Float32Array(0);
-    this.hasBias = bias.length > 0;
-    validateLayerTensors(this.layout, {
-      packedWeight,
-      scaleValues,
-      segmentOffsets,
-      bias,
-    });
-
-    this.packedWeightBuffer = createStorageBuffer(device, packedWeightToWords(packedWeight));
-    this.scaleBuffer = createStorageBuffer(device, scaleValues);
-    this.segmentOffsetBuffer = createStorageBuffer(device, new Uint32Array(segmentOffsets));
+    this.packedWeightBuffer = createStorageBuffer(device, packedWeightToWords(normalizedBundle.packedWeight));
+    this.scaleBuffer = createStorageBuffer(device, normalizedBundle.scaleValues);
+    this.segmentOffsetBuffer = createStorageBuffer(device, new Uint32Array(normalizedBundle.segmentOffsets));
     this.biasBuffer = createStorageBuffer(
       device,
-      this.hasBias ? bias : new Float32Array([0]),
+      this.hasBias ? normalizedBundle.bias : new Float32Array([0]),
     );
-    this.inputScaleBuffer = createStorageBuffer(device, this.inputScales);
+    this.inputScaleBuffer = createStorageBuffer(
+      device,
+      normalizedBundle.inputScales,
+    );
     this.paramsBuffer = device.createBuffer({
       size: PARAM_BUFFER_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -351,13 +385,6 @@ export class BitNetLinearWebGPU {
     if (x.length !== rows * this.layout.logicalIn) {
       throw new Error(`BitNet input length mismatch: got ${x.length}, expected ${rows * this.layout.logicalIn}`);
     }
-    validateInputQuantization(
-      this.inputScales,
-      rows,
-      this.inputQuantMode,
-      this.inputQuantBits,
-      this.inputScaleRows,
-    );
 
     const outputLength = rows * this.layout.logicalOut;
     const inputBytes = x.byteLength;

@@ -1,0 +1,12 @@
+This is Peyton speaking from Agent Kernel Lite with the clean distilled F5 TTS model.
+Agent Kernel Lite should not sound like Agent Colonel Light when the voice clone speaks.
+The iPhone runtime uses custom int4 WebAssembly kernels for voice generation.
+F5 TTS, Vocos, WebGPU, and WASM should all be pronounced clearly.
+The model should speak clearly without static, clipping, or missing words.
+Today we are testing longer voice cloning quality across several different sentences.
+When the sentence gets longer, the ending should stay coherent and avoid noisy artifacts.
+The quick brown fox jumps over the lazy dog while the audio remains natural.
+Numbers like twenty four kilohertz, eight steps, and four bit quantization should be intelligible.
+Please generate a complete sentence instead of cutting off halfway through the final word.
+Voice cloning should preserve Peyton's tone without overfitting to one sample.
+This held out evaluation is only for listening and should not be part of the training set.

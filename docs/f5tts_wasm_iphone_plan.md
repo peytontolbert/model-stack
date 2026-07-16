@@ -48,24 +48,30 @@ also needs the mel generator runtime, text/audio preprocessing, ODE sampling
 loop, and a vocoder. The current model uses 32 function evaluations, so even a
 2-bit linear kernel still repeats the DiT forward pass many times per utterance.
 
-## Existing BitNet Runtime
+## Current Browser Runtime Status
 
-This repo already has a browser WASM BitNet path:
+This repo now has two related browser WASM paths:
 
 - `browser/bitnet_wasm/src/lib.rs`
 - `browser/bitnet/bitnet_wasm_runtime.js`
+- `browser/bitnet/q4_wasm_runtime.js`
+- `browser/bitnet/f5tts_q4_dit_runtime.js`
 
-It supports packed signed ternary weights with row scales and optional int8-ish
-activation quantization for linear layers. This can be reused for F5TTS linear
-projections, but it is not a complete F5TTS runtime. We still need graph support
-for:
+The BitNet path supports packed signed ternary weights with row scales and
+optional activation quantization for linear layers. The Q4 path supports
+rowwise-symmetric 4-bit matrix weights, FP16/dense side tensors, chunked Q4
+bundles, fused triple-linears, fused MLPs, fused DiT blocks, cached rotary
+tables, head-major K/V attention, F5 session execution, and Vocos ISTFT-head
+reconstruction.
 
-- DiT attention and feed-forward blocks
-- ConvNeXt/text encoder convolution pieces
-- timestep/text/audio conditioning
-- ODE/sway sampling loop
-- mel spectrogram construction for reference audio
-- Vocos or a smaller replacement vocoder
+The remaining browser/iPhone work is no longer "write the whole F5 graph from
+scratch"; it is now mostly:
+
+- improving F5/Vocos latency on long durations
+- preserving quality at fewer steps
+- deciding when to select WASM, WebGPU, or native Metal
+- adding parity fixtures around promoted checkpoints
+- keeping model loading memory-aware on iPhone
 
 ## Practical Path
 
@@ -92,11 +98,10 @@ for:
    - `q4_symmetric_linear_f32(input, packed_weight, row_scales_f16, bias, rows, in_dim, out_dim)`
    - JS bundle loader: `browser/bitnet/q4_wasm_runtime.js`
 
-3. Export ONNX/Core ML baselines before BitNet.
-   For iPhone, Core ML or MPS-backed native inference is likely a much better
-   first target than browser WASM. For browser-on-iPhone, WebAssembly SIMD is
-   available, but WebGPU support and sustained thermal headroom are the harder
-   constraints.
+3. Keep ONNX/Core ML/Metal baselines beside WASM.
+   For iPhone app deployment, the native Metal scaffold in `native/apple_metal`
+   is the preferred long-term backend. Browser-on-iPhone should still use WASM
+   as the deterministic fallback; Safari cannot call Metal directly.
 
 4. Quantize selectively.
    Start with DiT linear layers only: Q/K/V/O and feed-forward projections.
@@ -107,10 +112,11 @@ for:
    Test `nfe_step=16` and then distill to fewer steps. This is probably more
    important for interactivity than reducing weights from INT8 to 2-bit.
 
-6. Replace or separately export the vocoder.
-   Vocos must be exported/ported too. A small neural vocoder in Core ML, ONNX
-   Runtime Web, or a server-generated LPCNet-style path may be easier than
-   hand-porting all Vocos modules to WASM.
+6. Keep Vocos packaged separately.
+   Vocos now has Q4/FP16 manifest indexes and tensor buffers under
+   `browser/models/vocos_mel_24khz_q4_v0`. Continue to treat it as a separate
+   bundle so F5 mel generation and waveform decoding can be profiled and
+   replaced independently.
 
 7. Distill if the target is fully offline browser TTS.
    The likely viable browser/iPhone target is a smaller student, not the full
@@ -127,5 +133,6 @@ as the first milestone. The fastest engineering path is:
 3. Apply ternary BitNet packing to DiT linear layers and compare audio quality.
 4. Distill step count and model width/depth only after the baseline runs.
 
-The existing BitNet WASM kernel is useful, but it should be treated as the
-linear-layer backend for a custom F5TTS runtime, not as a drop-in solution.
+The existing WASM kernels are useful, but they should be treated as custom
+runtime kernels for a controlled F5TTS/Vocos stack, not as a generic drop-in
+model execution engine.

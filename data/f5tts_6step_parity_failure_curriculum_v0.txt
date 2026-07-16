@@ -1,0 +1,15 @@
+F five T T S, Voh coes, Web G P U, and Web Assembly should all be pronounced clearly.
+The F five T T S model should pronounce Voh coes, Web G P U, and Web Assembly clearly.
+Please say F five T T S, Voh coes, Web G P U, and Web Assembly without changing the words.
+Today we are testing longer voice cloning quality across several different sentences.
+Longer voice cloning quality should remain clear across several different sentences.
+The voice cloning quality test should not turn into glow or cloning artifacts.
+Numbers like twenty four kilohertz, eight steps, and four bit quantization should be intelligible.
+Twenty four kilohertz, eight steps, and four bit quantization should sound clear.
+The model should say twenty four kilohertz and four bit quantization without changing the phrase.
+Agent Kernel Lite should not sound like Agent Colonel Light when the voice clone speaks.
+Agent Kernel Lite should remain Agent Kernel Lite in the generated speech.
+Please generate a complete sentence instead of cutting off halfway through the final word.
+When the sentence gets longer, the ending should stay coherent and avoid noisy artifacts.
+The generated voice should pronounce kernel, quantization, and diffusion correctly.
+The model should speak clearly without static, clipping, or missing words.

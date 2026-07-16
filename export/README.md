@@ -49,6 +49,19 @@ packed weights to dense ONNX weights. The v1 browser path requires `spin=False`
 and `quant_weight_opt=none`; AWQ/pre-scale and spin transforms need dedicated
 browser epilogues before they can be enabled.
 
+When the model config enables auxiliary heads, the browser manifest also records
+their execution surface:
+
+- retrieval embeddings through `retrieval_query_head` and `retrieval_doc_head`
+- agent intent logits through `agent_intent_head`
+- scalar agent policy heads such as `should_answer`, `should_clarify`,
+  `memory_write`, and `retrieval_coverage`
+
+The browser encoder-decoder runtime consumes these heads from pooled encoder
+states. Export should keep them as explicit named linears so WebGPU/WASM can
+route them through the same packed BitNet layer loader instead of adding
+task-specific JavaScript math.
+
 ## Programmatic
 
 ```python

@@ -3668,6 +3668,7 @@ class TrainableBitNetLinear(nn.Module):
         scale_layout: str = "runtime_row",
         group_size: int = 64,
         eps: float = 1e-8,
+        learned_scale: bool = False,
     ) -> None:
         super().__init__()
         layout = str(scale_layout).strip().lower()
@@ -3678,8 +3679,11 @@ class TrainableBitNetLinear(nn.Module):
         self.scale_layout = "runtime_row"
         self.group_size = int(group_size)
         self.eps = float(eps)
+        self.learned_scale = bool(learned_scale)
         self.weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
         self.bias = nn.Parameter(torch.empty(self.out_features)) if bias else None
+        if self.learned_scale:
+            self.weight_scale = nn.Parameter(torch.ones(self.out_features, dtype=torch.float32))
         self.register_buffer("spin_signs", torch.ones(self.in_features, dtype=torch.float32))
         self.register_buffer("spin_enabled_flag", torch.zeros((), dtype=torch.uint8))
         _configure_spin_state(
@@ -3706,6 +3710,9 @@ class TrainableBitNetLinear(nn.Module):
                 f"expected ({self.out_features}, {self.in_features}), got {tuple(module.weight.shape)}"
             )
         self.weight.copy_(module.weight.detach().to(device=self.weight.device, dtype=self.weight.dtype))
+        if self.learned_scale:
+            scale = module.weight.detach().float().flatten(1).abs().mean(dim=1).clamp_min(self.eps)
+            self.weight_scale.copy_(scale.to(device=self.weight_scale.device, dtype=self.weight_scale.dtype))
         if self.bias is not None:
             if module.bias is None:
                 self.bias.zero_()
@@ -3714,6 +3721,11 @@ class TrainableBitNetLinear(nn.Module):
         return self
 
     def ternary_weight(self) -> torch.Tensor:
+        if self.learned_scale:
+            qweight, _row_scale = _bitnet_runtime_row_codes_and_scale(self.weight.detach(), eps=self.eps)
+            scale = self.weight_scale.clamp_min(self.eps).to(device=self.weight.device, dtype=torch.float32)
+            quantized = qweight.to(device=self.weight.device, dtype=torch.float32).mul(scale.unsqueeze(-1))
+            return self.weight + (quantized.to(dtype=self.weight.dtype) - self.weight).detach()
         return _bitnet_runtime_row_ste_weight(self.weight, eps=self.eps)
 
     def runtime_weight(
@@ -3750,7 +3762,10 @@ class TrainableBitNetLinear(nn.Module):
 
     @torch.no_grad()
     def quantized_codes_and_scales(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return _bitnet_runtime_row_codes_and_scale(self.weight.detach(), eps=self.eps)
+        qweight, row_scale = _bitnet_runtime_row_codes_and_scale(self.weight.detach(), eps=self.eps)
+        if self.learned_scale:
+            row_scale = self.weight_scale.detach().float().clamp_min(self.eps)
+        return qweight, row_scale
 
     @torch.no_grad()
     def to_quantized(
@@ -3892,7 +3907,7 @@ class TrainableBitNetLinear(nn.Module):
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, scale_layout={self.scale_layout!r}, "
-            f"spin={_spin_enabled(self.spin_enabled_flag)}"
+            f"learned_scale={self.learned_scale}, spin={_spin_enabled(self.spin_enabled_flag)}"
         )
 
 
@@ -4196,6 +4211,7 @@ def prepare_bitnet_qat_linear_modules(
     scale_layout: str = "runtime_row",
     group_size: int = 64,
     eps: float = 1e-8,
+    learned_scale: bool = False,
 ) -> Dict[str, TrainableBitNetLinear]:
     """Replace ``nn.Linear`` modules with trainable runtime-row BitNet QAT layers."""
     replacements: Dict[str, TrainableBitNetLinear] = {}
@@ -4218,6 +4234,7 @@ def prepare_bitnet_qat_linear_modules(
             scale_layout=scale_layout,
             group_size=group_size,
             eps=eps,
+            learned_scale=learned_scale,
         ).to(device=module.weight.device, dtype=torch.float32)
         qat.from_float(module)
         setattr(parent, attr_name, qat)
@@ -4242,6 +4259,7 @@ def quantize_linear_modules(
     spin: bool = False,
     spin_random: bool = True,
     spin_seed: int = 0,
+    bitnet_qat_learned_scale: bool = False,
 ) -> Dict[str, nn.Module]:
     """Replace nn.Linear modules with quantized linear wrappers in-place.
 
@@ -4300,7 +4318,12 @@ def quantize_linear_modules(
             # source module dtype, commonly bf16 for small browser models,
             # makes the ternary thresholds too coarse for AdamW to recover
             # coherent generation after full-model BitNet projection.
-            ql = TrainableBitNetLinear(module.in_features, module.out_features, bias=(module.bias is not None)).to(
+            ql = TrainableBitNetLinear(
+                module.in_features,
+                module.out_features,
+                bias=(module.bias is not None),
+                learned_scale=bool(bitnet_qat_learned_scale),
+            ).to(
                 device=module.weight.device,
                 dtype=torch.float32,
             )

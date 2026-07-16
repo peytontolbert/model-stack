@@ -1,0 +1,8 @@
+Agent Kernel Lite can generate my voice on iPhone with the custom int4 WebAssembly runtime.
+This is Peyton speaking from Agent Kernel Lite with the clean LibriTTS two step distilled F5 TTS model.
+The model should speak clearly without static, clipping, or missing words.
+Today we are testing longer voice cloning quality across several different sentences.
+Agent Kernel Lite should not be pronounced as Agent Colonel Light.
+The F5 TTS int4 model should say WebAssembly clearly.
+The custom four bit diffusion voice model should stay coherent through the final words.
+Voice cloning quality should remain clear across longer generated speech.

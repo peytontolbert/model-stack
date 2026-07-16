@@ -89,6 +89,32 @@ The runtime supports:
 Cache APIs must preserve batch-row semantics. Beam search and speculative
 decoding depend on row reordering and split/concat behavior remaining stable.
 
+## Local Model Catalog
+
+`model_catalog.py` is the single-repository entry point for the downloaded model
+inventory in `/data/staticpeytonsite/src/research_library/data/model_index.json`.
+It keeps discovery and planning import-light, then routes first-wave integrations
+through bridge backends before native CUDA promotion:
+
+- `video_diffusion_bridge` and `diffusers_cuda_bridge`: start with `runtime.diffusers_bridge` on CUDA/BF16, with VAE slicing, optional attention slicing/xFormers, channels-last components, and opt-in `torch.compile` for transformer/UNet hot paths.
+- `nemo_asr_bridge`: plug concrete NeMo or Transformers ASR backends into `runtime.asr`.
+- `transformers_causal_lm_bridge`: run custom HF causal LMs through Transformers first.
+- `peft_adapter_bridge`: load adapters onto an explicit runnable base model.
+- `encoder_classifier_bridge`: run HF encoders/classifiers through Transformers first.
+
+Use `load_model_catalog()` and `primary_lane_records()` to inspect the first
+wave, `plan_model_integration()` to see the intended backend/performance path,
+and `load_catalog_model()` for best-effort local loading. Set
+`MODEL_STACK_MODEL_ROOT` when model paths in the catalog are relative. For very
+large Diffusers models, use `DiffusersBridgeOptions(device_map="balanced",
+max_memory=...)` instead of moving the whole pipeline to one GPU.
+`diffusers_snapshot_status()` validates required components and indexed shards;
+`load_diffusers_component()` supports targeted component smokes such as loading
+only the VAE before attempting a full pipeline. LoRA-style Diffusers assets can
+be checked with `diffusers_catalog_adapter_status()` and attached to an already
+loaded pipeline with `load_catalog_diffusers_lora_adapter()`. Keep per-model
+conda compatibility notes in [`docs/model-stack-conda-envs.md`](../docs/model-stack-conda-envs.md).
+
 ## Model Loading And Preparation
 
 The model loading surface is split by responsibility:
