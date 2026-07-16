@@ -18,6 +18,25 @@ DEFAULT_PROFILE = "/data/resumebot/voice_profiles/Peyton"
 DEFAULT_OUT_DIR = "/data/transformer_10/evals/f5tts_voice_profiles"
 
 
+def runtime_metadata(device: torch.device) -> dict:
+    metadata = {
+        "device": str(device),
+        "cuda_available": bool(torch.cuda.is_available()),
+    }
+    if device.type == "cuda":
+        index = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(index)
+        metadata.update(
+            {
+                "cuda_index": int(index),
+                "cuda_name": str(props.name),
+                "cuda_total_memory_gb": float(props.total_memory) / (1024.0**3),
+                "cuda_capability": f"{props.major}.{props.minor}",
+            }
+        )
+    return metadata
+
+
 def load_vocab(path: Path) -> tuple[dict[str, int], int]:
     vocab = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
     vocab_char_map = {char: idx for idx, char in enumerate(vocab) if char}
@@ -119,10 +138,22 @@ def main() -> None:
     parser.add_argument("--text", default="This is a four step distilled F5 TTS voice cloning test from Agent Kernel Lite.")
     parser.add_argument("--nfe-step", type=int, default=4)
     parser.add_argument("--cfg-strength", type=float, default=2.0)
+    parser.add_argument("--sway-sampling-coef", type=float, default=-1.0)
+    parser.add_argument("--ode-method", default="", help="Optional torchdiffeq ODE method override, e.g. euler or midpoint.")
     parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--simulate-q4", action="store_true")
+    parser.add_argument("--save-mel", action="store_true", help="Save generated mel spectrogram next to the WAV output.")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument(
+        "--min-cuda-total-gb",
+        type=float,
+        default=0.0,
+        help="Abort CUDA rendering if the selected GPU has less memory. Use for promotion/parity gates.",
+    )
     args = parser.parse_args()
+    torch.manual_seed(int(args.seed))
+    np.random.seed(int(args.seed))
 
     repo_root = Path("/data/resumebot")
     sys.path.insert(0, str(repo_root))
@@ -134,6 +165,15 @@ def main() -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
+    runtime = runtime_metadata(device)
+    if device.type == "cuda" and float(args.min_cuda_total_gb) > 0.0:
+        total_gb = float(runtime.get("cuda_total_memory_gb", 0.0))
+        if total_gb < float(args.min_cuda_total_gb):
+            raise RuntimeError(
+                f"selected CUDA device is below promotion/parity memory floor: "
+                f"{runtime.get('cuda_name')} has {total_gb:.2f} GB, "
+                f"required {float(args.min_cuda_total_gb):.2f} GB"
+            )
 
     checkpoint_path = Path(args.checkpoint)
     profile_dir = Path(args.voice_profile_dir)
@@ -142,17 +182,20 @@ def main() -> None:
 
     model = build_model(Path(args.vocab), device)
     step = load_checkpoint(model, checkpoint_path, device)
+    if str(args.ode_method).strip():
+        model.odeint_kwargs = {**getattr(model, "odeint_kwargs", {}), "method": str(args.ode_method).strip()}
     q4_tensors = 0
     q4_params = 0
     if args.simulate_q4:
         q4_tensors, q4_params = apply_q4_simulation(model)
     model.eval()
-    vocoder = load_vocoder(vocoder_name="vocos", is_local=False)
+    infer_device = str(device)
+    vocoder = load_vocoder(vocoder_name="vocos", is_local=False, device=infer_device)
     ref_audio_path, ref_text = first_profile_sample(profile_dir)
     ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_path, ref_text)
 
     with torch.no_grad():
-        audio, sample_rate, _ = infer_process(
+        audio, sample_rate, mel = infer_process(
             ref_audio,
             ref_text,
             str(args.text),
@@ -162,15 +205,16 @@ def main() -> None:
             speed=float(args.speed),
             nfe_step=int(args.nfe_step),
             cfg_strength=float(args.cfg_strength),
-            sway_sampling_coef=-1.0,
+            sway_sampling_coef=float(args.sway_sampling_coef),
+            device=infer_device,
         )
 
     if isinstance(audio, torch.Tensor):
         audio = audio.detach().cpu().numpy()
     audio = np.asarray(audio, dtype=np.float32)
     peak = float(np.max(np.abs(audio))) if audio.size else 0.0
-    if peak > 1.0:
-        audio = audio / peak
+    if peak > 0.98:
+        audio = audio * (0.98 / peak)
 
     if args.output_path:
         output_path = Path(args.output_path)
@@ -179,6 +223,10 @@ def main() -> None:
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         output_path = out_dir / f"{profile_dir.name.lower()}_f5tts_step{step or 0}_nfe{int(args.nfe_step)}_{timestamp}.wav"
     sf.write(output_path, audio, int(sample_rate), format="WAV", subtype="PCM_16")
+    mel_path = None
+    if bool(args.save_mel) and mel is not None:
+        mel_path = output_path.with_suffix(".mel.npy")
+        np.save(mel_path, np.asarray(mel, dtype=np.float32))
     print(json.dumps({
         "output": str(output_path),
         "checkpoint": str(checkpoint_path),
@@ -190,9 +238,11 @@ def main() -> None:
         "simulate_q4": bool(args.simulate_q4),
         "q4_tensors": int(q4_tensors),
         "q4_params": int(q4_params),
+        "runtime": runtime,
         "samples": int(audio.size),
         "sample_rate": int(sample_rate),
         "bytes": output_path.stat().st_size,
+        **({"mel_path": str(mel_path)} if mel_path is not None else {}),
     }, indent=2))
 
 

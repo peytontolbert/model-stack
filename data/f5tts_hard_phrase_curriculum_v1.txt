@@ -1,0 +1,20 @@
+Agent Kernel Lite can generate a natural voice on iPhone with the custom int4 WebAssembly runtime.
+Agent Kernel Lite should not be pronounced as Agent Colonel Light.
+The F5 TTS int4 model should say WebAssembly clearly.
+F5 TTS, Vocos, WebGPU, and WASM should all be pronounced clearly.
+The iPhone runtime uses custom int4 WebAssembly kernels for voice generation.
+The custom four bit diffusion voice model should stay coherent through the final words.
+Voice cloning quality should remain clear across longer generated speech.
+The model should speak clearly without static, clipping, or missing words.
+Today we are testing longer voice cloning quality across several different sentences.
+When the sentence gets longer, the ending should stay coherent and avoid noisy artifacts.
+Please generate a complete sentence instead of cutting off halfway through the final word.
+Numbers like twenty four kilohertz, eight steps, and four bit quantization should be intelligible.
+The distilled student should preserve the speaker tone without memorizing a single reference sample.
+The mobile app should report progress while the WebAssembly model generates speech.
+The audio should remain stable at the end of the sentence instead of repeating one sound.
+The custom kernel should run the diffusion loop with packed SIMD matrix operations.
+The vocoder and acoustic model should both stay quantized for mobile inference.
+The browser fallback should load the same model manifest as the iPhone app.
+The generated voice should pronounce kernel, quantization, and diffusion correctly.
+This held out evaluation is only for listening and should not be part of the training set.

@@ -51,3 +51,19 @@ Resume & EMA
 tc = TrainConfig(resume_from="ckpts/last/trainer_state.pt", ema_decay=0.999)
 trainer = Trainer(model, dist_cfg=dist, train_cfg=tc)
 ```
+
+Agent Kernel Lite migration lanes
+
+The Agent Kernel Lite training import can be launched through model-stack with:
+
+```bash
+python -m train.agent_kernel_lite list
+python -m train.agent_kernel_lite run seq2seq -- --help
+python -m train.agent_kernel_lite run diffusion-flow -- --help
+python -m train.agent_kernel_lite run f5tts-distill -- --help
+```
+
+The launcher keeps `scripts/agent_kernel_lite/` and the repo root on
+`sys.path`, so copied scripts with sibling imports can run without changing
+directory. Heavy artifacts, model bundles, and generated samples remain outside
+Git under ignored artifact paths.

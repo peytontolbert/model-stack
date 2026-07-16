@@ -19,6 +19,14 @@ That keeps model-specific encoder/decoder kernels out of the application layer
 and lets bddy switch between CPU, ONNX, CUDA, WebGPU, or custom kernels without
 rewiring capture code.
 
+## NeMo ASR Bridge
+
+NeMo ASR catalog entries are local under `/arxiv/models` and include `.nemo`
+archives. They should be validated in a dedicated `nemo_speech` conda env rather
+than the general `ai` Diffusers env. Use
+`scripts/smoke_nemo_asr_bridge.py <catalog-id>` for status-only checks and add
+`--restore` only after `nemo_toolkit` imports cleanly.
+
 ## Training and Distillation
 
 ASR training lives in scripts instead of the runtime package. The runtime package

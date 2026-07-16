@@ -28,6 +28,9 @@ public final class F5TTSMetalSession {
         rows: Int,
         output: MTLBuffer
     ) throws {
+        guard rows > 0, tensor.inDim > 0, tensor.outDim > 0 else {
+            throw ModelStackMetalError.invalidShape("Q4 linear dimensions must be positive")
+        }
         let shape = Q4LinearShape(rows: rows, inDim: tensor.inDim, outDim: tensor.outDim)
         let requiredInputBytes = rows * tensor.inDim * MemoryLayout<Float>.stride
         let requiredOutputBytes = rows * tensor.outDim * MemoryLayout<Float>.stride
@@ -75,4 +78,3 @@ struct Q4LinearKernelConstants {
     var outDim: UInt32
     var packedCols: UInt32
 }
-

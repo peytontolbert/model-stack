@@ -159,17 +159,20 @@ def scaled_dot_product_attention(
             from flash_attn import flash_attn_func  # type: ignore
 
             k_flash, v_flash = _expand_gqa_kv(q, k, v)
-            B, H, T, D = q.shape
-            S = k_flash.shape[2]
+            # runtime attention tensors are (B, H, T, D); flash_attn_func expects
+            # (B, T, H, D) and returns the same layout.
+            q_flash = q.transpose(1, 2).contiguous()
+            k_flash = k_flash.transpose(1, 2).contiguous()
+            v_flash = v_flash.transpose(1, 2).contiguous()
             out = flash_attn_func(
-                q.reshape(B * H, T, D),
-                k_flash.reshape(B * H, S, D),
-                v_flash.reshape(B * H, S, D),
+                q_flash,
+                k_flash,
+                v_flash,
                 causal=is_causal or False,
                 dropout_p=dropout_p,
                 softmax_scale=scale,
             )
-            return out.reshape(B, H, T, D)
+            return out.transpose(1, 2).contiguous()
         except Exception:
             k_exp, v_exp = _expand_gqa_kv(q, k, v)
             return torch.nn.functional.scaled_dot_product_attention(

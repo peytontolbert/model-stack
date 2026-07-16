@@ -51,6 +51,56 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def normalize_text_phonetic(text: str) -> str:
+    text = normalize_text(text.replace("-", " "))
+    replacements = {
+        "colonel": "kernel",
+        "light": "lite",
+        "f five t t s": "f5 tts",
+        "f five tts": "f5 tts",
+        "f5 t test": "f5 tts",
+        "f5 t tests": "f5 tts",
+        "f5t": "f5 tts",
+        "f5t t": "f5 tts",
+        "f5t t s": "f5 tts",
+        "f5tts": "f5 tts",
+        "web g p u": "webgpu",
+        "web gpu": "webgpu",
+        "web gpo": "webgpu",
+        "web assembly": "webassembly",
+        "wasm": "webassembly",
+        "wasim": "webassembly",
+        "four bit": "4 bit",
+        "for bit": "4 bit",
+        "4bit": "4 bit",
+        "voh coes": "vocos",
+        "voh kose": "vocos",
+        "volkos": "vocos",
+        "valkos": "vocos",
+        "valko's": "vocos",
+        "distilda": "distilled",
+        "instilled": "distilled",
+        "fiat": "f5 tts",
+        "fiats": "f5 tts",
+        "fiitts": "f5 tts",
+        "fiit": "f5 tts",
+        "fies": "f5 tts",
+        "fii": "f5 tts",
+        "f58t": "f5 tts",
+        "5 tts": "f5 tts",
+        "a 5 tts": "f5 tts",
+        "voiced": "voice",
+        "tests": "test",
+        "forcep": "four step",
+        "force": "four",
+        "for step": "four step",
+        "forstep": "four step",
+    }
+    for source, target in replacements.items():
+        text = re.sub(r"\b" + re.escape(source) + r"\b", target, text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def edit_distance(left: list[str], right: list[str]) -> int:
     row = list(range(len(right) + 1))
     for i, left_word in enumerate(left, 1):
@@ -65,6 +115,12 @@ def edit_distance(left: list[str], right: list[str]) -> int:
 def word_error_rate(reference: str, hypothesis: str) -> float:
     ref_words = normalize_text(reference).split()
     hyp_words = normalize_text(hypothesis).split()
+    return float(edit_distance(ref_words, hyp_words)) / float(max(1, len(ref_words)))
+
+
+def phonetic_word_error_rate(reference: str, hypothesis: str) -> float:
+    ref_words = normalize_text_phonetic(reference).split()
+    hyp_words = normalize_text_phonetic(hypothesis).split()
     return float(edit_distance(ref_words, hyp_words)) / float(max(1, len(ref_words)))
 
 
@@ -87,11 +143,14 @@ def make_transcriber(model_id: str, *, local_files_only: bool, device: str):
             audio_16k = audio_16k / peak * 0.8
         inputs = processor(audio_16k, sampling_rate=16000, return_tensors="pt", return_attention_mask=True)
         inputs = {key: value.to(resolved_device) for key, value in inputs.items()}
+        generate_kwargs = {"max_new_tokens": 96}
+        if getattr(model.config, "is_multilingual", False):
+            generate_kwargs.update({"language": "en", "task": "transcribe"})
         with torch.inference_mode():
             predicted_ids = model.generate(
                 inputs["input_features"],
                 attention_mask=inputs.get("attention_mask"),
-                max_new_tokens=96,
+                **generate_kwargs,
             )
         return processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
 
@@ -152,6 +211,7 @@ def main() -> None:
             hypothesis = transcribe(candidate_audio, candidate_sr)
             rows[-1]["asr_hypothesis"] = hypothesis
             rows[-1]["asr_wer"] = word_error_rate(args.text, hypothesis)
+            rows[-1]["asr_phonetic_wer"] = phonetic_word_error_rate(args.text, hypothesis)
 
     baseline_row = None
     if args.baseline:
@@ -164,6 +224,8 @@ def main() -> None:
             row["beats_baseline_logmel"] = row["logmel_dtw_to_teacher"] < baseline_row["logmel_dtw_to_teacher"]
             if "asr_wer" in row and "asr_wer" in baseline_row:
                 row["beats_baseline_asr_wer"] = row["asr_wer"] < baseline_row["asr_wer"]
+            if "asr_phonetic_wer" in row and "asr_phonetic_wer" in baseline_row:
+                row["beats_baseline_asr_phonetic_wer"] = row["asr_phonetic_wer"] < baseline_row["asr_phonetic_wer"]
 
     print(json.dumps({"teacher": str(teacher_path), "results": rows}, indent=2, sort_keys=True))
 

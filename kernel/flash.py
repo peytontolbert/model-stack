@@ -17,16 +17,19 @@ def _load_flash2():
     ) -> torch.Tensor:
         from flash_attn import flash_attn_func  # type: ignore
 
-        B, H, T, D = q.shape
-        S = k.shape[2]
+        # runtime attention tensors are (B, H, T, D); flash_attn_func expects
+        # (B, T, H, D) and returns the same layout.
+        q_flash = q.transpose(1, 2).contiguous()
+        k_flash = k.transpose(1, 2).contiguous()
+        v_flash = v.transpose(1, 2).contiguous()
         out = flash_attn_func(
-            q.reshape(B * H, T, D),
-            k.reshape(B * H, S, D),
-            v.reshape(B * H, S, D),
+            q_flash,
+            k_flash,
+            v_flash,
             causal=is_causal,
             dropout_p=dropout_p,
         )
-        return out.reshape(B, H, T, D)
+        return out.transpose(1, 2).contiguous()
 
     return _flash2_attn
 

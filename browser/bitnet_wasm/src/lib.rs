@@ -14,6 +14,7 @@ const IDX_TILE_N: usize = 1;
 const IDX_TILE_K: usize = 2;
 const IDX_LOGICAL_OUT: usize = 3;
 const IDX_LOGICAL_IN: usize = 4;
+const IDX_PADDED_OUT: usize = 5;
 const IDX_PADDED_IN: usize = 6;
 const IDX_SCALE_GRANULARITY: usize = 7;
 const IDX_SCALE_GROUP_SIZE: usize = 8;
@@ -46,6 +47,109 @@ fn validate_header(layout_header: &[i32]) -> Result<(), JsValue> {
         return Err(JsValue::from_str(
             "Unsupported BitNet WASM layout; expected v1 16x32 interleave mode 1",
         ));
+    }
+    let logical_out = layout_header[IDX_LOGICAL_OUT];
+    let logical_in = layout_header[IDX_LOGICAL_IN];
+    let padded_out = layout_header[IDX_PADDED_OUT];
+    let padded_in = layout_header[IDX_PADDED_IN];
+    let scale_granularity = layout_header[IDX_SCALE_GRANULARITY];
+    let scale_group_size = layout_header[IDX_SCALE_GROUP_SIZE];
+    let segment_count = layout_header[IDX_SEGMENT_COUNT];
+    if logical_out <= 0 || logical_in <= 0 {
+        return Err(JsValue::from_str("BitNet logical dimensions must be positive"));
+    }
+    if padded_out < logical_out || padded_in < logical_in {
+        return Err(JsValue::from_str(
+            "BitNet padded dimensions must be at least the logical dimensions",
+        ));
+    }
+    if padded_out % layout_header[IDX_TILE_N] != 0 {
+        return Err(JsValue::from_str("BitNet padded output features must be tile aligned"));
+    }
+    if padded_in % 4 != 0 {
+        return Err(JsValue::from_str(
+            "BitNet padded input features must be divisible by 4",
+        ));
+    }
+    if padded_in % layout_header[IDX_TILE_K] != 0 {
+        return Err(JsValue::from_str("BitNet padded input features must be tile aligned"));
+    }
+    if !matches!(scale_granularity, 0..=2) {
+        return Err(JsValue::from_str("Unsupported BitNet scale_granularity"));
+    }
+    if scale_granularity == 2 && scale_group_size <= 0 {
+        return Err(JsValue::from_str(
+            "BitNet per-output-group scaling requires a positive scale_group_size",
+        ));
+    }
+    if segment_count <= 0 {
+        return Err(JsValue::from_str("BitNet segment_count must be positive"));
+    }
+    Ok(())
+}
+
+fn validate_tensors(
+    logical_out: usize,
+    padded_in: usize,
+    scale_values: &[f32],
+    segment_offsets: &[i32],
+    bias_values: &[f32],
+    scale_granularity: usize,
+    scale_group_size: usize,
+    segment_count: usize,
+    input_scales: &[f32],
+    input_quant_mode: u32,
+    input_quant_bits: u32,
+    input_scale_rows: usize,
+) -> Result<(), JsValue> {
+    if segment_offsets.len() != segment_count + 1 {
+        return Err(JsValue::from_str("BitNet segment_offsets length mismatch"));
+    }
+    if segment_offsets.first().copied() != Some(0) {
+        return Err(JsValue::from_str("BitNet segment_offsets must start at 0"));
+    }
+    if segment_offsets.get(segment_count).copied() != Some(logical_out as i32) {
+        return Err(JsValue::from_str(
+            "BitNet segment_offsets must end at logical_out_features",
+        ));
+    }
+    for window in segment_offsets.windows(2) {
+        if window[1] < window[0] {
+            return Err(JsValue::from_str("BitNet segment_offsets must be non-decreasing"));
+        }
+    }
+    match scale_granularity {
+        0 if scale_values.is_empty() => {
+            return Err(JsValue::from_str(
+                "BitNet per-matrix scaling requires at least one value",
+            ));
+        }
+        1 if scale_values.len() != segment_count => {
+            return Err(JsValue::from_str("BitNet per-segment scaling size mismatch"));
+        }
+        2 => {
+            let expected_groups = logical_out.div_ceil(scale_group_size);
+            if scale_values.len() != expected_groups {
+                return Err(JsValue::from_str(
+                    "BitNet per-output-group scaling size mismatch",
+                ));
+            }
+        }
+        _ => {}
+    }
+    if !bias_values.is_empty() && bias_values.len() != logical_out {
+        return Err(JsValue::from_str("BitNet bias length mismatch"));
+    }
+    if input_quant_mode != 0 {
+        if !(2..=8).contains(&input_quant_bits) {
+            return Err(JsValue::from_str("BitNet input_quant_bits must be in [2, 8]"));
+        }
+        if input_scale_rows == 0 || input_scales.len() < input_scale_rows {
+            return Err(JsValue::from_str("BitNet input_scales length mismatch"));
+        }
+    }
+    if padded_in == 0 {
+        return Err(JsValue::from_str("BitNet padded input features must be positive"));
     }
     Ok(())
 }
@@ -269,6 +373,20 @@ fn bitnet_linear_impl(
     let scale_granularity = layout_header[IDX_SCALE_GRANULARITY].max(0) as usize;
     let scale_group_size = layout_header[IDX_SCALE_GROUP_SIZE].max(0) as usize;
     let segment_count = layout_header[IDX_SEGMENT_COUNT].max(0) as usize;
+    validate_tensors(
+        logical_out,
+        padded_in,
+        scale_values,
+        segment_offsets,
+        bias_values,
+        scale_granularity,
+        scale_group_size,
+        segment_count,
+        input_scales,
+        input_quant_mode,
+        input_quant_bits,
+        input_scale_rows,
+    )?;
     if logical_in == 0 || logical_out == 0 || rows == 0 {
         return Ok(Vec::new());
     }
@@ -890,6 +1008,24 @@ impl BitnetLinearHandle {
         let scale_granularity = layout_header[IDX_SCALE_GRANULARITY].max(0) as usize;
         let scale_group_size = layout_header[IDX_SCALE_GROUP_SIZE].max(0) as usize;
         let segment_count = layout_header[IDX_SEGMENT_COUNT].max(0) as usize;
+        validate_tensors(
+            logical_out,
+            padded_in,
+            &scale_values,
+            &segment_offsets,
+            &bias_values,
+            scale_granularity,
+            scale_group_size,
+            segment_count,
+            &input_scales,
+            input_quant_mode,
+            input_quant_bits,
+            input_scale_rows,
+        )?;
+        let row_stride_bytes = padded_in / 4;
+        if packed_weight.len() < logical_out * row_stride_bytes {
+            return Err(JsValue::from_str("BitNet packed_weight is shorter than layout requires"));
+        }
         let (pos_offsets, pos_indices, neg_offsets, neg_indices) =
             build_sparse_indices(&packed_weight, logical_out, logical_in, padded_in);
         let row_scales = build_row_scales(
@@ -1952,6 +2088,150 @@ fn attention_impl_kv_head_major(
     Ok(output)
 }
 
+fn attention_noncausal_already_head_major_64(
+    q: &[f32],
+    k_head: &[f32],
+    v_head: &[f32],
+    q_len: usize,
+    kv_len: usize,
+    n_heads: usize,
+) -> Vec<f32> {
+    let head_dim = 64usize;
+    let model_dim = n_heads * head_dim;
+    let mut output = vec![0.0f32; q_len * model_dim];
+    let mut scores = vec![0.0f32; kv_len];
+    let scale = 1.0f32 / 8.0f32;
+    for head in 0..n_heads {
+        let head_base = head * kv_len * head_dim;
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        {
+            let mut scores1 = vec![0.0f32; kv_len];
+            let mut scores2 = vec![0.0f32; kv_len];
+            let mut scores3 = vec![0.0f32; kv_len];
+            let mut qi = 0usize;
+            while qi + 3 < q_len {
+                let q_base0 = qi * model_dim + head * head_dim;
+                let q_base1 = (qi + 1) * model_dim + head * head_dim;
+                let q_base2 = (qi + 2) * model_dim + head * head_dim;
+                let q_base3 = (qi + 3) * model_dim + head * head_dim;
+                let mut max0 = f32::NEG_INFINITY;
+                let mut max1 = f32::NEG_INFINITY;
+                let mut max2 = f32::NEG_INFINITY;
+                let mut max3 = f32::NEG_INFINITY;
+                for kj in 0..kv_len {
+                    let k_base = head_base + kj * head_dim;
+                    let s = unsafe {
+                        dot4_queries_scaled_64_simd(
+                            q.as_ptr().add(q_base0),
+                            q.as_ptr().add(q_base1),
+                            q.as_ptr().add(q_base2),
+                            q.as_ptr().add(q_base3),
+                            k_head.as_ptr().add(k_base),
+                            scale,
+                        )
+                    };
+                    scores[kj] = s[0];
+                    scores1[kj] = s[1];
+                    scores2[kj] = s[2];
+                    scores3[kj] = s[3];
+                    max0 = max0.max(s[0]);
+                    max1 = max1.max(s[1]);
+                    max2 = max2.max(s[2]);
+                    max3 = max3.max(s[3]);
+                }
+                let mut denom0 = 0.0f32;
+                let mut denom1 = 0.0f32;
+                let mut denom2 = 0.0f32;
+                let mut denom3 = 0.0f32;
+                for kj in 0..kv_len {
+                    scores[kj] = (scores[kj] - max0).exp();
+                    scores1[kj] = (scores1[kj] - max1).exp();
+                    scores2[kj] = (scores2[kj] - max2).exp();
+                    scores3[kj] = (scores3[kj] - max3).exp();
+                    denom0 += scores[kj];
+                    denom1 += scores1[kj];
+                    denom2 += scores2[kj];
+                    denom3 += scores3[kj];
+                }
+                let inv0 = 1.0 / denom0.max(1.0e-20);
+                let inv1 = 1.0 / denom1.max(1.0e-20);
+                let inv2 = 1.0 / denom2.max(1.0e-20);
+                let inv3 = 1.0 / denom3.max(1.0e-20);
+                let out_base0 = qi * model_dim + head * head_dim;
+                let out_base1 = (qi + 1) * model_dim + head * head_dim;
+                let out_base2 = (qi + 2) * model_dim + head * head_dim;
+                let out_base3 = (qi + 3) * model_dim + head * head_dim;
+                for kj in 0..kv_len {
+                    let v_base = head_base + kj * head_dim;
+                    unsafe {
+                        add_weighted_64_four_simd(
+                            output.as_mut_ptr(),
+                            out_base0,
+                            out_base1,
+                            out_base2,
+                            out_base3,
+                            v_head.as_ptr().add(v_base),
+                            scores[kj] * inv0,
+                            scores1[kj] * inv1,
+                            scores2[kj] * inv2,
+                            scores3[kj] * inv3,
+                        );
+                    }
+                }
+                qi += 4;
+            }
+            while qi < q_len {
+                let mut max_score = f32::NEG_INFINITY;
+                let q_base = qi * model_dim + head * head_dim;
+                for kj in 0..kv_len {
+                    let k_base = head_base + kj * head_dim;
+                    let score = dot_scaled_64(&q[q_base..q_base + 64], &k_head[k_base..k_base + 64], scale);
+                    scores[kj] = score;
+                    max_score = max_score.max(score);
+                }
+                let mut denom = 0.0f32;
+                for score in scores.iter_mut().take(kv_len) {
+                    *score = (*score - max_score).exp();
+                    denom += *score;
+                }
+                let denom = denom.max(1.0e-20);
+                let out_base = qi * model_dim + head * head_dim;
+                for kj in 0..kv_len {
+                    let v_base = head_base + kj * head_dim;
+                    add_weighted_64(&mut output[out_base..out_base + 64], &v_head[v_base..v_base + 64], scores[kj] / denom);
+                }
+                qi += 1;
+            }
+            continue;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        {
+            for qi in 0..q_len {
+                let mut max_score = f32::NEG_INFINITY;
+                let q_base = qi * model_dim + head * head_dim;
+                for kj in 0..kv_len {
+                    let k_base = head_base + kj * head_dim;
+                    let score = dot_scaled_64(&q[q_base..q_base + 64], &k_head[k_base..k_base + 64], scale);
+                    scores[kj] = score;
+                    max_score = max_score.max(score);
+                }
+                let mut denom = 0.0f32;
+                for score in scores.iter_mut().take(kv_len) {
+                    *score = (*score - max_score).exp();
+                    denom += *score;
+                }
+                let denom = denom.max(1.0e-20);
+                let out_base = qi * model_dim + head * head_dim;
+                for kj in 0..kv_len {
+                    let v_base = head_base + kj * head_dim;
+                    add_weighted_64(&mut output[out_base..out_base + 64], &v_head[v_base..v_base + 64], scores[kj] / denom);
+                }
+            }
+        }
+    }
+    output
+}
+
 fn attention_impl_kv_already_head_major(
     q: &[f32],
     k_head: &[f32],
@@ -1977,37 +2257,7 @@ fn attention_impl_kv_already_head_major(
     let mut scores = vec![0.0f32; kv_len];
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     if !causal {
-        for head in 0..n_heads {
-            let head_base = head * kv_len * head_dim;
-            for qi in 0..q_len {
-                let mut max_score = f32::NEG_INFINITY;
-                let q_base = qi * model_dim + head * head_dim;
-                for kj in 0..kv_len {
-                    let k_base = head_base + kj * head_dim;
-                    let score = dot_scaled_64(&q[q_base..q_base + 64], &k_head[k_base..k_base + 64], scale);
-                    scores[kj] = score;
-                    if score > max_score {
-                        max_score = score;
-                    }
-                }
-                let mut denom = 0.0f32;
-                for score in scores.iter_mut().take(kv_len) {
-                    *score = (*score - max_score).exp();
-                    denom += *score;
-                }
-                let denom = denom.max(1.0e-20);
-                let out_base = qi * model_dim + head * head_dim;
-                for kj in 0..kv_len {
-                    let v_base = head_base + kj * head_dim;
-                    add_weighted_64(
-                        &mut output[out_base..out_base + 64],
-                        &v_head[v_base..v_base + 64],
-                        scores[kj] / denom,
-                    );
-                }
-            }
-        }
-        return Ok(output);
+        return Ok(attention_noncausal_already_head_major_64(q, k_head, v_head, q_len, kv_len, n_heads));
     }
     for head in 0..n_heads {
         let head_base = head * kv_len * head_dim;

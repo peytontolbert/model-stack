@@ -47,6 +47,9 @@ public final class Q4TensorBundleMetal {
         inDim: Int,
         outDim: Int
     ) throws {
+        guard inDim > 0, outDim > 0 else {
+            throw ModelStackMetalError.invalidShape("Q4 dimensions must be positive for \(name)")
+        }
         guard packedWeight.count >= outDim * ((inDim + 1) / 2) else {
             throw ModelStackMetalError.invalidShape("packed Q4 weight too small for \(name)")
         }
@@ -74,4 +77,3 @@ public final class Q4TensorBundleMetal {
         linearTensors[name]
     }
 }
-

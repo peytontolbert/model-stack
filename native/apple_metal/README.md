@@ -21,6 +21,21 @@ Do not call individual layers from JavaScript. Once Metal is selected, the whole
 
 The first app integration should accelerate F5 QKV, attention output, FF in/out, input projection, and later Vocos Q4 layers. WASM SIMD remains the fallback and the reference for parity checks.
 
+## Backend Selection
+
+On iPhone, prefer this backend only from the native app shell. Browser Safari
+should continue to use WebGPU when available and WASM otherwise; it cannot call
+Metal directly without a native bridge.
+
+Selection order for the app should be:
+
+1. Metal backend when the native bridge is present and parity gates pass.
+2. Browser WASM Q4/BitNet runtime as the deterministic fallback.
+3. WebGPU for browser-only BitNet linear paths where it is available and faster.
+
+Keep selection coarse-grained. JavaScript should choose a backend for the whole
+F5/Vocos request, not per-layer Metal calls.
+
 ## Required Gates
 
 Before the app selects this backend by default:
@@ -29,4 +44,3 @@ Before the app selects this backend by default:
 - 1-step Peyton checksum must remain `73.719445`.
 - 2-step CFG checksum must remain `-590.153`.
 - Generated audio must pass the existing quality sample review.
-
