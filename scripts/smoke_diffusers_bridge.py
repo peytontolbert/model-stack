@@ -36,6 +36,11 @@ def main() -> None:
     parser.add_argument("--device-map", default=None)
     parser.add_argument("--max-memory", action="append", help="Placement cap like 0=20GiB or cpu=110GiB; may repeat.")
     parser.add_argument("--skip-component", action="append", default=[], help="Pass a Diffusers component as None during pipeline load; may repeat.")
+    parser.add_argument("--use-safetensors", action="store_true", help="Force safetensors weights when Diffusers supports it.")
+    parser.add_argument("--model-cpu-offload", action="store_true", help="Enable Diffusers model CPU offload after pipeline load.")
+    parser.add_argument("--sequential-cpu-offload", action="store_true", help="Enable Diffusers sequential CPU offload after pipeline load.")
+    parser.add_argument("--vae-tiling", action="store_true", help="Enable VAE tiling for higher-resolution image/video outputs.")
+    parser.add_argument("--attention-slicing", action="store_true", help="Enable Diffusers attention slicing for memory-constrained runs.")
     parser.add_argument("--no-validate", action="store_true")
     args = parser.parse_args()
 
@@ -58,8 +63,13 @@ def main() -> None:
         dtype=args.dtype,
         device_map=args.device_map,
         max_memory=_parse_max_memory(args.max_memory),
+        use_safetensors=True if args.use_safetensors else None,
+        enable_model_cpu_offload=args.model_cpu_offload,
+        enable_sequential_cpu_offload=args.sequential_cpu_offload,
+        enable_vae_tiling=args.vae_tiling,
+        enable_attention_slicing=args.attention_slicing,
         validate_snapshot=not args.no_validate,
-        channels_last=args.device_map is None,
+        channels_last=args.device_map is None and not (args.model_cpu_offload or args.sequential_cpu_offload),
         skip_components=tuple(args.skip_component),
     )
     if args.component:

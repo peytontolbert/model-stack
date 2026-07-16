@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 
 import pytest
 
-from runtime.world_model_bridge import WorldModelBridgeUnsupported, load_world_model, world_model_status
+from runtime.world_model_bridge import (
+    WorldModelBridgeOptions,
+    WorldModelBridgeUnsupported,
+    load_diffusers_world_model,
+    load_transformers_image_text_model,
+    load_world_model,
+    world_model_status,
+)
 
 
 def test_cosmos_embed1_224p_status_is_runnable(tmp_path):
@@ -379,6 +388,141 @@ def test_egm_4b_routes_to_image_text_transformers_loader(tmp_path):
         assert status.runnable is True
         assert status.preferred_env == "ai"
         assert status.loader == "runtime.world_model_bridge.load_transformers_image_text_model"
+
+
+def test_egm_loader_forwards_transformers_placement_options(monkeypatch, tmp_path):
+    model_dir = tmp_path / "EGM-4B"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+    calls = {}
+
+    class FakeTorch:
+        bfloat16 = "bf16"
+        float16 = "fp16"
+        float32 = "fp32"
+
+        class cuda:
+            @staticmethod
+            def is_available():
+                return True
+
+        @staticmethod
+        def device(value):
+            return value
+
+    class FakeModel:
+        def __init__(self):
+            self.to_called = False
+            self.eval_called = False
+
+        def to(self, device):
+            self.to_called = True
+            return self
+
+        def eval(self):
+            self.eval_called = True
+            return self
+
+    fake_model = FakeModel()
+
+    class FakeAutoConfig:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            calls["config"] = (path, kwargs)
+            return {"ok": True}
+
+    class FakeAutoProcessor:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            calls["processor"] = (path, kwargs)
+            return "processor"
+
+    class FakeAutoModelForImageTextToText:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            calls["model"] = (path, kwargs)
+            return fake_model
+
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        types.SimpleNamespace(
+            AutoConfig=FakeAutoConfig,
+            AutoModelForImageTextToText=FakeAutoModelForImageTextToText,
+            AutoProcessor=FakeAutoProcessor,
+        ),
+    )
+
+    artifacts = load_transformers_image_text_model(
+        model_dir,
+        options=WorldModelBridgeOptions(
+            device="cuda:1",
+            dtype="bfloat16",
+            device_map="balanced",
+            max_memory={1: "20GiB", "cpu": "64GiB"},
+            offload_folder="/data/tmp/egm-offload",
+        ),
+    )
+
+    assert artifacts.model is fake_model
+    assert fake_model.to_called is False
+    assert fake_model.eval_called is True
+    assert calls["model"][1]["device_map"] == "balanced"
+    assert calls["model"][1]["max_memory"] == {1: "20GiB", "cpu": "64GiB"}
+    assert calls["model"][1]["low_cpu_mem_usage"] is True
+    assert calls["model"][1]["offload_folder"] == "/data/tmp/egm-offload"
+
+
+def test_diffusers_world_loader_forwards_profile_and_override_optimizations(monkeypatch, tmp_path):
+    model_dir = tmp_path / "AnyFlow-Wan2.1-T2V-1.3B-Diffusers"
+    for component in ("transformer", "vae", "tokenizer", "scheduler", "text_encoder"):
+        (model_dir / component).mkdir(parents=True)
+    (model_dir / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "AnyFlowPipeline",
+                "transformer": ["diffusers", "WanTransformer3DModel"],
+                "vae": ["diffusers", "AutoencoderKLWan"],
+                "tokenizer": ["transformers", "AutoTokenizer"],
+                "text_encoder": ["transformers", "T5EncoderModel"],
+                "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    calls = {}
+
+    def fake_load(path, *, options):
+        calls["path"] = path
+        calls["options"] = options
+        return "pipeline"
+
+    import runtime.diffusers_bridge as diffusers_bridge
+
+    monkeypatch.setattr(diffusers_bridge, "load_diffusers_pipeline", fake_load)
+
+    loaded = load_diffusers_world_model(
+        model_dir,
+        options=WorldModelBridgeOptions(
+            device="cuda:1",
+            dtype="bfloat16",
+            max_memory={1: "20GiB", "cpu": "96GiB"},
+            use_safetensors=True,
+            enable_model_cpu_offload=True,
+        ),
+    )
+
+    assert loaded == "pipeline"
+    assert calls["path"] == str(model_dir)
+    assert calls["options"].device_map == "cuda"
+    assert calls["options"].max_memory == {1: "20GiB", "cpu": "96GiB"}
+    assert calls["options"].use_safetensors is True
+    assert calls["options"].enable_model_cpu_offload is True
+    assert calls["options"].skip_components == ("text_encoder", "tokenizer")
+
 
 def test_lingbot_video_pipeline_has_specific_blocker(tmp_path):
     model_dir = tmp_path / "lingbot-video-dense-1.3b"

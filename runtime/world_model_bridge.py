@@ -14,6 +14,15 @@ class WorldModelBridgeOptions:
     local_files_only: bool = True
     trust_remote_code: bool = True
     eval_mode: bool = True
+    device_map: str | dict[int | str, str] | None = None
+    max_memory: dict[int | str, str | int] | None = None
+    low_cpu_mem_usage: bool = True
+    offload_folder: str | None = None
+    enable_model_cpu_offload: bool = False
+    enable_sequential_cpu_offload: bool = False
+    variant: str | None = None
+    use_safetensors: bool | None = None
+    skip_components: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -139,6 +148,7 @@ _DIFFUSERS_VIDEO_PROFILES: dict[str, dict[str, Any]] = {
         "status": "verified_flux2_klein_latent_generation",
         "supports_text": True,
         "supports_video": False,
+        "device_map": "balanced",
         "detail": (
             "FLUX.2-klein-9B full pipeline placement and 256x256 1-step latent generation pass in ai with "
             "device_map=balanced and explicit max_memory. Cold load is slow without cache, but the bounded warmed run loaded "
@@ -659,8 +669,13 @@ def load_transformers_image_text_model(
         trust_remote_code=selected.trust_remote_code,
         local_files_only=selected.local_files_only,
         dtype=dtype,
+        device_map=selected.device_map,
+        max_memory=selected.max_memory,
+        low_cpu_mem_usage=selected.low_cpu_mem_usage,
+        offload_folder=selected.offload_folder,
     )
-    model = model.to(device)
+    if selected.device_map is None:
+        model = model.to(device)
     if selected.eval_mode and hasattr(model, "eval"):
         model.eval()
     return TransformersWorldModelArtifacts(model=model, processor=processor, config=config, device=device, dtype=dtype, status=status)
@@ -685,10 +700,17 @@ def load_diffusers_world_model(
             dtype=selected.dtype or status.recommended_dtype,
             local_files_only=selected.local_files_only,
             trust_remote_code=selected.trust_remote_code,
+            variant=selected.variant if selected.variant is not None else profile.get("variant"),
+            use_safetensors=selected.use_safetensors if selected.use_safetensors is not None else profile.get("use_safetensors"),
             enable_vae_slicing=True,
             channels_last=True,
-            device_map=profile.get("device_map"),
-            skip_components=tuple(profile.get("skip_components", ())),
+            device_map=selected.device_map if selected.device_map is not None else profile.get("device_map"),
+            max_memory=selected.max_memory if selected.max_memory is not None else profile.get("max_memory"),
+            low_cpu_mem_usage=selected.low_cpu_mem_usage,
+            enable_model_cpu_offload=selected.enable_model_cpu_offload or bool(profile.get("enable_model_cpu_offload", False)),
+            enable_sequential_cpu_offload=selected.enable_sequential_cpu_offload
+            or bool(profile.get("enable_sequential_cpu_offload", False)),
+            skip_components=tuple(selected.skip_components or tuple(profile.get("skip_components", ()))),
         )
         return load_diffusers_pipeline(str(model_path), options=bridge_options)
     except Exception as exc:  # pragma: no cover - depends on optional env packages and GPU memory
