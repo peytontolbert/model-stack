@@ -10,6 +10,17 @@ generation, native dispatch, compression/export, tests, and restartable H100
 recipes, so an optimization can be trained, packed, exported, benchmarked, and
 served without rewriting glue code.
 
+## Runtime Model Coverage
+
+Model Stack currently has **51 verified model/runtime entries** in the local
+verification ledger. This count includes entries whose status starts with
+`works_` or `verified_`, meaning a model-stack bridge/runtime path has passed a
+snapshot, component, forward, generation, ONNX, or export smoke. Candidate,
+blocked, incomplete, and adapter-needs-base entries are tracked separately.
+
+See [docs/model-stack-model-verification.md](docs/model-stack-model-verification.md)
+for the full model-by-model table and smoke report links.
+
 ## Why Model Stack
 
 - Beats Hugging Face Transformers BitNet module execution on H100 for the
