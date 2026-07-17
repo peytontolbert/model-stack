@@ -243,6 +243,35 @@ def world_model_status(model_path: str | Path, *, model_id: str | None = None) -
         )
 
     lower_id = resolved_id.lower()
+    if "sapiens2-pose" in lower_id:
+        try:
+            from runtime.sapiens2_pose_bridge import sapiens2_pose_status
+
+            pose_status = sapiens2_pose_status(path, model_id=resolved_id)
+            return WorldModelStatus(
+                model_id=pose_status.model_id,
+                model_path=pose_status.model_path,
+                family="sapiens2_pose",
+                status=pose_status.status,
+                runnable=pose_status.runnable,
+                preferred_env=pose_status.preferred_env,
+                loader=pose_status.loader,
+                recommended_dtype=pose_status.recommended_dtype,
+                supports_text=False,
+                supports_video=False,
+                detail=pose_status.detail,
+                blockers=pose_status.blockers,
+            )
+        except Exception as exc:  # pragma: no cover - bridge import should be graceful
+            return _unsupported_custom_status(
+                path,
+                resolved_id,
+                family="sapiens2_pose",
+                status="sapiens2_pose_bridge_status_failed",
+                env="ai",
+                detail=f"Sapiens2 pose bridge status failed: {type(exc).__name__}:{exc}",
+            )
+
     if lower_id.startswith("pe-av-") or lower_id in {"pe-av-small", "pe-av-base", "pe-av-large", "pe-av-base-16-frame"}:
         return _unsupported_custom_status(
             path,

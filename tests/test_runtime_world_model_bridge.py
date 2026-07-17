@@ -232,6 +232,25 @@ def test_cogvideox_2b_diffusers_video_profile_is_runnable_candidate(tmp_path):
     assert "CogVideoX" in status.detail
 
 
+def test_sapiens2_pose_routes_to_custom_bridge(tmp_path):
+    model_dir = tmp_path / "sapiens2-pose-1b"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "sapiens2", "architectures": ["Sapiens2ForPoseEstimation"]}),
+        encoding="utf-8",
+    )
+    (model_dir / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").write_text("", encoding="utf-8")
+
+    status = world_model_status(model_dir, model_id="facebook/sapiens2-pose-1b")
+
+    assert status.family == "sapiens2_pose"
+    assert status.status == "verified_sapiens2_pose_load_bridge"
+    assert status.runnable is True
+    assert status.preferred_env == "ai"
+    assert status.loader == "runtime.sapiens2_pose_bridge.load_sapiens2_pose_model"
+
+
 def test_pe_av_and_lightx2v_have_specific_blockers(tmp_path):
     pe = tmp_path / "pe-av-small"
     pe.mkdir()

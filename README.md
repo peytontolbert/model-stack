@@ -12,7 +12,7 @@ served without rewriting glue code.
 
 ## Runtime Model Coverage
 
-Model Stack currently has **51 verified model/runtime entries** in the local
+Model Stack currently has **52 verified model/runtime entries** in the local
 verification ledger. This count includes entries whose status starts with
 `works_` or `verified_`, meaning a model-stack bridge/runtime path has passed a
 snapshot, component, forward, generation, ONNX, or export smoke. Candidate,

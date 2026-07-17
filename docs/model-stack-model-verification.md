@@ -31,6 +31,7 @@ Verifier env: `ai`.
 | `works_snapshot_status` | 10 |
 | `needs_nemo_speech_env` | 6 |
 | `works_adapter_status` | 2 |
+| `verified_sapiens2_pose_load_bridge` | 1 |
 | `incomplete_diffusers_snapshot` | 1 |
 
 | Lane | Count |
@@ -41,6 +42,7 @@ Verifier env: `ai`.
 | `transformers_causal_lm_bridge` | 15 |
 | `diffusers_cuda_bridge` | 6 |
 | `nemo_asr_bridge` | 6 |
+| `sapiens2_pose_bridge` | 1 |
 
 ## diffusers_cuda_bridge
 
@@ -106,6 +108,12 @@ Verifier env: `ai`.
 | `repository_library/verifier-accept-policy` | `BertForSequenceClassification` | 22,714,756 | 0.274s | 423 MB | `reports/encoder-classifier-smokes/verifier-accept-policy.cuda0.ai.json` |
 
 Patch note: `abstract-repo-planning`, `bug-localization`, `metadata-category-classifier`, and `self-play-reward-model` require `transformers_classifier_head_num_labels_from_checkpoint`; their checkpoint classifier head shape is authoritative over stale `config.num_labels`.
+
+## sapiens2_pose_bridge
+
+| Model | Status | Preferred Env | Local | Detail |
+| --- | --- | --- | --- | --- |
+| `facebook/sapiens2-pose-1b` | `verified_sapiens2_pose_load_bridge` | `ai` | yes | Custom model-stack bridge loads the original `backbone.*` / `decode_head.*` safetensors schema directly, avoiding the unavailable Transformers 5.10 dev Sapiens2 classes. BF16 load-only smoke on `cuda:0` passed in 164.64s with about 2.9GB allocated after load; full 1024x768 forward remains a separate latency/VRAM benchmark. |
 
 ## nemo_asr_bridge
 
